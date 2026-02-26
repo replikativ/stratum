@@ -51,18 +51,20 @@ jobs:
             -d target/classes \
             src-java/stratum/internal/ColumnOps.java \
             src-java/stratum/internal/ColumnOpsExt.java \
+            src-java/stratum/internal/ColumnOpsVar.java \
             src-java/stratum/internal/ColumnOpsChunked.java \
             src-java/stratum/internal/ColumnOpsChunkedSimd.java \
-            src-java/stratum/internal/ColumnOpsAnalytics.java
+            src-java/stratum/internal/ColumnOpsAnalytics.java \
+            src-java/stratum/internal/PgWireServer.java
 
       - name: Download Clojure dependencies
-        run: clj -P -M:dev
+        run: clojure -P -M:dev
 
       - name: Render Clay notebooks
         env:
           JVM_OPTS: "--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED"
         run: |
-          clj -M:dev -e "
+          clojure -M:dev -e "
           (require '[scicloj.clay.v2.api :as clay])
 
           ;; Render main notebook

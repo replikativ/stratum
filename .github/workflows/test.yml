@@ -42,12 +42,14 @@ jobs:
             -d target/classes \
             src-java/stratum/internal/ColumnOps.java \
             src-java/stratum/internal/ColumnOpsExt.java \
+            src-java/stratum/internal/ColumnOpsVar.java \
             src-java/stratum/internal/ColumnOpsChunked.java \
             src-java/stratum/internal/ColumnOpsChunkedSimd.java \
-            src-java/stratum/internal/ColumnOpsAnalytics.java
+            src-java/stratum/internal/ColumnOpsAnalytics.java \
+            src-java/stratum/internal/PgWireServer.java
 
       - name: Download Clojure dependencies
-        run: clj -P -M:ci
+        run: clojure -P -M:ci
 
       - name: Run tests
-        run: clj -M:ci
+        run: clojure -M:ci
