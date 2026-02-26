@@ -1,0 +1,207 @@
+{:deps/prep-lib {:ensure "target/classes"
+                 :alias :build
+                 :fn compile-java}
+
+ :paths ["src" "src-java" "target/classes" "resources"]
+
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        ;; PSS for tree structure with persistence
+        org.replikativ/persistent-sorted-set {:mvn/version "0.4.119"}
+        ;; konserve for durable storage
+        org.replikativ/konserve {:mvn/version "0.9.345"}
+        ;; hasch for content-addressed commit IDs (crypto-hash mode)
+        org.replikativ/hasch {:mvn/version "0.3.96"}
+        ;; core.cache for LRU caching in PSS-backed storage
+        org.clojure/core.cache {:mvn/version "1.1.234"}
+        ;; Malli for API specification and validation
+        metosin/malli {:mvn/version "0.20.0"}
+        ;; JSqlParser for SQL → AST parsing (single JAR, zero transitive deps)
+        com.github.jsqlparser/jsqlparser {:mvn/version "5.1"}
+        ;; Parquet import (minimal Hadoop — Configuration class required by ParquetFileReader)
+        org.apache.parquet/parquet-column {:mvn/version "1.15.1"}
+        org.apache.parquet/parquet-hadoop {:mvn/version "1.15.1"
+                                           :exclusions [org.apache.hadoop/hadoop-client]}
+        org.apache.hadoop/hadoop-mapreduce-client-core {:mvn/version "3.4.1"
+                                                       :exclusions [org.apache.hadoop/hadoop-yarn-common
+                                                                    org.apache.hadoop/hadoop-yarn-client
+                                                                    org.apache.hadoop/hadoop-hdfs-client
+                                                                    io.netty/netty-all]}
+        org.apache.hadoop/hadoop-common {:mvn/version "3.4.1"
+                                         :exclusions [org.apache.hadoop/hadoop-auth
+                                                      org.apache.hadoop.thirdparty/hadoop-shaded-protobuf_3_25
+                                                      org.apache.curator/curator-framework
+                                                      org.apache.curator/curator-client
+                                                      org.apache.curator/curator-recipes
+                                                      org.apache.commons/commons-configuration2
+                                                      org.apache.commons/commons-text
+                                                      org.apache.commons/commons-math3
+                                                      org.apache.httpcomponents/httpclient
+                                                      org.apache.kerby/kerb-core
+                                                      org.apache.avro/avro
+                                                      org.apache.zookeeper/zookeeper
+                                                      com.google.protobuf/protobuf-java
+                                                      com.google.code.gson/gson
+                                                      com.google.re2j/re2j
+                                                      com.google.code.findbugs/jsr305
+                                                      com.fasterxml.jackson.core/jackson-databind
+                                                      com.sun.jersey/jersey-core
+                                                      com.sun.jersey/jersey-servlet
+                                                      com.jcraft/jsch
+                                                      io.dropwizard.metrics/metrics-core
+                                                      org.eclipse.jetty/jetty-server
+                                                      org.eclipse.jetty/jetty-servlet
+                                                      org.eclipse.jetty/jetty-util
+                                                      org.eclipse.jetty/jetty-webapp
+                                                      dnsjava/dnsjava
+                                                      javax.servlet/javax.servlet-api]}}
+
+ :aliases
+ {:dev
+  {:extra-paths ["dev" "test" "bench" "notebooks"]
+   :extra-deps {nrepl/nrepl {:mvn/version "1.3.0"}
+                cider/cider-nrepl {:mvn/version "0.50.2"}
+                criterium/criterium {:mvn/version "0.4.6"}
+                com.clojure-goes-fast/clj-async-profiler {:mvn/version "1.6.2"}
+                com.clojure-goes-fast/clj-memory-meter {:mvn/version "0.3.0"}
+                ;; tech.ml.dataset for dataframe interop
+                techascent/tech.ml.dataset {:mvn/version "7.037"}
+                ;; tablecloth for high-level dataframe operations
+                scicloj/tablecloth {:mvn/version "7.062"}
+                ;; Kindly for notebook rendering hints
+                org.scicloj/kindly {:mvn/version "4-beta21"}
+                ;; Clay for rendering notebooks
+                org.scicloj/clay {:mvn/version "2.0.2"}
+                ;; Datahike for entity DB integration examples
+                io.replikativ/datahike {:mvn/version "0.6.1570"}
+                ;; DuckDB JDBC for benchmark validation
+                org.duckdb/duckdb_jdbc {:mvn/version "1.4.4.0"}}
+   :jvm-opts ["-Djdk.attach.allowAttachSelf=true"
+              "-XX:+UnlockDiagnosticVMOptions"
+              "-XX:+DebugNonSafepoints"
+              "-XX:+UseG1GC"
+              "-Xmx4g"
+              ;; Enable Vector API for SIMD
+              "--add-modules=jdk.incubator.vector"
+              ;; Enable foreign memory API
+              "--enable-native-access=ALL-UNNAMED"]}
+
+  :repl
+  {:extra-paths ["dev" "test" "bench" "notebooks"]
+   :extra-deps {nrepl/nrepl {:mvn/version "1.3.0"}
+                cider/cider-nrepl {:mvn/version "0.50.2"}
+                criterium/criterium {:mvn/version "0.4.6"}
+                com.clojure-goes-fast/clj-async-profiler {:mvn/version "1.6.2"}
+                ;; tech.ml.dataset for dataframe interop
+                techascent/tech.ml.dataset {:mvn/version "7.037"}
+                ;; tablecloth for high-level dataframe operations
+                scicloj/tablecloth {:mvn/version "7.062"}
+                ;; Kindly for notebook rendering hints
+                org.scicloj/kindly {:mvn/version "4-beta21"}
+                ;; Clay for rendering notebooks
+                org.scicloj/clay {:mvn/version "2.0.2"}
+                ;; Datahike for entity DB integration notebooks
+                io.replikativ/datahike {:mvn/version "0.6.1570"}
+                ;; DuckDB JDBC for benchmark validation
+                org.duckdb/duckdb_jdbc {:mvn/version "1.4.4.0"}
+                ;; Yggdrasil for CoW protocol compliance
+                org.replikativ/yggdrasil {:mvn/version "0.2.19"}}
+   :jvm-opts ["-Djdk.attach.allowAttachSelf=true"
+              "-XX:+UnlockDiagnosticVMOptions"
+              "-XX:+DebugNonSafepoints"
+              "-Xmx4g"
+              "--add-modules=jdk.incubator.vector"
+              "--enable-native-access=ALL-UNNAMED"]
+   :main-opts ["-m" "nrepl.cmdline"
+               "--middleware" "[cider.nrepl/cider-middleware]"]}
+
+  ;; GPU support (optional - requires CUDA)
+  :gpu
+  {:extra-deps {uncomplicate/clojurecuda {:mvn/version "0.18.0"}
+                uncomplicate/neanderthal {:mvn/version "0.49.1"}
+                ;; JavaCPP CUDA - large download!
+                org.bytedeco/cuda {:mvn/version "12.3-8.9-1.5.10"
+                                   :classifier "linux-x86_64-redist"}}
+   :jvm-opts ["--add-modules=jdk.incubator.vector"
+              "--enable-native-access=ALL-UNNAMED"]}
+
+  :test
+  {:extra-paths ["test" "notebooks"]
+   :extra-deps {io.github.cognitect-labs/test-runner
+                {:git/tag "v0.5.1" :git/sha "dfb30dd"}
+                ;; test.check for generative/property-based testing
+                org.clojure/test.check {:mvn/version "1.1.1"}
+                ;; tech.ml.dataset for dataframe interop (test-only)
+                techascent/tech.ml.dataset {:mvn/version "7.037"}
+                ;; tablecloth for high-level dataframe operations (test-only)
+                scicloj/tablecloth {:mvn/version "7.062"}
+                ;; Kindly for notebook rendering hints
+                org.scicloj/kindly {:mvn/version "4-beta21"}
+                ;; Yggdrasil for CoW protocol compliance (optional, test-only)
+                org.replikativ/yggdrasil {:local/root "../yggdrasil"}}
+   :jvm-opts ["--add-modules=jdk.incubator.vector"
+              "--enable-native-access=ALL-UNNAMED"
+              "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
+   :main-opts ["-m" "cognitect.test-runner"]}
+
+  ;; CI test alias (no local yggdrasil dep, excludes yggdrasil tests)
+  :ci
+  {:extra-paths ["test" "notebooks"]
+   :extra-deps {io.github.cognitect-labs/test-runner
+                {:git/tag "v0.5.1" :git/sha "dfb30dd"}
+                org.clojure/test.check {:mvn/version "1.1.1"}
+                techascent/tech.ml.dataset {:mvn/version "7.037"}
+                scicloj/tablecloth {:mvn/version "7.062"}
+                org.scicloj/kindly {:mvn/version "4-beta21"}}
+   :jvm-opts ["--add-modules=jdk.incubator.vector"
+              "--enable-native-access=ALL-UNNAMED"
+              "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
+   :main-opts ["-m" "cognitect.test-runner"
+               "--namespace-regex" "^stratum\\.(?!yggdrasil|benchmark).*"]}
+
+  :olap
+  {:extra-paths ["bench"]
+   :extra-deps {criterium/criterium {:mvn/version "0.4.6"}
+                org.roaringbitmap/RoaringBitmap {:mvn/version "1.3.0"}
+                org.duckdb/duckdb_jdbc {:mvn/version "1.4.4.0"}}
+   :jvm-opts ["--add-modules=jdk.incubator.vector"
+              "--enable-native-access=ALL-UNNAMED"
+              "-Xmx8g"]
+   :main-opts ["-m" "olap-bench"]}
+
+  :iforest
+  {:extra-paths ["bench"]
+   :jvm-opts ["--add-modules=jdk.incubator.vector"
+              "--enable-native-access=ALL-UNNAMED"
+              "-Xmx8g"]
+   :main-opts ["-m" "iforest-bench"]}
+
+  :insert-bench
+  {:extra-paths ["bench"]
+   :extra-deps {org.roaringbitmap/RoaringBitmap {:mvn/version "1.3.0"}}
+   :jvm-opts ["--add-modules=jdk.incubator.vector"
+              "--enable-native-access=ALL-UNNAMED"
+              "-Xmx8g"]
+   :main-opts ["-m" "insert-bench"]}
+
+  :server
+  {:jvm-opts ["--add-modules=jdk.incubator.vector"
+              "--enable-native-access=ALL-UNNAMED"
+              "-Xmx4g"]
+   :main-opts ["-m" "stratum.server"]}
+
+  ;; Build tooling (jar, uberjar, deploy)
+  :build
+  {:deps {io.github.clojure/tools.build {:mvn/version "0.10.7"}
+          slipset/deps-deploy {:mvn/version "0.2.2"}}
+   :ns-default build}
+
+  ;; Use published deps (for CI/release)
+  :release
+  {:override-deps {org.replikativ/persistent-sorted-set {:mvn/version "0.4.119"}
+                   org.replikativ/konserve {:mvn/version "0.9.345"}}}
+
+  :format {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+           :main-opts ["-m" "cljfmt.main" "check"]}
+
+  :ffix {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+         :main-opts ["-m" "cljfmt.main" "fix"]}}}

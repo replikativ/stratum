@@ -1,0 +1,14 @@
+data/
+target/
+.cpcache/
+.lsp/
+.clj-kondo/
+.nrepl-port
+classes/
+hs_err_pid*.log
+.internal/
+*.bundle
+*.swp
+*.swo
+bench/results_*.txt
+results*.txt

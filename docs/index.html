@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stratum Documentation</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            line-height: 1.6;
+            color: #333;
+        }
+        h1 {
+            color: #2780e3;
+            border-bottom: 3px solid #2780e3;
+            padding-bottom: 10px;
+        }
+        .notebook-list {
+            list-style: none;
+            padding: 0;
+        }
+        .notebook-list li {
+            margin: 15px 0;
+            padding: 15px;
+            background: #f8f9fa;
+            border-left: 4px solid #2780e3;
+            border-radius: 4px;
+        }
+        .notebook-list a {
+            color: #2780e3;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 1.1em;
+        }
+        .notebook-list a:hover {
+            text-decoration: underline;
+        }
+        .description {
+            color: #666;
+            margin-top: 5px;
+            font-size: 0.95em;
+        }
+        .github-link {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #ddd;
+            text-align: center;
+        }
+        .github-link a {
+            color: #666;
+            text-decoration: none;
+        }
+        .github-link a:hover {
+            color: #2780e3;
+        }
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            margin-left: 10px;
+            font-size: 0.8em;
+            background: #3fb618;
+            color: white;
+            border-radius: 3px;
+            text-transform: uppercase;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <h1>Stratum Documentation</h1>
+    <p>High-Performance Columnar Analytics for Clojure</p>
+
+    <ul class="notebook-list">
+        <li>
+            <a href="stratum_intro.html">📊 Stratum Introduction</a>
+            <span class="badge">Interactive</span>
+            <div class="description">
+                Complete guide covering query engine, persistence, tablecloth integration,
+                JOINs, zone map pruning, and performance benchmarks vs DuckDB.
+            </div>
+        </li>
+    </ul>
+
+    <div class="github-link">
+        <p>
+            <a href="https://github.com/replikativ/stratum">View on GitHub</a> |
+            <a href="https://clojars.org/io.github.replikativ/stratum">Clojars</a>
+        </p>
+        <p style="font-size: 0.9em; color: #999;">
+            Last updated: <script>document.write(new Date().toLocaleDateString())</script>
+        </p>
+    </div>
+</body>
+</html>

@@ -1,0 +1,100 @@
+# test_window.test
+# Window function tests
+
+statement ok
+CREATE TABLE sales (id INTEGER, dept TEXT, amount DOUBLE)
+
+statement ok
+INSERT INTO sales VALUES (1, 'A', 100.0), (2, 'A', 200.0), (3, 'B', 150.0), (4, 'B', 250.0), (5, 'A', 300.0), (6, 'B', 50.0)
+
+# ROW_NUMBER without partition
+query IR nosort
+SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM sales ORDER BY id
+----
+1	1.000000
+2	2.000000
+3	3.000000
+4	4.000000
+5	5.000000
+6	6.000000
+
+# ROW_NUMBER with PARTITION BY
+query TR rowsort
+SELECT dept, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY amount) AS rn FROM sales
+----
+A	1.000000
+A	2.000000
+A	3.000000
+B	1.000000
+B	2.000000
+B	3.000000
+
+# RANK with ties
+statement ok
+CREATE TABLE scores (name TEXT, score INTEGER)
+
+statement ok
+INSERT INTO scores VALUES ('Alice', 90), ('Bob', 85), ('Carol', 90), ('Dave', 80), ('Eve', 85)
+
+query TR rowsort
+SELECT name, RANK() OVER (ORDER BY score DESC) AS rnk FROM scores
+----
+Alice	1.000000
+Bob	3.000000
+Carol	1.000000
+Dave	5.000000
+Eve	3.000000
+
+# DENSE_RANK
+query TR rowsort
+SELECT name, DENSE_RANK() OVER (ORDER BY score DESC) AS drnk FROM scores
+----
+Alice	1.000000
+Bob	2.000000
+Carol	1.000000
+Dave	3.000000
+Eve	2.000000
+
+# Running SUM (window aggregate)
+query IRR nosort
+SELECT id, amount, SUM(amount) OVER (ORDER BY id) AS running_sum FROM sales ORDER BY id
+----
+1	100.000000	100.000000
+2	200.000000	300.000000
+3	150.000000	450.000000
+4	250.000000	700.000000
+5	300.000000	1000.000000
+6	50.000000	1050.000000
+
+# Running SUM with PARTITION BY
+query TRR rowsort
+SELECT dept, amount, SUM(amount) OVER (PARTITION BY dept ORDER BY amount) AS dept_running FROM sales
+----
+A	100.000000	100.000000
+A	200.000000	300.000000
+A	300.000000	600.000000
+B	50.000000	50.000000
+B	150.000000	200.000000
+B	250.000000	450.000000
+
+# LAG
+query IRR nosort
+SELECT id, amount, LAG(amount, 1) OVER (ORDER BY id) AS prev_amount FROM sales ORDER BY id
+----
+1	100.000000	NULL
+2	200.000000	100.000000
+3	150.000000	200.000000
+4	250.000000	150.000000
+5	300.000000	250.000000
+6	50.000000	300.000000
+
+# LEAD
+query IRR nosort
+SELECT id, amount, LEAD(amount, 1) OVER (ORDER BY id) AS next_amount FROM sales ORDER BY id
+----
+1	100.000000	200.000000
+2	200.000000	150.000000
+3	150.000000	250.000000
+4	250.000000	300.000000
+5	300.000000	50.000000
+6	50.000000	NULL

@@ -1,0 +1,3 @@
+{:base-target-path "docs"
+ :subdirs-to-sync  ["notebooks"]
+ :show             false}

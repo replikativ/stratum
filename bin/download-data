@@ -1,0 +1,127 @@
+#!/bin/bash
+# Download/generate real benchmark data using DuckDB CLI.
+# Usage: bin/download-data [N] [SF]
+#   N  = max rows per dataset (default: 6000000)
+#   SF = TPC-H scale factor (default: 1, use 10 for ~60M rows)
+#
+# Scale guide (TPC-H lineitem rows ≈ 6M × SF):
+#   SF=1   →   6M rows (default, ~500MB CSV)
+#   SF=2   →  12M rows (~1GB)
+#   SF=17  → 100M rows (~8GB)
+#   SF=167 →   1B rows (~80GB, needs ~200GB RAM for generation)
+#
+# ClickBench hits.parquet has ~100M rows total.
+# NYC Taxi: each month ≈ 3M rows, 24 months ≈ 72M rows available.
+#
+# Data sources:
+#   TPC-H:     DuckDB dbgen(sf=SF) — ~6M lineitem rows per SF (generated locally)
+#   ClickBench: hits.parquet from ClickHouse (14.8GB download, one-time)
+#   NYC Taxi:   TLC yellow taxi parquet (2024-01 + 2024-02 for ~6M rows)
+#
+# H2O and Join tiers keep synthetic generation (matches official spec / no standard source).
+
+set -euo pipefail
+
+DUCKDB="${DUCKDB:-duckdb}"
+N="${1:-6000000}"
+SF="${2:-1}"
+
+if ! command -v "$DUCKDB" &>/dev/null; then
+  echo "ERROR: DuckDB not found ('$DUCKDB')"
+  echo "Install DuckDB or set DUCKDB env var to the binary path"
+  exit 1
+fi
+
+cd "$(dirname "$0")/.."
+mkdir -p data/tpch data/cb data/nyc-taxi
+
+echo "=== TPC-H (sf=${SF}, ~$((SF * 6))M lineitem rows) ==="
+$DUCKDB -c "
+  INSTALL tpch; LOAD tpch; CALL dbgen(sf=${SF});
+  COPY (
+    SELECT epoch(l_shipdate::TIMESTAMP)::BIGINT / 86400 AS shipdate,
+           l_discount::DOUBLE AS discount,
+           l_quantity::BIGINT AS quantity,
+           l_extendedprice::DOUBLE AS price,
+           l_tax::DOUBLE AS tax,
+           CASE l_returnflag WHEN 'R' THEN 0 WHEN 'A' THEN 1 ELSE 2 END AS returnflag,
+           CASE l_linestatus WHEN 'O' THEN 0 ELSE 1 END AS linestatus
+    FROM lineitem
+  ) TO 'data/tpch/lineitem.csv' (HEADER, DELIMITER ',');
+"
+TPCH_ROWS=$(wc -l < data/tpch/lineitem.csv)
+echo "  Wrote data/tpch/lineitem.csv ($((TPCH_ROWS - 1)) rows)"
+
+echo ""
+echo "=== ClickBench (hits.parquet, ${N} row subset) ==="
+if [ ! -f data/cb/hits.parquet ]; then
+  echo "  Downloading ClickBench hits.parquet (14.8GB, one-time)..."
+  curl -L --progress-bar -o data/cb/hits.parquet \
+    https://datasets.clickhouse.com/hits_compatible/hits.parquet
+fi
+$DUCKDB -c "
+  COPY (
+    SELECT AdvEngineID::BIGINT AS AdvEngineID,
+           ResolutionWidth::BIGINT AS ResolutionWidth,
+           UserID::BIGINT AS UserID,
+           SearchEngineID::BIGINT AS SearchEngineID,
+           CounterID::BIGINT AS CounterID,
+           IsRefresh::BIGINT AS IsRefresh,
+           RegionID::BIGINT AS RegionID,
+           EventTime::BIGINT AS EventTime,
+           replace(replace(URL, chr(10), ''), chr(13), '')::VARCHAR AS URL,
+           replace(replace(COALESCE(SearchPhrase, ''), chr(10), ''), chr(13), '')::VARCHAR AS SearchPhrase,
+           DontCountHits::BIGINT AS DontCountHits
+    FROM 'data/cb/hits.parquet'
+    LIMIT ${N}
+  ) TO 'data/cb/hits.csv' (HEADER, DELIMITER ',');
+"
+CB_ROWS=$(wc -l < data/cb/hits.csv)
+echo "  Wrote data/cb/hits.csv ($((CB_ROWS - 1)) rows)"
+
+echo ""
+echo "=== NYC Taxi (TLC yellow taxi, ${N} row subset) ==="
+# Download enough months based on N (~3M rows per month)
+MONTHS_NEEDED=$(( (N + 2999999) / 3000000 ))
+if [ "$MONTHS_NEEDED" -lt 2 ]; then MONTHS_NEEDED=2; fi
+if [ "$MONTHS_NEEDED" -gt 12 ]; then MONTHS_NEEDED=12; fi
+echo "  Downloading ${MONTHS_NEEDED} months of taxi data..."
+TAXI_PARQUETS=""
+for i in $(seq 1 $MONTHS_NEEDED); do
+  MONTH=$(printf "%02d" $i)
+  FILE="data/nyc-taxi/yellow_2024_${MONTH}.parquet"
+  if [ ! -f "$FILE" ]; then
+    echo "  Downloading yellow_tripdata_2024-${MONTH}.parquet..."
+    curl -L --progress-bar -o "$FILE" \
+      "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-${MONTH}.parquet"
+  fi
+  if [ -n "$TAXI_PARQUETS" ]; then
+    TAXI_PARQUETS="${TAXI_PARQUETS} UNION ALL "
+  fi
+  TAXI_PARQUETS="${TAXI_PARQUETS}SELECT * FROM '${FILE}'"
+done
+$DUCKDB -c "
+  COPY (
+    SELECT trip_distance::DOUBLE AS trip_distance,
+           fare_amount::DOUBLE AS fare_amount,
+           tip_amount::DOUBLE AS tip_amount,
+           total_amount::DOUBLE AS total_amount,
+           passenger_count::BIGINT AS passenger_count,
+           payment_type::BIGINT AS payment_type,
+           EXTRACT(HOUR FROM tpep_pickup_datetime)::BIGINT AS pickup_hour,
+           EXTRACT(MONTH FROM tpep_pickup_datetime)::BIGINT AS pickup_month,
+           EXTRACT(DOW FROM tpep_pickup_datetime)::BIGINT AS pickup_dow
+    FROM (${TAXI_PARQUETS})
+    WHERE fare_amount > 0 AND trip_distance > 0
+    LIMIT ${N}
+  ) TO 'data/nyc-taxi/taxi.csv' (HEADER, DELIMITER ',');
+"
+TAXI_ROWS=$(wc -l < data/nyc-taxi/taxi.csv)
+echo "  Wrote data/nyc-taxi/taxi.csv ($((TAXI_ROWS - 1)) rows)"
+
+echo ""
+echo "=== Done ==="
+echo "  TPC-H:     data/tpch/lineitem.csv"
+echo "  ClickBench: data/cb/hits.csv"
+echo "  NYC Taxi:   data/nyc-taxi/taxi.csv"
+du -sh data/tpch/lineitem.csv data/cb/hits.csv data/nyc-taxi/taxi.csv

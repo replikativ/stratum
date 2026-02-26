@@ -1,0 +1,56 @@
+# test_update_from.test
+# UPDATE FROM (joined update) tests
+
+statement ok
+CREATE TABLE orders (order_id INTEGER, product_id INTEGER, qty INTEGER, total DOUBLE)
+
+statement ok
+CREATE TABLE prices (price_id INTEGER, unit_price DOUBLE)
+
+statement ok
+INSERT INTO orders VALUES (1, 10, 5, 0.0), (2, 20, 3, 0.0), (3, 10, 2, 0.0)
+
+statement ok
+INSERT INTO prices VALUES (10, 9.99), (20, 24.50)
+
+# UPDATE FROM: compute total = qty * unit_price
+statement ok
+UPDATE orders SET total = qty * unit_price FROM prices WHERE product_id = price_id
+
+query IIR rowsort
+SELECT order_id, qty, total FROM orders
+----
+1	5	49.950000
+2	3	73.500000
+3	2	19.980000
+
+# UPDATE FROM: set a column from the FROM table directly
+statement ok
+CREATE TABLE employees (emp_id INTEGER, dept_code INTEGER, dept_name TEXT)
+
+statement ok
+CREATE TABLE departments (dept_code INTEGER, dname TEXT)
+
+statement ok
+INSERT INTO employees VALUES (1, 100, 'unknown'), (2, 200, 'unknown'), (3, 100, 'unknown')
+
+statement ok
+INSERT INTO departments VALUES (100, 'Engineering'), (200, 'Marketing')
+
+# Join on shared column name (dept_code exists in both tables)
+statement ok
+UPDATE employees SET dept_name = dname FROM departments WHERE employees.dept_code = departments.dept_code
+
+query IIT rowsort
+SELECT emp_id, dept_code, dept_name FROM employees
+----
+1	100	Engineering
+2	200	Marketing
+3	100	Engineering
+
+# Verify FROM table is unchanged
+query IT rowsort
+SELECT dept_code, dname FROM departments
+----
+100	Engineering
+200	Marketing

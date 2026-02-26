@@ -1,0 +1,101 @@
+name: Render Clay Notebooks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'notebooks/**'
+      - 'src/**'
+      - 'deps.edn'
+      - '.github/workflows/clay-notebooks.yml'
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: write  # Required to push changes back
+
+jobs:
+  render-notebooks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for proper git operations
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install Clojure CLI
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: 1.12.0.1488
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/deps.edn') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Compile Java sources
+        run: |
+          mkdir -p target/classes
+          javac --add-modules jdk.incubator.vector \
+            -d target/classes \
+            src-java/stratum/internal/ColumnOps.java \
+            src-java/stratum/internal/ColumnOpsExt.java \
+            src-java/stratum/internal/ColumnOpsChunked.java \
+            src-java/stratum/internal/ColumnOpsChunkedSimd.java \
+            src-java/stratum/internal/ColumnOpsAnalytics.java
+
+      - name: Download Clojure dependencies
+        run: clj -P -M:dev
+
+      - name: Render Clay notebooks
+        env:
+          JVM_OPTS: "--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED"
+        run: |
+          clj -M:dev -e "
+          (require '[scicloj.clay.v2.api :as clay])
+
+          ;; Render main notebook
+          (clay/make! {:source-path \"notebooks/stratum_intro.clj\"
+                       :base-target-path \"docs\"
+                       :show false})
+
+          (println \"✓ Rendered notebooks to docs/\")
+          (System/exit 0)
+          "
+
+      - name: Check for changes
+        id: git-check
+        run: |
+          git diff --exit-code docs/ || echo "changed=true" >> $GITHUB_OUTPUT
+
+      - name: Commit rendered notebooks
+        if: steps.git-check.outputs.changed == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add docs/
+          git commit -m "docs: render Clay notebooks [skip ci]"
+          git push
+
+      - name: Summary
+        run: |
+          echo "### Clay Notebook Rendering" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.git-check.outputs.changed }}" == "true" ]; then
+            echo "✅ Notebooks rendered and committed to \`docs/\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ℹ️ No changes detected in rendered notebooks" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "View at: https://replikativ.github.io/stratum/stratum_intro.html" >> $GITHUB_STEP_SUMMARY

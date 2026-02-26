@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Download ODDS (Outlier Detection DataSets) for isolation forest benchmarks.
+# Source: https://odds.cs.stonybrook.edu/
+#
+# Datasets are in .mat (MATLAB) format. We convert to CSV using Python.
+# Last column is the anomaly label (0=normal, 1=anomaly).
+
+set -euo pipefail
+
+DATADIR="data/odds"
+mkdir -p "$DATADIR"
+
+echo "Downloading ODDS datasets..."
+
+# Shuttle dataset (49097 rows, 9 features, 7.2% anomalies)
+if [ ! -f "$DATADIR/shuttle.csv" ]; then
+  echo "  Downloading shuttle.mat..."
+  curl -sL "https://odds.cs.stonybrook.edu/wp-content/uploads/2016/04/shuttle.mat" -o "$DATADIR/shuttle.mat"
+  python3 -c "
+import scipy.io, numpy as np
+d = scipy.io.loadmat('$DATADIR/shuttle.mat')
+X, y = d['X'], d['y'].flatten()
+data = np.column_stack([X, y])
+np.savetxt('$DATADIR/shuttle.csv', data, delimiter=',', fmt='%.6f')
+print(f'  shuttle: {X.shape[0]} rows, {X.shape[1]} features, {int(y.sum())} anomalies ({100*y.mean():.1f}%)')
+"
+  rm -f "$DATADIR/shuttle.mat"
+fi
+
+# Http (KDD) dataset (567498 rows, 3 features, 0.4% anomalies)
+if [ ! -f "$DATADIR/http.csv" ]; then
+  echo "  Downloading http.mat..."
+  curl -sL "https://odds.cs.stonybrook.edu/wp-content/uploads/2016/04/http.mat" -o "$DATADIR/http.mat"
+  python3 -c "
+import scipy.io, numpy as np
+d = scipy.io.loadmat('$DATADIR/http.mat')
+X, y = d['X'], d['y'].flatten()
+data = np.column_stack([X, y])
+np.savetxt('$DATADIR/http.csv', data, delimiter=',', fmt='%.6f')
+print(f'  http: {X.shape[0]} rows, {X.shape[1]} features, {int(y.sum())} anomalies ({100*y.mean():.1f}%)')
+"
+  rm -f "$DATADIR/http.mat"
+fi
+
+# ForestCover dataset (286048 rows, 10 features, 0.96% anomalies)
+if [ ! -f "$DATADIR/forestcover.csv" ]; then
+  echo "  Downloading forestcover.mat..."
+  curl -sL "https://odds.cs.stonybrook.edu/wp-content/uploads/2016/04/forestcover.mat" -o "$DATADIR/forestcover.mat"
+  python3 -c "
+import scipy.io, numpy as np
+d = scipy.io.loadmat('$DATADIR/forestcover.mat')
+X, y = d['X'], d['y'].flatten()
+data = np.column_stack([X, y])
+np.savetxt('$DATADIR/forestcover.csv', data, delimiter=',', fmt='%.6f')
+print(f'  forestcover: {X.shape[0]} rows, {X.shape[1]} features, {int(y.sum())} anomalies ({100*y.mean():.1f}%)')
+"
+  rm -f "$DATADIR/forestcover.mat"
+fi
+
+# Mammography dataset (11183 rows, 6 features, 2.32% anomalies)
+if [ ! -f "$DATADIR/mammography.csv" ]; then
+  echo "  Downloading mammography.mat..."
+  curl -sL "https://odds.cs.stonybrook.edu/wp-content/uploads/2016/04/mammography.mat" -o "$DATADIR/mammography.mat"
+  python3 -c "
+import scipy.io, numpy as np
+d = scipy.io.loadmat('$DATADIR/mammography.mat')
+X, y = d['X'], d['y'].flatten()
+data = np.column_stack([X, y])
+np.savetxt('$DATADIR/mammography.csv', data, delimiter=',', fmt='%.6f')
+print(f'  mammography: {X.shape[0]} rows, {X.shape[1]} features, {int(y.sum())} anomalies ({100*y.mean():.1f}%)')
+"
+  rm -f "$DATADIR/mammography.mat"
+fi
+
+# Pima Indians Diabetes dataset (768 rows, 8 features, 34.9% anomalies — hard)
+if [ ! -f "$DATADIR/pima.csv" ]; then
+  echo "  Downloading pima.mat..."
+  curl -sL "https://odds.cs.stonybrook.edu/wp-content/uploads/2016/04/pima.mat" -o "$DATADIR/pima.mat"
+  python3 -c "
+import scipy.io, numpy as np
+d = scipy.io.loadmat('$DATADIR/pima.mat')
+X, y = d['X'], d['y'].flatten()
+data = np.column_stack([X, y])
+np.savetxt('$DATADIR/pima.csv', data, delimiter=',', fmt='%.6f')
+print(f'  pima: {X.shape[0]} rows, {X.shape[1]} features, {int(y.sum())} anomalies ({100*y.mean():.1f}%)')
+"
+  rm -f "$DATADIR/pima.mat"
+fi
+
+echo ""
+echo "Done. ODDS datasets saved to $DATADIR/"
+echo ""
+echo "Optional: For Credit Card fraud dataset (Kaggle, 284K rows, 28 features):"
+echo "  1. Download from https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud"
+echo "  2. Place creditcard.csv in $DATADIR/"
