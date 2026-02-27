@@ -1250,17 +1250,152 @@
                               :tag "SELECT 1"}
               nil)))))))
 
-(defn- pg-catalog-query?
-  "Check if query references pg_catalog tables."
+(def ^:private pg-type-oids
+  "Common PostgreSQL type OIDs."
+  {:int8 20
+   :int4 23
+   :float8 701
+   :float4 700
+   :text 25
+   :varchar 1043
+   :bool 16
+   :date 1082
+   :timestamp 1114
+   :oid 26
+   :name 19})
+
+(defn- pg-catalog-table
+  "Identify which pg_catalog table is being queried. Returns keyword or nil."
   [sql]
-  (boolean (re-find #"(?i)pg_catalog\.|pg_class|pg_namespace|pg_type|pg_attribute|pg_settings|pg_database|pg_roles|pg_stat_|information_schema\." sql)))
+  (let [sql-lower (.toLowerCase ^String sql)]
+    (cond
+      (or (.contains sql-lower "pg_database")
+          (.contains sql-lower "pg_catalog.pg_database"))
+      :pg_database
+
+      (or (.contains sql-lower "pg_class")
+          (.contains sql-lower "pg_catalog.pg_class"))
+      :pg_class
+
+      (or (.contains sql-lower "pg_namespace")
+          (.contains sql-lower "pg_catalog.pg_namespace"))
+      :pg_namespace
+
+      (or (.contains sql-lower "pg_type")
+          (.contains sql-lower "pg_catalog.pg_type"))
+      :pg_type
+
+      (or (.contains sql-lower "pg_attribute")
+          (.contains sql-lower "pg_catalog.pg_attribute"))
+      :pg_attribute
+
+      (or (.contains sql-lower "pg_tables")
+          (.contains sql-lower "information_schema.tables"))
+      :pg_tables
+
+      (.contains sql-lower "information_schema")
+      :information_schema
+
+      (or (.contains sql-lower "pg_settings")
+          (.contains sql-lower "pg_roles")
+          (.contains sql-lower "pg_stat_"))
+      :other_catalog
+
+      :else nil)))
+
+(defn- handle-pg-database
+  "Return mock pg_database rows for \\l support."
+  []
+  (let [rows [["stratum" "10" "6" "en_US.UTF-8" "en_US.UTF-8" "t"]]]
+    {:system true
+     :result {:columns ["datname" "datdba" "encoding" "datcollate" "datctype" "datistemplate"]
+              :oids [(:name pg-type-oids) (:oid pg-type-oids) (:int4 pg-type-oids)
+                     (:text pg-type-oids) (:text pg-type-oids) (:bool pg-type-oids)]
+              :rows rows}
+     :tag (str "SELECT " (count rows))}))
+
+(defn- handle-pg-namespace
+  "Return mock pg_namespace rows."
+  []
+  (let [rows [["2200" "public" "10"]]]
+    {:system true
+     :result {:columns ["oid" "nspname" "nspowner"]
+              :oids [(:oid pg-type-oids) (:name pg-type-oids) (:oid pg-type-oids)]
+              :rows rows}
+     :tag (str "SELECT " (count rows))}))
+
+(defn- handle-pg-class
+  "Return mock pg_class rows for \\dt support using registered tables."
+  [table-registry]
+  (let [rows (mapv (fn [[table-name _columns]]
+                     [table-name "2200" "r" "10"])
+                   table-registry)]
+    {:system true
+     :result {:columns ["relname" "relnamespace" "relkind" "relowner"]
+              :oids [(:name pg-type-oids) (:oid pg-type-oids) 18 (:oid pg-type-oids)]
+              :rows rows}
+     :tag (str "SELECT " (count rows))}))
+
+(defn- handle-pg-type
+  "Return minimal pg_type rows for type introspection."
+  []
+  (let [rows [["20" "int8" "8"]
+              ["23" "int4" "4"]
+              ["701" "float8" "8"]
+              ["25" "text" "-1"]
+              ["1043" "varchar" "-1"]
+              ["16" "bool" "1"]
+              ["1082" "date" "4"]
+              ["1114" "timestamp" "8"]]]
+    {:system true
+     :result {:columns ["oid" "typname" "typlen"]
+              :oids [(:oid pg-type-oids) (:name pg-type-oids) (:int4 pg-type-oids)]
+              :rows rows}
+     :tag (str "SELECT " (count rows))}))
+
+(defn- handle-pg-attribute
+  "Return mock pg_attribute rows. Minimal implementation for client compatibility."
+  []
+  {:system true
+   :result {:columns ["attname" "atttypid" "attnum"]
+            :oids [(:name pg-type-oids) (:oid pg-type-oids) (:int4 pg-type-oids)]
+            :rows []}
+   :tag "SELECT 0"})
+
+(defn- handle-pg-tables
+  "Return pg_tables view rows for registered tables."
+  [table-registry]
+  (let [rows (mapv (fn [[table-name _columns]]
+                     ["public" table-name "stratum" nil "false" "false" "false" "false"])
+                   table-registry)]
+    {:system true
+     :result {:columns ["schemaname" "tablename" "tableowner" "tablespace"
+                        "hasindexes" "hasrules" "hastriggers" "rowsecurity"]
+              :oids [(:name pg-type-oids) (:name pg-type-oids) (:name pg-type-oids)
+                     (:name pg-type-oids) (:bool pg-type-oids) (:bool pg-type-oids)
+                     (:bool pg-type-oids) (:bool pg-type-oids)]
+              :rows rows}
+     :tag (str "SELECT " (count rows))}))
 
 (defn- handle-pg-catalog
-  "Return empty result for pg_catalog queries."
-  [_sql]
-  {:system true
-   :result {:columns [] :oids [] :rows []}
-   :tag "SELECT 0"})
+  "Dispatch to appropriate catalog handler based on detected table."
+  [sql table-registry]
+  (case (pg-catalog-table sql)
+    :pg_database (handle-pg-database)
+    :pg_class (handle-pg-class table-registry)
+    :pg_namespace (handle-pg-namespace)
+    :pg_type (handle-pg-type)
+    :pg_attribute (handle-pg-attribute)
+    :pg_tables (handle-pg-tables table-registry)
+    :information_schema {:system true
+                         :result {:columns [] :oids [] :rows []}
+                         :tag "SELECT 0"}
+    :other_catalog {:system true
+                    :result {:columns [] :oids [] :rows []}
+                    :tag "SELECT 0"}
+    {:system true
+     :result {:columns [] :oids [] :rows []}
+     :tag "SELECT 0"}))
 
 (defn- handle-show-tables
   "Handle \\dt equivalent — list registered tables."
@@ -1460,9 +1595,9 @@
         ;; Check system queries first (SET, SHOW, BEGIN, etc.)
        (check-system-query sql table-registry)
 
-        ;; Check pg_catalog queries
-       (when (pg-catalog-query? sql)
-         (handle-pg-catalog sql))
+;; Check pg_catalog queries
+       (when (pg-catalog-table sql)
+         (handle-pg-catalog sql table-registry))
 
         ;; Parse with JSqlParser
        (let [stmt (CCJSqlParserUtil/parse ^String sql)]

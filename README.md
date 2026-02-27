@@ -16,6 +16,9 @@ Start a PostgreSQL-compatible server and query CSV/Parquet files directly:
 
 ```bash
 # Standalone JAR — no Clojure needed, just Java 21+
+java --add-modules jdk.incubator.vector -jar stratum-standalone.jar --demo
+
+# Or with your own data
 java --add-modules jdk.incubator.vector -jar stratum-standalone.jar \
   --index /data/orders.csv --index /data/events.parquet
 
