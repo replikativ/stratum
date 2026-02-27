@@ -96,70 +96,70 @@
    :flag   (long-array   (repeatedly 1000000 #(rand-int 2)))})</code></pre></div></div><div style="margin:15px;"><div><p>Single-pass fused filter + aggregate:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(time
   (st/q {:from  large-ds
          :where [[:&gt; :amount 500.0] [:= :flag 1]]
-         :agg   [[:sum :amount] [:count]]}))</code></pre></div></div><div style="margin:15px;"><div><strong>OUT</strong><pre><code>"Elapsed time: 477.039557 msecs"
-</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:_count 249791, :sum 1.8735921822152323E8, :count 249791}]
+         :agg   [[:sum :amount] [:count]]}))</code></pre></div></div><div style="margin:15px;"><div><strong>OUT</strong><pre><code>"Elapsed time: 745.622644 msecs"
+</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:_count 250044, :sum 1.875662563822782E8, :count 250044}]
 </code></pre></div></div><div style="margin:15px;"><div><p>Dense group-by (direct array indexing, no hash for ≤200K groups):</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(time
   (st/q {:from  large-ds
          :group [:region]
-         :agg   [[:sum :amount] [:avg :amount] [:count]]}))</code></pre></div></div><div style="margin:15px;"><div><strong>OUT</strong><pre><code>"Elapsed time: 125.550777 msecs"
+         :agg   [[:sum :amount] [:avg :amount] [:count]]}))</code></pre></div></div><div style="margin:15px;"><div><strong>OUT</strong><pre><code>"Elapsed time: 125.451823 msecs"
 </code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:region 0,
-  :_count 99832,
-  :sum 4.984979812538232E7,
-  :avg 499.3368671907036,
-  :count 99832}
+  :_count 100070,
+  :sum 4.988999541814934E7,
+  :avg 498.5509685035409,
+  :count 100070}
  {:region 1,
-  :_count 99849,
-  :sum 4.9880746600852E7,
-  :avg 499.5618043330629,
-  :count 99849}
+  :_count 100492,
+  :sum 5.022953172006592E7,
+  :avg 499.8361234731712,
+  :count 100492}
  {:region 2,
-  :_count 99878,
-  :sum 4.983648865253064E7,
-  :avg 498.97363435922466,
-  :count 99878}
+  :_count 99399,
+  :sum 4.974791869803327E7,
+  :avg 500.4871145387104,
+  :count 99399}
  {:region 3,
-  :_count 99903,
-  :sum 4.981424866684195E7,
-  :avg 498.62615403783616,
-  :count 99903}
+  :_count 99939,
+  :sum 4.9978934858833194E7,
+  :avg 500.09440617609937,
+  :count 99939}
  {:region 4,
-  :_count 99687,
-  :sum 4.996144638635216E7,
-  :avg 501.18316717678493,
-  :count 99687}
+  :_count 100233,
+  :sum 5.009205577906139E7,
+  :avg 499.7561260169943,
+  :count 100233}
  {:region 5,
-  :_count 99764,
-  :sum 4.98234758907312E7,
-  :avg 499.4133744710637,
-  :count 99764}
+  :_count 99664,
+  :sum 4.9897951325023964E7,
+  :avg 500.66173668550294,
+  :count 99664}
  {:region 6,
-  :_count 100745,
-  :sum 5.048420472551149E7,
-  :avg 501.1087867935033,
-  :count 100745}
+  :_count 100182,
+  :sum 5.004161000445469E7,
+  :avg 499.5069973094437,
+  :count 100182}
  {:region 7,
-  :_count 99851,
-  :sum 4.985141050218023E7,
-  :avg 499.2579994409694,
-  :count 99851}
+  :_count 99955,
+  :sum 5.004523374769073E7,
+  :avg 500.6776424159945,
+  :count 99955}
  {:region 8,
-  :_count 100003,
-  :sum 4.993377624752043E7,
-  :avg 499.32278279172056,
-  :count 100003}
+  :_count 100198,
+  :sum 5.0043233552947626E7,
+  :avg 499.44343752318036,
+  :count 100198}
  {:region 9,
-  :_count 100488,
-  :sum 5.019928136613044E7,
-  :avg 499.55498533287994,
-  :count 100488}]
+  :_count 99868,
+  :sum 5.002264971353778E7,
+  :avg 500.88766885827073,
+  :count 99868}]
 </code></pre></div></div><div style="margin:15px;"><div><h2 id="4.-zone-map-pruning">4. Zone Map Pruning</h2><p>For index-backed datasets, Stratum tracks min/max per 8192-row chunk. Range queries classify each chunk as: skip / stats-only / SIMD — so a predicate like ts >= 900000 only touches ~1% of chunks.</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def time-series
   (st/make-dataset
     {:ts    (st/index-from-seq :int64   (range 0 1000000))
      :value (st/index-from-seq :float64 (repeatedly 1000000 rand))}))</code></pre></div></div><div style="margin:15px;"><div><p>Only the last ~1% of chunks are scanned:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(time
   (st/q {:from  time-series
          :where [[:&gt;= :ts 900000] [:&lt; :ts 910000]]
-         :agg   [[:sum :value] [:count]]}))</code></pre></div></div><div style="margin:15px;"><div><strong>OUT</strong><pre><code>"Elapsed time: 13.857909 msecs"
-</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:_count 10000, :sum 4976.255276477182, :count 10000}]
+         :agg   [[:sum :value] [:count]]}))</code></pre></div></div><div style="margin:15px;"><div><strong>OUT</strong><pre><code>"Elapsed time: 17.712668 msecs"
+</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:_count 10000, :sum 4970.948979574672, :count 10000}]
 </code></pre></div></div><div style="margin:15px;"><div><h2 id="5.-persistence:-version-control-for-analytics">5. Persistence: Version Control for Analytics</h2><p>Datasets are immutable Clojure values. st/sync! durably persists to a Konserve store (file, S3, memory …). st/fork is O(1) — structural sharing with copy-on-write on mutation.</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(require &apos;[konserve.store :as kstore])</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def store-cfg
   {:backend :file
    :path    &quot;/tmp/stratum-intro&quot;
@@ -170,7 +170,7 @@
     {:product (st/index-from-seq :int64   [101 102 103])
      :qty     (st/index-from-seq :float64 [100.0 50.0 75.0])
      :revenue (st/index-from-seq :float64 [1000.0 750.0 1125.0])}
-    {:name &quot;sales-q1&quot;}))</code></pre></div></div><div style="margin:15px;"><div><p>Persist to "main" branch — returns new dataset with commit metadata:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def v1 (st/sync! base store &quot;main&quot;))</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(:id (:commit-info v1))</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">#uuid &quot;638e09e5-a522-47c6-9f40-f1cc85039d4f&quot;
+    {:name &quot;sales-q1&quot;}))</code></pre></div></div><div style="margin:15px;"><div><p>Persist to "main" branch — returns new dataset with commit metadata:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def v1 (st/sync! base store &quot;main&quot;))</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(:id (:commit-info v1))</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">#uuid &quot;4816039e-a864-4f4a-a91a-fefcddbee750&quot;
 </code></pre></div></div><div style="margin:15px;"><div><p>=> #uuid "..."</p><p>Fork for a what-if scenario. Fork is O(1) — all chunks shared. Mutations use the transient/persistent protocol (like Clojure's collections):</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def what-if
   (-&gt; (st/fork base)
       transient
