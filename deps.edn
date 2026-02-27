@@ -8,9 +8,15 @@
         ;; PSS for tree structure with persistence
         org.replikativ/persistent-sorted-set {:mvn/version "0.4.119"}
         ;; konserve for durable storage
-        org.replikativ/konserve {:mvn/version "0.9.345"}
+        org.replikativ/konserve {:mvn/version "0.9.345"
+                                 :exclusions [org.clojure/clojurescript
+                                              com.github.pkpkpk/cljs-node-io
+                                              com.github.pkpkpk/fress
+                                              org.clojars.mmb90/cljs-cache]}
         ;; hasch for content-addressed commit IDs (crypto-hash mode)
-        org.replikativ/hasch {:mvn/version "0.3.96"}
+        org.replikativ/hasch {:mvn/version "0.3.96"
+                              :exclusions [org.clojure/clojurescript
+                                           com.cognitect/transit-cljs]}
         ;; core.cache for LRU caching in PSS-backed storage
         org.clojure/core.cache {:mvn/version "1.1.234"}
         ;; Malli for API specification and validation
@@ -198,7 +204,14 @@
   ;; Use published deps (for CI/release)
   :release
   {:override-deps {org.replikativ/persistent-sorted-set {:mvn/version "0.4.119"}
-                   org.replikativ/konserve {:mvn/version "0.9.345"}}}
+                   org.replikativ/konserve {:mvn/version "0.9.345"
+                                            :exclusions [org.clojure/clojurescript
+                                                         com.github.pkpkpk/cljs-node-io
+                                                         com.github.pkpkpk/fress
+                                                         org.clojars.mmb90/cljs-cache]}
+                   org.replikativ/hasch {:mvn/version "0.3.96"
+                                         :exclusions [org.clojure/clojurescript
+                                                      com.cognitect/transit-cljs]}}}
 
   :format {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
            :main-opts ["-m" "cljfmt.main" "check"]}

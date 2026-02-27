@@ -8,10 +8,16 @@ on:
       - 'src/**'
       - 'deps.edn'
       - '.github/workflows/clay-notebooks.yml'
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:
 
 permissions:
-  contents: write  # Required to push changes back
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
 
 jobs:
   render-notebooks:
@@ -20,8 +26,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Full history for proper git operations
 
       - name: Set up Java 21
         uses: actions/setup-java@v4
@@ -69,35 +73,30 @@ jobs:
 
           ;; Render main notebook
           (clay/make! {:source-path \"notebooks/stratum_intro.clj\"
-                       :base-target-path \"docs\"
+                       :base-target-path \"_site\"
                        :show false})
 
-          (println \"✓ Rendered notebooks to docs/\")
+          ;; Create index.html redirect
+          (spit \"_site/index.html\"
+                \"<html><head><meta http-equiv='refresh' content='0;url=stratum_intro.html'/></head><body><a href='stratum_intro.html'>Stratum Documentation</a></body></html>\")
+
+          (println \"✓ Rendered notebooks to _site/\")
           (System/exit 0)
           "
 
-      - name: Check for changes
-        id: git-check
-        run: |
-          git diff --exit-code docs/ || echo "changed=true" >> $GITHUB_OUTPUT
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
 
-      - name: Commit rendered notebooks
-        if: steps.git-check.outputs.changed == 'true'
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add docs/
-          git commit -m "docs: render Clay notebooks [skip ci]"
-          git push
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
 
       - name: Summary
         run: |
           echo "### Clay Notebook Rendering" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.git-check.outputs.changed }}" == "true" ]; then
-            echo "✅ Notebooks rendered and committed to \`docs/\`" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "ℹ️ No changes detected in rendered notebooks" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "✅ Notebooks rendered and deployed to GitHub Pages" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "View at: https://replikativ.github.io/stratum/stratum_intro.html" >> $GITHUB_STEP_SUMMARY
+          echo "View at: https://replikativ.github.io/stratum/" >> $GITHUB_STEP_SUMMARY

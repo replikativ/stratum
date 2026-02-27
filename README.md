@@ -3,6 +3,7 @@
 [![Clojars Project](https://img.shields.io/clojars/v/org.replikativ/stratum.svg)](https://clojars.org/org.replikativ/stratum)
 [![CircleCI](https://circleci.com/gh/replikativ/stratum.svg?style=shield)](https://circleci.com/gh/replikativ/stratum)
 [![Slack](https://img.shields.io/badge/slack-join_chat-brightgreen.svg)](https://clojurians.slack.com/archives/CB7GJAN0L)
+[![Docs](https://img.shields.io/badge/docs-clay_notebooks-blue.svg)](https://replikativ.github.io/stratum/)
 
 *Stratum is in beta. Please provide feedback and report any issues you run into.*
 

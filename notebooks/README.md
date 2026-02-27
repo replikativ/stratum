@@ -2,6 +2,8 @@
 
 This directory contains interactive notebooks showcasing Stratum's features.
 
+**Live documentation**: https://replikativ.github.io/stratum/
+
 ## Available Notebooks
 
 - **stratum_intro.clj** — Comprehensive introduction to Stratum covering:

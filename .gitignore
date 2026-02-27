@@ -12,3 +12,7 @@ hs_err_pid*.log
 *.swo
 bench/results_*.txt
 results*.txt
+
+# Clay notebook output (deployed to gh-pages, not in main branch)
+docs/
+_site/
