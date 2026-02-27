@@ -237,8 +237,8 @@
    [:having {:optional true}
     [:vector {:error/message ":having must be a vector of predicates"} SPredSpec]]
    [:select {:optional true}
-    [:vector {:error/message ":select must be a vector of column refs or expressions"}
-     [:or :keyword vector?]]]
+    [:vector {:error/message ":select must be a vector of column refs, expressions, or literals"}
+     [:or :keyword vector? number? :string]]]
    [:order {:optional true}
     [:vector {:error/message ":order must be a vector of [:col :asc/:desc] or :col"}
      SOrderSpec]]

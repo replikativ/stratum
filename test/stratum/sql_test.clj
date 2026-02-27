@@ -1532,3 +1532,176 @@
       (is (= 1 (count results)))
       (is (= 0 (:cat (first results))))
       (is (> (:sum_price (first results)) 50.0)))))
+
+;; ============================================================================
+;; SQL Projection Tests (Postgres/xtdb-inspired)
+;; ============================================================================
+
+(deftest sql-select-star-test
+  (testing "SELECT * FROM orders returns all columns with correct row count"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT * FROM orders" reg)
+          results (q/q query)]
+      (is (= test-n (count results)))
+      (is (every? #(contains? % :price) results))
+      (is (every? #(contains? % :quantity) results))
+      (is (every? #(contains? % :category) results))
+      (is (every? #(contains? % :discount) results)))))
+
+(deftest sql-single-column-projection-test
+  (testing "SELECT price FROM orders — single column projection"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT price FROM orders" reg)
+          results (q/q query)]
+      (is (= test-n (count results)))
+      (is (every? #(contains? % :price) results))
+      (is (every? #(= 1 (count (keys %))) results)))))
+
+(deftest sql-multi-column-projection-test
+  (testing "SELECT price, quantity FROM orders — multi-column projection"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT price, quantity FROM orders" reg)
+          results (q/q query)]
+      (is (= test-n (count results)))
+      (is (every? #(and (contains? % :price) (contains? % :quantity)) results))
+      (is (every? #(= 2 (count (keys %))) results)))))
+
+(deftest sql-aliased-column-test
+  (testing "SELECT price AS p FROM orders — aliased column"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT price AS p FROM orders" reg)
+          results (q/q query)]
+      (is (= test-n (count results)))
+      (is (every? #(contains? % :p) results)))))
+
+(deftest sql-projection-with-filter-test
+  (testing "SELECT price, quantity FROM orders WHERE price > 100"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT price, quantity FROM orders WHERE price > 100" reg)
+          results (q/q query)]
+      (is (pos? (count results)))
+      (is (< (count results) test-n))
+      (is (every? #(> (:price %) 100.0) results)))))
+
+(deftest sql-integer-literal-test
+  (testing "SELECT 1 FROM orders — integer literal"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT 1 FROM orders" reg)
+          results (q/q query)]
+      (is (= test-n (count results)))
+      (is (every? #(= 1 (val (first %))) results)))))
+
+(deftest sql-literal-with-column-test
+  (testing "SELECT 1 AS one, price FROM orders — literal + column"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT 1 AS one, price FROM orders" reg)
+          results (q/q query)]
+      (is (= test-n (count results)))
+      (is (every? #(= 1 (:one %)) results))
+      (is (every? #(contains? % :price) results)))))
+
+(deftest sql-string-literal-test
+  (testing "SELECT 'hello' AS greeting FROM orders WHERE price > 200"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT 'hello' AS greeting FROM orders WHERE price > 200" reg)
+          results (q/q query)]
+      (is (pos? (count results)))
+      (is (every? #(= "hello" (:greeting %)) results)))))
+
+(deftest sql-order-by-asc-test
+  (testing "SELECT price FROM orders ORDER BY price ASC"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT price FROM orders ORDER BY price ASC" reg)
+          results (q/q query)]
+      (is (= test-n (count results)))
+      (is (apply <= (map :price results))))))
+
+(deftest sql-order-by-desc-test
+  (testing "SELECT price FROM orders ORDER BY price DESC"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT price FROM orders ORDER BY price DESC" reg)
+          results (q/q query)]
+      (is (= test-n (count results)))
+      (is (apply >= (map :price results))))))
+
+(deftest sql-order-by-multi-test
+  (testing "SELECT category, price FROM orders ORDER BY category ASC, price DESC"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT category, price FROM orders ORDER BY category ASC, price DESC" reg)
+          results (q/q query)]
+      (is (= test-n (count results)))
+      ;; Each category group should have descending prices
+      (doseq [[_cat rows] (group-by :category results)]
+        (is (apply >= (map :price rows)))))))
+
+(deftest sql-distinct-test
+  (testing "SELECT DISTINCT category FROM orders"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT DISTINCT category FROM orders" reg)
+          results (q/q query)]
+      (is (= 5 (count results)))
+      (is (= #{0 1 2 3 4} (set (map :category results)))))))
+
+(deftest sql-distinct-ordered-test
+  (testing "SELECT DISTINCT category FROM orders ORDER BY category"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT DISTINCT category FROM orders ORDER BY category" reg)
+          results (q/q query)]
+      (is (= 5 (count results)))
+      (is (= [0 1 2 3 4] (mapv :category results))))))
+
+(deftest sql-limit-test
+  (testing "SELECT price FROM orders ORDER BY price LIMIT 5"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT price FROM orders ORDER BY price LIMIT 5" reg)
+          results (q/q query)]
+      (is (= 5 (count results)))
+      (is (apply <= (map :price results))))))
+
+(deftest sql-limit-offset-test
+  (testing "SELECT price FROM orders ORDER BY price LIMIT 5 OFFSET 10"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT price FROM orders ORDER BY price LIMIT 5 OFFSET 10" reg)
+          results (q/q query)]
+      (is (= 5 (count results))))))
+
+(deftest sql-expression-in-select-test
+  (testing "SELECT price * quantity AS revenue FROM orders"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT price * quantity AS revenue FROM orders" reg)
+          results (q/q query)]
+      (is (= test-n (count results)))
+      (is (every? #(contains? % :revenue) results))
+      ;; First row: price=10.0, quantity=1 → revenue=10.0
+      (is (== 10.0 (:revenue (first results)))))))
+
+(deftest sql-expression-addition-test
+  (testing "SELECT price + 1 AS adjusted FROM orders"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT price + 1 AS adjusted FROM orders" reg)
+          results (q/q query)]
+      (is (= test-n (count results)))
+      ;; First row: price=10.0, adjusted=11.0
+      (is (== 11.0 (:adjusted (first results)))))))
+
+(deftest sql-group-by-having-count-test
+  (testing "SELECT category, COUNT(*) FROM orders GROUP BY category HAVING COUNT(*) > 100 ORDER BY category"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql
+                           "SELECT category, COUNT(*) FROM orders GROUP BY category HAVING COUNT(*) > 100 ORDER BY category"
+                           reg)
+          results (q/q query)]
+      ;; 1000 rows / 5 categories = 200 each, all pass HAVING > 100
+      (is (= 5 (count results)))
+      (is (every? #(> (:count %) 100) results))
+      (is (apply <= (map :category results))))))
+
+(deftest sql-group-by-having-min-max-test
+  (testing "SELECT category, MIN(price), MAX(price) FROM orders GROUP BY category HAVING MIN(price) > 5"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql
+                           "SELECT category, MIN(price), MAX(price) FROM orders GROUP BY category HAVING MIN(price) > 5"
+                           reg)
+          results (q/q query)]
+      (is (= 5 (count results)))
+      (is (every? #(> (:min %) 5.0) results)))))

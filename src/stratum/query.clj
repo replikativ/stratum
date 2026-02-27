@@ -593,12 +593,19 @@
     (let [items (vec item)
           inner (nth items 1)
           alias (nth items 2)]
-      (if (keyword? inner)
-        {:name alias :ref (norm/strip-ns inner)}
-        {:name alias :expr (norm/normalize-expr inner)}))
+      (cond
+        (keyword? inner) {:name alias :ref (norm/strip-ns inner)}
+        (or (number? inner) (string? inner)) {:name alias :literal inner}
+        :else {:name alias :expr (norm/normalize-expr inner)}))
 
     (sequential? item)
     {:name (keyword (str "_expr_" idx)) :expr (norm/normalize-expr item)}
+
+    (number? item)
+    {:name (keyword (str "_literal_" idx)) :literal item}
+
+    (string? item)
+    {:name (keyword (str "_literal_" idx)) :literal item}
 
     :else
     (throw (ex-info (str "Invalid select item: " item) {:item item}))))
@@ -638,36 +645,50 @@
       (let [result (transient {:n-rows n-matched})]
         (doseq [sel select-items]
           (let [k (:name sel)]
-            (if-let [ref (:ref sel)]
-              (let [src-col (get columns ref)
-                    src-data (if (map? src-col) (:data src-col) src-col)]
-                (if match-indices
-                  ;; Scatter-gather filtered rows
-                  (let [n n-matched]
-                    (cond
-                      (expr/long-array? src-data)
-                      (let [out (long-array n)]
-                        (dotimes [i n] (aset out i (aget ^longs src-data (int (nth match-indices i)))))
-                        (assoc! result k out))
+            (if (contains? sel :literal)
+              ;; Literal value — fill constant array
+              (let [lit (:literal sel)]
+                (if (integer? lit)
+                  (let [out (long-array n-matched)]
+                    (java.util.Arrays/fill out (long lit))
+                    (assoc! result k out))
+                  (if (number? lit)
+                    (let [out (double-array n-matched)]
+                      (java.util.Arrays/fill out (double lit))
+                      (assoc! result k out))
+                    (let [out (make-array String n-matched)]
+                      (java.util.Arrays/fill ^"[Ljava.lang.String;" out (str lit))
+                      (assoc! result k out)))))
+              (if-let [ref (:ref sel)]
+                (let [src-col (get columns ref)
+                      src-data (if (map? src-col) (:data src-col) src-col)]
+                  (if match-indices
+                    ;; Scatter-gather filtered rows
+                    (let [n n-matched]
+                      (cond
+                        (expr/long-array? src-data)
+                        (let [out (long-array n)]
+                          (dotimes [i n] (aset out i (aget ^longs src-data (int (nth match-indices i)))))
+                          (assoc! result k out))
 
-                      (expr/double-array? src-data)
-                      (let [out (double-array n)]
-                        (dotimes [i n] (aset out i (aget ^doubles src-data (int (nth match-indices i)))))
-                        (assoc! result k out))
+                        (expr/double-array? src-data)
+                        (let [out (double-array n)]
+                          (dotimes [i n] (aset out i (aget ^doubles src-data (int (nth match-indices i)))))
+                          (assoc! result k out))
 
-                      :else
-                      (let [out (make-array String n)]
-                        (dotimes [i n] (aset ^"[Ljava.lang.String;" out i
-                                             (aget ^"[Ljava.lang.String;" src-data (int (nth match-indices i)))))
-                        (assoc! result k out))))
-                  ;; No filtering — return source array directly
-                  (assoc! result k src-data)))
-              ;; Expression column — evaluate for all rows
-              (let [out (double-array n-matched)]
-                (dotimes [i n-matched]
-                  (let [ii (int (if match-indices (nth match-indices i) i))]
-                    (aset out i (double (gb/eval-agg-expr (:expr sel) col-arrays ii)))))
-                (assoc! result k out)))))
+                        :else
+                        (let [out (make-array String n)]
+                          (dotimes [i n] (aset ^"[Ljava.lang.String;" out i
+                                               (aget ^"[Ljava.lang.String;" src-data (int (nth match-indices i)))))
+                          (assoc! result k out))))
+                    ;; No filtering — return source array directly
+                    (assoc! result k src-data)))
+                ;; Expression column — evaluate for all rows
+                (let [out (double-array n-matched)]
+                  (dotimes [i n-matched]
+                    (let [ii (int (if match-indices (nth match-indices i) i))]
+                      (aset out i (double (gb/eval-agg-expr (:expr sel) col-arrays ii)))))
+                  (assoc! result k out))))))
         (persistent! result))
       ;; Row-oriented output (original path)
       (let [indices (or match-indices (range length))]
@@ -676,9 +697,11 @@
                   (into {}
                         (map (fn [sel]
                                [(:name sel)
-                                (if-let [ref (:ref sel)]
-                                  (aget-col-decoded (get col-arrays ref) (get mat-cols ref) ii)
-                                  (gb/eval-agg-expr (:expr sel) col-arrays ii))]))
+                                (if (contains? sel :literal)
+                                  (:literal sel)
+                                  (if-let [ref (:ref sel)]
+                                    (aget-col-decoded (get col-arrays ref) (get mat-cols ref) ii)
+                                    (gb/eval-agg-expr (:expr sel) col-arrays ii)))]))
                         select-items)))
               indices)))))
 

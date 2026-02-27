@@ -640,8 +640,8 @@
         records (parse-test-file content)
         registry (atom {})]
     (doseq [record records]
-      (when-let [msg (execute-record! registry record)]
-        (is (nil? msg) msg)))))
+      (let [msg (execute-record! registry record)]
+        (is (nil? msg) (or msg ""))))))
 
 ;; ============================================================================
 ;; Test entry point

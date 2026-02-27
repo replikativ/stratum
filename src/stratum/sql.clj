@@ -1045,7 +1045,13 @@
 
         ;; For non-aggregate SELECT without GROUP BY (pure projection)
         ;; Exclude window functions — they are handled separately
-        projection (when (and (not has-agg?) (not has-group?) (not all-star?))
+        projection (cond
+                     ;; SELECT * — project all columns from the source table
+                     (and (not has-agg?) (not has-group?) all-star?)
+                     (vec (keys from-data))
+
+                     ;; Explicit SELECT columns (non-aggregate, non-group)
+                     (and (not has-agg?) (not has-group?) (not all-star?))
                      (->> select-items
                           (keep (fn [^SelectItem item]
                                   (let [expr (.getExpression item)]
