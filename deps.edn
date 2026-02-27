@@ -104,7 +104,7 @@
                 ;; DuckDB JDBC for benchmark validation
                 org.duckdb/duckdb_jdbc {:mvn/version "1.4.4.0"}
                 ;; Yggdrasil for CoW protocol compliance
-                org.replikativ/yggdrasil {:mvn/version "0.2.19"}}
+                org.replikativ/yggdrasil {:mvn/version "0.2.20"}}
    :jvm-opts ["-Djdk.attach.allowAttachSelf=true"
               "-XX:+UnlockDiagnosticVMOptions"
               "-XX:+DebugNonSafepoints"
@@ -137,7 +137,7 @@
                 ;; Kindly for notebook rendering hints
                 org.scicloj/kindly {:mvn/version "4-beta21"}
                 ;; Yggdrasil for CoW protocol compliance (optional, test-only)
-                org.replikativ/yggdrasil {:local/root "../yggdrasil"}}
+                org.replikativ/yggdrasil {:mvn/version "0.2.20"}}
    :jvm-opts ["--add-modules=jdk.incubator.vector"
               "--enable-native-access=ALL-UNNAMED"
               "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
