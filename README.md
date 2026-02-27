@@ -57,19 +57,19 @@ Stratum vs DuckDB (10M rows, single-threaded, best of array/index mode)
 ──────────────────────────────────────────────────────────────────────
 TPC-H Q6 (filter+sum-product)        13ms       28ms    2.2x faster
 SSB Q1.1 (filter+sum-product)        13ms       28ms    2.2x faster
-Filtered COUNT (NEQ pred)              3ms       12ms    4.0x faster
-Group-by COUNT (3 groups)             17ms       24ms    1.4x faster
+Filtered COUNT (NEQ pred)             3ms       12ms    4.0x faster
+Group-by COUNT (3 groups)            17ms       24ms    1.4x faster
 TPC-H Q1 (7 aggs, 4 groups)          75ms       93ms    1.2x faster
 H2O Q3 (100K string groups)          71ms      362ms    5.1x faster
 H2O Q2 (10K string groups)           33ms      123ms    3.7x faster
 H2O Q6 (STDDEV, 10K groups)          30ms       81ms    2.7x faster
 H2O Q9 (CORR, 10K groups)            61ms      134ms    2.2x faster
 H2O Q10 (10M groups, 6 cols)        832ms     7056ms    8.5x faster
-LIKE '%search%' (string scan)         47ms      240ms    5.1x faster
-AVG(LENGTH(URL)) (string fn)          38ms      170ms    4.5x faster
+LIKE '%search%' (string scan)        47ms      240ms    5.1x faster
+AVG(LENGTH(URL)) (string fn)         38ms      170ms    4.5x faster
 ──────────────────────────────────────────────────────────────────────
-COUNT(DISTINCT) 1.1M                 109ms       61ms    DuckDB 1.8x
-COUNT WHERE sparse pred               22ms        5ms    DuckDB 4.9x
+COUNT(DISTINCT) 1.1M                109ms       61ms    DuckDB 1.8x
+COUNT WHERE sparse pred              22ms        5ms    DuckDB 4.9x
 ──────────────────────────────────────────────────────────────────────
 ```
 
