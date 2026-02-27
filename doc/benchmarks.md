@@ -29,7 +29,7 @@ Standard decision-support queries on TPC-H lineitem data (6M rows from CSV).
 | B1 | TPC-H Q6: filter + SUM(price*discount) | **12.9ms** | 7.3ms | 27.9ms | 5.4ms | **2.2x** |
 | B2 | TPC-H Q1: GROUP BY + 7 aggregates | **74.6ms** | 23.4ms | 92.5ms | 16.8ms | **1.2x** |
 | B3 | SSB Q1.1: filter + SUM(price*discount) | **12.9ms** | 4.8ms | 28.3ms | 5.7ms | **2.2x** |
-| B4 | COUNT(*) no filter | **0.1ms** | — | 0.4ms | 0.3ms | **4.0x** |
+| B4 | COUNT(*) no filter | **0.1ms** | - | 0.4ms | 0.3ms | **4.0x** |
 | B5 | Filtered COUNT (NEQ predicate) | **3.1ms** | 1.7ms | 12.2ms | 2.9ms | **4.0x** |
 | B6 | Low-cardinality GROUP BY + COUNT | **16.9ms** | 7.3ms | 24.0ms | 4.6ms | **1.4x** |
 | SSB-Q1.2 | Tighter filter + SUM(price*discount) | **12.5ms** | 4.8ms | 23.3ms | 4.5ms | **1.9x** |

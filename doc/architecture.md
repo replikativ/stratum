@@ -65,7 +65,7 @@ A persistent sorted set (PSS) tree of `ChunkEntry` records, each containing:
 - **PersistentColChunk**: CoW wrapper around a `long[]` or `double[]` (8192 elements default)
 - **ChunkStats**: per-chunk count, sum, sum-of-squares, min, max
 
-Indices support O(1) fork via structural sharing and copy-on-write on mutation. The query engine can stream over chunks without materializing the full array (64KB per chunk fits L2 cache). When persisted, the PSS tree is stored in konserve and lazy-loaded on demand — opening a billion-row index costs nothing until chunks are actually accessed.
+Indices support O(1) fork via structural sharing and copy-on-write on mutation. The query engine can stream over chunks without materializing the full array (64KB per chunk fits L2 cache). When persisted, the PSS tree is stored in konserve and lazy-loaded on demand - opening a billion-row index costs nothing until chunks are actually accessed.
 
 ### Dictionary-Encoded Strings
 
@@ -127,9 +127,9 @@ Total time: ~4ms single-threaded, ~1ms multi-threaded (6M rows).
 
 ## Related Documentation
 
-- [SIMD Internals](simd-internals.md) — Java Vector API patterns, fused filter+aggregate, morsel-driven parallelism
-- [Query Engine](query-engine.md) — Dispatch logic, expression evaluation, optimization
-- [Storage and Indices](storage-and-indices.md) — Chunks, CoW semantics, zone maps, Konserve
-- [Benchmarks](benchmarks.md) — Methodology, results, reproducing
-- [SQL Interface](sql-interface.md) — PgWire server, SQL translation, supported subset
-- [Anomaly Detection](anomaly-detection.md) — Isolation forest training, scoring, online rotation
+- [SIMD Internals](simd-internals.md) - Java Vector API patterns, fused filter+aggregate, morsel-driven parallelism
+- [Query Engine](query-engine.md) - Dispatch logic, expression evaluation, optimization
+- [Storage and Indices](storage-and-indices.md) - Chunks, CoW semantics, zone maps, Konserve
+- [Benchmarks](benchmarks.md) - Methodology, results, reproducing
+- [SQL Interface](sql-interface.md) - PgWire server, SQL translation, supported subset
+- [Anomaly Detection](anomaly-detection.md) - Isolation forest training, scoring, online rotation

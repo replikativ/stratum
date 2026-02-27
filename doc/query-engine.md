@@ -48,8 +48,8 @@ Both keyword vectors and s-expressions are supported:
 [:stddev :col]                 ;; STDDEV(col)
 [:variance :col]               ;; VARIANCE(col)
 [:corr :col1 :col2]           ;; CORR(col1, col2)
-[:sum [:* :price :qty]]        ;; SUM(price * qty) — expression in agg
-[:sum-product :price :qty]     ;; SUM(price * qty) — direct
+[:sum [:* :price :qty]]        ;; SUM(price * qty) - expression in agg
+[:sum-product :price :qty]     ;; SUM(price * qty) - direct
 [:median :col]                 ;; MEDIAN(col)
 [:percentile :col 0.95]        ;; PERCENTILE_CONT(0.95, col)
 [:approx-quantile :col 0.95]   ;; Approximate quantile via t-digest
@@ -75,7 +75,7 @@ Both keyword vectors and s-expressions are supported:
 
 ### Flat Namespace
 
-The DSL operates over a single flat namespace. Every clause (`:where`, `:agg`, `:group`, `:select`, `:having`, `:order`) resolves column names by keyword lookup against one merged column map. There is no scope nesting, no table qualification, and no quoting — just keywords:
+The DSL operates over a single flat namespace. Every clause (`:where`, `:agg`, `:group`, `:select`, `:having`, `:order`) resolves column names by keyword lookup against one merged column map. There is no scope nesting, no table qualification, and no quoting - just keywords:
 
 ```clojure
 {:from  {:price (double-array [10 20 30])
@@ -99,7 +99,7 @@ The DSL operates over a single flat namespace. Every clause (`:where`, `:agg`, `
  :agg   [[:count]]}           ;; both sides visible
 ```
 
-**Key collision**: when a column name appears in both `:from` and `:with`, the right (`:with`) side wins. The join key column from the right side is dropped after the join (it's redundant — it equals the left-side key by definition).
+**Key collision**: when a column name appears in both `:from` and `:with`, the right (`:with`) side wins. The join key column from the right side is dropped after the join (it's redundant - it equals the left-side key by definition).
 
 If you need both sides of a collision, rename the column in one of the input maps before building the query:
 
@@ -161,7 +161,7 @@ WHERE total > 500 GROUP BY region
          :agg   [[:sum :total]]}))
 ```
 
-This means the DSL is not less expressive than SQL — it has the same compositional power, expressed through Clojure's own value model rather than SQL's naming syntax.
+This means the DSL is not less expressive than SQL - it has the same compositional power, expressed through Clojure's own value model rather than SQL's naming syntax.
 
 ## Execution Pipeline
 
@@ -222,7 +222,7 @@ Is this a group-by?
       → fusedFilterGroupAggregatePartitioned (radix-partitioned hash)
 
 Is this a percentile/median/approx-quantile?
-  → Yes: Scalar path — collect matching values, QuickSelect or t-digest
+  → Yes: Scalar path - collect matching values, QuickSelect or t-digest
 
 Fallback: N-pass (one pass per agg) or scalar (< 1000 rows)
 ```
@@ -231,9 +231,9 @@ Fallback: N-pass (one pass per agg) or scalar (< 1000 rows)
 
 Statistical aggregates use specialized algorithms that don't fit the SIMD accumulator pattern:
 
-- **`:median`** — Sugar for `[:percentile :col 0.5]`
-- **`:percentile`** — Exact percentile via Hoare's QuickSelect (O(N) average). Copies matching values to work array, partitions in-place. For grouped queries, collects per-group values via ArrayList then sorts.
-- **`:approx-quantile`** — Approximate quantile via t-digest (Dunning 2019). Bounded memory (~6.4KB per digest), O(N) insertion. For ungrouped queries, uses single digest. For grouped queries, per-group digests in flat arrays. Accuracy within ±1% for 100K+ rows.
+- **`:median`** - Sugar for `[:percentile :col 0.5]`
+- **`:percentile`** - Exact percentile via Hoare's QuickSelect (O(N) average). Copies matching values to work array, partitions in-place. For grouped queries, collects per-group values via ArrayList then sorts.
+- **`:approx-quantile`** - Approximate quantile via t-digest (Dunning 2019). Bounded memory (~6.4KB per digest), O(N) insertion. For ungrouped queries, uses single digest. For grouped queries, per-group digests in flat arrays. Accuracy within ±1% for 100K+ rows.
 
 These are dispatched through the scalar aggregation path (`execute-scalar-aggs` and the collection-agg branch of hash group-by). They cannot use the SIMD fused paths because they require collecting individual values rather than accumulating running statistics.
 
@@ -247,7 +247,7 @@ String columns are dictionary-encoded for efficient group-by and LIKE operations
 ;;     :dict  (into-array String ["US" "EU" "JP"])}
 ```
 
-The codes are sequential integers (0, 1, 2, ...), enabling direct array indexing in dense group-by. Pre-encoding with `q/encode-column` is critical for performance — per-query encoding adds 3-4x overhead.
+The codes are sequential integers (0, 1, 2, ...), enabling direct array indexing in dense group-by. Pre-encoding with `q/encode-column` is critical for performance - per-query encoding adds 3-4x overhead.
 
 LIKE patterns on dictionary-encoded columns first filter the dictionary (e.g., which strings contain "foo"), then check per-row codes against a bitset of matching dictionary entries.
 
@@ -264,7 +264,7 @@ Predicates that can't be expressed as SIMD operations (`:or`, `:in`, `:not-in`) 
   mask)
 ```
 
-The compiled mask is passed as `[:__mask :eq 1]` — a SIMD-compatible equality predicate that integrates with the fused filter+aggregate pipeline.
+The compiled mask is passed as `[:__mask :eq 1]` - a SIMD-compatible equality predicate that integrates with the fused filter+aggregate pipeline.
 
 ## Expression Evaluation
 
@@ -310,7 +310,7 @@ Returns the execution plan without running the query.
 
 ## Related Documentation
 
-- [Architecture](architecture.md) — System overview
-- [SIMD Internals](simd-internals.md) — How the Java SIMD paths work
-- [Storage and Indices](storage-and-indices.md) — Index-aware query execution
-- [SQL Interface](sql-interface.md) — SQL queries translated to this DSL
+- [Architecture](architecture.md) - System overview
+- [SIMD Internals](simd-internals.md) - How the Java SIMD paths work
+- [Storage and Indices](storage-and-indices.md) - Index-aware query execution
+- [SQL Interface](sql-interface.md) - SQL queries translated to this DSL

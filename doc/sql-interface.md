@@ -38,10 +38,10 @@ Options:
 |------|---------|-------------|
 | `--port N` | 5432 | TCP port to listen on |
 | `--data-dir DIR` | `~/.local/share/stratum` | Directory for per-file index stores |
-| `--index NAME:FILE` | — | Pre-index FILE and register as table NAME |
-| `--demo` | — | Load synthetic demo tables (lineitem, taxi) |
+| `--index NAME:FILE` | - | Pre-index FILE and register as table NAME |
+| `--demo` | - | Load synthetic demo tables (lineitem, taxi) |
 
-`NAME` is optional — omitting it derives the table name from the filename stem:
+`NAME` is optional - omitting it derives the table name from the filename stem:
 
 ```bash
 # Start server, auto-index two files
@@ -89,7 +89,7 @@ clj -M:server --data-dir /mnt/analytics --port 5433
 
 ## File Indexing
 
-Stratum builds persistent column indices from CSV and Parquet files and caches them on disk. On subsequent loads only the lazy PSS tree is restored — zero file re-reading.
+Stratum builds persistent column indices from CSV and Parquet files and caches them on disk. On subsequent loads only the lazy PSS tree is restored - zero file re-reading.
 
 ### Ad-hoc file queries (auto-indexed on first access)
 
@@ -119,7 +119,7 @@ clj -M:server --index orders:/data/orders.csv
 (st/index-file! srv "orders" "/data/orders.csv" "/tmp/stratum-data")
 ```
 
-The indexed store lives at `<data-dir>/<filename>.stratum/`. On server restart with the same `--data-dir`, the index loads instantly (mtime check — re-indexed only if the source file changed).
+The indexed store lives at `<data-dir>/<filename>.stratum/`. On server restart with the same `--data-dir`, the index loads instantly (mtime check - re-indexed only if the source file changed).
 
 ### Bring-your-own store (Clojure)
 
@@ -131,7 +131,7 @@ For custom storage backends (S3, Redis, etc.), pass an already-open konserve sto
 
 (def store (s3/connect-store {:bucket "my-bucket"} {:sync? true}))
 
-;; Load/index into your own store — any konserve backend works
+;; Load/index into your own store - any konserve backend works
 (def ds (files/load-or-index-file! "/data/orders.csv" {:store store}))
 
 ;; Query
@@ -149,7 +149,7 @@ Tables are registered as column maps. String columns are automatically dictionar
    :qty    (long-array [1 2 3])
    :region (into-array String ["US" "EU" "US"])})
 
-;; From CSV (arrays — re-read on each server restart)
+;; From CSV (arrays - re-read on each server restart)
 (st/register-table! srv "taxi" (st/from-csv "data/taxi.csv"))
 
 ;; From CSV with persistent index (survives restarts, zone-map pruning)
@@ -350,7 +350,7 @@ GROUP BY product;
 SELECT region, SUM(amount) FROM '/data/sales.csv' GROUP BY region;
 ```
 
-Cached indices use zone map pruning and SIMD-accelerated execution — subsequent queries on the same file are much faster than re-reading from disk.
+Cached indices use zone map pruning and SIMD-accelerated execution - subsequent queries on the same file are much faster than re-reading from disk.
 
 ## Client Examples
 
@@ -383,5 +383,5 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM orders WHERE price > 100"
 
 ## Related Documentation
 
-- [Architecture](architecture.md) — System overview
-- [Query Engine](query-engine.md) — Query map format and execution
+- [Architecture](architecture.md) - System overview
+- [Query Engine](query-engine.md) - Query map format and execution

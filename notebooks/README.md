@@ -6,7 +6,7 @@ This directory contains interactive notebooks showcasing Stratum's features.
 
 ## Available Notebooks
 
-- **stratum_intro.clj** — Comprehensive introduction to Stratum covering:
+- **stratum_intro.clj** - Comprehensive introduction to Stratum covering:
   - Query engine basics
   - Tablecloth/tech.ml.dataset integration
   - Performance and SIMD execution

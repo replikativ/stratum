@@ -10,7 +10,7 @@ The fundamental data container. Wraps a Java heap array (`long[]` or `double[]`)
 ;; Create a chunk
 (def chunk (chunk/col-chunk-from-seq [1.0 2.0 3.0]))
 
-;; Fork is O(1) — structural sharing
+;; Fork is O(1) - structural sharing
 (def forked (chunk/col-chunk-fork chunk))
 
 ;; Mutation requires transient mode
@@ -85,9 +85,9 @@ Every chunk maintains aggregate statistics computed incrementally on mutation:
  :max     9999.99}
 ```
 
-The query engine uses these statistics for zone map pruning — skipping entire chunks that can't contain matching rows.
+The query engine uses these statistics for zone map pruning - skipping entire chunks that can't contain matching rows.
 
-Standard zone maps (Parquet row group statistics, DuckDB's `NumericStatsData`) store only min and max per segment, primarily for predicate filter pushdown. Stratum extends this with per-chunk sum and sum-of-squares, following the approach of Apache ORC ColumnStatistics. The addition of sum and count enables a wider class of aggregates to short-circuit without scanning row data — a capability not present in DuckDB, which must do a full scan for `COUNT(*)`, `SUM`, or `AVG` even without a WHERE clause.
+Standard zone maps (Parquet row group statistics, DuckDB's `NumericStatsData`) store only min and max per segment, primarily for predicate filter pushdown. Stratum extends this with per-chunk sum and sum-of-squares, following the approach of Apache ORC ColumnStatistics. The addition of sum and count enables a wider class of aggregates to short-circuit without scanning row data - a capability not present in DuckDB, which must do a full scan for `COUNT(*)`, `SUM`, or `AVG` even without a WHERE clause.
 
 ### Three-Way Chunk Classification
 
@@ -157,19 +157,19 @@ This is 2.5x faster than materializing the full array for compound aggregations 
 
 Chunk streaming supports all dense-path aggregation operations (SUM, COUNT, MIN, MAX, AVG, SUM_PRODUCT) and extended operations (VARIANCE, CORR) via variable-width accumulators.
 
-## Konserve Storage — PSS-Backed Lazy Loading
+## Konserve Storage - PSS-Backed Lazy Loading
 
-Indices are persisted via the persistent sorted set (PSS) library's `IStorage` protocol, backed by konserve. The PSS tree itself — including all chunk data inline in leaf nodes — is stored in konserve and lazy-loaded on demand.
+Indices are persisted via the persistent sorted set (PSS) library's `IStorage` protocol, backed by konserve. The PSS tree itself - including all chunk data inline in leaf nodes - is stored in konserve and lazy-loaded on demand.
 
 ### Memory Modes
 
 An index can be in one of three modes:
 
-**In-memory** — The default after `make-index` or `index-from-seq`. The entire PSS tree lives in JVM heap. The `storage` field is nil. This is the mode all OLAP benchmarks use.
+**In-memory** - The default after `make-index` or `index-from-seq`. The entire PSS tree lives in JVM heap. The `storage` field is nil. This is the mode all OLAP benchmarks use.
 
-**Storage-backed** — After `idx-sync!`. The PSS tree nodes have been written to konserve and have UUID addresses. The CachedStorage LRU cache still holds all nodes in memory, so access patterns are identical to in-memory mode. Subsequent syncs are incremental: `pss/store` walks the tree and only writes nodes without addresses (dirty nodes from transient mutations).
+**Storage-backed** - After `idx-sync!`. The PSS tree nodes have been written to konserve and have UUID addresses. The CachedStorage LRU cache still holds all nodes in memory, so access patterns are identical to in-memory mode. Subsequent syncs are incremental: `pss/store` walks the tree and only writes nodes without addresses (dirty nodes from transient mutations).
 
-**Lazy-loaded** — After `restore-index-from-snapshot`. Only the root address is known — no data is loaded. When the query engine iterates chunks (via `pss/slice` or point lookup), each PSS node access triggers `IStorage.restore()` which loads the node from konserve, deserializes it via Fressian, and caches it in the LRU cache. This is the key property for billion-row scale: opening a dataset doesn't require loading all data upfront.
+**Lazy-loaded** - After `restore-index-from-snapshot`. Only the root address is known - no data is loaded. When the query engine iterates chunks (via `pss/slice` or point lookup), each PSS node access triggers `IStorage.restore()` which loads the node from konserve, deserializes it via Fressian, and caches it in the LRU cache. This is the key property for billion-row scale: opening a dataset doesn't require loading all data upfront.
 
 ### Usage
 
@@ -182,13 +182,13 @@ An index can be in one of three modes:
 ;; Create a store (sync mode)
 (def store (new-mem-store (atom {}) {:sync? true}))
 
-;; Index-level persistence (no branches — indices are internal)
+;; Index-level persistence (no branches - indices are internal)
 (def idx (index/index-from-seq :float64 (range 1000000)))
 (def synced (index/idx-sync! idx store))          ;; writes PSS tree to konserve
 (def commit-id (get-in (meta synced) [:commit :id]))
 (def snapshot (storage/load-index-commit store commit-id))
 (def restored (index/restore-index-from-snapshot snapshot store))
-;; restored is lazy — no chunks loaded yet
+;; restored is lazy - no chunks loaded yet
 
 ;; Incremental sync: modify and re-sync (only dirty nodes written)
 (def modified (-> synced
@@ -220,7 +220,7 @@ Fressian handlers serialize PSS nodes (Leaf, Branch), ChunkEntry records (with c
 
 **Random UUID** (default): Each `idx-sync!` assigns fresh random UUIDs to new/dirty PSS nodes. Two syncs of identical data produce different addresses.
 
-**Content-addressed (merkle)**: When `{:metadata {:crypto-hash? true}}` is set on index creation, addresses are computed deterministically from content — Branch addresses hash child addresses, Leaf addresses hash chunk-ids and stats. Identical content always produces the same commit ID, enabling deduplication and integrity verification.
+**Content-addressed (merkle)**: When `{:metadata {:crypto-hash? true}}` is set on index creation, addresses are computed deterministically from content - Branch addresses hash child addresses, Leaf addresses hash chunk-ids and stats. Identical content always produces the same commit ID, enabling deduplication and integrity verification.
 
 ### Storage Layout in Konserve
 
@@ -245,7 +245,7 @@ Features:
 - **Dataset-level branches**: Datasets own branches; indices are internal
 - **Atomic commits**: Branch HEAD pointers update atomically
 - **Incremental sync**: Only dirty PSS nodes written (path from modified leaf to root)
-- **Lazy loading**: Zero startup cost — data loaded on demand via IStorage
+- **Lazy loading**: Zero startup cost - data loaded on demand via IStorage
 - **Structural sharing**: Forked indices share PSS nodes in storage
 - **Garbage collection**: Mark-and-sweep from branch heads, walks PSS trees
 
@@ -264,6 +264,6 @@ Features:
 
 ## Related Documentation
 
-- [Architecture](architecture.md) — System overview
-- [SIMD Internals](simd-internals.md) — Chunked streaming SIMD details
-- [Query Engine](query-engine.md) — Index-aware dispatch logic
+- [Architecture](architecture.md) - System overview
+- [SIMD Internals](simd-internals.md) - Chunked streaming SIMD details
+- [Query Engine](query-engine.md) - Index-aware dispatch logic

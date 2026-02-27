@@ -69,14 +69,14 @@ Only index-backed columns support persistence (`st/sync!`) and O(1) forking (`st
 Like Clojure collections, mutations require transient mode:
 
 ```clojure
-;; CORRECT — transient → mutate → persistent
+;; CORRECT - transient → mutate → persistent
 (-> ds
     dataset/ds-transient
     (dataset/ds-set! :price 0 99.0)
     (dataset/ds-append! {:price 40.0 :qty 4})
     dataset/ds-persistent!)
 
-;; WRONG — will throw IllegalStateException
+;; WRONG - will throw IllegalStateException
 (dataset/ds-set! ds :price 0 99.0)
 ```
 

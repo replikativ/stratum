@@ -47,11 +47,11 @@ Train an isolation forest on columnar data.
 ```
 
 **Parameters:**
-- `:from` — map of keyword to `double[]` or `long[]` columns (required)
-- `:n-trees` — number of isolation trees (default 100)
-- `:sample-size` — rows subsampled per tree (default 256). Controls tree depth: `ceil(log2(sample-size))`
-- `:seed` — random seed for reproducibility
-- `:contamination` — expected fraction of anomalies in training data. When set, computes a score threshold automatically from the training score distribution (percentile at `1 - contamination`)
+- `:from` - map of keyword to `double[]` or `long[]` columns (required)
+- `:n-trees` - number of isolation trees (default 100)
+- `:sample-size` - rows subsampled per tree (default 256). Controls tree depth: `ceil(log2(sample-size))`
+- `:seed` - random seed for reproducibility
+- `:contamination` - expected fraction of anomalies in training data. When set, computes a score threshold automatically from the training score distribution (percentile at `1 - contamination`)
 
 **Returns** a model map containing the flat forest array, metadata, and (if contamination was set) the threshold, training score min/max.
 
@@ -96,8 +96,8 @@ Prediction confidence based on tree agreement.
 
 Returns `double[]` in `[0, 1]` where `1.0` means all trees fully agree on the point's isolation depth. Uses the coefficient of variation (CV) of per-tree path lengths: `confidence = 1 / (1 + CV)`.
 
-- **High confidence** (>0.8): Trees agree — the prediction is reliable
-- **Low confidence** (<0.5): Trees disagree — the point is in an ambiguous region
+- **High confidence** (>0.8): Trees agree - the prediction is reliable
+- **Low confidence** (<0.5): Trees disagree - the point is in an ambiguous region
 
 ### `iforest-rotate`
 
@@ -222,6 +222,6 @@ All inputs are validated against malli schemas (`stratum.specification`):
 
 ## Related Documentation
 
-- [Query Engine](query-engine.md) — Using anomaly scores in queries
-- [SQL Interface](sql-interface.md) — SQL anomaly functions
-- [Architecture](architecture.md) — System overview
+- [Query Engine](query-engine.md) - Using anomaly scores in queries
+- [SQL Interface](sql-interface.md) - SQL anomaly functions
+- [Architecture](architecture.md) - System overview

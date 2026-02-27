@@ -10,7 +10,7 @@ Interactive notebooks for exploring Stratum's features.
 ;; In a running REPL (clj -M:repl):
 (require '[scicloj.clay.v2.api :as clay])
 
-;; Render to HTML — opens in browser at http://localhost:1971/
+;; Render to HTML - opens in browser at http://localhost:1971/
 (clay/make! {:source-path "notebooks/stratum_intro.clj" :show true})
 
 ;; Generate Quarto document
@@ -38,17 +38,17 @@ clj -M:dev -i notebooks/test_persistence.clj
 
 Introduction for Clojure data science practitioners:
 
-- **Column maps & SQL** — DSL query maps and SQL strings, same engine
-- **Tablecloth interop** — Pass `tc/dataset` directly, zero copy
-- **Fused SIMD execution** — Why it's fast, live timing on 1M rows
-- **Zone map pruning** — Range queries skip irrelevant chunks automatically
-- **Persistence** — `st/sync!`, `st/fork`, `st/load`, time-travel by commit UUID
-- **Statistics** — STDDEV, VARIANCE, CORR natively in a single pass
-- **Hash joins** — INNER, LEFT, RIGHT, FULL
+- **Column maps & SQL** - DSL query maps and SQL strings, same engine
+- **Tablecloth interop** - Pass `tc/dataset` directly, zero copy
+- **Fused SIMD execution** - Why it's fast, live timing on 1M rows
+- **Zone map pruning** - Range queries skip irrelevant chunks automatically
+- **Persistence** - `st/sync!`, `st/fork`, `st/load`, time-travel by commit UUID
+- **Statistics** - STDDEV, VARIANCE, CORR natively in a single pass
+- **Hash joins** - INNER, LEFT, RIGHT, FULL
 
 ### `datahike_integration.clj`
 
-Datahike + Stratum — entity queries alongside OLAP analytics, auto-sync
+Datahike + Stratum - entity queries alongside OLAP analytics, auto-sync
 via `d/listen!`, Yggdrasil composite for atomic snapshots, SQL via PgWire.
 
 ## Writing Notebooks

@@ -9,14 +9,14 @@
 
 SIMD-accelerated SQL engine for the JVM. Every table is a branchable, copy-on-write value.
 
-Stratum is a columnar analytics engine that combines the performance of fused SIMD execution with the semantics of immutable data. Tables are persistent values — fork one in O(1), modify it independently, persist snapshots to named branches, and time-travel to any previous commit. It's the same model as Clojure's persistent collections and git's object store, applied to analytical data.
+Stratum is a columnar analytics engine that combines the performance of fused SIMD execution with the semantics of immutable data. Tables are persistent values - fork one in O(1), modify it independently, persist snapshots to named branches, and time-travel to any previous commit. It's the same model as Clojure's persistent collections and git's object store, applied to analytical data.
 
 ## 30-Second Demo
 
 Start a PostgreSQL-compatible server and query CSV/Parquet files directly:
 
 ```bash
-# Standalone JAR — no Clojure needed, just Java 21+
+# Standalone JAR - no Clojure needed, just Java 21+
 java --add-modules jdk.incubator.vector -jar stratum-standalone.jar --demo
 
 # Or with your own data
@@ -50,7 +50,7 @@ clj -M:server --demo
 
 ## Performance
 
-Stratum's architecture — fused SIMD execution over copy-on-write columnar data — delivers strong analytical performance.
+Stratum's architecture - fused SIMD execution over copy-on-write columnar data - delivers strong analytical performance.
 
 Single-threaded comparison vs DuckDB v1.4.4 (JDBC in-process) on 10M rows, 8-core Intel Lunar Lake. Full results in [doc/benchmarks.md](doc/benchmarks.md).
 
@@ -134,7 +134,7 @@ clj -M:olap cb            # ClickBench tier only
 
 ## Snapshots and Branching
 
-Every Stratum dataset is a copy-on-write value. Fork one in O(1) to create an isolated branch — modifications only touch the changed chunks, everything else is structurally shared. Persist snapshots to named branches, load them back, or time-travel to any previous commit.
+Every Stratum dataset is a copy-on-write value. Fork one in O(1) to create an isolated branch - modifications only touch the changed chunks, everything else is structurally shared. Persist snapshots to named branches, load them back, or time-travel to any previous commit.
 
 ```clojure
 (require '[stratum.api :as st])
@@ -144,7 +144,7 @@ Every Stratum dataset is a copy-on-write value. Fork one in O(1) to create an is
                           :qty   (long-array [1 2 3])}
                          {:name "orders"}))
 
-;; O(1) fork — structural sharing, independent mutations
+;; O(1) fork - structural sharing, independent mutations
 (def experiment (st/fork ds))
 
 ;; Persist to storage
@@ -161,9 +161,9 @@ Every Stratum dataset is a copy-on-write value. Fork one in O(1) to create an is
 
 **DML**: SELECT, INSERT, UPDATE, DELETE, UPSERT (INSERT ON CONFLICT), UPDATE FROM (joined updates), CREATE TABLE, DROP TABLE
 
-**Joins**: INNER, LEFT, RIGHT, FULL — single and multi-column keys
+**Joins**: INNER, LEFT, RIGHT, FULL - single and multi-column keys
 
-**Window functions**: ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK, CUME_DIST, LAG, LEAD, SUM/AVG/COUNT/MIN/MAX OVER — with PARTITION BY, ORDER BY, and frame clauses
+**Window functions**: ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK, CUME_DIST, LAG, LEAD, SUM/AVG/COUNT/MIN/MAX OVER - with PARTITION BY, ORDER BY, and frame clauses
 
 **Subqueries and composition**: CTEs (WITH), correlated and uncorrelated subqueries, IN/NOT IN/EXISTS, set operations (UNION, INTERSECT, EXCEPT)
 
@@ -201,15 +201,15 @@ Bidirectional support: query `tech.ml.dataset` datasets directly with the Stratu
 
 ## Query DSL Reference
 
-> **Note:** The DSL is still a work in progress. SQL strings are the more complete interface — use the DSL when you want to compose queries programmatically or pass in Clojure data directly without a SQL layer.
+> **Note:** The DSL is still a work in progress. SQL strings are the more complete interface - use the DSL when you want to compose queries programmatically or pass in Clojure data directly without a SQL layer.
 
-The DSL is intentionally flat. Every clause resolves column names by keyword lookup against a single merged map: `:from` establishes the base columns, `:join` merges in the dimension table's columns, and all subsequent clauses (`:where`, `:agg`, `:group`, `:select`, `:having`, `:order`) reference any column by its keyword. This makes it straightforward to build queries from Clojure data — no quoting, no SQL string interpolation, just maps and vectors. Composition (the DSL equivalent of SQL CTEs/subqueries) is done with Clojure `let`/`def` — see [Column Scoping and Composition](doc/query-engine.md#column-scoping-and-composition) for details.
+The DSL is intentionally flat. Every clause resolves column names by keyword lookup against a single merged map: `:from` establishes the base columns, `:join` merges in the dimension table's columns, and all subsequent clauses (`:where`, `:agg`, `:group`, `:select`, `:having`, `:order`) reference any column by its keyword. This makes it straightforward to build queries from Clojure data - no quoting, no SQL string interpolation, just maps and vectors. Composition (the DSL equivalent of SQL CTEs/subqueries) is done with Clojure `let`/`def` - see [Column Scoping and Composition](doc/query-engine.md#column-scoping-and-composition) for details.
 
 ```clojure
 ;; Full query map
 {:from    {:col1 data1 :col2 data2}     ;; Column data (arrays, indices, or encoded)
  :join    [{:with {:k data}             ;; Dimension table columns
-            :on   [:= :col1 :k]        ;; :col1 from :from, :k from :with — both visible after join
+            :on   [:= :col1 :k]        ;; :col1 from :from, :k from :with - both visible after join
             :type :inner}]
  :where   [[:< :col1 100] [:like :name "%foo%"]]             ;; Predicates
  :select  [:col1 [:as [:* :col2 100] :pct]]                  ;; Projection
@@ -234,12 +234,12 @@ The DSL is intentionally flat. Every clause resolves column names by keyword loo
 
 ## Ecosystem
 
-Stratum is part of the [Replikativ](https://github.com/replikativ) ecosystem — a set of composable, immutable data systems:
+Stratum is part of the [Replikativ](https://github.com/replikativ) ecosystem - a set of composable, immutable data systems:
 
-- **[Datahike](https://github.com/replikativ/datahike)** — immutable graph database with Datalog queries
-- **[Yggdrasil](https://github.com/replikativ/yggdrasil)** — branching protocol for multi-system snapshots
-- **[Scriptum](https://github.com/replikativ/scriptum)** — full-text search
-- **[Proximum](https://github.com/replikativ/proximum)** — vector search
+- **[Datahike](https://github.com/replikativ/datahike)** - immutable graph database with Datalog queries
+- **[Yggdrasil](https://github.com/replikativ/yggdrasil)** - branching protocol for multi-system snapshots
+- **[Scriptum](https://github.com/replikativ/scriptum)** - full-text search
+- **[Proximum](https://github.com/replikativ/proximum)** - vector search
 
 All share copy-on-write semantics and can be branched together via Yggdrasil.
 
@@ -268,8 +268,8 @@ User → stratum.api/q
 ```
 
 **Data representations:**
-- `long[]` / `double[]` — heap arrays for raw columnar data
-- `PersistentColumnIndex` — chunked B-tree with per-chunk statistics and zone maps
+- `long[]` / `double[]` - heap arrays for raw columnar data
+- `PersistentColumnIndex` - chunked B-tree with per-chunk statistics and zone maps
 - `String[]` → dictionary-encoded `long[]` for group-by and LIKE
 
 ## Installation
@@ -326,9 +326,9 @@ javac --add-modules jdk.incubator.vector -d target/classes \
 # Restart REPL (JVM can't reload classes)
 ```
 
-## Commercial Support
+## Work with us
 
-Need SIMD-accelerated analytics in your JVM stack? We offer integration support, custom development, and commercial licensing. Contact [contact@datahike.io](mailto:contact@datahike.io) or visit [datahike.io](https://datahike.io/about).
+If you need help getting Stratum into production, we can help with integration, custom development, and support contracts. Contact [contact@datahike.io](mailto:contact@datahike.io) or visit [datahike.io](https://datahike.io/about).
 
 ## License
 

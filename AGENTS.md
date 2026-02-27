@@ -149,8 +149,8 @@ User → stratum.api/q
 ```
 
 **Data representations:**
-- `long[]` / `double[]` — heap arrays (JVM GC managed)
-- `PersistentColumnIndex` — chunked B-tree with per-chunk statistics and zone maps
+- `long[]` / `double[]` - heap arrays (JVM GC managed)
+- `PersistentColumnIndex` - chunked B-tree with per-chunk statistics and zone maps
 - `String[]` → dictionary-encoded `long[]` for group-by and LIKE
 
 ## Important Constraints
@@ -203,10 +203,10 @@ clj -M:release:test
 ## Technical Documentation
 
 See `doc/` for in-depth documentation:
-- [Architecture](doc/architecture.md) — System overview, module map, walkthrough
-- [SIMD Internals](doc/simd-internals.md) — Java Vector API patterns, JIT lessons
-- [Query Engine](doc/query-engine.md) — Dispatch logic, expressions, optimization
-- [Storage and Indices](doc/storage-and-indices.md) — Chunks, CoW, zone maps
-- [Benchmarks](doc/benchmarks.md) — Methodology, results, reproducing
-- [SQL Interface](doc/sql-interface.md) — PgWire server, SQL translation
-- [Anomaly Detection](doc/anomaly-detection.md) — Isolation forest training, scoring, online rotation
+- [Architecture](doc/architecture.md) - System overview, module map, walkthrough
+- [SIMD Internals](doc/simd-internals.md) - Java Vector API patterns, JIT lessons
+- [Query Engine](doc/query-engine.md) - Dispatch logic, expressions, optimization
+- [Storage and Indices](doc/storage-and-indices.md) - Chunks, CoW, zone maps
+- [Benchmarks](doc/benchmarks.md) - Methodology, results, reproducing
+- [SQL Interface](doc/sql-interface.md) - PgWire server, SQL translation
+- [Anomaly Detection](doc/anomaly-detection.md) - Isolation forest training, scoring, online rotation

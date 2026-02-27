@@ -2,8 +2,8 @@
 
 Stratum's performance-critical paths are implemented in Java using the JDK Vector API (incubator module since JDK 16, available in JDK 21+). Five class files contain all SIMD and analytics code:
 
-- **ColumnOps.java** (~76KB bytecode): Core operations — filter, aggregate, group-by, join, date/string array ops
-- **ColumnOpsExt.java** (~26KB bytecode): JIT-isolated extensions — VARIANCE/CORR, LIKE fast-path, LongVector multi-sum, fused extract+count, COUNT DISTINCT
+- **ColumnOps.java** (~76KB bytecode): Core operations - filter, aggregate, group-by, join, date/string array ops
+- **ColumnOpsExt.java** (~26KB bytecode): JIT-isolated extensions - VARIANCE/CORR, LIKE fast-path, LongVector multi-sum, fused extract+count, COUNT DISTINCT
 - **ColumnOpsChunked.java** (~12KB bytecode): Chunked dense group-by for index streaming (no SIMD filter+agg)
 - **ColumnOpsChunkedSimd.java** (~15KB bytecode): Chunked fused filter+aggregate SIMD, chunked COUNT for index streaming
 - **ColumnOpsAnalytics.java** (~24KB bytecode): T-digest, isolation forest, window functions, top-N
@@ -32,8 +32,8 @@ sum = sum.add(product, mask);  // only accumulate where mask is true
 
 Key concepts:
 - **VectorMask**: Boolean mask from comparison, supports AND/OR
-- **Masked operations**: `v.add(other, mask)` — only lanes where mask is true
-- **Reduce**: `sum.reduceLanes(VectorOperators.ADD)` — horizontal sum to scalar
+- **Masked operations**: `v.add(other, mask)` - only lanes where mask is true
+- **Reduce**: `sum.reduceLanes(VectorOperators.ADD)` - horizontal sum to scalar
 - **Tail handling**: Remaining elements (length % lanes) processed in scalar loop
 
 ## Fused Filter+Aggregate
@@ -73,7 +73,7 @@ Aggregation types: `AGG_SUM_PRODUCT=0`, `AGG_SUM=1`, `AGG_COUNT=2`, `AGG_MIN=3`,
 
 ### Shared JIT Compilation Unit
 
-A critical pattern: `fusedSimdUnrolled(...)` delegates to `fusedSimdUnrolledRange(0, length)`. This ensures the JIT compiles a single method body that serves both the full-array and range-based entry points. Without this, JIT compiles them independently — warming one doesn't benefit the other (measured: 21ms → 3.2ms).
+A critical pattern: `fusedSimdUnrolled(...)` delegates to `fusedSimdUnrolledRange(0, length)`. This ensures the JIT compiles a single method body that serves both the full-array and range-based entry points. Without this, JIT compiles them independently - warming one doesn't benefit the other (measured: 21ms → 3.2ms).
 
 ## Morsel-Driven Parallelism
 
@@ -88,7 +88,7 @@ ForkJoinPool (Runtime.availableProcessors() threads)
     └── Thread N-1: ...
 ```
 
-Each morsel is 64K elements (~512KB for doubles), fitting comfortably in L2 cache (~1-2MB). The alternative — one large range per thread — causes cache thrashing when 8 threads each process 750K elements (24MB scattered across DRAM).
+Each morsel is 64K elements (~512KB for doubles), fitting comfortably in L2 cache (~1-2MB). The alternative - one large range per thread - causes cache thrashing when 8 threads each process 750K elements (24MB scattered across DRAM).
 
 Implementation: N futures submitted to ForkJoinPool, each with an internal morsel loop. This avoids FJP overhead from submitting one future per morsel (which would be 96 futures for 6M rows).
 
@@ -114,7 +114,7 @@ for (int i = start; i < end; i++) {
 ```
 
 Key optimizations:
-- **Flat contiguous arrays**: `double[maxKey * accSize]` instead of `double[maxKey][]` — eliminates pointer chasing, better cache utilization
+- **Flat contiguous arrays**: `double[maxKey * accSize]` instead of `double[maxKey][]` - eliminates pointer chasing, better cache utilization
 - **Branchless accumulation**: `accs[base] += val * matchBit` eliminates branch misprediction at ~50% selectivity
 - **Conditional morsel split**: If `maxKey * accSize * 8 < 64KB`, use morsels (data locality); otherwise single call per thread (avoids massive per-morsel allocation)
 - **L3-adaptive thread capping**: Read L3 cache size from sysfs, cap threads so total accumulator memory fits L3
@@ -186,7 +186,7 @@ Hard-won rules from extensive benchmarking:
 
 2. **Avoid switches in hot loops**: Inner loops with `switch(aggType)` prevent SIMD vectorization (106ms vs 16ms). Use separate methods for each aggregation type.
 
-3. **Object[][] kills specialization**: JIT can't type-specialize through `Object[][]` — every `(long[]) arr[p][c]` cast prevents bounds-check hoisting. Use typed arrays (`long[][][]`, `double[][][]`).
+3. **Object[][] kills specialization**: JIT can't type-specialize through `Object[][]` - every `(long[]) arr[p][c]` cast prevents bounds-check hoisting. Use typed arrays (`long[][][]`, `double[][][]`).
 
 4. **LongVector.convertShape is not intrinsified**: `convertShape(L2D, ...)` caused 8x regression. Convert at reduceLanes only.
 
@@ -198,6 +198,6 @@ Hard-won rules from extensive benchmarking:
 
 ## Related Documentation
 
-- [Architecture](architecture.md) — System overview and module map
-- [Query Engine](query-engine.md) — How queries compile to these SIMD paths
-- [Benchmarks](benchmarks.md) — Performance measurements
+- [Architecture](architecture.md) - System overview and module map
+- [Query Engine](query-engine.md) - How queries compile to these SIMD paths
+- [Benchmarks](benchmarks.md) - Performance measurements
