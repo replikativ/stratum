@@ -47,230 +47,155 @@
 <link href="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.css" rel="stylesheet" type="text/css" />
 <title>Clay</title></head><body data-spy="scroll" data-target="#toc" style="border:;margin:auto;">
 <script src="https://code.jquery.com/jquery-3.6.0.min.js" type="text/javascript"></script><script src="https://code.jquery.com/ui/1.13.1/jquery-ui.min.js" type="text/javascript"></script><script src="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.js" type="text/javascript"></script>
-<div class="container"><div class="row"><div class="col-sm-12"><div><div><div style="margin:15px;"><div><h1 id="stratum:-high-performance-columnar-analytics-for-clojure">Stratum: High-Performance Columnar Analytics for Clojure</h1><p>authors: Christian Weilbach</p><p>last change: 2026-02-10</p><h2 id="introduction">Introduction</h2><p>Stratum is a persistent columnar analytics engine built for the JVM, combining Clojure's immutability with Java Vector API SIMD acceleration. It provides:</p><ul><li><strong>Blazing fast queries</strong> — competitive with DuckDB on OLAP benchmarks</li><li><strong>Copy-on-write semantics</strong> — fork indices in O(1), structural sharing like Clojure collections</li><li><strong>Zero-copy tablecloth interop</strong> — work seamlessly with tech.ml.dataset</li><li><strong>SQL interface</strong> — PostgreSQL wire protocol server (psql, JDBC, DBeaver)</li><li><strong>Persistent storage</strong> — Konserve-backed with snapshot isolation</li></ul><h2 id="setup">Setup</h2></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(ns stratum-intro
-  (:require [stratum.api :as stratum]
-            [stratum.query :as q]
-            [stratum.index :as idx]
-            [stratum.dataset :as dataset]
-            [stratum.storage :as storage]
-            [stratum.tablecloth :as tc-stratum]
+<div class="container"><div class="row"><div class="col-sm-12"><div><div><div style="margin:15px;"><div><h1 id="stratum:-high-performance-columnar-analytics-for-clojure">Stratum: High-Performance Columnar Analytics for Clojure</h1><p>authors: Christian Weilbach</p><p>last change: 2026-02-17</p><h2 id="introduction">Introduction</h2><p>Stratum is a persistent columnar analytics engine built for the JVM, combining Clojure's immutability with Java Vector API SIMD acceleration. It provides:</p><ul><li><strong>Blazing fast queries</strong> — competitive with or faster than DuckDB on OLAP benchmarks</li><li><strong>Clojure-native API</strong> — query maps, SQL strings, or tablecloth datasets</li><li><strong>Copy-on-write semantics</strong> — fork datasets in O(1), structural sharing</li><li><strong>Persistent storage</strong> — Konserve-backed with snapshot isolation and time-travel</li><li><strong>SQL interface</strong> — PostgreSQL wire protocol (psql, JDBC, DBeaver, psycopg2)</li></ul><h2 id="setup">Setup</h2></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(ns stratum-intro
+  (:require [stratum.api :as st]
+            [stratum.dataset :as dataset]    ;; transient mutations
+            [stratum.storage :as storage]    ;; branch management
             [tablecloth.api :as tc]
             [tech.v3.dataset :as ds]
-            [scicloj.kindly.v4.kind :as kind]))</code></pre></div></div><div style="margin:15px;"><div><h2 id="quick-start:-query-engine">Quick Start: Query Engine</h2><p>Stratum's query engine works on plain Clojure data structures. Let's start with a simple example:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def sales-data
+            [scicloj.kindly.v4.kind :as kind]))</code></pre></div></div><div style="margin:15px;"><div><h2 id="1.-your-data,-your-way">1. Your Data, Your Way</h2><p>Stratum works with column maps — maps from keywords to typed arrays. The same shape tablecloth uses under the hood.</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def orders
   {:product (into-array String [&quot;Apple&quot; &quot;Banana&quot; &quot;Apple&quot; &quot;Cherry&quot; &quot;Banana&quot; &quot;Apple&quot;])
-   :quantity (double-array [10.0 15.0 8.0 5.0 20.0 12.0])
-   :price (double-array [1.2 0.5 1.2 2.5 0.5 1.2])})</code></pre></div></div><div style="margin:15px;"><div><p>Simple aggregation:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(q/execute {:from sales-data
-            :agg [[:sum :quantity]
-                  [:avg :price]]})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:_count 6, :sum 70.0, :avg 1.1833333333333333}]
-</code></pre></div></div><div style="margin:15px;"><div><p>Group by with multiple aggregations:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(q/execute {:from sales-data
-            :group [:product]
-            :agg [[:sum :quantity]
-                  [:avg :price]
-                  [:count]]})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:product &quot;Apple&quot;, :_count 3, :sum 30.0, :avg 1.2, :count 3}
+   :qty     (double-array [10.0 15.0 8.0 5.0 20.0 12.0])
+   :price   (double-array [1.2  0.5  1.2  2.5  0.5  1.2])})</code></pre></div></div><div style="margin:15px;"><div><p>DSL query — Clojure map with keywords:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(st/q {:from   orders
+       :group  [:product]
+       :agg    [[:sum :qty]
+                [:avg :price]
+                [:count]]})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:product &quot;Apple&quot;, :_count 3, :sum 30.0, :avg 1.2, :count 3}
  {:product &quot;Banana&quot;, :_count 2, :sum 35.0, :avg 0.5, :count 2}
  {:product &quot;Cherry&quot;, :_count 1, :sum 5.0, :avg 2.5, :count 1}]
-</code></pre></div></div><div style="margin:15px;"><div><p>Filtered aggregation (WHERE clause):</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(q/execute {:from sales-data
-            :where [[:&gt; :quantity 10.0]]
-            :agg [[:sum :quantity]
-                  [:count]]})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:_count 3, :sum 47.0, :count 3}]
-</code></pre></div></div><div style="margin:15px;"><div><h2 id="tablecloth-integration">Tablecloth Integration</h2><p>Stratum seamlessly integrates with tablecloth and tech.ml.dataset. You can pass tech.ml.dataset instances directly to Stratum queries:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def tech-ds
-  (ds/-&gt;dataset {:category [&quot;A&quot; &quot;B&quot; &quot;A&quot; &quot;B&quot; &quot;A&quot;]
-                 :value (double-array [10.0 20.0 15.0 25.0 12.0])
-                 :count (long-array [1 2 3 4 5])}))</code></pre></div></div><div style="margin:15px;"><div><p>Query a tech.ml.dataset directly (zero-copy!):</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(q/execute {:from tech-ds
-            :group [:category]
-            :agg [[:sum :value]
-                  [:avg :count]]})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:category &quot;A&quot;, :_count 3, :sum 37.0, :avg 3.0}
- {:category &quot;B&quot;, :_count 2, :sum 45.0, :avg 3.0}]
-</code></pre></div></div><div style="margin:15px;"><div><p>Stratum datasets can be queried with any tech.ml.dataset operations:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def stratum-result
-  (q/execute {:from tech-ds
-              :group [:category]
-              :agg [[:as [:sum :value] :total]]}))</code></pre></div></div><div style="margin:15px;"><div><p>Results can be converted to tech.ml.dataset for downstream processing:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">stratum-result</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:category &quot;A&quot;, :_count 3, :total 37.0}
- {:category &quot;B&quot;, :_count 2, :total 45.0}]
-</code></pre></div></div><div style="margin:15px;"><div><p>Returns sequence of maps by default</p><h2 id="performance:-fused-simd-execution">Performance: Fused SIMD Execution</h2><p>Stratum compiles queries into fused filter+aggregate operations using Java Vector API. Let's demonstrate with a larger dataset:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def large-data
+</code></pre></div></div><div style="margin:15px;"><div><p>SQL string — same query, same result:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(st/q &quot;SELECT product, SUM(qty), AVG(price), COUNT(*) FROM orders GROUP BY product&quot;
+      {&quot;orders&quot; orders})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:product &quot;Apple&quot;, :_count 3, :sum 30.0, :avg 1.2, :count 3}
+ {:product &quot;Banana&quot;, :_count 2, :sum 35.0, :avg 0.5, :count 2}
+ {:product &quot;Cherry&quot;, :_count 1, :sum 5.0, :avg 2.5, :count 1}]
+</code></pre></div></div><div style="margin:15px;"><div><p>Predicates in the DSL accept both keyword and symbol style:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(st/q {:from  orders
+       :where [[:&gt; :price 0.6]]
+       :agg   [[:sum :qty] [:count]]})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:_count 4, :sum 35.0, :count 4}]
+</code></pre></div></div><div style="margin:15px;"><div><h2 id="2.-tablecloth-integration">2. Tablecloth Integration</h2><p>Pass a tablecloth (or tech.ml.dataset) dataset directly — Stratum reads its columns with zero copy. Results come back as a sequence of maps by default.</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def tc-ds
+  (tc/dataset {:category [&quot;Electronics&quot; &quot;Clothing&quot; &quot;Electronics&quot; &quot;Clothing&quot; &quot;Electronics&quot;]
+               :revenue  (double-array [250.0 80.0 320.0 110.0 280.0])
+               :qty      (long-array [1 2 1 3 2])}))</code></pre></div></div><div style="margin:15px;"><div><p>Query it like any Stratum source:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(st/q {:from  tc-ds
+       :group [:category]
+       :agg   [[:sum :revenue]
+               [:sum :qty]
+               [:count]]})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:category &quot;Electronics&quot;,
+  :_count 3,
+  :sum_revenue 850.0,
+  :sum_qty 4.0,
+  :count 3}
+ {:category &quot;Clothing&quot;,
+  :_count 2,
+  :sum_revenue 190.0,
+  :sum_qty 5.0,
+  :count 2}]
+</code></pre></div></div><div style="margin:15px;"><div><p>SQL also works directly with tablecloth datasets:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(st/q &quot;SELECT category, SUM(revenue) AS total FROM t WHERE qty &gt; 1 GROUP BY category&quot;
+      {&quot;t&quot; tc-ds})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:category &quot;Electronics&quot;, :_count 1, :total 280.0}
+ {:category &quot;Clothing&quot;, :_count 2, :total 190.0}]
+</code></pre></div></div><div style="margin:15px;"><div><h2 id="3.-why-it&apos;s-fast:-fused-simd-execution">3. Why It's Fast: Fused SIMD Execution</h2><p>Stratum compiles filter + aggregate into a single pass using the Java Vector API (AVX-512 / AVX2 / NEON depending on CPU). No intermediate arrays, no row-by-row iteration. At 1M rows you'll see sub-millisecond aggregations.</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def large-ds
   {:amount (double-array (repeatedly 1000000 #(* (rand) 1000.0)))
-   :status (into-array String (repeatedly 1000000 #(rand-nth [&quot;pending&quot; &quot;completed&quot; &quot;failed&quot;])))
-   :region (long-array (repeatedly 1000000 #(rand-int 10)))})</code></pre></div></div><div style="margin:15px;"><div><p>Single-pass fused filter + aggregate (SIMD accelerated):</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(time
-  (q/execute {:from large-data
-              :where [[:&gt; :amount 500.0]
-                      [:= :status &quot;completed&quot;]]
-              :agg [[:sum :amount]
-                    [:count]]}))</code></pre></div></div><div style="margin:15px;"><div><strong>OUT</strong><pre><code>"Elapsed time: 452.191421 msecs"
-</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:_count 166955, :sum 1.2520496655973938E8, :count 166955}]
-</code></pre></div></div><div style="margin:15px;"><div><p>Group-by with dense path optimization (low cardinality):</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(time
-  (q/execute {:from large-data
-              :group [:region]
-              :agg [[:sum :amount]
-                    [:avg :amount]
-                    [:count]]}))</code></pre></div></div><div style="margin:15px;"><div><strong>OUT</strong><pre><code>"Elapsed time: 175.800524 msecs"
+   :region (long-array   (repeatedly 1000000 #(rand-int 10)))
+   :flag   (long-array   (repeatedly 1000000 #(rand-int 2)))})</code></pre></div></div><div style="margin:15px;"><div><p>Single-pass fused filter + aggregate:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(time
+  (st/q {:from  large-ds
+         :where [[:&gt; :amount 500.0] [:= :flag 1]]
+         :agg   [[:sum :amount] [:count]]}))</code></pre></div></div><div style="margin:15px;"><div><strong>OUT</strong><pre><code>"Elapsed time: 477.039557 msecs"
+</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:_count 249791, :sum 1.8735921822152323E8, :count 249791}]
+</code></pre></div></div><div style="margin:15px;"><div><p>Dense group-by (direct array indexing, no hash for ≤200K groups):</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(time
+  (st/q {:from  large-ds
+         :group [:region]
+         :agg   [[:sum :amount] [:avg :amount] [:count]]}))</code></pre></div></div><div style="margin:15px;"><div><strong>OUT</strong><pre><code>"Elapsed time: 125.550777 msecs"
 </code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:region 0,
-  :_count 99358,
-  :sum 4.972598313271701E7,
-  :avg 500.4728671341715,
-  :count 99358}
+  :_count 99832,
+  :sum 4.984979812538232E7,
+  :avg 499.3368671907036,
+  :count 99832}
  {:region 1,
-  :_count 99989,
-  :sum 4.989725855114246E7,
-  :avg 499.0274785340634,
-  :count 99989}
+  :_count 99849,
+  :sum 4.9880746600852E7,
+  :avg 499.5618043330629,
+  :count 99849}
  {:region 2,
-  :_count 100595,
-  :sum 5.028115887205136E7,
-  :avg 499.8375552666769,
-  :count 100595}
+  :_count 99878,
+  :sum 4.983648865253064E7,
+  :avg 498.97363435922466,
+  :count 99878}
  {:region 3,
-  :_count 99843,
-  :sum 4.9997883784521885E7,
-  :avg 500.76503895638035,
-  :count 99843}
+  :_count 99903,
+  :sum 4.981424866684195E7,
+  :avg 498.62615403783616,
+  :count 99903}
  {:region 4,
-  :_count 100170,
-  :sum 5.006857230692595E7,
-  :avg 499.8360018660872,
-  :count 100170}
+  :_count 99687,
+  :sum 4.996144638635216E7,
+  :avg 501.18316717678493,
+  :count 99687}
  {:region 5,
-  :_count 100356,
-  :sum 5.0081838587474674E7,
-  :avg 499.04179707715207,
-  :count 100356}
+  :_count 99764,
+  :sum 4.98234758907312E7,
+  :avg 499.4133744710637,
+  :count 99764}
  {:region 6,
-  :_count 99694,
-  :sum 4.990645670393272E7,
-  :avg 500.5963919988436,
-  :count 99694}
+  :_count 100745,
+  :sum 5.048420472551149E7,
+  :avg 501.1087867935033,
+  :count 100745}
  {:region 7,
-  :_count 100417,
-  :sum 5.034897088389952E7,
-  :avg 501.3988755280432,
-  :count 100417}
+  :_count 99851,
+  :sum 4.985141050218023E7,
+  :avg 499.2579994409694,
+  :count 99851}
  {:region 8,
-  :_count 99560,
-  :sum 4.9871803467693396E7,
-  :avg 500.9220918812113,
-  :count 99560}
+  :_count 100003,
+  :sum 4.993377624752043E7,
+  :avg 499.32278279172056,
+  :count 100003}
  {:region 9,
-  :_count 100018,
-  :sum 5.002046923897879E7,
-  :avg 500.1146717488731,
-  :count 100018}]
-</code></pre></div></div><div style="margin:15px;"><div><h2 id="dataset-persistence:-version-control-for-analytics">Dataset Persistence: Version Control for Analytics</h2><p>Stratum datasets provide Git-like version control for analytical data. Datasets own branches, indices are internal. O(1) forks with structural sharing.</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(require &apos;[konserve.store :as kstore])</code></pre></div></div><div style="margin:15px;"><div><p>Define store configuration (polymorphic dispatch on :backend)</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def store-config {:backend :file
-                   :path &quot;/tmp/stratum-demo&quot;
-                   :id #uuid &quot;550e8400-e29b-41d4-a716-446655440000&quot;})</code></pre></div></div><div style="margin:15px;"><div><p>Delete old store if exists (for clean demo)</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(when (kstore/store-exists? store-config {:sync? true})
-  (kstore/delete-store store-config {:sync? true}))</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">nil
-</code></pre></div></div><div style="margin:15px;"><div><p>Create new store</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def store (kstore/create-store store-config {:sync? true}))</code></pre></div></div><div style="margin:15px;"><div><p>Step 1: Create a base dataset with indexed columns</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def base-sales
-  (dataset/make-dataset
-    {:product (idx/index-from-seq :int64 [101 102 103])  ;; Product IDs
-     :quantity (idx/index-from-seq :float64 [100.0 50.0 75.0])
-     :revenue (idx/index-from-seq :float64 [1000.0 750.0 1125.0])}
-    {:name &quot;sales-q1&quot;}))</code></pre></div></div><div style="margin:15px;"><div><p>Step 2: Sync to "main" branch (like git commit + push)</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def saved-main (dataset/ds-sync! base-sales store &quot;main&quot;))</code></pre></div></div><div style="margin:15px;"><div><p>Verify branch was created</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(storage/list-dataset-branches store)</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">#{&quot;main&quot;}
-</code></pre></div></div><div style="margin:15px;"><div><p>=> #{main}</p><p>Step 3: Fork for forecast scenario (O(1) structural sharing)</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def forecast-sales (dataset/ds-fork base-sales))</code></pre></div></div><div style="margin:15px;"><div><p>Step 4: Modify forecast in transient mode (CoW)</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(dataset/ds-transient forecast-sales)</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">{:product
- {:type :int64,
-  :source :index,
-  :index
-  #object[stratum.index.PersistentColumnIndex 0x1ea18836 &quot;#ColumnIndex[int64 x 4 in 1 chunks, persistent]&quot;]},
- :quantity
- {:type :float64,
-  :source :index,
-  :index
-  #object[stratum.index.PersistentColumnIndex 0x4cc20b5a &quot;#ColumnIndex[float64 x 4 in 1 chunks, persistent]&quot;]},
- :revenue
- {:type :float64,
-  :source :index,
-  :index
-  #object[stratum.index.PersistentColumnIndex 0x41016cc &quot;#ColumnIndex[float64 x 4 in 1 chunks, persistent]&quot;]}}
-</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(dataset/ds-set! forecast-sales :quantity 0 150.0)</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">{:product
- {:type :int64,
-  :source :index,
-  :index
-  #object[stratum.index.PersistentColumnIndex 0x1ea18836 &quot;#ColumnIndex[int64 x 4 in 1 chunks, persistent]&quot;]},
- :quantity
- {:type :float64,
-  :source :index,
-  :index
-  #object[stratum.index.PersistentColumnIndex 0x4cc20b5a &quot;#ColumnIndex[float64 x 4 in 1 chunks, persistent]&quot;]},
- :revenue
- {:type :float64,
-  :source :index,
-  :index
-  #object[stratum.index.PersistentColumnIndex 0x41016cc &quot;#ColumnIndex[float64 x 4 in 1 chunks, persistent]&quot;]}}
-</code></pre></div></div><div style="margin:15px;"><div><p>Optimistic Widget sales</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(dataset/ds-set! forecast-sales :revenue 0 1500.0)</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">{:product
- {:type :int64,
-  :source :index,
-  :index
-  #object[stratum.index.PersistentColumnIndex 0x1ea18836 &quot;#ColumnIndex[int64 x 4 in 1 chunks, persistent]&quot;]},
- :quantity
- {:type :float64,
-  :source :index,
-  :index
-  #object[stratum.index.PersistentColumnIndex 0x4cc20b5a &quot;#ColumnIndex[float64 x 4 in 1 chunks, persistent]&quot;]},
- :revenue
- {:type :float64,
-  :source :index,
-  :index
-  #object[stratum.index.PersistentColumnIndex 0x41016cc &quot;#ColumnIndex[float64 x 4 in 1 chunks, persistent]&quot;]}}
-</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(dataset/ds-append! forecast-sales {:product 104 :quantity 60.0 :revenue 900.0})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">{:product
- {:type :int64,
-  :source :index,
-  :index
-  #object[stratum.index.PersistentColumnIndex 0x1ea18836 &quot;#ColumnIndex[int64 x 4 in 1 chunks, persistent]&quot;]},
- :quantity
- {:type :float64,
-  :source :index,
-  :index
-  #object[stratum.index.PersistentColumnIndex 0x4cc20b5a &quot;#ColumnIndex[float64 x 4 in 1 chunks, persistent]&quot;]},
- :revenue
- {:type :float64,
-  :source :index,
-  :index
-  #object[stratum.index.PersistentColumnIndex 0x41016cc &quot;#ColumnIndex[float64 x 4 in 1 chunks, persistent]&quot;]}}
-</code></pre></div></div><div style="margin:15px;"><div><p>New product</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(dataset/ds-persistent! forecast-sales)</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">{:product
- {:type :int64,
-  :source :index,
-  :index
-  #object[stratum.index.PersistentColumnIndex 0x1ea18836 &quot;#ColumnIndex[int64 x 4 in 1 chunks, persistent]&quot;]},
- :quantity
- {:type :float64,
-  :source :index,
-  :index
-  #object[stratum.index.PersistentColumnIndex 0x4cc20b5a &quot;#ColumnIndex[float64 x 4 in 1 chunks, persistent]&quot;]},
- :revenue
- {:type :float64,
-  :source :index,
-  :index
-  #object[stratum.index.PersistentColumnIndex 0x41016cc &quot;#ColumnIndex[float64 x 4 in 1 chunks, persistent]&quot;]}}
-</code></pre></div></div><div style="margin:15px;"><div><p>Step 5: Sync forecast to separate branch</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def saved-forecast (dataset/ds-sync! forecast-sales store &quot;forecast&quot;))</code></pre></div></div><div style="margin:15px;"><div><p>Both branches coexist</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(storage/list-dataset-branches store)</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">#{&quot;forecast&quot; &quot;main&quot;}
-</code></pre></div></div><div style="margin:15px;"><div><p>=> #{forecast main}</p><p>Step 6: Load both versions from storage</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def reloaded-main (dataset/ds-load store &quot;main&quot;))</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def reloaded-forecast (dataset/ds-load store &quot;forecast&quot;))</code></pre></div></div><div style="margin:15px;"><div><p>Query both versions side-by-side</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def main-result (q/execute {:from reloaded-main :agg [[:sum :revenue]]}))</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def forecast-result (q/execute {:from reloaded-forecast :agg [[:sum :revenue]]}))</code></pre></div></div><div style="margin:15px;"><div><p>Compare results</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">[(:sum (first main-result))      ;; =&gt; 2875.0 (original)
- (:sum (first forecast-result))]</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[2875.0 4275.0]
-</code></pre></div></div><div style="margin:15px;"><div><p>=> 4275.0 (forecast)</p><p>Step 7: Garbage collection (mark-and-sweep from branch HEADs)</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(storage/ds-gc! store)</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">{:deleted-pss-nodes 0,
+  :_count 100488,
+  :sum 5.019928136613044E7,
+  :avg 499.55498533287994,
+  :count 100488}]
+</code></pre></div></div><div style="margin:15px;"><div><h2 id="4.-zone-map-pruning">4. Zone Map Pruning</h2><p>For index-backed datasets, Stratum tracks min/max per 8192-row chunk. Range queries classify each chunk as: skip / stats-only / SIMD — so a predicate like ts >= 900000 only touches ~1% of chunks.</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def time-series
+  (st/make-dataset
+    {:ts    (st/index-from-seq :int64   (range 0 1000000))
+     :value (st/index-from-seq :float64 (repeatedly 1000000 rand))}))</code></pre></div></div><div style="margin:15px;"><div><p>Only the last ~1% of chunks are scanned:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(time
+  (st/q {:from  time-series
+         :where [[:&gt;= :ts 900000] [:&lt; :ts 910000]]
+         :agg   [[:sum :value] [:count]]}))</code></pre></div></div><div style="margin:15px;"><div><strong>OUT</strong><pre><code>"Elapsed time: 13.857909 msecs"
+</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:_count 10000, :sum 4976.255276477182, :count 10000}]
+</code></pre></div></div><div style="margin:15px;"><div><h2 id="5.-persistence:-version-control-for-analytics">5. Persistence: Version Control for Analytics</h2><p>Datasets are immutable Clojure values. st/sync! durably persists to a Konserve store (file, S3, memory …). st/fork is O(1) — structural sharing with copy-on-write on mutation.</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(require &apos;[konserve.store :as kstore])</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def store-cfg
+  {:backend :file
+   :path    &quot;/tmp/stratum-intro&quot;
+   :id      #uuid &quot;550e8400-e29b-41d4-a716-446655440000&quot;})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(when (kstore/store-exists? store-cfg {:sync? true})
+  (kstore/delete-store store-cfg {:sync? true}))</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">nil
+</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def store (kstore/create-store store-cfg {:sync? true}))</code></pre></div></div><div style="margin:15px;"><div><p>Create a dataset with index-backed columns (required for persistence):</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def base
+  (st/make-dataset
+    {:product (st/index-from-seq :int64   [101 102 103])
+     :qty     (st/index-from-seq :float64 [100.0 50.0 75.0])
+     :revenue (st/index-from-seq :float64 [1000.0 750.0 1125.0])}
+    {:name &quot;sales-q1&quot;}))</code></pre></div></div><div style="margin:15px;"><div><p>Persist to "main" branch — returns new dataset with commit metadata:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def v1 (st/sync! base store &quot;main&quot;))</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(:id (:commit-info v1))</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">#uuid &quot;638e09e5-a522-47c6-9f40-f1cc85039d4f&quot;
+</code></pre></div></div><div style="margin:15px;"><div><p>=> #uuid "..."</p><p>Fork for a what-if scenario. Fork is O(1) — all chunks shared. Mutations use the transient/persistent protocol (like Clojure's collections):</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def what-if
+  (-&gt; (st/fork base)
+      transient
+      (dataset/set-at!    :qty     0 150.0)      ;; optimistic product 101 sales
+      (dataset/set-at!    :revenue 0 1500.0)
+      (dataset/append! {:product 104 :qty 60.0 :revenue 900.0})
+      persistent!))</code></pre></div></div><div style="margin:15px;"><div><p>Sync what-if to a separate branch:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def v1-whatif (st/sync! what-if store &quot;what-if&quot;))</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(storage/list-dataset-branches store)</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">#{&quot;what-if&quot; &quot;main&quot;}
+</code></pre></div></div><div style="margin:15px;"><div><p>=> #{"main" "what-if"}</p><p>Time-travel: load any version and query:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(let [main-ds   (st/load store &quot;main&quot;)
+      whatif-ds (st/load store &quot;what-if&quot;)]
+  {:main   (first (st/q {:from main-ds   :agg [[:sum :revenue]]}))
+   :whatif (first (st/q {:from whatif-ds :agg [[:sum :revenue]]}))})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">{:main {:sum 2875.0, :_count 3}, :whatif {:sum 4275.0, :_count 4}}
+</code></pre></div></div><div style="margin:15px;"><div><p>=> {:main {:sum 2875.0} :whatif {:sum 4275.0}}</p><p>GC: mark-and-sweep from all branch HEADs — unreachable chunks deleted:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(st/gc! store)</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">{:deleted-pss-nodes 0,
  :deleted-index-commits 0,
  :deleted-dataset-commits 0,
  :kept-pss-nodes 6,
  :kept-index-commits 6,
  :kept-dataset-commits 2}
-</code></pre></div></div><div style="margin:15px;"><div><p>=> {:deleted-pss-nodes 0, :kept-pss-nodes 6, ...}  All reachable, nothing deleted</p><p>Step 8: Delete forecast branch and reclaim space</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(dataset/ds-delete-branch! store &quot;forecast&quot;)</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">true
-</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(storage/ds-gc! store)</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">{:deleted-pss-nodes 3,
- :deleted-index-commits 3,
- :deleted-dataset-commits 1,
- :kept-pss-nodes 3,
- :kept-index-commits 3,
- :kept-dataset-commits 1}
-</code></pre></div></div><div style="margin:15px;"><div><p>=> {:deleted-pss-nodes 3, :deleted-index-commits 3, :deleted-dataset-commits 1, ...}</p><h2 id="zone-map-pruning">Zone Map Pruning</h2><p>Stratum tracks min/max statistics per chunk and skips irrelevant chunks during queries:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def time-series
-  (dataset/make-dataset
-    {:timestamp (idx/index-from-seq :int64 (range 0 1000000))
-     :value (idx/index-from-seq :float64 (repeatedly 1000000 rand))}))</code></pre></div></div><div style="margin:15px;"><div><p>Query with range predicate — zone maps skip most chunks:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(time
-  (q/execute {:from time-series
-              :where [[:&gt;= :timestamp 900000]
-                      [:&lt; :timestamp 910000]]
-              :agg [[:sum :value]
-                    [:count]]}))</code></pre></div></div><div style="margin:15px;"><div><strong>OUT</strong><pre><code>"Elapsed time: 6.465671 msecs"
-</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:_count 10000, :sum 4951.474967777803, :count 10000}]
-</code></pre></div></div><div style="margin:15px;"><div><p>Only ~1% of chunks are scanned!</p><h2 id="advanced-features">Advanced Features</h2><h3 id="statistical-aggregations">Statistical Aggregations</h3><p>Stratum supports VARIANCE, STDDEV, and CORR natively in Java (not decomposed into SUMs):</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def measurements
-  {:temp (double-array [20.1 20.5 21.0 19.8 20.3 22.0])
+</code></pre></div></div><div style="margin:15px;"><div><h2 id="6.-advanced:-statistics-and-joins">6. Advanced: Statistics and Joins</h2><p>VARIANCE, STDDEV, CORR — Welford's online algorithm, single pass in Java:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def sensors
+  {:temp     (double-array [20.1 20.5 21.0 19.8 20.3 22.0])
    :humidity (double-array [65.0 68.0 70.0 62.0 66.0 72.0])
-   :sensor (into-array String [&quot;A&quot; &quot;A&quot; &quot;A&quot; &quot;B&quot; &quot;B&quot; &quot;B&quot;])})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(q/execute {:from measurements
-            :group [:sensor]
-            :agg [[:avg :temp]
-                  [:stddev :temp]
-                  [:corr :temp :humidity]]})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:sensor &quot;A&quot;,
+   :sensor   (into-array String [&quot;A&quot; &quot;A&quot; &quot;A&quot; &quot;B&quot; &quot;B&quot; &quot;B&quot;])})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(st/q {:from  sensors
+       :group [:sensor]
+       :agg   [[:avg :temp]
+               [:stddev :temp]
+               [:corr :temp :humidity]]})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:sensor &quot;A&quot;,
   :avg 20.533333333333335,
   :stddev 0.4509249752821684,
   :corr 0.984018104872232}
@@ -278,151 +203,28 @@
   :avg 20.7,
   :stddev 1.1532562594670808,
   :corr 0.9819805060619333}]
-</code></pre></div></div><div style="margin:15px;"><div><h3 id="hash-joins">Hash Joins</h3><p>Stratum supports INNER, LEFT, RIGHT, and FULL joins:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def orders
-  {:order-id (long-array [1 2 3 4 5])
+</code></pre></div></div><div style="margin:15px;"><div><p>Hash joins — INNER, LEFT, RIGHT, FULL:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def fact
+  {:order-id   (long-array [1 2 3 4 5])
    :product-id (long-array [101 102 101 103 102])
-   :quantity (double-array [2 1 3 1 2])})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def products
+   :qty        (double-array [2 1 3 1 2])})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def dim
   {:product-id (long-array [101 102 103])
-   :name (into-array String [&quot;Widget&quot; &quot;Gadget&quot; &quot;Gizmo&quot;])
-   :price (double-array [10.0 20.0 15.0])})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(q/execute {:from orders
-            :join [{:with products
-                    :on [:= :product-id :product-id]
-                    :type :inner}]
-            :group [:name]
-            :agg [[:sum :quantity]]})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:name &quot;Widget&quot;, :_count 2, :sum 5.0}
+   :name       (into-array String [&quot;Widget&quot; &quot;Gadget&quot; &quot;Gizmo&quot;])
+   :price      (double-array [10.0 20.0 15.0])})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(st/q {:from fact
+       :join [{:with dim
+               :on   [:= :product-id :product-id]
+               :type :inner}]
+       :group [:name]
+       :agg   [[:sum :qty]]})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:name &quot;Widget&quot;, :_count 2, :sum 5.0}
  {:name &quot;Gadget&quot;, :_count 2, :sum 3.0}
  {:name &quot;Gizmo&quot;, :_count 1, :sum 1.0}]
-</code></pre></div></div><div style="margin:15px;"><div><h3 id="sql-interface">SQL Interface</h3><p>Stratum provides a PostgreSQL wire protocol server:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(comment
-  (require &apos;[stratum.server :as server])
+</code></pre></div></div><div style="margin:15px;"><div><h2 id="7.-sql-interface">7. SQL Interface</h2><p>Any PostgreSQL-compatible client works: psql, DBeaver, Python psycopg2, JDBC.</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(comment
+  (def srv (st/start-server {:port 5433}))
+  (st/register-table! srv &quot;orders&quot; orders)
 
-  ;; Register tables
-  (server/register-table! :sales sales-data)
-
-  ;; Start server on port 5433
-  (def srv (server/start-server {:port 5433}))
-
-  ;; Connect with psql:
   ;; psql -h localhost -p 5433 -U stratum
-  ;;
-  ;; Run SQL queries:
-  ;; stratum=&gt; SELECT product, SUM(quantity) FROM sales GROUP BY product;
-  )</code></pre></div></div><div style="margin:15px;"><div><h3 id="date/time-operations">Date/Time Operations</h3></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def events
-  {:event-time (long-array [1704067200 1704153600 1704240000])  ;; Unix epoch seconds
-   :user-id (long-array [1 2 1])
-   :value (double-array [100.0 200.0 150.0])})</code></pre></div></div><div style="margin:15px;"><div><p>DATE_TRUNC for time-series aggregation:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(q/execute {:from events
-            :group [[:date-trunc :day :event-time] :user-id]
-            :agg [[:sum :value]]})</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:__grp_0 1704240000, :user-id 1, :_count 1, :sum 150.0}
- {:__grp_0 1704067200, :user-id 1, :_count 1, :sum 100.0}
- {:__grp_0 1704153600, :user-id 2, :_count 1, :sum 200.0}]
-</code></pre></div></div><div style="margin:15px;"><div><h2 id="real-world-example:-e-commerce-analytics">Real-World Example: E-commerce Analytics</h2><p>Let's analyze a more realistic dataset:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def transactions
-  {:transaction-id (long-array (range 100000))
-   :user-id (long-array (repeatedly 100000 #(rand-int 10000)))
-   :amount (double-array (repeatedly 100000 #(+ 10.0 (* (rand) 990.0))))
-   :category (into-array String (repeatedly 100000 #(rand-nth [&quot;Electronics&quot; &quot;Clothing&quot; &quot;Food&quot; &quot;Books&quot;])))
-   :timestamp (long-array (repeatedly 100000 #(+ 1704067200 (rand-int 2592000))))})</code></pre></div></div><div style="margin:15px;"><div><p>Jan 2024</p><p>Top spending users:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(time
-  (q/execute {:from transactions
-              :group [:user-id]
-              :agg [[:as [:sum :amount] :total]
-                    [:as [:count] :num-transactions]]
-              :order [[:total :desc]]
-              :limit 10}))</code></pre></div></div><div style="margin:15px;"><div><strong>OUT</strong><pre><code>"Elapsed time: 39.429894 msecs"
-</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:user-id 8954,
-  :_count 20,
-  :total 13421.627954676731,
-  :num-transactions 20}
- {:user-id 8343,
-  :_count 20,
-  :total 12006.962973690146,
-  :num-transactions 20}
- {:user-id 9231,
-  :_count 23,
-  :total 11927.263601077691,
-  :num-transactions 23}
- {:user-id 6388,
-  :_count 18,
-  :total 11734.790609768797,
-  :num-transactions 18}
- {:user-id 6382,
-  :_count 20,
-  :total 11643.997412140334,
-  :num-transactions 20}
- {:user-id 5384,
-  :_count 17,
-  :total 11563.871557878083,
-  :num-transactions 17}
- {:user-id 803,
-  :_count 22,
-  :total 11493.659665794874,
-  :num-transactions 22}
- {:user-id 8816,
-  :_count 21,
-  :total 11430.411968735541,
-  :num-transactions 21}
- {:user-id 898,
-  :_count 18,
-  :total 11235.130129631772,
-  :num-transactions 18}
- {:user-id 5688,
-  :_count 20,
-  :total 11219.803053406693,
-  :num-transactions 20}]
-</code></pre></div></div><div style="margin:15px;"><div><p>Category breakdown with statistics:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(time
-  (q/execute {:from transactions
-              :group [:category]
-              :agg [[:as [:sum :amount] :total-sales]
-                    [:as [:avg :amount] :avg-transaction]
-                    [:as [:stddev :amount] :stddev]
-                    [:as [:count] :num-transactions]]}))</code></pre></div></div><div style="margin:15px;"><div><strong>OUT</strong><pre><code>"Elapsed time: 8.89694 msecs"
-</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:category &quot;Food&quot;,
-  :total-sales 1.2572634222526925E7,
-  :avg-transaction 503.0864800338892,
-  :stddev 286.60499306026884,
-  :num-transactions 24991}
- {:category &quot;Clothing&quot;,
-  :total-sales 1.2631217474804426E7,
-  :avg-transaction 504.7237862544724,
-  :stddev 285.9076993311708,
-  :num-transactions 25026}
- {:category &quot;Electronics&quot;,
-  :total-sales 1.2551557288274627E7,
-  :avg-transaction 503.7549080219388,
-  :stddev 285.6699025381671,
-  :num-transactions 24916}
- {:category &quot;Books&quot;,
-  :total-sales 1.2680373699636165E7,
-  :avg-transaction 505.85924520828837,
-  :stddev 285.60481468127193,
-  :num-transactions 25067}]
-</code></pre></div></div><div style="margin:15px;"><div><p>High-value transactions:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(time
-  (q/execute {:from transactions
-              :where [[:&gt; :amount 800.0]]
-              :group [:category]
-              :agg [[:as [:count] :high-value-count]
-                    [:as [:avg :amount] :avg-high-value]]}))</code></pre></div></div><div style="margin:15px;"><div><strong>OUT</strong><pre><code>"Elapsed time: 4.241589 msecs"
-</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">[{:category &quot;Food&quot;,
-  :_count 5028,
-  :high-value-count 5028,
-  :avg-high-value 900.7355425622995}
- {:category &quot;Clothing&quot;,
-  :_count 5047,
-  :high-value-count 5047,
-  :avg-high-value 900.730977027107}
- {:category &quot;Electronics&quot;,
-  :_count 5006,
-  :high-value-count 5006,
-  :avg-high-value 898.7794524371335}
- {:category &quot;Books&quot;,
-  :_count 4998,
-  :high-value-count 4998,
-  :avg-high-value 900.4347426746695}]
-</code></pre></div></div><div style="margin:15px;"><div><h2 id="performance-comparison">Performance Comparison</h2><p>Stratum is competitive with DuckDB on OLAP benchmarks:</p><p><strong>TPC-H Q1 (6M rows, 8-core Lunar Lake):</strong></p><ul><li>Stratum: 61ms (1 thread), 26ms (8 threads)</li><li>DuckDB: 102ms (1 thread), 19ms (8 threads)</li></ul><p><strong>SSB Q1.1 (6M rows):</strong></p><ul><li>Stratum: 12ms (1 thread), 2.8ms (8 threads)</li><li>DuckDB: 35ms (1 thread), 7.3ms (8 threads)</li></ul><p><strong>Filtered aggregation (6M rows):</strong></p><ul><li>Stratum: 1.8ms (1 thread), 0.7ms (8 threads)</li><li>DuckDB: 14ms (1 thread), 3.3ms (8 threads)</li></ul><h2 id="columnar-output-format">Columnar Output Format</h2><p>For large result sets, use columnar output (15x faster):</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(def result
-  (q/execute {:from transactions
-              :group [:user-id]
-              :agg [[:as [:sum :amount] :total]
-                    [:as [:count] :n]]
-              :result :columns}))</code></pre></div></div><div style="margin:15px;"><div><p>Returns {:total array, :n array, :n-rows N}</p><p>Access columns directly:</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(type (:total result))</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">double/1
-</code></pre></div></div><div style="margin:15px;"><div><p>=> double[]</p></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure source-clojure bg-light">(:n-rows result)</code></pre></div></div><div style="margin:15px;"><div><pre><code class="sourceCode language-clojure printed-clojure">9999
-</code></pre></div></div><div style="margin:15px;"><div><p>=> number of groups</p><h2 id="conclusion">Conclusion</h2><p>Stratum brings high-performance columnar analytics to Clojure with:</p><ul><li><strong>Native performance</strong> — SIMD-accelerated Java hot paths</li><li><strong>Functional semantics</strong> — immutable indices with structural sharing</li><li><strong>Ecosystem integration</strong> — works seamlessly with tablecloth, tech.ml.dataset</li><li><strong>Standard interfaces</strong> — PostgreSQL wire protocol, SQL support</li><li><strong>Production ready</strong> — 569 tests, all passing</li></ul><p>Perfect for:</p><ul><li>Interactive data exploration in the REPL</li><li>Embedded analytics in applications</li><li>Time-series databases with snapshot isolation</li><li>Building custom analytics tools</li></ul><h2 id="learn-more">Learn More</h2><ul><li>GitHub: <a href="https://github.com/user/stratum">https://github.com/user/stratum</a> (replace with actual URL)</li><li>Documentation: See <code>doc/</code> directory for in-depth guides</li><li>Benchmarks: <code>clj -M:olap</code> for full OLAP benchmark suite</li></ul></div></div><div style="margin:15px;"><div style="background-color:grey;height:2px;width:100%;"></div></div><div style="margin:15px;"><div><pre><small><small>source: notebooks/stratum_intro.clj</small></small></pre></div></div></div></div></div></div></div><script type="text/javascript">/*!
+  ;; SELECT product, SUM(qty) FROM orders GROUP BY product;
+
+  (st/stop-server srv))</code></pre></div></div><div style="margin:15px;"><div><h2 id="performance-numbers-(6m-rows,-8-core-lunar-lake,-vs-duckdb-v1.5)">Performance Numbers (6M rows, 8-core Lunar Lake, vs DuckDB v1.5)</h2><table class="table"><thead><tr><th>Query</th><th>Stratum 1T</th><th>Stratum 8T</th><th>DuckDB 1T</th><th>DuckDB 8T</th></tr></thead><tbody><tr><td>Filtered agg (TPC-H)</td><td>12ms</td><td>2.9ms</td><td>34ms</td><td>6.9ms</td></tr><tr><td>TPC-H Q1</td><td>61ms</td><td>26ms</td><td>102ms</td><td>19ms</td></tr><tr><td>SSB Q1.1</td><td>12ms</td><td>2.8ms</td><td>35ms</td><td>7.3ms</td></tr><tr><td>Filtered count</td><td>2.1ms</td><td>1.3ms</td><td>14ms</td><td>3.4ms</td></tr><tr><td>Group-by 10 keys</td><td>12ms</td><td>3.5ms</td><td>28ms</td><td>5.9ms</td></tr><tr><td>STDDEV group-by</td><td>28ms</td><td>19ms</td><td>54ms</td><td>30ms</td></tr><tr><td>CORR group-by</td><td>53ms</td><td>32ms</td><td>72ms</td><td>37ms</td></tr></tbody></table><p>All benchmarks: single JVM process, G1GC, JDK 21, no JVM tuning.</p></div></div><div style="margin:15px;"><div style="background-color:grey;height:2px;width:100%;"></div></div><div style="margin:15px;"><div><pre><small><small>source: notebooks/stratum_intro.clj</small></small></pre></div></div></div></div></div></div></div><script type="text/javascript">/*!
   Highlight.js v11.9.0 (git: b7ec4bfafc)
   (c) 2006-2023 undefined and other contributors
   License: BSD-3-Clause
