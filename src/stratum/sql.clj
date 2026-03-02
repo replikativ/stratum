@@ -910,13 +910,21 @@
     (when (and (nil? join-data) join-table-name)
       (throw (ex-info (str "Unknown table in JOIN: " join-table-name)
                       {:table join-table-name})))
-    (let [on-clauses (mapv (fn [on-expr]
+    (let [;; Flatten AND expressions in ON clause (e.g., ON a = b AND c = d)
+          flat-exprs (mapcat (fn flatten-on [expr]
+                               (if (instance? AndExpression expr)
+                                 (let [^AndExpression ae expr]
+                                   (concat (flatten-on (.getLeftExpression ae))
+                                           (flatten-on (.getRightExpression ae))))
+                                 [expr]))
+                             on-exprs)
+          on-clauses (mapv (fn [on-expr]
                              (when (instance? EqualsTo on-expr)
                                (let [^EqualsTo eq on-expr
                                      left (.getLeftExpression eq)
                                      right (.getRightExpression eq)]
                                  [:= (translate-expr left) (translate-expr right)])))
-                           on-exprs)
+                           flat-exprs)
           on-spec (if (= 1 (count on-clauses))
                     (first on-clauses)
                     (vec on-clauses))]
@@ -1029,19 +1037,52 @@
         window-specs (when (seq window-specs)
                        (mapv #(dissoc % :_inner-agg) window-specs))
 
-        ;; Build SELECT (projection) columns for non-agg, non-window items when we have GROUP BY
-        select-cols (when (and has-group? (not all-star?))
-                      (->> select-items
-                           (keep (fn [^SelectItem item]
-                                   (let [expr (.getExpression item)]
-                                     (when-not (or (select-item-is-agg? expr)
-                                                   (window-function? expr))
-                                       (let [alias-name (.getAliasName item)
-                                             col-expr (translate-expr expr)]
-                                         (if alias-name
-                                           [:as col-expr (keyword alias-name)]
-                                           col-expr))))))
-                           (vec)))
+        ;; Build _select-columns: describes each output column for final projection.
+        ;; Used only when literals need injection into agg/group-by queries.
+        ;; Agg specs use {:type :agg} without a key — the key is discovered
+        ;; at apply-select-columns time by positional matching against result keys.
+        select-column-specs
+        (->> select-items
+             (map-indexed
+               (fn [idx ^SelectItem item]
+                 (let [expr (.getExpression item)
+                       alias (.getAliasName item)]
+                   (cond
+                     ;; SELECT *
+                     (instance? AllColumns expr)
+                     (mapv (fn [k] {:type :ref :key k}) (keys from-data))
+
+                     ;; Aggregate function
+                     (select-item-is-agg? expr)
+                     [{:type :agg :alias (when alias (keyword alias))}]
+
+                     ;; Window function
+                     (window-function? expr)
+                     [{:type :ref :key (keyword (or alias (str "_win_" idx)))}]
+
+                     ;; Column reference, literal, or expression
+                     :else
+                     (let [col-expr (translate-expr expr)]
+                       [(cond
+                          (keyword? col-expr)
+                          {:type :ref :key (if alias (keyword alias) col-expr)
+                           :source col-expr}
+
+                          (number? col-expr)
+                          {:type :literal :key (if alias (keyword alias)
+                                                 (keyword (str col-expr)))
+                           :value col-expr}
+
+                          (string? col-expr)
+                          {:type :literal :key (if alias (keyword alias)
+                                                 (keyword (str "'" col-expr "'")))
+                           :value col-expr}
+
+                          :else ;; expression like [:* :a :b]
+                          {:type :ref :key (if alias (keyword alias)
+                                            (keyword (str "_expr_" idx)))})])))))
+             (mapcat identity)
+             (vec))
 
         ;; For non-aggregate SELECT without GROUP BY (pure projection)
         ;; Exclude window functions — they are handled separately
@@ -1144,7 +1185,13 @@
                 (seq join-specs) (assoc :join join-specs)
                 projection (assoc :select projection)
                 (seq window-specs) (assoc :window window-specs)
-                (seq post-aggs) (assoc :_post-aggs post-aggs))]
+                (seq post-aggs) (assoc :_post-aggs post-aggs)
+                ;; Only attach _select-columns when literals need injection into
+                ;; an aggregate/group-by query (the bug: literals are dropped).
+                ;; Pure projection queries use :select; don't interfere.
+                (and (or has-agg? has-group?)
+                     (some #(= :literal (:type %)) select-column-specs))
+                (assoc :_select-columns select-column-specs))]
     query))
 
 ;; ============================================================================
@@ -1179,6 +1226,46 @@
                                      row post-aggs)]
                 ;; Remove internal agg keys that are only used for computation
                 (apply dissoc computed source-keys)))
+            results))))
+
+(defn apply-select-columns
+  "Reshape query results to match SQL SELECT clause.
+   Injects literal values into result rows, reorders columns to match SELECT order.
+   Agg keys are discovered by positional matching: ref/literal keys are removed from
+   the result key set, remaining keys are matched to :agg specs in order."
+  [results select-columns]
+  (cond
+    (or (empty? select-columns) (not (sequential? results)) (empty? results))
+    results
+
+    :else
+    (let [;; Discover agg keys by removing known ref keys from result keys
+          ref-keys (set (keep (fn [spec]
+                                (when (= :ref (:type spec))
+                                  (or (:source spec) (:key spec))))
+                              select-columns))
+          first-row (first results)
+          result-keys (vec (keys first-row))
+          ;; Agg keys = result keys not claimed by :ref specs, in result order
+          agg-keys (filterv #(not (contains? ref-keys %)) result-keys)
+          ;; Assign agg keys to agg specs positionally
+          agg-key-seq (atom (seq agg-keys))
+          resolved-specs (mapv (fn [spec]
+                                 (if (= :agg (:type spec))
+                                   (let [k (first @agg-key-seq)]
+                                     (swap! agg-key-seq rest)
+                                     (assoc spec :key (or (:alias spec) k)))
+                                   spec))
+                               select-columns)]
+      (mapv (fn [row]
+              (reduce (fn [out spec]
+                        (case (:type spec)
+                          :literal (assoc out (:key spec) (:value spec))
+                          :ref (assoc out (:key spec)
+                                      (get row (or (:source spec) (:key spec))))
+                          :agg (assoc out (:key spec) (get row (:key spec)))
+                          out))
+                      (array-map) resolved-specs))
             results))))
 
 ;; ============================================================================

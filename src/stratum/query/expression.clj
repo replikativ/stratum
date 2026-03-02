@@ -84,7 +84,7 @@
     col-data
     (if (and cache (.containsKey cache col-data))
       (.get cache col-data)
-      (let [result (ColumnOps/longToDouble ^longs col-data (int length))]
+      (let [result (ColumnOps/longToDoubleNullSafe ^longs col-data (int length))]
         (when cache (.put cache col-data result))
         result))))
 

@@ -106,10 +106,15 @@
          (:result parsed)
 
          (:query parsed)
-         (let [result (query/q (:query parsed))]
-           (if-let [post (:_post-aggs (:query parsed))]
-             (sql/apply-post-aggs result post)
-             result))
+         (let [q (:query parsed)
+               result (query/q q)
+               result (if-let [post (:_post-aggs q)]
+                        (sql/apply-post-aggs result post)
+                        result)
+               result (if-let [sel (:_select-columns q)]
+                        (sql/apply-select-columns result sel)
+                        result)]
+           result)
 
          :else
          (throw (ex-info "Unexpected parse result" {:sql query-or-sql :parsed parsed}))))
@@ -149,10 +154,15 @@
        (:result parsed)
 
        (:query parsed)
-       (let [result (query/q (:query parsed))]
-         (if-let [post (:_post-aggs (:query parsed))]
-           (sql/apply-post-aggs result post)
-           result))
+       (let [q (:query parsed)
+             result (query/q q)
+             result (if-let [post (:_post-aggs q)]
+                      (sql/apply-post-aggs result post)
+                      result)
+             result (if-let [sel (:_select-columns q)]
+                      (sql/apply-select-columns result sel)
+                      result)]
+         result)
 
        :else
        (throw (ex-info "Unexpected parse result" {:sql sql :parsed parsed}))))))

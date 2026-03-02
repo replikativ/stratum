@@ -1,0 +1,35 @@
+# test_order_null.test
+# ORDER BY with NULL values — inspired by PostgreSQL regression/select.sql
+# Tests NULL ordering behavior (NULLs last for ASC, first for DESC).
+
+statement ok
+CREATE TABLE t1 (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t1 VALUES (3, 'c'), (NULL, 'x'), (1, 'a'), (5, NULL), (2, 'b')
+
+# ============================================================
+# ORDER BY ASC — NULLs last
+# ============================================================
+
+query IT nosort
+SELECT a, b FROM t1 ORDER BY a ASC
+----
+1	a
+2	b
+3	c
+5	NULL
+NULL	x
+
+# ============================================================
+# ORDER BY DESC — NULLs last (Stratum uses NULLs-last for both ASC/DESC)
+# ============================================================
+
+query IT nosort
+SELECT a, b FROM t1 ORDER BY a DESC
+----
+5	NULL
+3	c
+2	b
+1	a
+NULL	x

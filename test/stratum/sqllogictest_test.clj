@@ -605,7 +605,15 @@
 
           (:query parsed)
           (try
-            (let [results (strip-system-keys (q/q (:query parsed)))
+            (let [query (:query parsed)
+                  results (q/q query)
+                  results (if-let [post (:_post-aggs query)]
+                            (sql/apply-post-aggs results post)
+                            results)
+                  results (if-let [sel (:_select-columns query)]
+                            (sql/apply-select-columns results sel)
+                            results)
+                  results (strip-system-keys results)
                   col-keys (when (seq results)
                              (vec (keys (first results))))
                   actual-lines (result-to-lines results (:types record)

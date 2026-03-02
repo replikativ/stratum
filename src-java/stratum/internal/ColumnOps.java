@@ -2023,6 +2023,15 @@ public final class ColumnOps {
         return r;
     }
 
+    /** Convert long[] to double[], mapping Long.MIN_VALUE (NULL sentinel) to NaN */
+    public static double[] longToDoubleNullSafe(long[] src, int length) {
+        double[] r = new double[length];
+        for (int i = 0; i < length; i++) {
+            r[i] = (src[i] == Long.MIN_VALUE) ? Double.NaN : (double) src[i];
+        }
+        return r;
+    }
+
     // =========================================================================
     // NULL Handling Array Operations
     // =========================================================================

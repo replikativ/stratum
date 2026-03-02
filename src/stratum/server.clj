@@ -727,6 +727,9 @@
                   result (q/q query)
                   result (if-let [post-aggs (:_post-aggs query)]
                            (sql/apply-post-aggs result post-aggs)
+                           result)
+                  result (if-let [sel-cols (:_select-columns query)]
+                           (sql/apply-select-columns result sel-cols)
                            result)]
               (sql/format-results result))
 
