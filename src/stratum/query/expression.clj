@@ -286,6 +286,11 @@
    (eval-expr-vectorized expr col-arrays length nil))
   (^doubles [expr col-arrays ^long length ^java.util.HashMap cache]
    (cond
+     (nil? expr)
+     (let [a (double-array length)]
+       (java.util.Arrays/fill a Double/NaN)
+       a)
+
      (keyword? expr)
      (col-as-doubles-cached (get col-arrays expr) length cache)
 

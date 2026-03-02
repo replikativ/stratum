@@ -290,7 +290,12 @@
                 [:round (first params)])
 
       ;; NULL handling
-      "COALESCE" (into [:coalesce] params)
+      "COALESCE" (if (<= (count params) 2)
+                   (into [:coalesce] params)
+                   ;; Nest: COALESCE(a,b,c) → [:coalesce a [:coalesce b c]]
+                   (reduce (fn [acc p] [:coalesce p acc])
+                           (last params)
+                           (reverse (butlast params))))
       "NULLIF" [:nullif (first params) (second params)]
       "GREATEST" (into [:greatest] params)
       "LEAST" (into [:least] params)
@@ -1004,7 +1009,8 @@
   (let [join-table (when (instance? Table (.getFromItem join))
                      ^Table (.getFromItem join))
         join-table-name (when join-table (table-name join-table))
-        join-data (when join-table-name (get table-registry (.getName join-table)))
+        join-real-name (when join-table (.getName join-table))
+        join-data (when join-real-name (get table-registry join-real-name))
         join-type (cond
                     (.isLeft join) :left
                     (.isRight join) :right
@@ -1036,6 +1042,89 @@
        :on on-spec
        :type join-type})))
 
+;; ============================================================================
+;; Qualified column resolution for JOINs
+;; ============================================================================
+
+(defn- build-join-ref-map
+  "Build a mapping from qualified/bare column keywords to unique internal keys.
+   Detects column name collisions across tables and renames right-side colliding
+   columns to :table__col form. Returns [ref-map collision-set renamed-keys-by-table]
+   where ref-map is {qualified-kw → internal-key, bare-kw → left-table-key}.
+   renamed-keys-by-table is {table-alias → {old-key → new-key}}."
+  [from-table-name from-cols join-tables]
+  (let [;; join-tables: [{:alias name :cols #{keys}}]
+        all-tables (into [{:alias from-table-name :cols from-cols}] join-tables)
+        ;; Count how many tables have each column
+        col-freq (reduce (fn [m {:keys [cols]}]
+                           (reduce (fn [m2 c] (update m2 c (fnil inc 0))) m cols))
+                         {} all-tables)
+        collision-set (set (keep (fn [[c cnt]] (when (> cnt 1) c)) col-freq))
+        ;; Build ref-map and renamed-keys-by-table
+        ref-map (atom {})
+        renamed-keys (atom {})]
+    (doseq [{:keys [alias cols]} all-tables]
+      (doseq [c cols]
+        (let [qualified (keyword alias (name c))
+              is-from? (= alias from-table-name)
+              collides? (contains? collision-set c)]
+          (if collides?
+            (if is-from?
+              ;; FROM table keeps original key
+              (do
+                (swap! ref-map assoc qualified c)
+                ;; bare colliding keyword → FROM table's version
+                (swap! ref-map (fn [m] (if (contains? m c) m (assoc m c c)))))
+              ;; JOIN table gets renamed key
+              (let [internal-key (keyword (str alias "__" (name c)))]
+                (swap! ref-map assoc qualified internal-key)
+                (swap! renamed-keys assoc-in [alias c] internal-key)))
+            ;; Non-colliding: qualified → bare, bare → identity
+            (do
+              (swap! ref-map assoc qualified c)
+              (when-not (contains? @ref-map c)
+                (swap! ref-map assoc c c)))))))
+    [@ref-map collision-set @renamed-keys]))
+
+(defn- rewrite-ref
+  "Rewrite a keyword reference using the ref-map. Falls back to strip-ns."
+  [ref-map kw]
+  (if-let [mapped (get ref-map kw)]
+    mapped
+    ;; Not in ref-map: strip namespace as fallback (backward compat)
+    (if (and (keyword? kw) (namespace kw))
+      (keyword (name kw))
+      kw)))
+
+(defn- rewrite-refs
+  "Recursively rewrite keyword references in an expression/predicate tree."
+  [ref-map expr]
+  (cond
+    (keyword? expr) (rewrite-ref ref-map expr)
+    (number? expr) expr
+    (string? expr) expr
+    (nil? expr) nil
+    (vector? expr) (mapv (partial rewrite-refs ref-map) expr)
+    (sequential? expr) (map (partial rewrite-refs ref-map) expr)
+    (map? expr) (reduce-kv (fn [m k v]
+                              (assoc m k (if (#{:col :cols :key :source :as :partition-by} k)
+                                           (if (vector? v)
+                                             (mapv (partial rewrite-refs ref-map) v)
+                                             (rewrite-refs ref-map v))
+                                           (rewrite-refs ref-map v))))
+                            {} expr)
+    :else expr))
+
+(defn- rename-join-data-keys
+  "Rename colliding column keys in join :with data map.
+   renamed-keys is {old-key → new-key}."
+  [with-data renamed-keys]
+  (reduce-kv (fn [m old-k new-k]
+               (if-let [v (get m old-k)]
+                 (-> m (dissoc old-k) (assoc new-k v))
+                 m))
+             with-data renamed-keys))
+
 (defn- translate-select
   "Translate a PlainSelect AST to a Stratum query map."
   [^PlainSelect select table-registry]
@@ -1051,8 +1140,13 @@
         joins (.getJoins select)
 
         ;; Resolve FROM — either a table reference or a subquery
+        ;; Use alias if present (e.g., FROM t1 a → "a"), otherwise real name
         from-table-name (when (instance? Table from-item)
-                          (.getName ^Table from-item))
+                          (let [alias (.getAlias ^Table from-item)]
+                            (if alias (.getName alias) (.getName ^Table from-item))))
+        ;; Real table name for registry lookup (alias may differ)
+        from-real-name (when (instance? Table from-item)
+                         (.getName ^Table from-item))
         ;; Handle FROM (SELECT ...) AS alias — subquery in FROM
         [from-data table-registry]
         (cond
@@ -1073,14 +1167,16 @@
                        (assoc table-registry alias-name col-map)
                        table-registry)])
 
-          ;; Normal table reference
-          from-table-name
-          (let [data (get table-registry from-table-name)]
+          ;; Normal table reference — look up by real name, register under alias
+          from-real-name
+          (let [data (get table-registry from-real-name)]
             (when (nil? data)
-              (throw (ex-info (str "Unknown table: " from-table-name)
-                              {:table from-table-name
+              (throw (ex-info (str "Unknown table: " from-real-name)
+                              {:table from-real-name
                                :available (keys table-registry)})))
-            [data table-registry])
+            [data (if (not= from-table-name from-real-name)
+                    (assoc table-registry from-table-name data)
+                    table-registry)])
 
           :else [nil table-registry])
 
@@ -1303,8 +1399,80 @@
                          (.getValue ^LongValue ov))))
 
         ;; Build JOINs
-        join-specs (when (seq joins)
-                     (mapv #(translate-join % table-registry from-table-name) joins))
+        join-specs-raw (when (seq joins)
+                         (mapv #(translate-join % table-registry from-table-name) joins))
+
+        ;; Qualified column resolution: detect collisions and rewrite refs
+        ;; Build join table info for ref-map
+        join-table-infos (when (seq join-specs-raw)
+                           (mapv (fn [^Join j]
+                                   (when (instance? Table (.getFromItem j))
+                                     (let [t ^Table (.getFromItem j)
+                                           alias (table-name t)
+                                           real-name (.getName t)
+                                           data (get table-registry real-name)]
+                                       {:alias alias
+                                        :cols (set (keys data))})))
+                                 joins))
+
+        ;; Build ref-map when joins exist and there are collisions
+        [ref-map collision-set renamed-keys-by-table]
+        (if (seq join-table-infos)
+          (build-join-ref-map from-table-name
+                              (set (keys from-data))
+                              (filterv some? join-table-infos))
+          [nil nil nil])
+
+        ;; Apply rewriting when ref-map is non-empty and has actual renames
+        has-renames? (and ref-map (seq renamed-keys-by-table))
+
+        ;; Rename join :with data keys for colliding columns
+        join-specs (if has-renames?
+                     (mapv (fn [spec table-info]
+                             (if-let [renames (and table-info
+                                                   (get renamed-keys-by-table (:alias table-info)))]
+                               (update spec :with rename-join-data-keys renames)
+                               spec))
+                           join-specs-raw
+                           (concat join-table-infos (repeat nil)))
+                     join-specs-raw)
+
+        ;; Rewrite all refs through ref-map
+        preds (if has-renames? (rewrite-refs ref-map preds) preds)
+        projection (if (and has-renames? projection) (rewrite-refs ref-map projection) projection)
+        groups (if has-renames? (rewrite-refs ref-map groups) groups)
+        having-preds (if has-renames? (rewrite-refs ref-map having-preds) having-preds)
+        orders (if has-renames? (rewrite-refs ref-map orders) orders)
+        aggs (if has-renames? (rewrite-refs ref-map aggs) aggs)
+        window-specs (if has-renames? (rewrite-refs ref-map window-specs) window-specs)
+        join-specs (if has-renames?
+                     (mapv (fn [spec]
+                             (update spec :on (partial rewrite-refs ref-map)))
+                           join-specs)
+                     join-specs)
+        select-column-specs (if has-renames?
+                              (mapv (fn [spec]
+                                      (cond-> spec
+                                        (:source spec) (update :source #(rewrite-ref ref-map %))
+                                        (:key spec) (update :key #(rewrite-ref ref-map %))))
+                                    select-column-specs)
+                              select-column-specs)
+        ;; For SELECT * with joins: expand to include renamed join columns
+        projection (if (and has-renames? all-star? (not has-agg?) (not has-group?))
+                     (let [from-keys (vec (keys from-data))
+                           join-keys (mapcat (fn [spec table-info]
+                                               (when table-info
+                                                 (let [renames (get renamed-keys-by-table (:alias table-info))
+                                                       cols (keys (:with spec))]
+                                                   (mapv (fn [k]
+                                                           (if (and renames (get renames k))
+                                                             (get renames k)
+                                                             k))
+                                                         cols))))
+                                             join-specs
+                                             (concat join-table-infos (repeat nil)))]
+                       (into from-keys join-keys))
+                     projection)
 
         ;; Assemble query map
         query (cond-> {:from from-data}

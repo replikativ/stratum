@@ -600,8 +600,11 @@
           [build-indices probe-indices]
           [probe-indices build-indices])
         ;; Determine right key columns to drop (redundant with left key)
+        ;; Only drop right key cols when they have the same name as left key cols
+        ;; (i.e., they would collide in the merged map). Renamed keys are kept.
+        left-key-set (set left-key-cols)
         drop-right-keys (if (#{:inner :left} type)
-                          (set right-key-cols)
+                          (set (filter left-key-set right-key-cols))
                           #{})
         ;; Gather left columns
         merged (reduce-kv

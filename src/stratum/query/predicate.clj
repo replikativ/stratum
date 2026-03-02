@@ -66,47 +66,57 @@
       (let [sub-preds (subvec pred 2)]
         `(or ~@(mapv #(pred->code % col-syms columns) sub-preds)))
 
-      ;; IN: unroll equality checks
+      ;; IN: unroll equality checks (NULL values filtered — x=NULL is always UNKNOWN)
       :in
-      (let [vals (nth pred 2)
+      (let [vals (filterv some? (nth pred 2))
             col-info (get columns col)
             sym (get col-syms col)
             long-col? (= :int64 (:type col-info))]
-        (if (and (:dict col-info) (some string? vals))
-          ;; Dict-encoded string column: look up string → code
-          (let [dict ^"[Ljava.lang.String;" (:dict col-info)
-                dict-map (into {} (for [i (range (alength dict))] [(aget dict i) (long i)]))
-                code-vals (sort (keep #(get dict-map %) vals))]
-            (if (seq code-vals)
+        (if (empty? vals)
+          `false
+          (if (and (:dict col-info) (some string? vals))
+            ;; Dict-encoded string column: look up string → code
+            (let [dict ^"[Ljava.lang.String;" (:dict col-info)
+                  dict-map (into {} (for [i (range (alength dict))] [(aget dict i) (long i)]))
+                  code-vals (sort (keep #(get dict-map %) vals))]
+              (if (seq code-vals)
+                `(let [~'v (aget ~sym (int ~'i))]
+                   (or ~@(mapv (fn [v] `(== ~'v ~v)) code-vals)))
+                `false))
+            (if long-col?
               `(let [~'v (aget ~sym (int ~'i))]
-                 (or ~@(mapv (fn [v] `(== ~'v ~v)) code-vals)))
-              `false))
-          (if long-col?
-            `(let [~'v (aget ~sym (int ~'i))]
-               (or ~@(mapv (fn [v] `(== ~'v ~(long v))) (sort vals))))
-            `(let [~'v (aget ~sym (int ~'i))]
-               (or ~@(mapv (fn [v] `(== ~'v ~(double v))) (sort vals)))))))
+                 (or ~@(mapv (fn [v] `(== ~'v ~(long v))) (sort vals))))
+              `(let [~'v (aget ~sym (int ~'i))]
+                 (or ~@(mapv (fn [v] `(== ~'v ~(double v))) (sort vals))))))))
 
       ;; NOT-IN: negate IN
+      ;; SQL three-valued logic: NOT IN (1, NULL) is UNKNOWN for all rows.
+      ;; If NULL is present in the list, no row can satisfy NOT IN → always false.
       :not-in
-      (let [vals (nth pred 2)
+      (let [raw-vals (nth pred 2)
+            has-null? (some nil? raw-vals)
+            vals (filterv some? raw-vals)
             col-info (get columns col)
             sym (get col-syms col)
             long-col? (= :int64 (:type col-info))]
-        (if (and (:dict col-info) (some string? vals))
-          ;; Dict-encoded string column: look up string → code
-          (let [dict ^"[Ljava.lang.String;" (:dict col-info)
-                dict-map (into {} (for [i (range (alength dict))] [(aget dict i) (long i)]))
-                code-vals (sort (keep #(get dict-map %) vals))]
-            (if (seq code-vals)
-              `(let [~'v (aget ~sym (int ~'i))]
-                 (and ~@(mapv (fn [v] `(not= ~'v ~v)) code-vals)))
-              `true))
-          (if long-col?
-            `(let [~'v (aget ~sym (int ~'i))]
-               (and ~@(mapv (fn [v] `(not= ~'v ~(long v))) (sort vals))))
-            `(let [~'v (aget ~sym (int ~'i))]
-               (and ~@(mapv (fn [v] `(not= ~'v ~(double v))) (sort vals)))))))
+        (if has-null?
+          `false ;; NOT IN with NULL → always UNKNOWN → no match
+          (if (empty? vals)
+            `true
+            (if (and (:dict col-info) (some string? vals))
+              ;; Dict-encoded string column: look up string → code
+              (let [dict ^"[Ljava.lang.String;" (:dict col-info)
+                    dict-map (into {} (for [i (range (alength dict))] [(aget dict i) (long i)]))
+                    code-vals (sort (keep #(get dict-map %) vals))]
+                (if (seq code-vals)
+                  `(let [~'v (aget ~sym (int ~'i))]
+                     (and ~@(mapv (fn [v] `(not= ~'v ~v)) code-vals)))
+                  `true))
+              (if long-col?
+                `(let [~'v (aget ~sym (int ~'i))]
+                   (and ~@(mapv (fn [v] `(not= ~'v ~(long v))) (sort vals))))
+                `(let [~'v (aget ~sym (int ~'i))]
+                   (and ~@(mapv (fn [v] `(not= ~'v ~(double v))) (sort vals)))))))))
 
       ;; Simple comparison ops (fallback for preds on missing columns etc.)
       (:lt :gt :lte :gte :eq :neq :range :not-range)

@@ -205,6 +205,9 @@
      - {:op :mul/:add/:sub/:div :args [...]} → recursive"
   ^double [expr col-arrays ^long i]
   (cond
+    (nil? expr)
+    Double/NaN
+
     (keyword? expr)
     (let [col (get col-arrays expr)]
       (if (expr/long-array? col)
@@ -622,6 +625,29 @@
                                                   (let [d (- v mean)] (+ acc (* d d))))))
                                             0.0 match-indices)
                                     (double (if (= (:op agg) :variance-pop) cnt (dec cnt)))))))
+                           :corr
+                           (let [[c1 c2] (:cols agg)
+                                 a1 (get col-arrays c1)
+                                 a2 (get col-arrays c2)
+                                 is-long1 (expr/long-array? a1)
+                                 is-long2 (expr/long-array? a2)
+                                 [sx sy sxx syy sxy cnt]
+                                 (reduce (fn [[^double sx ^double sy ^double sxx ^double syy ^double sxy ^long c] i]
+                                           (let [x (aget-col a1 (int i))
+                                                 y (aget-col a2 (int i))
+                                                 x-null (if is-long1 (= (long x) Long/MIN_VALUE) (Double/isNaN x))
+                                                 y-null (if is-long2 (= (long y) Long/MIN_VALUE) (Double/isNaN y))]
+                                             (if (or x-null y-null)
+                                               [sx sy sxx syy sxy c]
+                                               [(+ sx x) (+ sy y) (+ sxx (* x x)) (+ syy (* y y)) (+ sxy (* x y)) (inc c)])))
+                                         [0.0 0.0 0.0 0.0 0.0 0] match-indices)]
+                             (if (< (long cnt) 2)
+                               Double/NaN
+                               (let [n (double cnt)
+                                     num (- (* n sxy) (* sx sy))
+                                     den (Math/sqrt (* (- (* n sxx) (* sx sx))
+                                                       (- (* n syy) (* sy sy))))]
+                                 (if (zero? den) Double/NaN (/ num den)))))
                            (:stddev :stddev-pop)
                            (let [var-op (if (= (:op agg) :stddev-pop) :variance-pop :variance)
                                  v (execute-scalar-aggs preds [{:op var-op :col (:col agg) :as nil}] columns length)]

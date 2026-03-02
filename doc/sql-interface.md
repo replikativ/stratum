@@ -213,10 +213,10 @@ Translates to:
 | String functions | `UPPER, LOWER, LENGTH, SUBSTR, REPLACE, TRIM, CONCAT` (in SELECT, WHERE, GROUP BY, ORDER BY) |
 | Date functions | `DATE_TRUNC, EXTRACT, DATE_ADD, DATE_DIFF` |
 | Type casts | `CAST(col AS DOUBLE)` |
-| COALESCE / NULLIF | `COALESCE(col, 0)` |
+| COALESCE / NULLIF | `COALESCE(col, 0)`, `COALESCE(a, b, c)` (N-ary) |
 | EXPLAIN | `EXPLAIN SELECT ...` |
 | Table functions | `SELECT * FROM read_csv('file.csv')` |
-| JOINs | `SELECT ... FROM a JOIN b ON a.id = b.id` |
+| JOINs | `SELECT ... FROM a JOIN b ON a.id = b.id` (self-joins, qualified columns) |
 | Subqueries | `WHERE x IN (SELECT ...)`, `WHERE x NOT IN (SELECT ...)`, derived tables |
 | CTEs (WITH) | `WITH t AS (SELECT ...) SELECT ... FROM t` |
 | SELECT with literals | `SELECT 1, COUNT(*)`, `SELECT 'tag' AS label, SUM(x)` |
@@ -296,7 +296,24 @@ SELECT *, RANK() OVER (ORDER BY score DESC) AS rank
 FROM scores;
 ```
 
-Supported window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `PERCENT_RANK`, `CUME_DIST`, `LAG`, `LEAD`, `SUM`, `COUNT`, `AVG`, `MIN`, `MAX` (with optional frame clauses). Default frame follows the SQL standard: without ORDER BY uses the full partition, with ORDER BY uses UNBOUNDED PRECEDING to CURRENT ROW.
+Supported window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `PERCENT_RANK`, `CUME_DIST`, `LAG`, `LEAD`, `SUM`, `COUNT`, `AVG`, `MIN`, `MAX` (with optional frame clauses).
+
+Frame clause examples:
+```sql
+-- Default: UNBOUNDED PRECEDING TO CURRENT ROW (running aggregate)
+SUM(x) OVER (ORDER BY date)
+
+-- Reverse running aggregate
+SUM(x) OVER (ORDER BY date ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+
+-- Sliding window
+AVG(x) OVER (ORDER BY date ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+
+-- Full partition
+SUM(x) OVER (PARTITION BY dept)
+```
+
+Default frame follows the SQL standard: without ORDER BY uses the full partition, with ORDER BY uses UNBOUNDED PRECEDING to CURRENT ROW.
 
 ### DML Statements
 
@@ -324,7 +341,16 @@ INSERT INTO users (id, name) VALUES (1, 'Alice')
   ON CONFLICT (id) DO NOTHING;
 ```
 
-Table-qualified column references are supported for disambiguation in UPDATE FROM and JOINs (e.g., `employees.dept_code = departments.dept_code`).
+Table-qualified column references are supported for disambiguation in UPDATE FROM and JOINs (e.g., `employees.dept_code = departments.dept_code`). Self-joins and joins between tables with overlapping column names are fully supported:
+
+```sql
+-- Self-join: qualified columns resolve to the correct table alias
+SELECT e.name, m.name AS manager
+FROM employees e JOIN employees m ON e.mgr_id = m.id;
+
+-- Tables with shared column names
+SELECT s.name, d.name AS dept FROM staff s JOIN dept d ON s.dept_id = d.id;
+```
 
 ### Not Yet Supported
 

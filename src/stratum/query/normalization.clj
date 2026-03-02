@@ -34,6 +34,7 @@
    [:* :price [:- 1 :discount]] become trees."
   [expr]
   (cond
+    (nil? expr)     nil
     (keyword? expr) (strip-ns expr)
     (number? expr)  expr
     (string? expr)  expr

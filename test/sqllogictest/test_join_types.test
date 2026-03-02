@@ -37,8 +37,7 @@ SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a
 
 # ============================================================
 # RIGHT JOIN — unmatched right rows get NULLs for left cols
-# NOTE: RIGHT JOIN shows right-side key value for unmatched rows
-# (Postgres shows NULL for left-side key; this is a known deviation)
+# Postgres: SELECT t1.a shows NULL for unmatched right rows
 # ============================================================
 
 query ITT rowsort
@@ -46,21 +45,20 @@ SELECT t1.a, t1.b, t2.c FROM t1 RIGHT JOIN t2 ON t1.a = t2.a
 ----
 2	y	p
 3	z	q
-4	NULL	r
+NULL	NULL	r
 
 # ============================================================
 # FULL OUTER JOIN — unmatched from both sides
-# NOTE: FULL JOIN key column shows the non-NULL side's value
-# (matches Postgres COALESCE semantics for key columns)
+# t1.a shows the left-side value (NULL for unmatched right rows)
 # ============================================================
 
 query ITT rowsort
 SELECT t1.a, t1.b, t2.c FROM t1 FULL JOIN t2 ON t1.a = t2.a
 ----
+1	x	NULL
 2	y	p
 3	z	q
-4	NULL	r
-NULL	x	NULL
+NULL	NULL	r
 
 # ============================================================
 # Multi-column join key

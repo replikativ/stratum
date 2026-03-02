@@ -98,6 +98,15 @@
        (or (vector? (:start frame))
            (vector? (:end frame)))))
 
+(defn- non-default-running-frame?
+  "True when frame is specified and isn't the default running sum
+   (UNBOUNDED PRECEDING TO CURRENT ROW). Such frames need the sliding
+   window path even without numeric bounds (e.g. CURRENT ROW TO UNBOUNDED FOLLOWING)."
+  [frame]
+  (and frame
+       (not (and (= :unbounded-preceding (:start frame))
+                 (= :current-row (:end frame))))))
+
 (defn- compute-sliding-window-sum
   "Compute sliding window SUM using prefix sums.
    sorted-indices: row indices in partition-sorted order.
@@ -242,9 +251,6 @@
 
                :sum
                (cond
-                 sliding-frame?
-                 (compute-sliding-window-sum sorted-indices part-keys
-                                             (get col-arrays col) length (:start frame) (:end frame))
                  full-partition-frame?
                   ;; Full partition frame: partition totals broadcast
                  (let [val-arr (get col-arrays col)
@@ -263,6 +269,10 @@
                              p (aget ^longs part-keys idx)]
                          (aset result idx (double (.get part-totals p)))))
                      result))
+
+                 (or sliding-frame? (non-default-running-frame? frame))
+                 (compute-sliding-window-sum sorted-indices part-keys
+                                             (get col-arrays col) length (:start frame) (:end frame))
                  :else
                   ;; Running sum — Java
                  (ColumnOpsAnalytics/windowRunningSum part-keys sorted-indices
@@ -378,27 +388,50 @@
                  result)
 
                :count
-               (if sliding-frame?
+               (cond
+                 full-partition-frame?
+                 (let [result (double-array length)
+                       ^java.util.HashMap part-counts (compute-partition-sizes sorted-indices part-keys length)]
+                   (dotimes [i length]
+                     (let [idx (aget ^ints sorted-indices i)
+                               p (aget ^longs part-keys idx)]
+                       (aset result idx (double (.get part-counts p)))))
+                   result)
+                 (or sliding-frame? (non-default-running-frame? frame))
                  (compute-sliding-window-count sorted-indices part-keys length
                                                (:start frame) (:end frame))
+                 :else
                  (let [result (double-array length)]
-                   (if full-partition-frame?
-                     (let [^java.util.HashMap part-counts (compute-partition-sizes sorted-indices part-keys length)]
-                       (dotimes [i length]
-                         (let [idx (aget ^ints sorted-indices i)
-                               p (aget ^longs part-keys idx)]
-                           (aset result idx (double (.get part-counts p))))))
-                     (loop [i (int 0), cnt (long 0), prev-part Long/MIN_VALUE]
-                       (when (< i length)
-                         (let [idx (aget ^ints sorted-indices i)
-                               p (aget ^longs part-keys idx)
-                               new-cnt (long (if (= p prev-part) (inc cnt) 1))]
-                           (aset result idx (double new-cnt))
-                           (recur (inc i) new-cnt p)))))
+                   (loop [i (int 0), cnt (long 0), prev-part Long/MIN_VALUE]
+                     (when (< i length)
+                       (let [idx (aget ^ints sorted-indices i)
+                             p (aget ^longs part-keys idx)
+                             new-cnt (long (if (= p prev-part) (inc cnt) 1))]
+                         (aset result idx (double new-cnt))
+                         (recur (inc i) new-cnt p))))
                    result))
 
                :avg
-               (if sliding-frame?
+               (cond
+                 full-partition-frame?
+                 (let [result (double-array length)
+                       val-arr (get col-arrays col)
+                       is-double (expr/double-array? val-arr)
+                       part-totals (java.util.HashMap.)
+                       part-counts (java.util.HashMap.)]
+                   (dotimes [i length]
+                     (let [idx (aget ^ints sorted-indices i)
+                           p (aget ^longs part-keys idx)
+                           v (if is-double (aget ^doubles val-arr idx) (double (aget ^longs val-arr idx)))]
+                       (.put part-totals p (+ (double (or (.get part-totals p) 0.0)) v))
+                       (.put part-counts p (inc (long (or (.get part-counts p) 0))))))
+                   (dotimes [i length]
+                     (let [idx (aget ^ints sorted-indices i)
+                           p (aget ^longs part-keys idx)]
+                       (aset result idx (/ (double (.get part-totals p))
+                                           (double (.get part-counts p))))))
+                   result)
+                 (or sliding-frame? (non-default-running-frame? frame))
                   ;; AVG = SUM / COUNT over the sliding window
                  (let [sums (compute-sliding-window-sum sorted-indices part-keys
                                                         (get col-arrays col) length (:start frame) (:end frame))
@@ -409,24 +442,11 @@
                      (aset result i (/ (aget ^doubles sums i)
                                        (Math/max 1.0 (aget ^doubles cnts i)))))
                    result)
+                 :else
                  (let [result (double-array length)
                        val-arr (get col-arrays col)
                        is-double (expr/double-array? val-arr)]
-                   (if full-partition-frame?
-                     (let [part-totals (java.util.HashMap.)
-                           part-counts (java.util.HashMap.)]
-                       (dotimes [i length]
-                         (let [idx (aget ^ints sorted-indices i)
-                               p (aget ^longs part-keys idx)
-                               v (if is-double (aget ^doubles val-arr idx) (double (aget ^longs val-arr idx)))]
-                           (.put part-totals p (+ (double (or (.get part-totals p) 0.0)) v))
-                           (.put part-counts p (inc (long (or (.get part-counts p) 0))))))
-                       (dotimes [i length]
-                         (let [idx (aget ^ints sorted-indices i)
-                               p (aget ^longs part-keys idx)]
-                           (aset result idx (/ (double (.get part-totals p))
-                                               (double (.get part-counts p)))))))
-                     (loop [i (int 0), running-sum 0.0, cnt (long 0), prev-part Long/MIN_VALUE]
+                   (loop [i (int 0), running-sum 0.0, cnt (long 0), prev-part Long/MIN_VALUE]
                        (when (< i length)
                          (let [idx (aget ^ints sorted-indices i)
                                p (aget ^longs part-keys idx)
@@ -434,7 +454,7 @@
                                new-sum (if (= p prev-part) (+ running-sum v) v)
                                new-cnt (long (if (= p prev-part) (inc cnt) 1))]
                            (aset result idx (/ new-sum (double new-cnt)))
-                           (recur (inc i) new-sum new-cnt p)))))
+                           (recur (inc i) new-sum new-cnt p))))
                    result))
 
                :min
