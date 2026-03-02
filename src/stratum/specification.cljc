@@ -157,9 +157,9 @@
 ;; =============================================================================
 
 (def SOrderSpec
-  "Order-by specification: [:col :asc/:desc] or :col."
+  "Order-by specification: [:col :asc/:desc], :col, or [expr :asc/:desc]."
   [:or :keyword
-   [:tuple :keyword [:enum :asc :desc]]])
+   [:tuple [:or :keyword vector?] [:enum :asc :desc]]])
 
 (def SJoinType
   "Join type."

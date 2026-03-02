@@ -77,16 +77,43 @@
                          normalized))
                results))))
 
+(defn- eval-order-expr
+  "Evaluate an ORDER BY expression on a result row map.
+   Handles keywords (column refs) and expression vectors ([:* :a :b])."
+  [expr row]
+  (cond
+    (keyword? expr) (get row expr)
+    (number? expr) expr
+    (sequential? expr)
+    (let [[op & args] expr
+          a (eval-order-expr (first args) row)
+          b (when (second args) (eval-order-expr (second args) row))]
+      (if (and (#{:+ :- :* :/ :add :sub :mul :div :mod} op) (or (nil? a) (nil? b)))
+        nil ;; NULL propagation for arithmetic
+        (case op
+          (:+ :add) (+ (double a) (double b))
+          (:- :sub) (- (double a) (double b))
+          (:* :mul) (* (double a) (double b))
+          (:/ :div) (/ (double a) (double b))
+          (:mod) (mod (double a) (double b))
+          (:lower) (when a (clojure.string/lower-case (str a)))
+          (:upper) (when a (clojure.string/upper-case (str a)))
+          nil)))
+    :else expr))
+
 (defn- make-row-comparator
   "Build a comparator function for result map rows from order specs."
   ^java.util.Comparator [order-specs]
   (let [comparators
         (mapv (fn [spec]
                 (let [[col dir] (if (vector? spec) spec [spec :asc])
-                      dir (or dir :asc)]
+                      dir (or dir :asc)
+                      get-val (if (keyword? col)
+                                #(get % col)
+                                #(eval-order-expr col %))]
                   (fn [a b]
-                    (let [va (get a col)
-                          vb (get b col)
+                    (let [va (get-val a)
+                          vb (get-val b)
                           ;; SQL NULL ordering: NULLs last for ASC, first for DESC
                           cmp (cond
                                 (and (nil? va) (nil? vb)) 0

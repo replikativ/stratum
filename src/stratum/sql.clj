@@ -425,8 +425,13 @@
         ;; ORDER BY
         order-by (when-let [obs (.getOrderByElements ae)]
                    (mapv translate-order-element obs))
-        ;; Window frame
-        frame (translate-window-frame (.getWindowElement ae))
+        ;; Window frame — apply SQL-standard defaults:
+        ;; With ORDER BY, no frame → ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ;; Without ORDER BY, no frame → ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        frame (or (translate-window-frame (.getWindowElement ae))
+                  (if (seq order-by)
+                    {:type :rows :start :unbounded-preceding :end :current-row}
+                    {:type :rows :start :unbounded-preceding :end :unbounded-following}))
         ;; Output alias
         as-kw (keyword (or alias-name (str "_win_" name)))]
     (cond-> {:op op :as as-kw}
@@ -435,7 +440,7 @@
       (seq order-by) (assoc :order-by order-by)
       offset-val (assoc :offset offset-val)
       default-val (assoc :default default-val)
-      frame (assoc :frame frame)
+      true (assoc :frame frame)
       nested-agg? (assoc :_inner-agg [:as inner-agg-spec inner-agg-alias]))))
 
 ;; ============================================================================

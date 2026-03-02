@@ -437,7 +437,7 @@
     (cond
       (and (instance? Double v) (Double/isNaN (double v))) "NULL"
       (and (instance? Long v) (= (long v) Long/MIN_VALUE)) "NULL"
-      :else (format "%.6f" (double v)))
+      :else (let [d (double v)] (format "%.6f" (if (== d 0.0) 0.0 d))))
 
     ;; T (text) or default
     :else

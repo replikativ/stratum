@@ -1002,6 +1002,25 @@
                                          [pruned (long new-len)])
                                        [columns length])
 
+        ;; Pre-materialize string-producing expression predicates (e.g., LOWER(name) = 'bob')
+        ;; into dict-encoded temp columns. Must happen before materialize-computed-preds
+        ;; which would fail on string expressions via eval-expr-vectorized.
+                    [preds columns] (if (some #(and (map? (first %))
+                                                    (expr/string-producing-expr? (first %))) preds)
+                                      (let [counter (atom 0)]
+                                        (reduce (fn [[ps cs] pred]
+                                                  (let [col-ref (first pred)]
+                                                    (if (and (map? col-ref) (expr/string-producing-expr? col-ref))
+                                                      (let [n (swap! counter inc)
+                                                            col-name (keyword (str "__pred_str_" n))
+                                                            col-entry (expr/eval-string-expr col-ref cs length)]
+                                                        [(conj ps (assoc pred 0 col-name))
+                                                         (assoc cs col-name col-entry)])
+                                                      [(conj ps pred) cs])))
+                                                [[] columns]
+                                                preds))
+                                      [preds columns])
+
         ;; Pre-compute expression predicates (e.g., [:> [:* :a :b] 1000])
                     [preds columns] (if (some #(map? (first %)) preds)
                                       (materialize-computed-preds preds columns length)
