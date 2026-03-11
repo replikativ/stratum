@@ -1,101 +1,75 @@
 # Stratum Notebooks
 
-This directory contains interactive notebooks showcasing Stratum's features.
+Literate documentation and tests for Stratum, rendered as a
+[Quarto](https://quarto.org/) book via [Clay](https://scicloj.github.io/clay/).
 
-**Live documentation**: https://replikativ.github.io/stratum/
+## Structure
 
-## Available Notebooks
+```
+notebooks/
+├── chapters.edn              # book outline — parts and chapter filenames
+├── index.clj                 # landing page (renders README.md)
+├── dev.clj                   # build helpers (make-book!, make-gfm!)
+├── custom.scss               # Quarto styling (Fira Code, table tweaks)
+└── stratum_book/             # chapters live here
+    ├── quickstart.clj
+    ├── csv_import.clj
+    ├── columnar_internals.clj
+    └── api_reference.clj
 
-- **stratum_intro.clj** - Comprehensive introduction to Stratum covering:
-  - Query engine basics
-  - Tablecloth/tech.ml.dataset integration
-  - Performance and SIMD execution
-  - Persistent indices with copy-on-write
-  - Zone map pruning
-  - Statistical aggregations
-  - Hash joins
-  - SQL interface
-  - Real-world examples
+clay.edn                      # Clay config (Quarto theme, target paths)
+```
 
-## Using Notebooks
+## How it works
 
-### In the REPL
+Each `.clj` file under `stratum_book/` is a regular Clojure namespace
+that doubles as a notebook. Prose goes in `;;` comments (rendered as
+Markdown), and top-level expressions become evaluated code cells.
 
-Start a REPL with notebook support:
+Assertions use `kind/test-last`:
+
+```clojure
+(st/q {:from data :agg [[:count]]})
+
+(kind/test-last
+ [(fn [result] (= 1 (count result)))])
+```
+
+When Clay renders the notebook, `kind/test-last` runs the predicate
+against the preceding expression's value. If it fails, the build fails
+— so the rendered docs are always correct.
+
+## Building the book
+
+Start a REPL with the `:dev` alias, then:
+
+```clojure
+(require '[dev :refer [make-book! make-gfm!]])
+
+(make-book!)           ; → docs/  (Quarto HTML book)
+(make-gfm!)            ; → gfm/   (GitHub-flavored Markdown)
+(make-gfm! "stratum_book/quickstart.clj")  ; single chapter
+```
+
+`make-book!` reads `chapters.edn` to assemble the book structure,
+then calls Clay which:
+
+1. Evaluates each `.clj` file top-to-bottom
+2. Converts the output to `.qmd` (Quarto Markdown)
+3. Runs Quarto to produce the HTML site in `docs/`
+
+## Adding a chapter
+
+1. Create `notebooks/stratum_book/my_chapter.clj` with an `(ns stratum-book.my-chapter ...)` form
+2. Add `"my_chapter"` to the appropriate part in `chapters.edn`
+3. Run `(make-book!)` to verify
+
+## Running tests
+
+The notebooks are on the `:test` classpath. The test runner picks up
+any `deftest` forms in them. The `kind/test-last` assertions run
+during Clay rendering — they don't need the test runner.
 
 ```bash
-clj -M:repl
+./run_tests.sh
 ```
-
-Then load and evaluate the notebook:
-
-```clojure
-(load-file "notebooks/stratum_intro.clj")
-```
-
-### With Clay
-
-Stratum notebooks use the [Kindly](https://scicloj.github.io/kindly/) convention and can be rendered with [Clay](https://scicloj.github.io/clay/):
-
-```clojure
-(require '[scicloj.clay.v2.api :as clay])
-
-;; Render to HTML
-(clay/make! {:source-path "notebooks/stratum_intro.clj"
-             :show true})  ;; Opens in browser
-
-;; Or generate Quarto document
-(clay/make! {:source-path "notebooks/stratum_intro.clj"
-             :format [:quarto :html]})
-```
-
-### Evaluating Sections
-
-The notebooks are regular Clojure files with comment-based documentation. You can:
-
-1. Load the entire file in your REPL
-2. Evaluate sections one at a time using your editor's eval commands
-3. Copy-paste examples into your own code
-
-## Creating New Notebooks
-
-Follow the Kindly convention:
-
-1. Use `;;` for documentation (rendered as markdown)
-2. Use `;; #` for headers, `;; ##` for subheaders
-3. Code blocks are regular Clojure expressions
-4. Use `scicloj.kindly.v4.kind` namespace for special rendering hints
-
-Example:
-
-```clojure
-;; # My Notebook Title
-
-;; This is regular text that explains something.
-
-(ns my-notebook
-  (:require [stratum.api :as stratum]
-            [scicloj.kindly.v4.kind :as kind]))
-
-;; ## Section Header
-
-;; More explanation here.
-
-(def my-data {:x [1 2 3]})
-
-;; The result will be displayed:
-my-data
-```
-
-## Dependencies
-
-Notebooks have access to:
-- All Stratum namespaces
-- `tablecloth.api` and `tech.v3.dataset` for dataframe interop
-- `scicloj.kindly.v4.kind` for rendering hints (when using Clay)
-
-## Learn More
-
-- [Kindly documentation](https://scicloj.github.io/kindly/)
-- [Clay documentation](https://scicloj.github.io/clay/)
-- [Noj notebooks](https://scicloj.github.io/noj/) for more examples

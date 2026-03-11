@@ -1,4 +1,6 @@
 {"Getting Started" ["quickstart"]
  "Internals" ["csv_import"
-              "columnar_internals"]
+              "columnar_internals"
+              "dataset_persistence"
+              "tablecloth_interop"]
  "Reference" ["api_reference"]}
