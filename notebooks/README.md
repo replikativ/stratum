@@ -21,6 +21,10 @@ notebooks/
 clay.edn                      # Clay config (Quarto theme, target paths)
 ```
 
+## Requirements
+
+The Quarto CLI needs to be [installed](https://quarto.org/docs/get-started/).
+
 ## How it works
 
 Each `.clj` file under `stratum_book/` is a regular Clojure namespace
