@@ -44,6 +44,42 @@ Clay's [test generation](https://scicloj.github.io/clay/clay_book.test_generatio
 turns these annotations into standard `clojure.test` / `deftest` forms,
 so the assertions run as part of the regular test suite.
 
+## Documenting API entries with `kind/doc`
+
+For API reference pages, use
+[`kind/doc`](https://scicloj.github.io/clay/#documentation)
+to generate a ### heading from a var's docstring. These headings
+appear in Quarto's table of contents automatically.
+
+Add metadata to the `ns` form so the `kind/doc` calls themselves
+are hidden in the rendered output:
+
+```clojure
+^{:kindly/hide-code true
+  :kindly/options {:kinds-that-hide-code #{:kind/doc}}}
+(ns stratum-book.api-reference
+  (:require [stratum.api :as st]
+            [scicloj.kindly.v4.kind :as kind]))
+```
+
+Then, instead of writing manual `### heading` comments, call
+`kind/doc` on the var:
+
+```clojure
+(kind/doc #'st/q)
+
+;; Free-form prose and examples follow as usual.
+
+(st/q {:from data :agg [[:sum :qty]]})
+
+(kind/test-last
+ [(fn [result] (= 1 (count result)))])
+```
+
+Use `## Section` comments (level 2) for grouping entries into
+logical sections, and `kind/doc` (which renders as level 3) for
+individual API entries within each section.
+
 ## Building the book
 
 Start a REPL with the `:dev` alias, then:
