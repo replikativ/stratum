@@ -27,7 +27,9 @@
                :source-path (into ["index.clj"] (chapters->parts (read-chapters)))
                :base-target-path "docs"
                :book {:title "Stratum"}
-               :clean-up-target-dir true}))
+               ;; Comment this out to wipe the whole target on every render:
+               ;; :clean-up-target-dir true
+               }))
 
 (defn make-gfm!
   "Render all (or specified) notebooks as GitHub-flavored Markdown."
