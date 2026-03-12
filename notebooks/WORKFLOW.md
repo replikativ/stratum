@@ -112,6 +112,3 @@ annotations [generate](https://scicloj.github.io/clay/clay_book.test_generation.
 `deftest` forms that the test runner picks up
 alongside traditional `deftest` tests.
 
-```bash
-./run_tests.sh
-```
