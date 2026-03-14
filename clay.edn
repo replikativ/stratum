@@ -1,3 +1,8 @@
-{:base-target-path "docs"
- :subdirs-to-sync  ["notebooks"]
- :show             false}
+{:remote-repo {:git-url "https://github.com/replikativ/stratum"
+               :branch "main"}
+ :quarto {:format {:html {:toc true
+                          :toc-expand 3
+                          :number-depth 1
+                          :toc-depth 4
+                          :theme [:cosmo "notebooks/custom.scss"]}}}
+ :base-target-path ".clay-temp"}
