@@ -720,15 +720,18 @@
     (double-array 0) ;; dummy, never accessed by Java COUNT path
 
     :count-non-null
-    ;; Create 1.0/NaN mask: 1.0 for non-null values, NaN for nulls
-    ;; AGG_SUM with nan-safe will sum the 1.0s = count of non-null values
+    ;; Create 1.0/0.0 mask: 1.0 for non-null values, 0.0 for nulls.
+    ;; AGG_SUM will sum the 1.0s = count of non-null values.
+    ;; Using 0.0 (not NaN) ensures the count slot is always incremented,
+    ;; so groups with all-NULL values are still detected as occupied
+    ;; by compact-dense-flat-to-pair (which checks count > 0).
     (let [src (if-let [expr (:expr agg)]
                 (expr/eval-expr-vectorized expr col-arrays length cache)
                 (expr/col-as-doubles-cached (get col-arrays (:col agg)) length cache))
           ^doubles mask (double-array length)]
       (dotimes [i length]
         (aset mask i (if (Double/isNaN (aget ^doubles src i))
-                       Double/NaN
+                       0.0
                        1.0)))
       mask)
 
@@ -2294,18 +2297,15 @@
                 numeric-agg-cols numeric-agg-col2s]} (prepare-agg-type-arrays aggs col-arrays columns length)
         ;; Check if any agg source columns have NULLs — skip NaN masking when not needed
         nan-safe (boolean
-                  (or
-                   ;; count-non-null always needs NaN masking (the mask column has NaNs)
-                   (some #(= :count-non-null (:op %)) aggs)
-                   (columns-have-nulls?
-                    columns
-                    (distinct (mapcat (fn [a]
-                                        (case (:op a)
-                                          (:count :count-non-null) []
-                                          :count-distinct [(:col a)]
-                                          (:sum-product :corr) (:cols a)
-                                          [(:col a)]))
-                                      aggs)))))]
+                  (columns-have-nulls?
+                   columns
+                   (distinct (mapcat (fn [a]
+                                       (case (:op a)
+                                         (:count :count-non-null) []
+                                         :count-distinct [(:col a)]
+                                         (:sum-product :corr) (:cols a)
+                                         [(:col a)]))
+                                     aggs))))]
 
     ;; Call Java - dispatch between dense and HashMap paths
     ;; Dense path uses parallel execution for large datasets
