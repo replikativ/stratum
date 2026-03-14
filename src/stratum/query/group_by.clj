@@ -704,7 +704,7 @@
    Requires: all group columns are long[], supported agg ops.
    Compound aggs (variance/stddev/corr) are eligible because they decompose into SUM/COUNT."
   [group-cols aggs columns]
-  (let [supported-agg-ops #{:sum :count :min :max :avg :sum-product :variance :variance-pop :stddev :stddev-pop :corr :count-distinct}
+  (let [supported-agg-ops #{:sum :count :count-non-null :min :max :avg :sum-product :variance :variance-pop :stddev :stddev-pop :corr :count-distinct}
         group-cols-ok? (every? #(= :int64 (:type (get columns %))) group-cols)
         aggs-ok? (every? #(supported-agg-ops (:op %)) aggs)]
     (and group-cols-ok? aggs-ok?)))
@@ -718,6 +718,19 @@
   (case (:op agg)
     :count
     (double-array 0) ;; dummy, never accessed by Java COUNT path
+
+    :count-non-null
+    ;; Create 1.0/NaN mask: 1.0 for non-null values, NaN for nulls
+    ;; AGG_SUM with nan-safe will sum the 1.0s = count of non-null values
+    (let [src (if-let [expr (:expr agg)]
+                (expr/eval-expr-vectorized expr col-arrays length cache)
+                (expr/col-as-doubles-cached (get col-arrays (:col agg)) length cache))
+          ^doubles mask (double-array length)]
+      (dotimes [i length]
+        (aset mask i (if (Double/isNaN (aget ^doubles src i))
+                       Double/NaN
+                       1.0)))
+      mask)
 
     :sum-product
     (let [[c1 _c2] (:cols agg)]
@@ -765,7 +778,7 @@
    For expressions, returns double[] (eval-expr always produces double[])."
   [agg col-arrays ^long length ^java.util.HashMap cache]
   (case (:op agg)
-    :count nil
+    (:count :count-non-null) nil
     :sum-product (let [[c1 c2] (:cols agg)
                        a1 (expr/col-as-doubles-cached (get col-arrays c1) length cache)
                        a2 (expr/col-as-doubles-cached (get col-arrays c2) length cache)]
@@ -815,6 +828,7 @@
                        cnt (long (aget accs (inc agg-base)))
                        result (case (:op agg)
                                 :count cnt
+                                :count-non-null (if (zero? cnt) 0 (long (aget accs agg-base)))
                                 (:sum :sum-product) (if (zero? cnt) nil (aget accs agg-base))
                                 (:min :max) (if (zero? cnt) nil (aget accs agg-base))
                                 :avg (if (zero? cnt) nil
@@ -859,6 +873,7 @@
                           op (nth agg-ops j)
                           val (case op
                                 :count cnt
+                                :count-non-null (if (zero? cnt) 0 (long (aget flat-accs ab)))
                                 (:sum :sum-product) (if (zero? cnt) nil (aget flat-accs ab))
                                 (:min :max) (if (zero? cnt) nil (aget flat-accs ab))
                                 :avg (if (zero? cnt) nil
@@ -1034,6 +1049,7 @@
                           op (nth agg-ops j)
                           val (case op
                                 :count cnt
+                                :count-non-null (if (zero? cnt) 0 (long (aget flat-accs ab)))
                                 (:sum :sum-product) (if (zero? cnt) nil (aget flat-accs ab))
                                 (:min :max) (if (zero? cnt) nil (aget flat-accs ab))
                                 :avg (if (zero? cnt) nil
@@ -1171,6 +1187,8 @@
                 (compute-correlation (aget accs off) (aget accs (+ off 1)) (aget accs (+ off 2))
                                      (aget accs (+ off 3)) (aget accs (+ off 4)) cnt)))
     :count (long (aget accs (+ off (dec (var-acc-slots op)))))
+    :count-non-null (let [cnt (long (aget accs (+ off 1)))]
+                      (if (zero? cnt) 0 (long (aget accs off))))
     :avg (let [sum (aget accs off)
                cnt (long (aget accs (+ off 1)))]
            (if (zero? cnt) nil (/ sum (double cnt))))
@@ -1850,6 +1868,7 @@
                                           cnt (if agg-base (long (aget numeric-accs (inc (int agg-base)))) 0)
                                           val (case (:op agg)
                                                 :count cnt
+                                                :count-non-null (if (and agg-base (pos? cnt)) (long (aget numeric-accs (int agg-base))) 0)
                                                 (:sum :sum-product :min :max) (if agg-base (aget numeric-accs (int agg-base)) 0.0)
                                                 :avg (if (or (nil? agg-base) (zero? cnt)) Double/NaN
                                                          (/ (aget numeric-accs (int agg-base)) (double cnt)))
@@ -1985,6 +2004,7 @@
                                           cnt (if agg-base (long (aget numeric-accs (inc (int agg-base)))) 0)
                                           val (case (:op agg)
                                                 :count cnt
+                                                :count-non-null (if (and agg-base (pos? cnt)) (long (aget numeric-accs (int agg-base))) 0)
                                                 (:sum :sum-product :min :max) (if agg-base (aget numeric-accs (int agg-base)) 0.0)
                                                 :avg (if (or (nil? agg-base) (zero? cnt)) Double/NaN
                                                          (/ (aget numeric-accs (int agg-base)) (double cnt)))
@@ -2069,6 +2089,7 @@
     :sum           (int ColumnOps/AGG_SUM)
     :sum-product   (int ColumnOps/AGG_SUM_PRODUCT)
     :count         (int ColumnOps/AGG_COUNT)
+    :count-non-null (int ColumnOps/AGG_SUM) ;; sum of 1.0/NaN mask = count non-null
     :min           (int ColumnOps/AGG_MIN)
     :max           (int ColumnOps/AGG_MAX)
     :avg           (int ColumnOps/AGG_SUM)
@@ -2273,15 +2294,18 @@
                 numeric-agg-cols numeric-agg-col2s]} (prepare-agg-type-arrays aggs col-arrays columns length)
         ;; Check if any agg source columns have NULLs — skip NaN masking when not needed
         nan-safe (boolean
-                  (columns-have-nulls?
-                   columns
-                   (distinct (mapcat (fn [a]
-                                       (case (:op a)
-                                         :count []
-                                         :count-distinct [(:col a)]
-                                         (:sum-product :corr) (:cols a)
-                                         [(:col a)]))
-                                     aggs))))]
+                  (or
+                   ;; count-non-null always needs NaN masking (the mask column has NaNs)
+                   (some #(= :count-non-null (:op %)) aggs)
+                   (columns-have-nulls?
+                    columns
+                    (distinct (mapcat (fn [a]
+                                        (case (:op a)
+                                          (:count :count-non-null) []
+                                          :count-distinct [(:col a)]
+                                          (:sum-product :corr) (:cols a)
+                                          [(:col a)]))
+                                      aggs)))))]
 
     ;; Call Java - dispatch between dense and HashMap paths
     ;; Dense path uses parallel execution for large datasets

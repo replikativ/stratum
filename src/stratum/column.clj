@@ -45,29 +45,32 @@
     ;; NULL strings (nil) are encoded as Long.MIN_VALUE sentinel (same as int64 NULL)
     (instance? (Class/forName "[Ljava.lang.String;") col-val)
     (let [^"[Ljava.lang.String;" strings col-val
-          n (alength strings)
-          dict-map (java.util.HashMap.)
-          encoded (long-array n)
-          next-id (long-array 1)] ;; mutable counter
-      (dotimes [i n]
-        (let [s (aget strings i)]
-          (if (nil? s)
-            ;; NULL string → Long.MIN_VALUE sentinel
-            (aset encoded i Long/MIN_VALUE)
-            (let [id (.get dict-map s)]
-              (if id
-                (aset encoded i (long id))
-                (let [new-id (aget next-id 0)]
-                  (.put dict-map s new-id)
-                  (aset encoded i new-id)
-                  (aset next-id 0 (inc new-id))))))))
-      ;; Build reverse dict: int → String
-      (let [dict-size (aget next-id 0)
-            reverse-dict (make-array String dict-size)]
-        (doseq [^java.util.Map$Entry e (.entrySet dict-map)]
-          (when-let [k (.getKey e)]
-            (aset ^"[Ljava.lang.String;" reverse-dict (int (long (.getValue e))) k)))
-        {:type :int64 :data encoded :dict reverse-dict :dict-type :string}))
+          n (alength strings)]
+      (if (zero? n)
+        ;; Empty string array — preserve dict metadata so schema stays correct
+        {:type :int64 :data (long-array 0) :dict (make-array String 0) :dict-type :string}
+        (let [dict-map (java.util.HashMap.)
+              encoded (long-array n)
+              next-id (long-array 1)] ;; mutable counter
+          (dotimes [i n]
+            (let [s (aget strings i)]
+              (if (nil? s)
+                ;; NULL string → Long.MIN_VALUE sentinel
+                (aset encoded i Long/MIN_VALUE)
+                (let [id (.get dict-map s)]
+                  (if id
+                    (aset encoded i (long id))
+                    (let [new-id (aget next-id 0)]
+                      (.put dict-map s new-id)
+                      (aset encoded i new-id)
+                      (aset next-id 0 (inc new-id))))))))
+          ;; Build reverse dict: int → String
+          (let [dict-size (aget next-id 0)
+                reverse-dict (make-array String dict-size)]
+            (doseq [^java.util.Map$Entry e (.entrySet dict-map)]
+              (when-let [k (.getKey e)]
+                (aset ^"[Ljava.lang.String;" reverse-dict (int (long (.getValue e))) k)))
+            {:type :int64 :data encoded :dict reverse-dict :dict-type :string}))))
 
     ;; Stratum index - preserve as index source for chunk-streaming
     (satisfies? index/IColumnIndex col-val)
