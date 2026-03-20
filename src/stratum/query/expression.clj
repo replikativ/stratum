@@ -685,14 +685,14 @@
               col-data (get col-arrays col-key)
               ^longs long-data (ensure-longs col-data length)]
           (case (:op expr)
-            :year         (ColumnOpsExt/arrayExtractYearLong long-data (int length))
-            :month        (ColumnOpsExt/arrayExtractMonthLong long-data (int length))
-            :day          (ColumnOpsExt/arrayExtractDayLong long-data (int length))
-            :hour         (ColumnOpsExt/arrayExtractHourLong long-data (int length))
-            :minute       (ColumnOpsExt/arrayExtractMinuteLong long-data (int length))
-            :second       (ColumnOpsExt/arrayExtractSecondLong long-data (int length))
-            :day-of-week  (ColumnOpsExt/arrayExtractDayOfWeekLong long-data (int length))
-            :week-of-year (ColumnOpsExt/arrayExtractWeekOfYearLong long-data (int length))))
+            :year         (ColumnOpsLong/arrayExtractYearLong long-data (int length))
+            :month        (ColumnOpsLong/arrayExtractMonthLong long-data (int length))
+            :day          (ColumnOpsLong/arrayExtractDayLong long-data (int length))
+            :hour         (ColumnOpsLong/arrayExtractHourLong long-data (int length))
+            :minute       (ColumnOpsLong/arrayExtractMinuteLong long-data (int length))
+            :second       (ColumnOpsLong/arrayExtractSecondLong long-data (int length))
+            :day-of-week  (ColumnOpsLong/arrayExtractDayOfWeekLong long-data (int length))
+            :week-of-year (ColumnOpsLong/arrayExtractWeekOfYearLong long-data (int length))))
 
         ;; Fall back to eval-expr-vectorized + double→long conversion
         (let [result-arr (eval-expr-vectorized expr col-arrays length cache)

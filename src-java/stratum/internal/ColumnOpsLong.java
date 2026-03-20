@@ -61,6 +61,114 @@ public final class ColumnOpsLong {
     private static final long NULL = Long.MIN_VALUE;
 
     // =========================================================================
+    // Extract operations returning long[] directly
+    // (moved from ColumnOpsExt for JIT isolation)
+    // =========================================================================
+
+    public static long[] arrayExtractYearLong(long[] epochDays, int length) {
+        long[] r = new long[length];
+        for (int i = 0; i < length; i++) {
+            long z = epochDays[i] + 719468;
+            long era = (z >= 0 ? z : z - 146096) / 146097;
+            long doe = z - era * 146097;
+            long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+            long y = yoe + era * 400;
+            long doy = doe - (365*yoe + yoe/4 - yoe/100);
+            long mp = (5*doy + 2) / 153;
+            long m = mp + (mp < 10 ? 3 : -9);
+            r[i] = y + (m <= 2 ? 1 : 0);
+        }
+        return r;
+    }
+
+    public static long[] arrayExtractMonthLong(long[] epochDays, int length) {
+        long[] r = new long[length];
+        for (int i = 0; i < length; i++) {
+            long z = epochDays[i] + 719468;
+            long era = (z >= 0 ? z : z - 146096) / 146097;
+            long doe = z - era * 146097;
+            long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+            long doy = doe - (365*yoe + yoe/4 - yoe/100);
+            long mp = (5*doy + 2) / 153;
+            r[i] = mp + (mp < 10 ? 3 : -9);
+        }
+        return r;
+    }
+
+    public static long[] arrayExtractDayLong(long[] epochDays, int length) {
+        long[] r = new long[length];
+        for (int i = 0; i < length; i++) {
+            long z = epochDays[i] + 719468;
+            long era = (z >= 0 ? z : z - 146096) / 146097;
+            long doe = z - era * 146097;
+            long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+            long doy = doe - (365*yoe + yoe/4 - yoe/100);
+            long mp = (5*doy + 2) / 153;
+            r[i] = doy - (153*mp + 2)/5 + 1;
+        }
+        return r;
+    }
+
+    public static long[] arrayExtractHourLong(long[] epochSeconds, int length) {
+        long[] r = new long[length];
+        for (int i = 0; i < length; i++) {
+            r[i] = Math.floorMod(epochSeconds[i], 86400L) / 3600;
+        }
+        return r;
+    }
+
+    public static long[] arrayExtractMinuteLong(long[] epochSeconds, int length) {
+        long[] r = new long[length];
+        for (int i = 0; i < length; i++) {
+            r[i] = Math.floorMod(epochSeconds[i], 3600L) / 60;
+        }
+        return r;
+    }
+
+    public static long[] arrayExtractSecondLong(long[] epochSeconds, int length) {
+        long[] r = new long[length];
+        for (int i = 0; i < length; i++) {
+            r[i] = Math.floorMod(epochSeconds[i], 60L);
+        }
+        return r;
+    }
+
+    public static long[] arrayExtractDayOfWeekLong(long[] epochDays, int length) {
+        long[] r = new long[length];
+        for (int i = 0; i < length; i++) {
+            r[i] = Math.floorMod(epochDays[i] + 3, 7L);
+        }
+        return r;
+    }
+
+    public static long[] arrayExtractWeekOfYearLong(long[] epochDays, int length) {
+        long[] r = new long[length];
+        for (int i = 0; i < length; i++) {
+            long ed = epochDays[i];
+            long dow = ((ed % 7) + 10) % 7;
+            long thu = ed + (3 - dow);
+            long z = thu + 719468;
+            long era = (z >= 0 ? z : z - 146096) / 146097;
+            long doe = z - era * 146097;
+            long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+            long y = yoe + era * 400;
+            long doy2 = doe - (365*yoe + yoe/4 - yoe/100);
+            long mp = (5*doy2 + 2) / 153;
+            long m = mp + (mp < 10 ? 3 : -9);
+            long thuYear = y + (m <= 2 ? 1 : 0);
+            long yy = thuYear - (m <= 2 ? 1 : 0);
+            long eraY = (yy >= 0 ? yy : yy - 399) / 400;
+            long yoeY = yy - eraY * 400;
+            long doyY = (365*yoeY + yoeY/4 - yoeY/100);
+            long jan1 = eraY * 146097 + doyY - 719468;
+            long jan1dow = ((jan1 % 7) + 10) % 7;
+            long week1Mon = jan1 + ((jan1dow <= 3) ? -jan1dow : 7 - jan1dow);
+            r[i] = (ed - week1Mon) / 7 + 1;
+        }
+        return r;
+    }
+
+    // =========================================================================
     // Element-wise Binary Array Operations (NULL-aware)
     // =========================================================================
 
