@@ -4,7 +4,8 @@
    Provides column type detection and normalization to canonical format
    used by query engine and datasets."
   (:require [stratum.index :as index])
-  (:import [stratum.index PersistentColumnIndex]))
+  (:import [stratum.index PersistentColumnIndex]
+           [stratum.internal ColumnOpsExt]))
 
 (set! *warn-on-reflection* true)
 
@@ -70,7 +71,9 @@
             (doseq [^java.util.Map$Entry e (.entrySet dict-map)]
               (when-let [k (.getKey e)]
                 (aset ^"[Ljava.lang.String;" reverse-dict (int (long (.getValue e))) k)))
-            {:type :int64 :data encoded :dict reverse-dict :dict-type :string}))))
+            {:type :int64 :data encoded :dict reverse-dict :dict-type :string
+             :dict-alpha-masks (ColumnOpsExt/buildDictAlphaMasks reverse-dict)
+             :dict-bigram-masks (ColumnOpsExt/buildDictBigramMasks reverse-dict)}))))
 
     ;; Stratum index - preserve as index source for chunk-streaming
     (satisfies? index/IColumnIndex col-val)

@@ -728,13 +728,58 @@ public final class ColumnOpsExt {
     // Fast-path LIKE matching (moved from ColumnOps to reduce bytecode bloat)
     // =========================================================================
 
+    // --- Bitmask pre-filtering for LIKE ---
+
+    /** Compute 26-bit alpha mask: one bit per letter a-z (case-insensitive). */
+    public static int alphaMask(String s) {
+        int mask = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c >= 'a' && c <= 'z') mask |= (1 << (c - 'a'));
+            else if (c >= 'A' && c <= 'Z') mask |= (1 << (c - 'A'));
+        }
+        return mask;
+    }
+
+    /** Compute 64-bit bigram mask: hashed consecutive character pairs (case-insensitive). */
+    public static long bigramMask(String s) {
+        long mask = 0;
+        for (int i = 0; i < s.length() - 1; i++) {
+            char c0 = Character.toLowerCase(s.charAt(i));
+            char c1 = Character.toLowerCase(s.charAt(i + 1));
+            int hash = ((c0 * 131) + c1) & 63;
+            mask |= (1L << hash);
+        }
+        return mask;
+    }
+
+    /** Build alpha masks for entire dictionary. */
+    public static int[] buildDictAlphaMasks(String[] dict) {
+        int[] masks = new int[dict.length];
+        for (int i = 0; i < dict.length; i++) masks[i] = alphaMask(dict[i]);
+        return masks;
+    }
+
+    /** Build bigram masks for entire dictionary. */
+    public static long[] buildDictBigramMasks(String[] dict) {
+        long[] masks = new long[dict.length];
+        for (int i = 0; i < dict.length; i++) masks[i] = bigramMask(dict[i]);
+        return masks;
+    }
+
     /** LIKE predicate on dict-encoded column with fast-path detection + parallel matching. */
     public static long[] arrayStringLikeFast(long[] codes, String[] dict, String pattern, int length) {
+        return arrayStringLikeFastMasked(codes, dict, pattern, length, null, null);
+    }
+
+    /** LIKE predicate with optional bitmask pre-filtering for large dictionaries. */
+    public static long[] arrayStringLikeFastMasked(long[] codes, String[] dict, String pattern,
+                                                    int length, int[] alphaMasks, long[] bigramMasks) {
         boolean[] dictMatch = new boolean[dict.length];
         if (dict.length > 100000) {
-            matchDictLikeParallel(dict, pattern, dictMatch);
+            matchDictLikeParallel(dict, pattern, dictMatch, alphaMasks, bigramMasks);
         } else {
-            matchDictLike(dict, pattern, dictMatch);
+            matchDictLike(dict, pattern, dictMatch, alphaMasks, bigramMasks);
         }
         long[] r = new long[length];
         // Sequential broadcast — trivial per-element work (single array lookup)
@@ -791,7 +836,8 @@ public final class ColumnOpsExt {
     }
 
     /** Parallel dict matching for large dictionaries (>100K entries). */
-    private static void matchDictLikeParallel(String[] dict, String pattern, boolean[] dictMatch) {
+    private static void matchDictLikeParallel(String[] dict, String pattern, boolean[] dictMatch,
+                                               int[] alphaMasks, long[] bigramMasks) {
         int nThreads = POOL.getParallelism();
         int chunkSize = (dict.length + nThreads - 1) / nThreads;
         @SuppressWarnings("unchecked")
@@ -801,7 +847,7 @@ public final class ColumnOpsExt {
             final int end = Math.min(start + chunkSize, dict.length);
             if (start >= dict.length) break;
             futures[t] = POOL.submit(() -> {
-                matchDictLikeRange(dict, pattern, dictMatch, start, end);
+                matchDictLikeRange(dict, pattern, dictMatch, start, end, alphaMasks, bigramMasks);
             });
         }
         for (int t = 0; t < nThreads; t++) {
@@ -810,21 +856,45 @@ public final class ColumnOpsExt {
         }
     }
 
-    /** Match a range of dictionary entries with fast-path detection. */
-    private static void matchDictLikeRange(String[] dict, String pattern, boolean[] dictMatch, int start, int end) {
+    /** Match a range of dictionary entries with fast-path detection and optional bitmask pre-filtering. */
+    private static void matchDictLikeRange(String[] dict, String pattern, boolean[] dictMatch,
+                                            int start, int end, int[] alphaMasks, long[] bigramMasks) {
         int pLen = pattern.length();
         boolean startsPercent = pLen > 0 && pattern.charAt(0) == '%';
         boolean endsPercent = pLen > 0 && pattern.charAt(pLen - 1) == '%';
         String inner = pattern.substring(startsPercent ? 1 : 0, endsPercent ? pLen - 1 : pLen);
         boolean innerHasWild = inner.indexOf('%') >= 0 || inner.indexOf('_') >= 0;
 
+        // Build pattern bitmasks for pre-filtering (only for simple patterns with a literal)
+        boolean useMasks = alphaMasks != null && bigramMasks != null
+                           && !innerHasWild && inner.length() >= 2;
+        int patAlpha = 0;
+        long patBigram = 0;
+        if (useMasks) {
+            patAlpha = alphaMask(inner);
+            patBigram = bigramMask(inner);
+        }
+
         if (!innerHasWild && startsPercent && endsPercent && inner.length() > 0) {
-            for (int d = start; d < end; d++) dictMatch[d] = dict[d].contains(inner);
+            for (int d = start; d < end; d++) {
+                if (useMasks && ((alphaMasks[d] & patAlpha) != patAlpha
+                                 || (bigramMasks[d] & patBigram) != patBigram)) continue;
+                dictMatch[d] = dict[d].contains(inner);
+            }
         } else if (!innerHasWild && !startsPercent && endsPercent && inner.length() > 0) {
-            for (int d = start; d < end; d++) dictMatch[d] = dict[d].startsWith(inner);
+            for (int d = start; d < end; d++) {
+                if (useMasks && ((alphaMasks[d] & patAlpha) != patAlpha
+                                 || (bigramMasks[d] & patBigram) != patBigram)) continue;
+                dictMatch[d] = dict[d].startsWith(inner);
+            }
         } else if (!innerHasWild && startsPercent && !endsPercent && inner.length() > 0) {
-            for (int d = start; d < end; d++) dictMatch[d] = dict[d].endsWith(inner);
+            for (int d = start; d < end; d++) {
+                if (useMasks && ((alphaMasks[d] & patAlpha) != patAlpha
+                                 || (bigramMasks[d] & patBigram) != patBigram)) continue;
+                dictMatch[d] = dict[d].endsWith(inner);
+            }
         } else {
+            // Regex path — bitmasks can't help here
             String regex = ColumnOps.likeToRegex(pattern);
             java.util.regex.Pattern p = java.util.regex.Pattern.compile(regex);
             for (int d = start; d < end; d++) dictMatch[d] = p.matcher(dict[d]).matches();
@@ -832,24 +902,9 @@ public final class ColumnOpsExt {
     }
 
     /** Match dictionary entries against LIKE pattern with fast-path for common patterns. */
-    private static void matchDictLike(String[] dict, String pattern, boolean[] dictMatch) {
-        int pLen = pattern.length();
-        boolean startsPercent = pLen > 0 && pattern.charAt(0) == '%';
-        boolean endsPercent = pLen > 0 && pattern.charAt(pLen - 1) == '%';
-        String inner = pattern.substring(startsPercent ? 1 : 0, endsPercent ? pLen - 1 : pLen);
-        boolean innerHasWild = inner.indexOf('%') >= 0 || inner.indexOf('_') >= 0;
-
-        if (!innerHasWild && startsPercent && endsPercent && inner.length() > 0) {
-            for (int d = 0; d < dict.length; d++) dictMatch[d] = dict[d].contains(inner);
-        } else if (!innerHasWild && !startsPercent && endsPercent && inner.length() > 0) {
-            for (int d = 0; d < dict.length; d++) dictMatch[d] = dict[d].startsWith(inner);
-        } else if (!innerHasWild && startsPercent && !endsPercent && inner.length() > 0) {
-            for (int d = 0; d < dict.length; d++) dictMatch[d] = dict[d].endsWith(inner);
-        } else {
-            String regex = ColumnOps.likeToRegex(pattern);
-            java.util.regex.Pattern p = java.util.regex.Pattern.compile(regex);
-            for (int d = 0; d < dict.length; d++) dictMatch[d] = p.matcher(dict[d]).matches();
-        }
+    private static void matchDictLike(String[] dict, String pattern, boolean[] dictMatch,
+                                       int[] alphaMasks, long[] bigramMasks) {
+        matchDictLikeRange(dict, pattern, dictMatch, 0, dict.length, alphaMasks, bigramMasks);
     }
 
     // =========================================================================
