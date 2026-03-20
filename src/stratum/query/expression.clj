@@ -15,7 +15,7 @@
      eval-expr-to-long    — eval returning long[] directly (avoids round-trip)
      materialize-string-exprs — pre-materialize string expressions to temp columns"
   (:require [stratum.query.normalization :as norm])
-  (:import [stratum.internal ColumnOps ColumnOpsExt]))
+  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong]))
 
 (set! *warn-on-reflection* true)
 
@@ -89,10 +89,23 @@
         result))))
 
 ;; ============================================================================
+;; Type coercion helpers
+;; ============================================================================
+
+(defn ensure-double-arr
+  "Ensure result is double[], converting long[] if needed. Used as adapter
+   between polymorphic (long[]/double[]) and double[]-only callers."
+  ^doubles [arr ^long length]
+  (if (double-array? arr)
+    arr
+    (ColumnOps/longToDoubleNullSafe ^longs arr (int length))))
+
+;; ============================================================================
 ;; Mutual recursion forward declaration
 ;; ============================================================================
 
 (declare eval-expr-vectorized)
+(declare eval-expr-polymorphic)
 
 ;; ============================================================================
 ;; CASE/WHEN predicate mask evaluation
@@ -317,18 +330,17 @@
       :years   (ColumnOps/arrayDateAddMonths long-data (int (* n 12)) (int length)))))
 
 ;; ============================================================================
-;; Vectorized expression evaluation (array ops, hot path)
+;; Polymorphic expression evaluation (returns long[] or double[])
 ;; ============================================================================
 
-(defn eval-expr-vectorized
-  "Evaluate an expression tree on entire arrays at once using Java array ops.
-   Returns a double[] of length rows. Much faster than per-row eval-agg-expr.
-   Optimizes scalar-array ops to avoid 48MB broadcast allocations.
-   Optional cache parameter avoids duplicate longToDouble conversions.
-   Bind *columns-meta* for string function dict access."
-  (^doubles [expr col-arrays ^long length]
-   (eval-expr-vectorized expr col-arrays length nil))
-  (^doubles [expr col-arrays ^long length ^java.util.HashMap cache]
+(defn eval-expr-polymorphic
+  "Evaluate an expression tree returning the natural array type: long[] for
+   integer arithmetic, long[] for date ops, double[] for float/division/math.
+   Callers must handle both return types. Use eval-expr-vectorized for
+   guaranteed double[] return."
+  ([expr col-arrays ^long length]
+   (eval-expr-polymorphic expr col-arrays length nil))
+  ([expr col-arrays ^long length ^java.util.HashMap cache]
    (cond
      (nil? expr)
      (let [a (double-array length)]
@@ -336,26 +348,38 @@
        a)
 
      (keyword? expr)
-     (col-as-doubles-cached (get col-arrays expr) length cache)
+     ;; Return raw array (long[] or double[]) — no conversion
+     (get col-arrays expr)
 
      (number? expr)
-     (ColumnOps/arrayBroadcast (double expr) (int length))
+     ;; Integer literal → long[], float literal → double[]
+     (if (integer? expr)
+       (ColumnOpsLong/arrayBroadcastLong (long expr) (int length))
+       (ColumnOps/arrayBroadcast (double expr) (int length)))
 
-     ;; Unary math functions (must be before binary op extraction)
+     ;; Unary math functions
      (and (map? expr) (#{:abs :sqrt :log :log10 :exp :round :floor :ceil :sign} (:op expr)))
-     (let [a (eval-expr-vectorized (first (:args expr)) col-arrays length cache)]
-       (case (:op expr)
-         :abs   (ColumnOps/arrayAbs a (int length))
-         :sqrt  (ColumnOps/arraySqrt a (int length))
-         :log   (ColumnOps/arrayLog a (int length))
-         :log10 (ColumnOps/arrayLog10 a (int length))
-         :exp   (ColumnOps/arrayExp a (int length))
-         :round (ColumnOps/arrayRound a (int length))
-         :floor (ColumnOps/arrayFloor a (int length))
-         :ceil  (ColumnOps/arrayCeil a (int length))
-         :sign  (ColumnOps/arraySign a (int length))))
+     (let [op (:op expr)
+           arg-result (eval-expr-polymorphic (first (:args expr)) col-arrays length cache)]
+       (if (and (#{:abs :sign} op) (long-array? arg-result))
+         ;; Integer-preserving unary ops
+         (case op
+           :abs  (ColumnOpsLong/arrayAbsLong ^longs arg-result (int length))
+           :sign (ColumnOpsLong/arraySignLong ^longs arg-result (int length)))
+         ;; Fractional-producing or double input → double path
+         (let [^doubles a (ensure-double-arr arg-result length)]
+           (case op
+             :abs   (ColumnOps/arrayAbs a (int length))
+             :sqrt  (ColumnOps/arraySqrt a (int length))
+             :log   (ColumnOps/arrayLog a (int length))
+             :log10 (ColumnOps/arrayLog10 a (int length))
+             :exp   (ColumnOps/arrayExp a (int length))
+             :round (ColumnOps/arrayRound a (int length))
+             :floor (ColumnOps/arrayFloor a (int length))
+             :ceil  (ColumnOps/arrayCeil a (int length))
+             :sign  (ColumnOps/arraySign a (int length))))))
 
-     ;; Date extraction functions (input is long[] epoch-days or epoch-seconds)
+     ;; Date extraction functions — return double[] (extract produces small ints)
      (and (map? expr) (#{:year :month :day :hour :minute :second :day-of-week :week-of-year} (:op expr)))
      (let [col-key (first (:args expr))
            col-data (if (keyword? col-key)
@@ -371,7 +395,6 @@
            :second       (ColumnOps/arrayExtractSecond ^longs col-data (int length))
            :day-of-week  (ColumnOps/arrayExtractDayOfWeek ^longs col-data (int length))
            :week-of-year (ColumnOps/arrayExtractWeekOfYear ^longs col-data (int length)))
-         ;; double[] input: convert to long[] first
          (let [long-data (long-array length)]
            (dotimes [i length] (aset long-data i (long (aget ^doubles col-data i))))
            (case (:op expr)
@@ -384,19 +407,21 @@
              :day-of-week  (ColumnOps/arrayExtractDayOfWeek long-data (int length))
              :week-of-year (ColumnOps/arrayExtractWeekOfYear long-data (int length))))))
 
-     ;; Date/time arithmetic (input/output is long[], return as double[])
+     ;; Date/time arithmetic — return long[] for date-trunc/date-add (integer epoch)
      (and (map? expr) (#{:date-trunc :date-add :date-diff :epoch-days :epoch-seconds} (:op expr)))
      (let [args (:args expr)]
        (case (:op expr)
          :date-trunc
          (let [col-key (second args)
                col-data (get col-arrays col-key)]
-           (ColumnOps/longToDouble (eval-date-trunc-to-long (first args) col-data length) (int length)))
+           ;; Return long[] directly — no longToDouble conversion
+           (eval-date-trunc-to-long (first args) col-data length))
 
          :date-add
          (let [col-key (nth args 2)
                col-data (get col-arrays col-key)]
-           (ColumnOps/longToDouble (eval-date-add-to-long (first args) (second args) col-data length) (int length)))
+           ;; Return long[] directly
+           (eval-date-add-to-long (first args) (second args) col-data length))
 
          :date-diff
          (let [unit (first args)
@@ -414,19 +439,19 @@
          (let [col-key (first args)
                col-data (get col-arrays col-key)
                ^longs long-data (ensure-longs col-data length)
-               r (double-array length)]
-           (dotimes [i length] (aset r i (double (quot (aget long-data i) 86400))))
+               r (long-array length)]
+           (dotimes [i length] (aset r i (quot (aget long-data i) 86400)))
            r)
 
          :epoch-seconds
          (let [col-key (first args)
                col-data (get col-arrays col-key)
                ^longs long-data (ensure-longs col-data length)
-               r (double-array length)]
-           (dotimes [i length] (aset r i (double (* (aget long-data i) 86400))))
+               r (long-array length)]
+           (dotimes [i length] (aset r i (* (aget long-data i) 86400)))
            r)))
 
-     ;; NULL handling expressions
+     ;; NULL handling expressions — stay in double domain (complex sentinel logic)
      (and (map? expr) (#{:greatest :least} (:op expr)))
      (let [args (:args expr)
            op (:op expr)]
@@ -436,7 +461,7 @@
                                           a (double-array length)]
                                       (java.util.Arrays/fill a v)
                                       a)
-                                    (eval-expr-vectorized arg col-arrays length cache))
+                                    (ensure-double-arr (eval-expr-polymorphic arg col-arrays length cache) length))
                        ^doubles r (double-array length)]
                    (if (= op :greatest)
                      (dotimes [i length] (aset r i (Math/max (aget acc i) (aget b i))))
@@ -448,7 +473,7 @@
                          a (double-array length)]
                      (java.util.Arrays/fill a v)
                      a)
-                   (eval-expr-vectorized first-arg col-arrays length cache)))
+                   (ensure-double-arr (eval-expr-polymorphic first-arg col-arrays length cache) length)))
                (rest args)))
 
      (and (map? expr) (#{:coalesce :nullif} (:op expr)))
@@ -457,36 +482,30 @@
          :coalesce
          (let [a-raw (first args)
                b-raw (second args)
-               ;; Check if first arg is a long[] column (for long COALESCE path)
-               ;; Long[] COALESCE uses Long.MIN_VALUE sentinel instead of NaN
                a-is-long? (and (keyword? a-raw) (long-array? (get col-arrays a-raw)))]
            (if a-is-long?
-             ;; Long path: operate on long[] with Long.MIN_VALUE sentinel, convert result to double[]
              (let [^longs a-data (get col-arrays a-raw)
                    ^longs result (if (number? b-raw)
                                    (ColumnOps/arrayCoalesceLongScalar a-data (long b-raw) (int length))
                                    (if (and (keyword? b-raw) (long-array? (get col-arrays b-raw)))
                                      (ColumnOps/arrayCoalesceLong a-data ^longs (get col-arrays b-raw) (int length))
-                                     ;; b is not long — convert a to double[] with NaN sentinel
                                      nil))]
                (if result
                  (ColumnOps/longToDouble result (int length))
-                 ;; Fallback: convert long[] to double[] with NaN for NULL, then use double coalesce
                  (let [a (col-as-doubles-cached a-data length cache)]
                    (if (number? b-raw)
                      (ColumnOps/arrayCoalesceScalar a (double b-raw) (int length))
-                     (ColumnOps/arrayCoalesce a (eval-expr-vectorized b-raw col-arrays length cache) (int length))))))
-             ;; Double path: use NaN sentinel
-             (let [a (eval-expr-vectorized a-raw col-arrays length cache)]
+                     (ColumnOps/arrayCoalesce a (ensure-double-arr (eval-expr-polymorphic b-raw col-arrays length cache) length) (int length))))))
+             (let [a (ensure-double-arr (eval-expr-polymorphic a-raw col-arrays length cache) length)]
                (if (number? b-raw)
                  (ColumnOps/arrayCoalesceScalar a (double b-raw) (int length))
-                 (ColumnOps/arrayCoalesce a (eval-expr-vectorized b-raw col-arrays length cache) (int length))))))
+                 (ColumnOps/arrayCoalesce a (ensure-double-arr (eval-expr-polymorphic b-raw col-arrays length cache) length) (int length))))))
          :nullif
-         (let [a (eval-expr-vectorized (first args) col-arrays length cache)
+         (let [a (ensure-double-arr (eval-expr-polymorphic (first args) col-arrays length cache) length)
                val (double (second args))]
            (ColumnOps/arrayNullif a val (int length)))))
 
-     ;; String functions
+     ;; String functions — always double[]
      (and (map? expr) (#{:length :upper :lower :substr :replace :trim :concat} (:op expr)))
      (let [col-key (first (:args expr))]
        (case (:op expr)
@@ -514,29 +533,23 @@
          (cond
            (long-array? col-data)
            (if (and col-meta (:dict col-meta) (= :string (:dict-type col-meta)))
-             ;; string → double
              (ColumnOps/arrayStringToDouble ^longs col-data ^"[Ljava.lang.String;" (:dict col-meta) (int length))
-             ;; long → double
              (ColumnOps/arrayLongToDouble ^longs col-data (int length)))
            :else col-data)
          :long
          (cond
            (long-array? col-data)
            (if (and col-meta (:dict col-meta) (= :string (:dict-type col-meta)))
-             ;; string → long: return as double[] for eval-expr-vectorized compatibility
              (let [^longs la (ColumnOps/arrayStringToLong ^longs col-data ^"[Ljava.lang.String;" (:dict col-meta) (int length))]
                (ColumnOps/arrayLongToDouble la (int length)))
-             ;; already long → return as double[]
              (col-as-doubles-cached col-data length cache))
            :else
-           ;; double → long → double[]
            (let [^longs la (ColumnOps/arrayDoubleToLong ^doubles col-data (int length))]
              (ColumnOps/arrayLongToDouble la (int length))))
-         ;; :string target type should have been pre-materialized
          :string
          (throw (ex-info "CAST to string must be pre-materialized" {:expr expr}))))
 
-     ;; CASE/WHEN expression
+     ;; CASE/WHEN expression — stay double (complex branch mixing)
      (and (map? expr) (= :case (:op expr)))
      (let [branches (:branches expr)
            has-else? (some #(= :else (:op %)) branches)
@@ -545,54 +558,99 @@
            assigned (long-array length)]
        (doseq [branch branches]
          (if (= :else (:op branch))
-           (let [^doubles val-arr (eval-expr-vectorized (:val branch) col-arrays length cache)]
+           (let [^doubles val-arr (ensure-double-arr (eval-expr-polymorphic (:val branch) col-arrays length cache) length)]
              (dotimes [i length]
                (when (zero? (aget assigned i))
                  (aset result i (aget val-arr i)))))
            (let [mask (eval-case-pred-mask (:pred branch) col-arrays length cache)
-                 ^doubles val-arr (eval-expr-vectorized (:val branch) col-arrays length cache)]
+                 ^doubles val-arr (ensure-double-arr (eval-expr-polymorphic (:val branch) col-arrays length cache) length)]
              (dotimes [i length]
                (when (and (zero? (aget ^longs assigned i)) (== 1 (aget ^longs mask i)))
                  (aset result i (aget val-arr i))
                  (aset assigned i 1))))))
        result)
 
-     ;; Binary arithmetic ops
+     ;; Binary arithmetic ops — type-preserving when both sides are long[]
      (map? expr)
      (let [args (:args expr)
            arg0 (nth args 0)
            arg1 (nth args 1)
            scalar0? (number? arg0)
-           scalar1? (number? arg1)]
-       (case (:op expr)
-         :mul (cond
-                scalar0? (ColumnOps/arrayMulScalar (double arg0) (eval-expr-vectorized arg1 col-arrays length cache) (int length))
-                scalar1? (ColumnOps/arrayMulScalar (double arg1) (eval-expr-vectorized arg0 col-arrays length cache) (int length))
-                :else (ColumnOps/arrayMul (eval-expr-vectorized arg0 col-arrays length cache)
-                                          (eval-expr-vectorized arg1 col-arrays length cache) (int length)))
-         :add (cond
-                scalar0? (ColumnOps/arrayAddScalar (double arg0) (eval-expr-vectorized arg1 col-arrays length cache) (int length))
-                scalar1? (ColumnOps/arrayAddScalar (double arg1) (eval-expr-vectorized arg0 col-arrays length cache) (int length))
-                :else (ColumnOps/arrayAdd (eval-expr-vectorized arg0 col-arrays length cache)
-                                          (eval-expr-vectorized arg1 col-arrays length cache) (int length)))
-         :sub (cond
-                scalar0? (ColumnOps/arraySubScalar (double arg0) (eval-expr-vectorized arg1 col-arrays length cache) (int length))
-                :else (ColumnOps/arraySub (eval-expr-vectorized arg0 col-arrays length cache)
-                                          (eval-expr-vectorized arg1 col-arrays length cache) (int length)))
-         :div (ColumnOps/arrayDiv (eval-expr-vectorized arg0 col-arrays length cache)
-                                  (eval-expr-vectorized arg1 col-arrays length cache) (int length))
-         ;; Binary math
-         :mod (let [a (eval-expr-vectorized arg0 col-arrays length cache)]
-                (if (number? arg1)
-                  (ColumnOps/arrayModScalar a (double arg1) (int length))
-                  (ColumnOps/arrayMod a (eval-expr-vectorized arg1 col-arrays length cache) (int length))))
-         :pow (let [a (eval-expr-vectorized arg0 col-arrays length cache)]
-                (if (number? arg1)
-                  (ColumnOps/arrayPowScalar a (double arg1) (int length))
-                  (ColumnOps/arrayPow a (eval-expr-vectorized arg1 col-arrays length cache) (int length))))))
+           scalar1? (number? arg1)
+           op (:op expr)]
+       ;; Division, pow always produce double[]
+       (if (#{:div :pow} op)
+         (let [a (ensure-double-arr (eval-expr-polymorphic arg0 col-arrays length cache) length)
+               b (ensure-double-arr (eval-expr-polymorphic arg1 col-arrays length cache) length)]
+           (case op
+             :div (ColumnOps/arrayDiv a b (int length))
+             :pow (if (number? arg1)
+                    (ColumnOps/arrayPowScalar a (double arg1) (int length))
+                    (ColumnOps/arrayPow a b (int length)))))
+         ;; mul, add, sub, mod — try long[] path
+         (let [;; Evaluate operands polymorphically
+               r0 (if scalar0? nil (eval-expr-polymorphic arg0 col-arrays length cache))
+               r1 (if scalar1? nil (eval-expr-polymorphic arg1 col-arrays length cache))
+               ;; Check if we can stay in long domain
+               both-long? (and (or scalar0? (long-array? r0))
+                               (or scalar1? (long-array? r1))
+                               ;; Scalars must be integer
+                               (or (not scalar0?) (integer? arg0))
+                               (or (not scalar1?) (integer? arg1)))]
+           (if both-long?
+             ;; Long path
+             (case op
+               :mul (cond
+                      scalar0? (ColumnOpsLong/arrayMulLongScalar (long arg0) ^longs r1 (int length))
+                      scalar1? (ColumnOpsLong/arrayMulLongScalar (long arg1) ^longs r0 (int length))
+                      :else (ColumnOpsLong/arrayMulLong ^longs r0 ^longs r1 (int length)))
+               :add (cond
+                      scalar0? (ColumnOpsLong/arrayAddLongScalar (long arg0) ^longs r1 (int length))
+                      scalar1? (ColumnOpsLong/arrayAddLongScalar (long arg1) ^longs r0 (int length))
+                      :else (ColumnOpsLong/arrayAddLong ^longs r0 ^longs r1 (int length)))
+               :sub (cond
+                      scalar0? (ColumnOpsLong/arraySubLongScalar (long arg0) ^longs r1 (int length))
+                      :else (ColumnOpsLong/arraySubLong ^longs r0 ^longs r1 (int length)))
+               :mod (cond
+                      scalar1? (ColumnOpsLong/arrayModLongScalar ^longs r0 (long arg1) (int length))
+                      :else (ColumnOpsLong/arrayModLong ^longs r0 ^longs r1 (int length))))
+             ;; Double path (mixed types or float scalars)
+             (let [a (if scalar0? nil (ensure-double-arr r0 length))
+                   b (if scalar1? nil (ensure-double-arr r1 length))]
+               (case op
+                 :mul (cond
+                        scalar0? (ColumnOps/arrayMulScalar (double arg0) b (int length))
+                        scalar1? (ColumnOps/arrayMulScalar (double arg1) a (int length))
+                        :else (ColumnOps/arrayMul a b (int length)))
+                 :add (cond
+                        scalar0? (ColumnOps/arrayAddScalar (double arg0) b (int length))
+                        scalar1? (ColumnOps/arrayAddScalar (double arg1) a (int length))
+                        :else (ColumnOps/arrayAdd a b (int length)))
+                 :sub (cond
+                        scalar0? (ColumnOps/arraySubScalar (double arg0) b (int length))
+                        :else (ColumnOps/arraySub a b (int length)))
+                 :mod (if (number? arg1)
+                        (ColumnOps/arrayModScalar a (double arg1) (int length))
+                        (ColumnOps/arrayMod a b (int length)))))))))
 
      :else
      (throw (ex-info (str "Unsupported vectorized expr: " (type expr) " " expr) {:expr expr})))))
+
+;; ============================================================================
+;; Vectorized expression evaluation (guaranteed double[] return)
+;; ============================================================================
+
+(defn eval-expr-vectorized
+  "Evaluate an expression tree on entire arrays at once using Java array ops.
+   Returns a double[] of length rows. Wrapper around eval-expr-polymorphic
+   that ensures double[] return type for backward compatibility.
+   Optimizes scalar-array ops to avoid 48MB broadcast allocations.
+   Optional cache parameter avoids duplicate longToDouble conversions.
+   Bind *columns-meta* for string function dict access."
+  (^doubles [expr col-arrays ^long length]
+   (eval-expr-vectorized expr col-arrays length nil))
+  (^doubles [expr col-arrays ^long length ^java.util.HashMap cache]
+   (ensure-double-arr (eval-expr-polymorphic expr col-arrays length cache) length)))
 
 ;; ============================================================================
 ;; Long-returning expression evaluation (avoids double round-trip)

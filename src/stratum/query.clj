@@ -47,7 +47,7 @@
             [stratum.specification :as spec]
             [stratum.column :as column]
             [stratum.dataset :as dataset])
-  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsChunked ColumnOpsChunkedSimd ColumnOpsAnalytics]
+  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsChunked ColumnOpsChunkedSimd ColumnOpsAnalytics]
            [stratum.index ChunkEntry]))
 
 (set! *warn-on-reflection* true)
@@ -219,28 +219,52 @@
         ;; Collect SUM columns (skip COUNT-only aggs)
         sum-aggs (filterv #(not= :count (:op %)) aggs)
         n-sum    (count sum-aggs)
-        ;; Check if ALL sum columns are long[] and no double preds and no SUM_PRODUCT
+        ;; Check if ALL sum columns are long[] (including SUM_PRODUCT with both cols long[])
         ;; → use all-long path (LongVector accumulators, no longToDouble allocation)
-        all-long? (and (zero? n-dbl)
-                       (every? (fn [a]
-                                 (and (not= :sum-product (:op a))
-                                      (let [col-info (case (:op a)
-                                                       (:sum :avg) (get columns (:col a)))]
-                                        (expr/long-array? (:data col-info)))))
-                               sum-aggs))
-        ;; Call Java single-pass
-        ^doubles result (if all-long?
-                          ;; All-long path: LongVector accumulators, no conversion
-                          (let [sum-long-cols (into-array expr/long-array-class
-                                                          (mapv (fn [a]
-                                                                  (:data (get columns (:col a))))
-                                                                sum-aggs))]
-                            (ColumnOpsExt/fusedSimdMultiSumAllLongParallel
-                             (int n-long) long-pred-types
-                             ^"[[J" long-cols ^longs long-lo ^longs long-hi
-                             (int n-sum) ^"[[J" sum-long-cols
-                             (int length)))
-                          ;; Double path: ensure-doubles conversion
+        ;; Double predicates are OK — they're orthogonal to agg column type
+        all-long? (every? (fn [a]
+                            (case (:op a)
+                              (:sum :avg)
+                              (expr/long-array? (:data (get columns (:col a))))
+                              :sum-product
+                              (and (expr/long-array? (:data (get columns (first (:cols a)))))
+                                   (expr/long-array? (:data (get columns (second (:cols a))))))
+                              false))
+                          sum-aggs)
+        ;; For SUM_PRODUCT in long path: pre-multiply with overflow check
+        ;; Returns nil on overflow → falls back to double path
+        ;; Call Java single-pass — try long path first, fall back to double on overflow
+        ^doubles result (or
+                          (when all-long?
+                            ;; All-long path: LongVector accumulators, no conversion
+                            (let [overflow? (volatile! false)
+                                  sum-long-cols
+                                  (into-array expr/long-array-class
+                                              (mapv (fn [a]
+                                                      (case (:op a)
+                                                        (:sum :avg) (:data (get columns (:col a)))
+                                                        :sum-product
+                                                        (let [c1 (:data (get columns (first (:cols a))))
+                                                              c2 (:data (get columns (second (:cols a))))
+                                                              r (ColumnOpsLong/arrayMulLongChecked ^longs c1 ^longs c2 (int length))]
+                                                          (when-not r (vreset! overflow? true))
+                                                          (or r (long-array 0)))))
+                                                    sum-aggs))]
+                              (when-not @overflow?
+                                (if (zero? n-dbl)
+                                  (ColumnOpsExt/fusedSimdMultiSumAllLongParallel
+                                   (int n-long) long-pred-types
+                                   ^"[[J" long-cols ^longs long-lo ^longs long-hi
+                                   (int n-sum) ^"[[J" sum-long-cols
+                                   (int length))
+                                  (ColumnOpsLong/fusedSimdMultiSumAllLongMixedPredsParallel
+                                   (int n-long) long-pred-types
+                                   ^"[[J" long-cols ^longs long-lo ^longs long-hi
+                                   (int n-dbl) dbl-pred-types
+                                   ^"[[D" dbl-cols ^doubles dbl-lo ^doubles dbl-hi
+                                   (int n-sum) ^"[[J" sum-long-cols
+                                   (int length))))))
+                          ;; Double path: ensure-doubles conversion (also fallback on overflow)
                           (let [sum-cols1 (into-array expr/double-array-class
                                                       (mapv (fn [a]
                                                               (case (:op a)
