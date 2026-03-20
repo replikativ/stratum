@@ -1138,7 +1138,7 @@
       (println (format "  DuckDB  (1T): %s" (fmt-ms (:median rd-1t))))
       (println (format "  DuckDB  (NT): %s" (fmt-ms (:median rd))))
       (validate-query "INT-Q1" conn
-                      "SELECT id4, SUM(v1) AS sum, SUM(v2) AS sum_2, COUNT(*) AS count FROM h2o GROUP BY id4"
+                      "SELECT id4, SUM(v1) AS sum_v1, SUM(v2) AS sum_v2, COUNT(*) AS count FROM h2o GROUP BY id4"
                       v [:id4])
       {:stratum-1t (:median r-1t) :stratum (:median r)
        :duckdb-1t (:median rd-1t) :duckdb (:median rd)})))
@@ -1162,7 +1162,7 @@
       (println (format "  DuckDB  (1T): %s" (fmt-ms (:median rd-1t))))
       (println (format "  DuckDB  (NT): %s" (fmt-ms (:median rd))))
       (validate-query "INT-Q2" conn
-                      "SELECT id4, SUM(v1) AS sum, MIN(v1) AS min, MAX(v2) AS max, COUNT(*) AS count FROM h2o GROUP BY id4"
+                      "SELECT id4, SUM(v1) AS sum_v1, MIN(v1) AS min, MAX(v2) AS max, COUNT(*) AS count FROM h2o GROUP BY id4"
                       v [:id4])
       {:stratum-1t (:median r-1t) :stratum (:median r)
        :duckdb-1t (:median rd-1t) :duckdb (:median rd)})))
@@ -1178,7 +1178,7 @@
         r-1t (bench-1t #(q/q q))
         v (q/q q)]
     (println (format "  Stratum (1T): %s  (sum_v1=%.0f, sum_v2=%.0f)" (fmt-ms (:median r-1t))
-                     (double (:sum (first v))) (double (:sum_v2 (first v)))))
+                     (double (:sum_v1 (first v))) (double (:sum_v2 (first v)))))
     (println (format "  Stratum (NT): %s" (fmt-ms (:median r))))
     (let [sql "SELECT SUM(v1), SUM(v2), COUNT(*) FROM h2o"
           rd-1t (duckdb-bench conn sql :threads 1)
@@ -1188,7 +1188,7 @@
       ;; Validate
       (let [duck-r (duckdb-query-results conn "SELECT SUM(v1) AS s1, SUM(v2) AS s2, COUNT(*) AS cnt FROM h2o")
             [ds1 ds2 dcnt] (first (:rows duck-r))
-            sv1 (:sum (first v))
+            sv1 (:sum_v1 (first v))
             sv2 (:sum_v2 (first v))
             scnt (:count (first v))]
         (if (and (== (long sv1) (long ds1)) (== (long sv2) (long ds2)) (== scnt dcnt))
