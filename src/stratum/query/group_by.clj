@@ -8,7 +8,7 @@
             [stratum.chunk :as chunk]
             [stratum.stats :as stats]
             [org.replikativ.persistent-sorted-set :as pss])
-  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsChunked ColumnOpsAnalytics ColumnOpsVar]
+  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsChunked ColumnOpsAnalytics ColumnOpsVar]
            [stratum.index ChunkEntry]))
 
 (set! *warn-on-reflection* true)
@@ -2584,8 +2584,28 @@
                                   (decode-dense-group-results-2d result-array group-cols group-muls aggs group-dicts))
                                 (apply-group-offsets group-cols group-offsets null-sentinels columnar?))]
                 decoded)
-            ;; General path: flat double[] layout
-              (if true ;; Long[] group-by path disabled pending SIMD pred inlining
+            ;; Try long[] path: all agg sources are long[], no AVG/SUM_PRODUCT/CD
+              (if (and (not compound?)
+                       (all-aggs-long-eligible? aggs col-arrays length))
+                ;; Long path: long[] accumulators, type-preserving results
+                (let [long-agg-cols (into-array expr/long-array-class
+                                               (mapv (fn [a]
+                                                       (or (prepare-agg-source-col-native a col-arrays length conv-cache)
+                                                           (long-array 0)))
+                                                     aggs))
+                      ^longs result-flat
+                      (ColumnOpsLong/fusedFilterGroupAggregateDenseLongParallel
+                       (int n-long) long-pred-types ^"[[J" long-cols long-lo long-hi
+                       (int n-dbl) dbl-pred-types ^"[[D" dbl-cols dbl-lo dbl-hi
+                       (int n-group) group-arrays group-muls
+                       (int n-aggs) agg-types ^"[[J" long-agg-cols
+                       (int length) max-key-inc)
+                      decoded (-> (if columnar?
+                                    (decode-dense-group-results-long-columnar result-flat max-key-inc group-cols group-muls aggs group-dicts)
+                                    (decode-dense-group-results-long result-flat max-key-inc group-cols group-muls aggs group-dicts))
+                                  (apply-group-offsets group-cols group-offsets null-sentinels columnar?))]
+                  decoded)
+                ;; General path: flat double[] layout
                 (let [^doubles result-flat
                       (ColumnOps/fusedFilterGroupAggregateDenseParallel
                        (int n-long) long-pred-types ^"[[J" long-cols long-lo long-hi

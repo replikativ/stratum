@@ -513,6 +513,9 @@ public final class ColumnOpsLong {
      * Dense group-by with long[] accumulators. Requires ALL agg columns to be long[].
      * Supports SUM, COUNT, MIN, MAX (no AVG — needs division).
      * Returns flat long[maxKey * accSize] where accSize = 2 * numAggs (value + count).
+     *
+     * <p>Uses branchless accumulation pattern (val * m where m=0|1) matching
+     * the battle-tested ColumnOps.fusedFilterGroupAggregateDenseRange.
      */
     private static long[] fusedFilterGroupAggregateDenseLongRange(
             int numLongPreds, int[] longPredTypes,
@@ -523,10 +526,10 @@ public final class ColumnOpsLong {
             int numAggs, int[] aggTypes, long[][] aggCols,
             int start, int end, int maxKey) {
 
-        int accSize = numAggs * 2; // value + count per agg
+        int accSize = numAggs * 2;
         long[] accs = new long[maxKey * accSize];
 
-        // Initialize MIN to MAX_VALUE, MAX to MIN_VALUE+1 (not MIN_VALUE which is NULL)
+        // Initialize MIN to MAX_VALUE, MAX to MIN_VALUE+1
         for (int a = 0; a < numAggs; a++) {
             if (aggTypes[a] == AGG_MIN) {
                 for (int k = 0; k < maxKey; k++) accs[k * accSize + a * 2] = Long.MAX_VALUE;
@@ -535,40 +538,64 @@ public final class ColumnOpsLong {
             }
         }
 
+        // Extract group columns as final locals (same pattern as ColumnOps)
+        final long[] gc0 = numGroupCols > 0 ? groupCols[0] : null;
+        final long[] gc1 = numGroupCols > 1 ? groupCols[1] : null;
+        final long[] gc2 = numGroupCols > 2 ? groupCols[2] : null;
+        final long[] gc3 = numGroupCols > 3 ? groupCols[3] : null;
+        final long[] gc4 = numGroupCols > 4 ? groupCols[4] : null;
+        final long[] gc5 = numGroupCols > 5 ? groupCols[5] : null;
+        final long gm0 = numGroupCols > 0 ? groupMuls[0] : 0;
+        final long gm1 = numGroupCols > 1 ? groupMuls[1] : 0;
+        final long gm2 = numGroupCols > 2 ? groupMuls[2] : 0;
+        final long gm3 = numGroupCols > 3 ? groupMuls[3] : 0;
+        final long gm4 = numGroupCols > 4 ? groupMuls[4] : 0;
+        final long gm5 = numGroupCols > 5 ? groupMuls[5] : 0;
+
         for (int i = start; i < end; i++) {
-            if (!ColumnOps.evaluatePredicates(numLongPreds, longPredTypes, longCols, longLo, longHi,
-                                              numDblPreds, dblPredTypes, dblCols, dblLo, dblHi, i)) continue;
+            // Branchless predicate: m = 0 or 1
+            int m = ColumnOps.evaluatePredicates(numLongPreds, longPredTypes, longCols, longLo, longHi,
+                                                  numDblPreds, dblPredTypes, dblCols, dblLo, dblHi, i) ? 1 : 0;
 
-            // Compute group key
-            long key = 0;
-            for (int g = 0; g < numGroupCols; g++) {
-                key += groupCols[g][i] * groupMuls[g];
+            // Compute key unconditionally (same pattern as ColumnOps dense path)
+            int key = (int)(gc0[i] * gm0);
+            if (numGroupCols > 1) key += (int)(gc1[i] * gm1);
+            if (numGroupCols > 2) key += (int)(gc2[i] * gm2);
+            if (numGroupCols > 3) key += (int)(gc3[i] * gm3);
+            if (numGroupCols > 4) key += (int)(gc4[i] * gm4);
+            if (numGroupCols > 5) key += (int)(gc5[i] * gm5);
+            for (int g = 6; g < numGroupCols; g++) {
+                key += (int)(groupCols[g][i] * groupMuls[g]);
             }
-            if (key < 0 || key >= maxKey) continue;
-            int base = (int) key * accSize;
 
-            // Accumulate
+            int base = key * accSize;
             for (int a = 0; a < numAggs; a++) {
                 int off = base + a * 2;
-                if (aggTypes[a] == AGG_COUNT) {
-                    accs[off + 1]++;
-                    continue;
-                }
-                long val = aggCols[a][i];
-                if (val == NULL) continue;
                 switch (aggTypes[a]) {
-                    case AGG_SUM:
-                        accs[off] += val;
-                        accs[off + 1]++;
+                    case AGG_SUM: {
+                        long val = aggCols[a][i];
+                        long nn = (val != NULL) ? 1 : 0;
+                        accs[off] += val * m * nn;
+                        accs[off + 1] += m * nn;
                         break;
-                    case AGG_MIN:
-                        if (val < accs[off]) accs[off] = val;
-                        accs[off + 1]++;
+                    }
+                    case AGG_COUNT:
+                        accs[off + 1] += m;
                         break;
-                    case AGG_MAX:
-                        if (val > accs[off]) accs[off] = val;
-                        accs[off + 1]++;
+                    case AGG_MIN: {
+                        long val = aggCols[a][i];
+                        if (m != 0 && val != NULL && val < accs[off]) accs[off] = val;
+                        long nn = (val != NULL) ? 1 : 0;
+                        accs[off + 1] += m * nn;
                         break;
+                    }
+                    case AGG_MAX: {
+                        long val = aggCols[a][i];
+                        if (m != 0 && val != NULL && val > accs[off]) accs[off] = val;
+                        long nn = (val != NULL) ? 1 : 0;
+                        accs[off + 1] += m * nn;
+                        break;
+                    }
                 }
             }
         }
