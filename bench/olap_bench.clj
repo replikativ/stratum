@@ -1162,7 +1162,7 @@
       (println (format "  DuckDB  (1T): %s" (fmt-ms (:median rd-1t))))
       (println (format "  DuckDB  (NT): %s" (fmt-ms (:median rd))))
       (validate-query "INT-Q2" conn
-                      "SELECT id4, SUM(v1) AS sum_v1, MIN(v1) AS min, MAX(v2) AS max, COUNT(*) AS count FROM h2o GROUP BY id4"
+                      "SELECT id4, SUM(v1) AS sum, MIN(v1) AS min, MAX(v2) AS max, COUNT(*) AS count FROM h2o GROUP BY id4"
                       v [:id4])
       {:stratum-1t (:median r-1t) :stratum (:median r)
        :duckdb-1t (:median rd-1t) :duckdb (:median rd)})))
