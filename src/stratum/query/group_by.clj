@@ -798,26 +798,26 @@
    Returns nil if the agg op is not compatible with long[] accumulation."
   [agg col-arrays ^long length ^java.util.HashMap cache]
   (case (:op agg)
-    (:sum :min :max)
+    (:sum :min :max :avg)
     (if-let [e (:expr agg)]
-      ;; Expression: use polymorphic eval, return long[] only if it produces one
       (let [result (expr/eval-expr-polymorphic e col-arrays length cache)]
         (when (expr/long-array? result) result))
-      ;; Direct column ref: return long[] if native, nil otherwise
       (let [data (get col-arrays (:col agg))]
         (when (expr/long-array? data) data)))
-    :count nil ;; COUNT doesn't need data
-    nil)) ;; AVG, SUM_PRODUCT, etc. not supported in long path
+    :count nil
+    nil))
 
 (defn all-aggs-long-eligible?
   "Check if all aggs can use the long[] dense group-by path.
-   Requires: no AVG, no SUM_PRODUCT, no COUNT-DISTINCT, no COUNT-NON-NULL,
-   and all SUM/MIN/MAX source columns must be long[]."
+   Requires: no SUM_PRODUCT, no COUNT-DISTINCT, no COUNT-NON-NULL,
+   and all SUM/MIN/MAX/AVG source columns must be long[].
+   AVG is eligible because it's SUM/COUNT in the accumulator —
+   division to double happens at decode time."
   [aggs col-arrays ^long length]
   (every? (fn [a]
             (case (:op a)
               :count true
-              (:sum :min :max)
+              (:sum :min :max :avg)
               (if-let [e (:expr a)]
                 (let [result (expr/eval-expr-polymorphic e col-arrays length nil)]
                   (expr/long-array? result))
@@ -1163,21 +1163,32 @@
 
 (defn decode-agg-columns-long
   "Extract per-agg result columns from flat long[] accumulator array.
-   Returns a vector of arrays: long[] for SUM/MIN/MAX/COUNT."
+   Returns a vector of arrays: long[] for SUM/MIN/MAX/COUNT, double[] for AVG."
   [^longs flat-accs ^long n ^long stride aggs]
   (let [n-aggs (count aggs)]
     (mapv (fn [idx]
-            (let [op (:op (nth aggs idx))
-                  result (long-array n)]
-              (dotimes [i n]
-                (let [base (+ (* i stride) (* idx 2))
-                      cnt (aget flat-accs (inc base))]
-                  (aset result i
-                        (case op
-                          :count cnt
-                          (:sum :min :max) (if (zero? cnt) Long/MIN_VALUE (aget flat-accs base))
-                          (aget flat-accs base)))))
-              result))
+            (let [op (:op (nth aggs idx))]
+              (if (= :avg op)
+                ;; AVG: divide long SUM by count → double[]
+                (let [result (double-array n)]
+                  (dotimes [i n]
+                    (let [base (+ (* i stride) (* idx 2))
+                          cnt (aget flat-accs (inc base))]
+                      (aset result i
+                            (if (zero? cnt) Double/NaN
+                                (/ (double (aget flat-accs base)) (double cnt))))))
+                  result)
+                ;; SUM/MIN/MAX/COUNT: long[]
+                (let [result (long-array n)]
+                  (dotimes [i n]
+                    (let [base (+ (* i stride) (* idx 2))
+                          cnt (aget flat-accs (inc base))]
+                      (aset result i
+                            (case op
+                              :count cnt
+                              (:sum :min :max) (if (zero? cnt) Long/MIN_VALUE (aget flat-accs base))
+                              (aget flat-accs base)))))
+                  result))))
           (range n-aggs))))
 
 (defn decode-group-results-long
@@ -1213,6 +1224,8 @@
                           val (case op
                                 :count cnt
                                 (:sum :min :max) (if (zero? cnt) nil (aget flat-accs ab))
+                                :avg (if (zero? cnt) nil
+                                         (/ (double (aget flat-accs ab)) (double cnt)))
                                 (aget flat-accs ab))]
                       (recur (inc j) (assoc! m (nth agg-aliases j) val)))
                     (persistent! m)))]
