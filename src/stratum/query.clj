@@ -235,60 +235,60 @@
         ;; Returns nil on overflow → falls back to double path
         ;; Call Java single-pass — try long path first, fall back to double on overflow
         ^doubles result (or
-                          (when all-long?
+                         (when all-long?
                             ;; All-long path: LongVector accumulators, no conversion
-                            (let [overflow? (volatile! false)
-                                  sum-long-cols
-                                  (into-array expr/long-array-class
-                                              (mapv (fn [a]
-                                                      (case (:op a)
-                                                        (:sum :avg) (:data (get columns (:col a)))
-                                                        :sum-product
-                                                        (let [c1 (:data (get columns (first (:cols a))))
-                                                              c2 (:data (get columns (second (:cols a))))
-                                                              r (ColumnOpsLong/arrayMulLongChecked ^longs c1 ^longs c2 (int length))]
-                                                          (when-not r (vreset! overflow? true))
-                                                          (or r (long-array 0)))))
-                                                    sum-aggs))]
-                              (when-not @overflow?
-                                (if (zero? n-dbl)
-                                  (ColumnOpsExt/fusedSimdMultiSumAllLongParallel
-                                   (int n-long) long-pred-types
-                                   ^"[[J" long-cols ^longs long-lo ^longs long-hi
-                                   (int n-sum) ^"[[J" sum-long-cols
-                                   (int length))
-                                  (ColumnOpsLong/fusedSimdMultiSumAllLongMixedPredsParallel
-                                   (int n-long) long-pred-types
-                                   ^"[[J" long-cols ^longs long-lo ^longs long-hi
-                                   (int n-dbl) dbl-pred-types
-                                   ^"[[D" dbl-cols ^doubles dbl-lo ^doubles dbl-hi
-                                   (int n-sum) ^"[[J" sum-long-cols
-                                   (int length))))))
+                           (let [overflow? (volatile! false)
+                                 sum-long-cols
+                                 (into-array expr/long-array-class
+                                             (mapv (fn [a]
+                                                     (case (:op a)
+                                                       (:sum :avg) (:data (get columns (:col a)))
+                                                       :sum-product
+                                                       (let [c1 (:data (get columns (first (:cols a))))
+                                                             c2 (:data (get columns (second (:cols a))))
+                                                             r (ColumnOpsLong/arrayMulLongChecked ^longs c1 ^longs c2 (int length))]
+                                                         (when-not r (vreset! overflow? true))
+                                                         (or r (long-array 0)))))
+                                                   sum-aggs))]
+                             (when-not @overflow?
+                               (if (zero? n-dbl)
+                                 (ColumnOpsExt/fusedSimdMultiSumAllLongParallel
+                                  (int n-long) long-pred-types
+                                  ^"[[J" long-cols ^longs long-lo ^longs long-hi
+                                  (int n-sum) ^"[[J" sum-long-cols
+                                  (int length))
+                                 (ColumnOpsLong/fusedSimdMultiSumAllLongMixedPredsParallel
+                                  (int n-long) long-pred-types
+                                  ^"[[J" long-cols ^longs long-lo ^longs long-hi
+                                  (int n-dbl) dbl-pred-types
+                                  ^"[[D" dbl-cols ^doubles dbl-lo ^doubles dbl-hi
+                                  (int n-sum) ^"[[J" sum-long-cols
+                                  (int length))))))
                           ;; Double path: ensure-doubles conversion (also fallback on overflow)
-                          (let [sum-cols1 (into-array expr/double-array-class
-                                                      (mapv (fn [a]
-                                                              (case (:op a)
-                                                                (:sum :avg) (ensure-doubles (get columns (:col a)) length)
-                                                                :sum-product (ensure-doubles (get columns (first (:cols a))) length)))
-                                                            sum-aggs))
-                                sum-cols2 (into-array expr/double-array-class
-                                                      (mapv (fn [a]
-                                                              (case (:op a)
-                                                                :sum-product (ensure-doubles (get columns (second (:cols a))) length)
-                                                                nil))
-                                                            sum-aggs))]
-                            (let [nan-safe (boolean
-                                            (or (some #(ColumnOps/arrayHasNaN ^doubles % (alength ^doubles %))
-                                                      sum-cols1)
-                                                (some #(when % (ColumnOps/arrayHasNaN ^doubles % (alength ^doubles %)))
-                                                      sum-cols2)))]
-                              (ColumnOpsExt/fusedSimdMultiSumParallel
-                               (int n-long) long-pred-types
-                               ^"[[J" long-cols ^longs long-lo ^longs long-hi
-                               (int n-dbl) dbl-pred-types
-                               ^"[[D" dbl-cols ^doubles dbl-lo ^doubles dbl-hi
-                               (int n-sum) ^"[[D" sum-cols1 ^"[[D" sum-cols2
-                               (int length) nan-safe))))
+                         (let [sum-cols1 (into-array expr/double-array-class
+                                                     (mapv (fn [a]
+                                                             (case (:op a)
+                                                               (:sum :avg) (ensure-doubles (get columns (:col a)) length)
+                                                               :sum-product (ensure-doubles (get columns (first (:cols a))) length)))
+                                                           sum-aggs))
+                               sum-cols2 (into-array expr/double-array-class
+                                                     (mapv (fn [a]
+                                                             (case (:op a)
+                                                               :sum-product (ensure-doubles (get columns (second (:cols a))) length)
+                                                               nil))
+                                                           sum-aggs))]
+                           (let [nan-safe (boolean
+                                           (or (some #(ColumnOps/arrayHasNaN ^doubles % (alength ^doubles %))
+                                                     sum-cols1)
+                                               (some #(when % (ColumnOps/arrayHasNaN ^doubles % (alength ^doubles %)))
+                                                     sum-cols2)))]
+                             (ColumnOpsExt/fusedSimdMultiSumParallel
+                              (int n-long) long-pred-types
+                              ^"[[J" long-cols ^longs long-lo ^longs long-hi
+                              (int n-dbl) dbl-pred-types
+                              ^"[[D" dbl-cols ^doubles dbl-lo ^doubles dbl-hi
+                              (int n-sum) ^"[[D" sum-cols1 ^"[[D" sum-cols2
+                              (int length) nan-safe))))
         cnt (long (aget result n-sum))
         ;; Map sum-agg index for each agg
         sum-idx (volatile! 0)]
