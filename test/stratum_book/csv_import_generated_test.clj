@@ -123,7 +123,7 @@
 (deftest
   t40_l161
   (is
-   ((fn [m] (and (= 7.0 (get m "Widget")) (= 3.0 (get m "Gadget"))))
+   ((fn [m] (and (== 7 (get m "Widget")) (== 3 (get m "Gadget"))))
     v39_l159)))
 
 (def

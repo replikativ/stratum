@@ -976,7 +976,7 @@
                                                              (first np))
                                                            (catch Exception _ nil)))
                                                        (or where []))))]
-                            (when (jn/bitmap-semi-join-eligible? (first join) used-cols)
+                            (when (jn/bitmap-semi-join-eligible? (first join) used-cols (some? select))
                               (let [fact-length (get-column-length (val (first columns)))
                                     result (jn/execute-bitmap-semi-join columns fact-length (first join))]
                                 result))))

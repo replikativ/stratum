@@ -39,9 +39,11 @@
 
 ;; ChunkEntry is a defrecord from stratum.index with fields:
 ;;   chunk-id, chunk, stats
-;; We reference it via its generated class.
+;; Use delay+resolve to get the actual class from Clojure's classloader
+;; (Class/forName uses the system classloader which may differ).
 (def ^:private chunk-entry-class
-  (delay (Class/forName "stratum.index.ChunkEntry")))
+  (delay (let [ctor (resolve 'stratum.index/->ChunkEntry)]
+           (class (ctor nil nil nil)))))
 
 (defn- chunk-entry?
   "Check if x is a ChunkEntry record."
@@ -63,9 +65,9 @@
   "Create ChunkEntryMeasureOps instance for PSS Settings.
    Lazy to avoid circular dependency with stratum.index."
   ^IMeasure []
-  (let [cls (Class/forName "stratum.index.ChunkEntryMeasureOps")]
-    (.newInstance (.getConstructor cls (make-array Class 0))
-                  (object-array 0))))
+  (let [ctor (resolve 'stratum.index/->ChunkEntryMeasureOps)]
+    (ctor)))
+
 
 ;; ============================================================================
 ;; Address Generation

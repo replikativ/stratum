@@ -630,16 +630,20 @@
    - INNER join (semi-join is existence-only)
    - Single-column integer join key
    - No columns from dim (:with) side referenced in query output
+   - No SELECT (projection queries may reference dim cols with qualified names)
    - FK key space fits in BitSet (max value < 10M)
-   The `used-cols` set contains all column keywords used in :agg, :group, :select, :where."
-  [join-spec used-cols]
+   The `used-cols` set contains all column keywords used in :agg, :group, :where."
+  [join-spec used-cols has-select?]
   (let [{:keys [with on type]} join-spec
         join-type (or type :inner)]
     (and (= :inner join-type)
+         ;; No SELECT — projection queries often reference dim columns via
+         ;; qualified names that may not match our used-cols keyword extraction
+         (not has-select?)
          ;; Single-column ON clause: [:= :fact-col :dim-col]
          (vector? on) (= := (first on)) (= 3 (count on))
          (let [dim-col-names (set (keys with))]
-           ;; No dim columns used in query output (except join key)
+           ;; No dim columns used in agg/group/where (except join key)
            (empty? (disj (clojure.set/intersection dim-col-names used-cols)
                          (nth on 2)))))))
 
