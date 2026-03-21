@@ -78,8 +78,8 @@
                        :agg [[:sum :qty]]})]
       (is (= 2 (count result)))
       (let [by-prod (into {} (map (fn [r] [(:product r) (:sum r)])) result)]
-        (is (= 7.0 (get by-prod "Widget")))
-        (is (= 3.0 (get by-prod "Gadget")))))))
+        (is (== 7 (get by-prod "Widget")))
+        (is (== 3 (get by-prod "Gadget")))))))
 
 ;; ============================================================================
 ;; from-maps Tests
