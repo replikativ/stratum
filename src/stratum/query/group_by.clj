@@ -2407,16 +2407,22 @@
   "Execute grouped aggregation via Java fusedFilterGroupAggregate.
    Single-pass in Java: filter predicates + group key + accumulate, no Clojure per-row overhead."
   [preds aggs group-cols columns length columnar?]
-  (let [;; Decompose compound aggs (variance/stddev/corr) if present
+  (let [;; Check for native compound path BEFORE decomposition — avoids
+        ;; wasteful pre-computation of xy/xx/yy arrays (120ms for CORR on 10M rows)
         col-arrays-raw (into {} (map (fn [[k v]] [k (:data v)])) columns)
         compound? (has-compound-aggs? aggs)
         orig-aggs aggs
+        ;; Defer compound decomposition until we know use-dense? (from group key stats).
+        ;; Native compound path (ColumnOpsVar) handles VARIANCE/CORR natively in Java
+        ;; and doesn't need the 120ms decomposition (xy/xx/yy pre-computation).
+        has-cd? (some #(= :count-distinct (:op %)) aggs)
+        native-compound-candidate? (and compound? (has-native-compound-aggs? aggs) (not has-cd?))
+        ;; Eagerly decompose only when native path is impossible
         {:keys [aggs mapping]}
-        (if compound?
+        (if (and compound? (not native-compound-candidate?))
           (decompose-compound-aggs aggs col-arrays-raw length)
           {:aggs aggs :mapping nil})
-        ;; Add any temp columns from decomposition
-        columns (if compound?
+        columns (if (and compound? (not native-compound-candidate?))
                   (reduce-kv
                    (fn [cols _idx m]
                      (case (:type m)
@@ -2599,10 +2605,10 @@
               (if long-gb-eligible?
                 ;; Long path: long[] accumulators, type-preserving results
                 (let [long-agg-cols (into-array expr/long-array-class
-                                               (mapv (fn [a]
-                                                       (or (prepare-agg-source-col-native a col-arrays length conv-cache)
-                                                           (long-array 0)))
-                                                     aggs))
+                                                (mapv (fn [a]
+                                                        (or (prepare-agg-source-col-native a col-arrays length conv-cache)
+                                                            (long-array 0)))
+                                                      aggs))
                       ^longs result-flat
                       (ColumnOpsLong/fusedFilterGroupAggregateDenseLongParallel
                        (int n-long) long-pred-types ^"[[J" long-cols long-lo long-hi
@@ -2635,7 +2641,34 @@
       ;; Multi-key hash fallback: when composite key space overflows long,
       ;; hash all group columns into a single key, pass to existing partitioned path,
       ;; and decode using reverse lookup table.
-      (let [;; Compute multi-key hash if overflow, else use original group-arrays/muls
+      ;; Late decomposition: if we deferred compound decomposition for native path
+      ;; but ended up here (use-dense? was false), decompose now.
+      (let [;; Late decompose if needed
+            [aggs mapping columns col-arrays agg-prep]
+            (if (and native-compound-candidate? (nil? mapping))
+              (let [{da :aggs dm :mapping} (decompose-compound-aggs orig-aggs col-arrays-raw length)
+                    cols2 (reduce-kv
+                           (fn [cols _idx m]
+                             (case (:type m)
+                               (:variance :variance-pop :stddev :stddev-pop)
+                               (assoc cols (:sq-col m) {:type :float64 :data (:sq-data m)})
+                               :corr
+                               (-> cols
+                                   (assoc (:xy-col m) {:type :float64 :data (:xy-data m)})
+                                   (assoc (:xx-col m) {:type :float64 :data (:xx-data m)})
+                                   (assoc (:yy-col m) {:type :float64 :data (:yy-data m)}))
+                               cols))
+                           columns dm)
+                    ca2 (into {} (map (fn [[k v]] [k (:data v)])) cols2)
+                    ap2 (prepare-agg-type-arrays da ca2 cols2 length)]
+                [da dm cols2 ca2 ap2])
+              [aggs mapping columns col-arrays agg-prep])
+            {:keys [has-cd? numeric-agg-indices numeric-aggs n-numeric
+                    agg-types numeric-agg-types conv-cache agg-cols agg-col2s
+                    numeric-agg-cols numeric-agg-col2s]} (or agg-prep {})
+            n-aggs (or n-aggs (count aggs))
+            agg-types (or agg-types (int-array (mapv #(agg-op->java-type (:op %)) aggs)))
+            ;; Compute multi-key hash if overflow, else use original group-arrays/muls
             [eff-group-arrays eff-group-muls eff-n-group multi-key-lookup]
             (if key-overflow?
               (let [^objects mk-result
