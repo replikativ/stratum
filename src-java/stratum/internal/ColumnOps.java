@@ -1621,7 +1621,7 @@ public final class ColumnOps {
     /** LIKE predicate on dict-encoded column. Returns 1/0 mask.
      *  Delegates to ColumnOpsExt for fast-path detection + parallel matching. */
     public static long[] arrayStringLike(long[] codes, String[] dict, String pattern, int length) {
-        return ColumnOpsExt.arrayStringLikeFast(codes, dict, pattern, length);
+        return ColumnOpsString.arrayStringLikeFast(codes, dict, pattern, length);
     }
 
     /** Convert SQL LIKE pattern to Java regex. */
@@ -1645,7 +1645,7 @@ public final class ColumnOps {
     /** LIKE predicate on raw String[] column. Returns 1/0 mask.
      *  Delegates to ColumnOpsExt for fast-path detection. */
     public static long[] arrayRawStringLike(String[] strings, String pattern, int length) {
-        return ColumnOpsExt.arrayRawStringLikeFast(strings, pattern, length);
+        return ColumnOpsString.arrayRawStringLikeFast(strings, pattern, length);
     }
 
     /** String lengths from raw String[] column. */

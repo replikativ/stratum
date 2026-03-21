@@ -620,6 +620,69 @@
                 merged right-columns)]
     {:columns merged :length result-length}))
 
+;; ============================================================================
+;; Bitmap Semi-Join
+;; ============================================================================
+
+(defn bitmap-semi-join-eligible?
+  "Check if a join can use bitmap semi-join instead of hash join.
+   Requires:
+   - INNER join (semi-join is existence-only)
+   - Single-column integer join key
+   - No columns from dim (:with) side referenced in query output
+   - No SELECT (projection queries may reference dim cols with qualified names)
+   - FK key space fits in BitSet (max value < 10M)
+   The `used-cols` set contains all column keywords used in :agg, :group, :where."
+  [join-spec used-cols has-select?]
+  (let [{:keys [with on type]} join-spec
+        join-type (or type :inner)]
+    (and (= :inner join-type)
+         ;; No SELECT — projection queries often reference dim columns via
+         ;; qualified names that may not match our used-cols keyword extraction
+         (not has-select?)
+         ;; Single-column ON clause: [:= :fact-col :dim-col]
+         (vector? on) (= := (first on)) (= 3 (count on))
+         (let [dim-col-names (set (keys with))]
+           ;; No dim columns used in agg/group/where (except join key)
+           (empty? (disj (clojure.set/intersection dim-col-names used-cols)
+                         (nth on 2)))))))
+
+(defn execute-bitmap-semi-join
+  "Execute a bitmap semi-join: build BitSet from filtered dim, probe fact rows.
+   Returns {:columns updated-columns :mask-key keyword} where mask-key is the
+   injected predicate column name. Length stays the same (no row materialization)."
+  [fact-columns ^long fact-length join-spec]
+  (let [{:keys [with on type]} join-spec
+        fact-key-col (nth on 1)   ;; left (fact) join column
+        dim-key-col (nth on 2)    ;; right (dim) join column
+        ;; Prepare dim columns
+        dim-columns (cols/prepare-columns with)
+        dim-columns (cols/materialize-columns dim-columns)
+        dim-length (column-length (val (first dim-columns)))
+        ;; Get dim key data
+        dim-key-info (get dim-columns dim-key-col)
+        ^longs dim-keys (:data dim-key-info)
+        ;; Find max key value for BitSet sizing
+        max-key (long (ColumnOps/arrayMaxLong dim-keys (int dim-length)))
+        ;; Build BitSet from all dim rows (dim-side filtering already applied by caller)
+        ^java.util.BitSet bs (java.util.BitSet. (int (inc max-key)))]
+    (dotimes [i dim-length]
+      (let [k (aget dim-keys i)]
+        (when (and (>= k 0) (<= k max-key))
+          (.set bs (int k)))))
+    ;; Probe fact rows → build long[] mask
+    (let [fact-key-info (get fact-columns fact-key-col)
+          ^longs fact-keys (:data fact-key-info)
+          ^longs mask (long-array fact-length)
+          mask-key :__semi_mask]
+      (dotimes [i fact-length]
+        (let [k (aget fact-keys i)]
+          (aset mask i (if (and (>= k 0) (<= k max-key) (.get bs (int k))) 1 0))))
+      ;; Return: original columns + injected mask column, same length
+      {:columns (assoc fact-columns mask-key {:type :int64 :data mask})
+       :mask-key mask-key
+       :length fact-length})))
+
 (defn execute-joins
   "Execute a chain of joins sequentially."
   [columns ^long length join-specs]

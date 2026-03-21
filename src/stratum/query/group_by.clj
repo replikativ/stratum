@@ -8,7 +8,7 @@
             [stratum.chunk :as chunk]
             [stratum.stats :as stats]
             [org.replikativ.persistent-sorted-set :as pss])
-  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsChunked ColumnOpsAnalytics ColumnOpsVar]
+  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsChunked ColumnOpsAnalytics ColumnOpsVar]
            [stratum.index ChunkEntry]))
 
 (set! *warn-on-reflection* true)
@@ -792,6 +792,39 @@
       (get col-arrays (:col agg)))  ;; raw: may be long[] or double[]
     nil))
 
+(defn prepare-agg-source-col-native
+  "Prepare a native long[] source column for a single aggregate.
+   Returns long[] if the source is natively long[] and no expression forces double[].
+   Returns nil if the agg op is not compatible with long[] accumulation."
+  [agg col-arrays ^long length ^java.util.HashMap cache]
+  (case (:op agg)
+    (:sum :min :max :avg)
+    (if-let [e (:expr agg)]
+      (let [result (expr/eval-expr-polymorphic e col-arrays length cache)]
+        (when (expr/long-array? result) result))
+      (let [data (get col-arrays (:col agg))]
+        (when (expr/long-array? data) data)))
+    :count nil
+    nil))
+
+(defn all-aggs-long-eligible?
+  "Check if all aggs can use the long[] dense group-by path.
+   Requires: no SUM_PRODUCT, no COUNT-DISTINCT, no COUNT-NON-NULL,
+   and all SUM/MIN/MAX/AVG source columns must be long[].
+   AVG is eligible because it's SUM/COUNT in the accumulator —
+   division to double happens at decode time."
+  [aggs col-arrays ^long length]
+  (every? (fn [a]
+            (case (:op a)
+              :count true
+              (:sum :min :max :avg)
+              (if-let [e (:expr a)]
+                (let [result (expr/eval-expr-polymorphic e col-arrays length nil)]
+                  (expr/long-array? result))
+                (expr/long-array? (get col-arrays (:col a))))
+              false))
+          aggs))
+
 (defn decode-key
   "Decode a composite group key back to individual column values."
   [^long key ^longs group-muls ^long n-group]
@@ -1106,6 +1139,131 @@
   (let [acc-size (int (* 2 (count aggs)))
         pair (compact-dense-flat-to-pair flat-array (long max-key) acc-size 1)]
     (decode-group-results-columnar pair group-cols group-muls aggs group-dicts)))
+
+;; ============================================================================
+;; Long[] Dense Group-By Decode
+;; ============================================================================
+
+(defn compact-dense-long-to-pair
+  "Compact a flat long[] accumulator array into [long[] keys, long[] accs] pair.
+   Filters out groups where accs[key*acc-size + count-offset] <= 0."
+  [^longs flat-array ^long max-key ^long acc-size ^long count-offset]
+  (let [key-list (java.util.ArrayList.)]
+    (dotimes [k max-key]
+      (when (> (aget flat-array (+ (* (long k) acc-size) count-offset)) 0)
+        (.add key-list (long k))))
+    (let [n (.size key-list)
+          keys (long-array n)
+          compact-accs (long-array (* n acc-size))]
+      (dotimes [i n]
+        (let [k (long (.get key-list i))]
+          (aset keys i k)
+          (System/arraycopy flat-array (int (* k acc-size)) compact-accs (* i acc-size) acc-size)))
+      (object-array [keys compact-accs]))))
+
+(defn decode-agg-columns-long
+  "Extract per-agg result columns from flat long[] accumulator array.
+   Returns a vector of arrays: long[] for SUM/MIN/MAX/COUNT, double[] for AVG."
+  [^longs flat-accs ^long n ^long stride aggs]
+  (let [n-aggs (count aggs)]
+    (mapv (fn [idx]
+            (let [op (:op (nth aggs idx))]
+              (if (= :avg op)
+                ;; AVG: divide long SUM by count → double[]
+                (let [result (double-array n)]
+                  (dotimes [i n]
+                    (let [base (+ (* i stride) (* idx 2))
+                          cnt (aget flat-accs (inc base))]
+                      (aset result i
+                            (if (zero? cnt) Double/NaN
+                                (/ (double (aget flat-accs base)) (double cnt))))))
+                  result)
+                ;; SUM/MIN/MAX/COUNT: long[]
+                (let [result (long-array n)]
+                  (dotimes [i n]
+                    (let [base (+ (* i stride) (* idx 2))
+                          cnt (aget flat-accs (inc base))]
+                      (aset result i
+                            (case op
+                              :count cnt
+                              (:sum :min :max) (if (zero? cnt) Long/MIN_VALUE (aget flat-accs base))
+                              (aget flat-accs base)))))
+                  result))))
+          (range n-aggs))))
+
+(defn decode-group-results-long
+  "Decode Java [long[] keys, long[] flatAccs] into Clojure result maps.
+   Type-preserving: SUM/MIN/MAX return Long values, not Double."
+  [^objects result-pair group-cols ^longs group-muls aggs group-dicts]
+  (let [n-group (count group-cols)
+        ^longs keys (aget result-pair 0)
+        ^longs flat-accs (aget result-pair 1)
+        n (alength keys)
+        n-aggs (count aggs)
+        stride (int (* 2 n-aggs))
+        agg-aliases (mapv #(or (:as %) (:op %)) aggs)
+        agg-ops (mapv :op aggs)]
+    (loop [i 0 results (transient [])]
+      (if (< i n)
+        (let [key (aget keys i)
+              base-offset (* i stride)
+              group-vals (decode-key key group-muls n-group)
+              group-vals (if group-dicts
+                           (mapv (fn [v dict]
+                                   (if dict
+                                     (aget ^"[Ljava.lang.String;" dict (int (long v)))
+                                     v))
+                                 group-vals group-dicts)
+                           group-vals)
+              m (loop [j 0 m (transient (-> (into {} (map vector group-cols group-vals))
+                                            (assoc :_count (aget flat-accs (inc base-offset)))))]
+                  (if (< j n-aggs)
+                    (let [ab (+ base-offset (* j 2))
+                          cnt (aget flat-accs (inc ab))
+                          op (nth agg-ops j)
+                          val (case op
+                                :count cnt
+                                (:sum :min :max) (if (zero? cnt) nil (aget flat-accs ab))
+                                :avg (if (zero? cnt) nil
+                                         (/ (double (aget flat-accs ab)) (double cnt)))
+                                (aget flat-accs ab))]
+                      (recur (inc j) (assoc! m (nth agg-aliases j) val)))
+                    (persistent! m)))]
+          (recur (inc i) (conj! results m)))
+        (persistent! results)))))
+
+(defn decode-group-results-long-columnar
+  "Decode Java [long[] keys, long[] flatAccs] into columnar format.
+   Returns {:col1 array1 :col2 array2 ... :n-rows N}."
+  [^objects result-pair group-cols ^longs group-muls aggs group-dicts]
+  (let [^longs keys (aget result-pair 0)
+        ^longs flat-accs (aget result-pair 1)
+        n (alength keys)
+        n-group (count group-cols)
+        n-aggs (count aggs)
+        stride (int (* 2 n-aggs))
+        group-arrays (decode-group-key-columns keys group-muls n-group group-dicts)
+        agg-arrays (decode-agg-columns-long flat-accs n stride aggs)
+        agg-aliases (mapv #(or (:as %) (:op %)) aggs)]
+    (-> (into {} (map vector group-cols group-arrays))
+        (into (map vector agg-aliases agg-arrays))
+        (assoc :n-rows n))))
+
+(defn decode-dense-group-results-long
+  "Decode Java long[] (flat dense array) into Clojure result maps.
+   Compacts non-empty groups, type-preserving Long results."
+  [^longs flat-array max-key group-cols ^longs group-muls aggs group-dicts]
+  (let [acc-size (int (* 2 (count aggs)))
+        pair (compact-dense-long-to-pair flat-array (long max-key) acc-size 1)]
+    (decode-group-results-long pair group-cols group-muls aggs group-dicts)))
+
+(defn decode-dense-group-results-long-columnar
+  "Decode Java long[] (flat dense array) into columnar format.
+   Compacts non-empty groups, type-preserving Long arrays."
+  [^longs flat-array max-key group-cols ^longs group-muls aggs group-dicts]
+  (let [acc-size (int (* 2 (count aggs)))
+        pair (compact-dense-long-to-pair flat-array (long max-key) acc-size 1)]
+    (decode-group-results-long-columnar pair group-cols group-muls aggs group-dicts)))
 
 (defn decode-dense-group-results-2d
   "Decode Java double[][] (per-key accumulator arrays) into Clojure result maps.
@@ -2262,16 +2420,22 @@
   "Execute grouped aggregation via Java fusedFilterGroupAggregate.
    Single-pass in Java: filter predicates + group key + accumulate, no Clojure per-row overhead."
   [preds aggs group-cols columns length columnar?]
-  (let [;; Decompose compound aggs (variance/stddev/corr) if present
+  (let [;; Check for native compound path BEFORE decomposition — avoids
+        ;; wasteful pre-computation of xy/xx/yy arrays (120ms for CORR on 10M rows)
         col-arrays-raw (into {} (map (fn [[k v]] [k (:data v)])) columns)
         compound? (has-compound-aggs? aggs)
         orig-aggs aggs
+        ;; Defer compound decomposition until we know use-dense? (from group key stats).
+        ;; Native compound path (ColumnOpsVar) handles VARIANCE/CORR natively in Java
+        ;; and doesn't need the 120ms decomposition (xy/xx/yy pre-computation).
+        has-cd? (some #(= :count-distinct (:op %)) aggs)
+        native-compound-candidate? (and compound? (has-native-compound-aggs? aggs) (not has-cd?))
+        ;; Eagerly decompose only when native path is impossible
         {:keys [aggs mapping]}
-        (if compound?
+        (if (and compound? (not native-compound-candidate?))
           (decompose-compound-aggs aggs col-arrays-raw length)
           {:aggs aggs :mapping nil})
-        ;; Add any temp columns from decomposition
-        columns (if compound?
+        columns (if (and compound? (not native-compound-candidate?))
                   (reduce-kv
                    (fn [cols _idx m]
                      (case (:type m)
@@ -2287,25 +2451,36 @@
                   columns)
         col-arrays (into {} (map (fn [[k v]] [k (:data v)])) columns)
 
-        ;; Prepare predicates, group keys, and agg arrays
+        ;; Prepare predicates and group keys
         {:keys [n-long long-pred-types long-cols long-lo long-hi
                 n-dbl dbl-pred-types dbl-cols dbl-lo dbl-hi]} (prepare-pred-arrays preds columns)
         {:keys [group-arrays group-muls group-maxes group-dicts group-offsets
                 max-key use-dense? n-group key-overflow? null-sentinels]} (prepare-group-key-arrays group-cols columns length)
+        ;; Check long[] eligibility BEFORE preparing agg arrays (avoids wasteful longToDouble)
+        long-gb-eligible? (and use-dense?
+                               (not (has-compound-aggs? aggs))
+                               (not (some #(= :count-distinct (:op %)) aggs))
+                               (all-aggs-long-eligible? aggs col-arrays length))
+        ;; Defer agg type array preparation — only needed for double/compound paths
+        agg-prep (when-not long-gb-eligible?
+                   (prepare-agg-type-arrays aggs col-arrays columns length))
         {:keys [has-cd? numeric-agg-indices numeric-aggs n-numeric n-aggs
                 agg-types numeric-agg-types conv-cache agg-cols agg-col2s
-                numeric-agg-cols numeric-agg-col2s]} (prepare-agg-type-arrays aggs col-arrays columns length)
-        ;; Check if any agg source columns have NULLs — skip NaN masking when not needed
+                numeric-agg-cols numeric-agg-col2s]} agg-prep
+        n-aggs (or n-aggs (count aggs))
+        agg-types (or agg-types (int-array (mapv #(agg-op->java-type (:op %)) aggs)))
+        conv-cache (or conv-cache (java.util.HashMap.))
         nan-safe (boolean
-                  (columns-have-nulls?
-                   columns
-                   (distinct (mapcat (fn [a]
-                                       (case (:op a)
-                                         (:count :count-non-null) []
-                                         :count-distinct [(:col a)]
-                                         (:sum-product :corr) (:cols a)
-                                         [(:col a)]))
-                                     aggs))))]
+                  (when-not long-gb-eligible?
+                    (columns-have-nulls?
+                     columns
+                     (distinct (mapcat (fn [a]
+                                         (case (:op a)
+                                           (:count :count-non-null) []
+                                           :count-distinct [(:col a)]
+                                           (:sum-product :corr) (:cols a)
+                                           [(:col a)]))
+                                       aggs)))))]
 
     ;; Call Java - dispatch between dense and HashMap paths
     ;; Dense path uses parallel execution for large datasets
@@ -2439,27 +2614,74 @@
                                   (decode-dense-group-results-2d result-array group-cols group-muls aggs group-dicts))
                                 (apply-group-offsets group-cols group-offsets null-sentinels columnar?))]
                 decoded)
-            ;; General path: flat double[] layout
-              (let [^doubles result-flat
-                    (ColumnOps/fusedFilterGroupAggregateDenseParallel
-                     (int n-long) long-pred-types ^"[[J" long-cols long-lo long-hi
-                     (int n-dbl) dbl-pred-types ^"[[D" dbl-cols dbl-lo dbl-hi
-                     (int n-group) group-arrays group-muls
-                     (int n-aggs) agg-types ^"[[D" agg-cols ^"[[D" agg-col2s
-                     (int length) max-key-inc nan-safe)
-                    decoded (-> (if columnar?
-                                  (decode-dense-group-results-columnar result-flat max-key-inc group-cols group-muls aggs group-dicts)
-                                  (decode-dense-group-results result-flat max-key-inc group-cols group-muls aggs group-dicts))
-                                (apply-group-offsets group-cols group-offsets null-sentinels columnar?))]
-                (if compound?
-                  (if columnar?
-                    (recompose-columnar-results decoded orig-aggs mapping)
-                    (mapv #(recompose-row-results % orig-aggs mapping) decoded))
-                  decoded))))))
+            ;; Try long[] path: eligibility checked above (before agg type prep)
+              (if long-gb-eligible?
+                ;; Long path: long[] accumulators, type-preserving results
+                (let [long-agg-cols (into-array expr/long-array-class
+                                                (mapv (fn [a]
+                                                        (or (prepare-agg-source-col-native a col-arrays length conv-cache)
+                                                            (long-array 0)))
+                                                      aggs))
+                      ^longs result-flat
+                      (ColumnOpsLong/fusedFilterGroupAggregateDenseLongParallel
+                       (int n-long) long-pred-types ^"[[J" long-cols long-lo long-hi
+                       (int n-dbl) dbl-pred-types ^"[[D" dbl-cols dbl-lo dbl-hi
+                       (int n-group) group-arrays group-muls
+                       (int n-aggs) agg-types ^"[[J" long-agg-cols
+                       (int length) max-key-inc)
+                      decoded (-> (if columnar?
+                                    (decode-dense-group-results-long-columnar result-flat max-key-inc group-cols group-muls aggs group-dicts)
+                                    (decode-dense-group-results-long result-flat max-key-inc group-cols group-muls aggs group-dicts))
+                                  (apply-group-offsets group-cols group-offsets null-sentinels columnar?))]
+                  decoded)
+                ;; General path: flat double[] layout
+                (let [^doubles result-flat
+                      (ColumnOps/fusedFilterGroupAggregateDenseParallel
+                       (int n-long) long-pred-types ^"[[J" long-cols long-lo long-hi
+                       (int n-dbl) dbl-pred-types ^"[[D" dbl-cols dbl-lo dbl-hi
+                       (int n-group) group-arrays group-muls
+                       (int n-aggs) agg-types ^"[[D" agg-cols ^"[[D" agg-col2s
+                       (int length) max-key-inc nan-safe)
+                      decoded (-> (if columnar?
+                                    (decode-dense-group-results-columnar result-flat max-key-inc group-cols group-muls aggs group-dicts)
+                                    (decode-dense-group-results result-flat max-key-inc group-cols group-muls aggs group-dicts))
+                                  (apply-group-offsets group-cols group-offsets null-sentinels columnar?))]
+                  (if compound?
+                    (if columnar?
+                      (recompose-columnar-results decoded orig-aggs mapping)
+                      (mapv #(recompose-row-results % orig-aggs mapping) decoded))
+                    decoded)))))))
       ;; Multi-key hash fallback: when composite key space overflows long,
       ;; hash all group columns into a single key, pass to existing partitioned path,
       ;; and decode using reverse lookup table.
-      (let [;; Compute multi-key hash if overflow, else use original group-arrays/muls
+      ;; Late decomposition: if we deferred compound decomposition for native path
+      ;; but ended up here (use-dense? was false), decompose now.
+      (let [;; Late decompose if needed
+            [aggs mapping columns col-arrays agg-prep]
+            (if (and native-compound-candidate? (nil? mapping))
+              (let [{da :aggs dm :mapping} (decompose-compound-aggs orig-aggs col-arrays-raw length)
+                    cols2 (reduce-kv
+                           (fn [cols _idx m]
+                             (case (:type m)
+                               (:variance :variance-pop :stddev :stddev-pop)
+                               (assoc cols (:sq-col m) {:type :float64 :data (:sq-data m)})
+                               :corr
+                               (-> cols
+                                   (assoc (:xy-col m) {:type :float64 :data (:xy-data m)})
+                                   (assoc (:xx-col m) {:type :float64 :data (:xx-data m)})
+                                   (assoc (:yy-col m) {:type :float64 :data (:yy-data m)}))
+                               cols))
+                           columns dm)
+                    ca2 (into {} (map (fn [[k v]] [k (:data v)])) cols2)
+                    ap2 (prepare-agg-type-arrays da ca2 cols2 length)]
+                [da dm cols2 ca2 ap2])
+              [aggs mapping columns col-arrays agg-prep])
+            {:keys [has-cd? numeric-agg-indices numeric-aggs n-numeric
+                    agg-types numeric-agg-types conv-cache agg-cols agg-col2s
+                    numeric-agg-cols numeric-agg-col2s]} (or agg-prep {})
+            n-aggs (or n-aggs (count aggs))
+            agg-types (or agg-types (int-array (mapv #(agg-op->java-type (:op %)) aggs)))
+            ;; Compute multi-key hash if overflow, else use original group-arrays/muls
             [eff-group-arrays eff-group-muls eff-n-group multi-key-lookup]
             (if key-overflow?
               (let [^objects mk-result

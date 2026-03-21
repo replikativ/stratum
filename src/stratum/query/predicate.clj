@@ -6,7 +6,7 @@
      2. Compiled predicate mask — non-SIMD predicates compiled to JVM bytecode via eval
      3. String predicate materialization — LIKE/ILIKE/contains evaluated to long[] masks
      4. Strategy selection — simd-eligible? / multi-agg-simd-eligible?"
-  (:import [stratum.internal ColumnOps]))
+  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsString]))
 
 (set! *warn-on-reflection* true)
 
@@ -244,23 +244,25 @@
                        ;; Dict-encoded string column
                        (and (:dict col-info) (= :string (:dict-type col-info)))
                        (let [codes ^longs (:data col-info)
-                             dict ^"[Ljava.lang.String;" (:dict col-info)]
+                             dict ^"[Ljava.lang.String;" (:dict col-info)
+                             alpha-masks ^ints (:dict-alpha-masks col-info)
+                             bigram-masks ^longs (:dict-bigram-masks col-info)]
                          (case op
-                           :like (ColumnOps/arrayStringLike codes dict (str pattern) (int length))
-                           :not-like (let [m (ColumnOps/arrayStringLike codes dict (str pattern) (int length))
+                           :like (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern) (int length) alpha-masks bigram-masks)
+                           :not-like (let [m (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern) (int length) alpha-masks bigram-masks)
                                            r (long-array length)]
                                        (dotimes [j length] (aset r j (if (zero? (aget m j)) 1 0)))
                                        r)
                            :ilike (let [ldict (into-array String (map #(.toLowerCase ^String %) dict))]
-                                    (ColumnOps/arrayStringLike codes ldict (.toLowerCase (str pattern)) (int length)))
+                                    (ColumnOpsString/arrayStringLikeFastMasked codes ldict (.toLowerCase (str pattern)) (int length) alpha-masks bigram-masks))
                            :not-ilike (let [ldict (into-array String (map #(.toLowerCase ^String %) dict))
-                                            m (ColumnOps/arrayStringLike codes ldict (.toLowerCase (str pattern)) (int length))
+                                            m (ColumnOpsString/arrayStringLikeFastMasked codes ldict (.toLowerCase (str pattern)) (int length) alpha-masks bigram-masks)
                                             r (long-array length)]
                                         (dotimes [j length] (aset r j (if (zero? (aget m j)) 1 0)))
                                         r)
-                           :contains (ColumnOps/arrayStringLike codes dict (str "%" pattern "%") (int length))
-                           :starts-with (ColumnOps/arrayStringLike codes dict (str pattern "%") (int length))
-                           :ends-with (ColumnOps/arrayStringLike codes dict (str "%" pattern) (int length))))
+                           :contains (ColumnOpsString/arrayStringLikeFastMasked codes dict (str "%" pattern "%") (int length) alpha-masks bigram-masks)
+                           :starts-with (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern "%") (int length) alpha-masks bigram-masks)
+                           :ends-with (ColumnOpsString/arrayStringLikeFastMasked codes dict (str "%" pattern) (int length) alpha-masks bigram-masks)))
                        ;; Not dict-encoded — cannot handle as string pred
                        :else
                        (throw (ex-info (str "String predicate requires dict-encoded column. Use encode-column first.")

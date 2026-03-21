@@ -21,7 +21,7 @@
                  [:quantity :lt 24]]
     :aggregate  [:sum-product :price :discount]
     :length     6000000}"
-  (:import [stratum.internal ColumnOps]))
+  (:import [stratum.internal ColumnOps ColumnOpsLong]))
 
 (set! *warn-on-reflection* true)
 
@@ -129,40 +129,49 @@
       data
       (ColumnOps/longToDoubleNullSafe ^longs data (int length)))))
 
+(def ^:private ^Class long-array-class (Class/forName "[J"))
+(defn- long-array? [x] (instance? long-array-class x))
+
 (defn- prepare-aggregation
   "Prepare aggregation arrays for Java methods.
-   Returns [agg-type agg-col1 agg-col2].
-   Converts long[] columns to double[] as needed."
+   Returns [agg-type agg-col1 agg-col2 long-agg?].
+   When agg column is natively long[] and op is SUM/MIN/MAX,
+   sets long-agg? to true so caller can route to long SIMD path."
   [aggregate columns length]
   (case (first aggregate)
     :sum-product
     (let [[_ col-a col-b] aggregate]
       [(int ColumnOps/AGG_SUM_PRODUCT)
        (ensure-doubles (get columns col-a) length)
-       (ensure-doubles (get columns col-b) length)])
+       (ensure-doubles (get columns col-b) length)
+       false])
 
     :sum
-    (let [[_ col] aggregate]
-      [(int ColumnOps/AGG_SUM)
-       (ensure-doubles (get columns col) length)
-       (double-array 0)])
+    (let [[_ col] aggregate
+          data (:data (get columns col))]
+      (if (long-array? data)
+        [(int ColumnOps/AGG_SUM) data (long-array 0) true]
+        [(int ColumnOps/AGG_SUM) (ensure-doubles (get columns col) length) (double-array 0) false]))
 
     :min
-    (let [[_ col] aggregate]
-      [(int ColumnOps/AGG_MIN)
-       (ensure-doubles (get columns col) length)
-       (double-array 0)])
+    (let [[_ col] aggregate
+          data (:data (get columns col))]
+      (if (long-array? data)
+        [(int ColumnOps/AGG_MIN) data (long-array 0) true]
+        [(int ColumnOps/AGG_MIN) (ensure-doubles (get columns col) length) (double-array 0) false]))
 
     :max
-    (let [[_ col] aggregate]
-      [(int ColumnOps/AGG_MAX)
-       (ensure-doubles (get columns col) length)
-       (double-array 0)])
+    (let [[_ col] aggregate
+          data (:data (get columns col))]
+      (if (long-array? data)
+        [(int ColumnOps/AGG_MAX) data (long-array 0) true]
+        [(int ColumnOps/AGG_MAX) (ensure-doubles (get columns col) length) (double-array 0) false]))
 
     :count
     [(int ColumnOps/AGG_COUNT)
      (double-array 0)
-     (double-array 0)]))
+     (double-array 0)
+     false]))
 
 ;; ============================================================================
 ;; Execution
@@ -171,7 +180,7 @@
 (defn- execute-fused-simd
   [{:keys [predicates aggregate]} columns length]
   (let [pp (prepare-predicates predicates columns)
-        [agg-type ^doubles agg-col1 ^doubles agg-col2] (prepare-aggregation aggregate columns length)
+        [agg-type agg-col1 agg-col2 long-agg?] (prepare-aggregation aggregate columns length)
         ^doubles result
         (if (= (int agg-type) (int ColumnOps/AGG_COUNT))
           (ColumnOps/fusedSimdCountParallel
@@ -186,10 +195,10 @@
            ^doubles (:dbl-lo pp)
            ^doubles (:dbl-hi pp)
            (int length))
-          (let [nan-safe (boolean
-                          (or (and agg-col1 (ColumnOps/arrayHasNaN agg-col1 (alength agg-col1)))
-                              (and agg-col2 (ColumnOps/arrayHasNaN agg-col2 (alength agg-col2)))))]
-            (ColumnOps/fusedSimdParallel
+          (if (and long-agg? (zero? (:num-dbl-preds pp)))
+            ;; Long path: LongVector accumulators, no longToDouble allocation
+            ;; Only when no double preds — mask transfer cost outweighs benefit
+            (ColumnOpsLong/fusedSimdLongParallel
              (int (:num-long-preds pp))
              ^ints (:long-pred-types pp)
              ^"[[J" (:long-cols pp)
@@ -201,17 +210,40 @@
              ^doubles (:dbl-lo pp)
              ^doubles (:dbl-hi pp)
              (int agg-type)
-             agg-col1
-             agg-col2
-             (int length)
-             nan-safe)))]
+             ^longs agg-col1
+             (int length))
+            ;; Double path
+            (let [nan-safe (boolean
+                            (or (and agg-col1 (ColumnOps/arrayHasNaN ^doubles agg-col1 (alength ^doubles agg-col1)))
+                                (and agg-col2 (ColumnOps/arrayHasNaN ^doubles agg-col2 (alength ^doubles agg-col2)))))]
+              (ColumnOps/fusedSimdParallel
+               (int (:num-long-preds pp))
+               ^ints (:long-pred-types pp)
+               ^"[[J" (:long-cols pp)
+               ^longs (:long-lo pp)
+               ^longs (:long-hi pp)
+               (int (:num-dbl-preds pp))
+               ^ints (:dbl-pred-types pp)
+               ^"[[D" (:dbl-cols pp)
+               ^doubles (:dbl-lo pp)
+               ^doubles (:dbl-hi pp)
+               (int agg-type)
+               ^doubles agg-col1
+               ^doubles agg-col2
+               (int length)
+               nan-safe))))]
     {:result (aget result 0)
      :count  (long (aget result 1))}))
 
 (defn- execute-fused-scalar
   [{:keys [predicates aggregate]} columns length]
   (let [pp (prepare-predicates predicates columns)
-        [agg-type ^doubles agg-col1 ^doubles agg-col2] (prepare-aggregation aggregate columns length)
+        [agg-type agg-col1 agg-col2 long-agg?] (prepare-aggregation aggregate columns length)
+        ;; For scalar path (<1000 rows), always use double path — no SIMD benefit
+        ^doubles agg-col1-d (if long-agg?
+                              (ColumnOps/longToDoubleNullSafe ^longs agg-col1 (int length))
+                              agg-col1)
+        ^doubles agg-col2-d (if long-agg? (double-array 0) agg-col2)
         ^doubles result
         (ColumnOps/fusedFilterAggregate
          (int (:num-long-preds pp))
@@ -225,8 +257,8 @@
          ^doubles (:dbl-lo pp)
          ^doubles (:dbl-hi pp)
          (int agg-type)
-         agg-col1
-         agg-col2
+         agg-col1-d
+         agg-col2-d
          (int length))]
     {:result (aget result 0)
      :count  (long (aget result 1))}))
