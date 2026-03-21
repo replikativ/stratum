@@ -2432,25 +2432,36 @@
                   columns)
         col-arrays (into {} (map (fn [[k v]] [k (:data v)])) columns)
 
-        ;; Prepare predicates, group keys, and agg arrays
+        ;; Prepare predicates and group keys
         {:keys [n-long long-pred-types long-cols long-lo long-hi
                 n-dbl dbl-pred-types dbl-cols dbl-lo dbl-hi]} (prepare-pred-arrays preds columns)
         {:keys [group-arrays group-muls group-maxes group-dicts group-offsets
                 max-key use-dense? n-group key-overflow? null-sentinels]} (prepare-group-key-arrays group-cols columns length)
+        ;; Check long[] eligibility BEFORE preparing agg arrays (avoids wasteful longToDouble)
+        long-gb-eligible? (and use-dense?
+                               (not (has-compound-aggs? aggs))
+                               (not (some #(= :count-distinct (:op %)) aggs))
+                               (all-aggs-long-eligible? aggs col-arrays length))
+        ;; Defer agg type array preparation — only needed for double/compound paths
+        agg-prep (when-not long-gb-eligible?
+                   (prepare-agg-type-arrays aggs col-arrays columns length))
         {:keys [has-cd? numeric-agg-indices numeric-aggs n-numeric n-aggs
                 agg-types numeric-agg-types conv-cache agg-cols agg-col2s
-                numeric-agg-cols numeric-agg-col2s]} (prepare-agg-type-arrays aggs col-arrays columns length)
-        ;; Check if any agg source columns have NULLs — skip NaN masking when not needed
+                numeric-agg-cols numeric-agg-col2s]} agg-prep
+        n-aggs (or n-aggs (count aggs))
+        agg-types (or agg-types (int-array (mapv #(agg-op->java-type (:op %)) aggs)))
+        conv-cache (or conv-cache (java.util.HashMap.))
         nan-safe (boolean
-                  (columns-have-nulls?
-                   columns
-                   (distinct (mapcat (fn [a]
-                                       (case (:op a)
-                                         (:count :count-non-null) []
-                                         :count-distinct [(:col a)]
-                                         (:sum-product :corr) (:cols a)
-                                         [(:col a)]))
-                                     aggs))))]
+                  (when-not long-gb-eligible?
+                    (columns-have-nulls?
+                     columns
+                     (distinct (mapcat (fn [a]
+                                         (case (:op a)
+                                           (:count :count-non-null) []
+                                           :count-distinct [(:col a)]
+                                           (:sum-product :corr) (:cols a)
+                                           [(:col a)]))
+                                       aggs)))))]
 
     ;; Call Java - dispatch between dense and HashMap paths
     ;; Dense path uses parallel execution for large datasets
@@ -2584,9 +2595,8 @@
                                   (decode-dense-group-results-2d result-array group-cols group-muls aggs group-dicts))
                                 (apply-group-offsets group-cols group-offsets null-sentinels columnar?))]
                 decoded)
-            ;; Try long[] path: all agg sources are long[], no AVG/SUM_PRODUCT/CD
-              (if (and (not compound?)
-                       (all-aggs-long-eligible? aggs col-arrays length))
+            ;; Try long[] path: eligibility checked above (before agg type prep)
+              (if long-gb-eligible?
                 ;; Long path: long[] accumulators, type-preserving results
                 (let [long-agg-cols (into-array expr/long-array-class
                                                (mapv (fn [a]
