@@ -958,6 +958,33 @@
                                (:partition-by ws) (update :partition-by #(mapv norm/strip-ns %))
                                (:order-by ws) (update :order-by #(mapv (fn [[c d]] [(norm/strip-ns c) d]) %))))
                            window))
+        ;; BITMAP SEMI-JOIN: check first — converts eligible joins to mask predicates
+        ;; so subsequent paths (fused, normal) operate on pre-filtered fact data.
+            bitmap-semi (when (and (seq join) (= 1 (count join)))
+                          (let [used-cols (into #{}
+                                                (concat
+                                                 (when group (filter keyword? group))
+                                                 (mapcat (fn [a]
+                                                           (let [na (norm/normalize-agg a)]
+                                                             (concat (when (:col na) [(:col na)])
+                                                                     (when (:cols na) (:cols na)))))
+                                                         (or agg []))
+                                                 (when select (filter keyword? select))
+                                                 (keep (fn [pred]
+                                                         (try
+                                                           (let [np (norm/normalize-pred pred)]
+                                                             (first np))
+                                                           (catch Exception _ nil)))
+                                                       (or where []))))]
+                            (when (jn/bitmap-semi-join-eligible? (first join) used-cols)
+                              (let [fact-length (get-column-length (val (first columns)))
+                                    result (jn/execute-bitmap-semi-join columns fact-length (first join))]
+                                result))))
+        ;; If bitmap semi-join fired, remove join and inject mask predicate
+            [columns join where] (if bitmap-semi
+                                   [(:columns bitmap-semi) nil
+                                    (conj (vec (or where [])) [:= (:mask-key bitmap-semi) 1])]
+                                   [columns join where])
         ;; FUSED JOIN+GROUP+AGG: probe+gather+group-by in single Java pass
         ;; Eligible when: single INNER join, GROUP BY dim cols, agg fact cols, no WHERE
             fused-result
@@ -996,43 +1023,16 @@
                   results (if (or limit offset) (post/apply-limit-offset results limit offset) results)]
               results))
       ;; Normal path
-          (let [;; JOIN PHASE: try bitmap semi-join first, fall back to hash join
-                [columns length extra-preds]
+          (let [;; JOIN PHASE: bitmap semi-join already handled above; remaining joins use hash
+                [columns length]
                 (if (seq join)
                   (let [initial-length (get-column-length (val (first columns)))
-                        ;; Collect all column refs used in query (agg/group/select/where)
-                        ;; If any dim column appears here, can't use bitmap semi-join
-                        used-cols (into #{}
-                                        (concat
-                                         (when group (filter keyword? group))
-                                         (mapcat (fn [a]
-                                                   (let [na (norm/normalize-agg a)]
-                                                     (concat (when (:col na) [(:col na)])
-                                                             (when (:cols na) (:cols na)))))
-                                                 (or agg []))
-                                         (when select (filter keyword? select))
-                                         ;; Extract column refs from WHERE — first element of normalized pred
-                                         (keep (fn [pred]
-                                                 (try
-                                                   (let [np (norm/normalize-pred pred)]
-                                                     (first np))
-                                                   (catch Exception _ nil)))
-                                               (or where []))))
-                        ;; Check bitmap semi-join eligibility for single joins
-                        bitmap-eligible? (and (= 1 (count join))
-                                             (jn/bitmap-semi-join-eligible? (first join) used-cols))]
-                    (if bitmap-eligible?
-                      ;; Bitmap semi-join: inject mask column + predicate, no row materialization
-                      (let [result (jn/execute-bitmap-semi-join columns initial-length (first join))]
-                        [(:columns result) nil [[:= (:mask-key result) 1]]])
-                      ;; Standard hash join
-                      (let [result (jn/execute-joins columns initial-length join)]
-                        [(:columns result) (long (:length result)) nil])))
-                  [columns nil nil])]
+                        result (jn/execute-joins columns initial-length join)]
+                    [(:columns result) (long (:length result))])
+                  [columns nil])]
   ;; Bind expr/*columns-meta* so expr/eval-expr-vectorized and gb/eval-agg-expr can access dict metadata
             (binding [expr/*columns-meta* (into {} (keep (fn [[k v]] (when (:dict v) [k v]))) columns)]
-              (let [preds (into (mapv norm/normalize-pred (or where []))
-                                (mapv norm/normalize-pred (or extra-preds [])))
+              (let [preds (mapv norm/normalize-pred (or where []))
                     aggs (norm/auto-alias-aggs (mapv norm/normalize-agg (or agg [])))
         ;; Determine data length from first column (use join length if available)
                     length (long (or length

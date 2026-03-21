@@ -1422,6 +1422,168 @@
        :duckdb-1t (:median rd-1t) :duckdb (:median rd)})))
 
 ;; ============================================================================
+;; Bitmap Semi-Join Benchmarks
+;; ============================================================================
+
+(defn- generate-semi-join-data
+  "Generate dimension table for semi-join benchmarks.
+   150K customers with nation (0-24). Semi-join filters to ~1/25 of customers."
+  [^long n-fact]
+  (println "  Generating semi-join dimension data...")
+  (let [rng (java.util.Random. 44)
+        n-dim 150000
+        dim-key (long-array n-dim)
+        dim-nation (long-array n-dim)]
+    (dotimes [i n-dim]
+      (aset dim-key i (long i))
+      (aset dim-nation i (.nextInt rng 25)))
+    ;; FK column in fact table
+    (let [fact-fk (long-array n-fact)]
+      (dotimes [i n-fact]
+        (aset fact-fk i (.nextInt rng n-dim)))
+      {:dim-key dim-key :dim-nation dim-nation :fact-fk fact-fk :n-dim n-dim})))
+
+(defn- duckdb-setup-semi-join
+  "Create DuckDB tables for semi-join benchmarks."
+  [^Connection conn semi h2o n]
+  (let [csv-dim "/tmp/olap_bench_semi_dim.csv"
+        csv-fact "/tmp/olap_bench_semi_fact.csv"]
+    (write-arrays-csv csv-dim [[:cust_key (:dim-key semi)] [:nation (:dim-nation semi)]] (:n-dim semi))
+    (duckdb-load-csv conn "semi_dim" csv-dim)
+    ;; Standalone fact table with custkey + v1 + id4
+    (write-arrays-csv csv-fact [[:custkey (:fact-fk semi)]
+                                [:v1 (:v1 h2o)]
+                                [:id4 (:id4 h2o)]] n)
+    (duckdb-load-csv conn "semi_fact" csv-fact)))
+
+(defn- bench-semi-q1
+  "SEMI-Q1: SUM(v1) WHERE customer nation = 5 — pure existence filter.
+   Bitmap semi-join: only fact-side columns in agg, dim used only for filtering."
+  [h2o semi ^Connection conn]
+  (println "\nSEMI-Q1: SUM(v1) WHERE EXISTS customer(nation=5) — bitmap semi-join")
+  ;; Pre-filter dim to nation=5
+  (let [^longs dk (:dim-key semi)
+        ^longs dn (:dim-nation semi)
+        n-dim (int (:n-dim semi))
+        filtered-keys (let [ks (java.util.ArrayList.)]
+                        (dotimes [i n-dim]
+                          (when (== 5 (aget dn i))
+                            (.add ks (aget dk i))))
+                        (let [a (long-array (.size ks))]
+                          (dotimes [i (.size ks)] (aset a i (long (.get ks i))))
+                          a))
+        q {:from {:custkey {:type :int64 :data (:fact-fk semi)}
+                  :v1 (:v1 h2o)}
+           :join [{:with {:dk {:type :int64 :data filtered-keys}}
+                   :on [:= :custkey :dk]
+                   :type :inner}]
+           :agg [[:sum :v1] [:count]]}
+        r-1t (bench-1t #(q/q q))
+        r (bench #(q/q q))
+        v (q/q q)]
+    (println (format "  Stratum (1T): %s  (sum=%.0f, cnt=%d)" (fmt-ms (:median r-1t))
+                     (double (:sum (first v))) (long (:count (first v)))))
+    (println (format "  Stratum (NT): %s" (fmt-ms (:median r))))
+    (let [sql "SELECT SUM(x.v1), COUNT(*) FROM semi_fact x WHERE EXISTS (SELECT 1 FROM semi_dim d WHERE d.cust_key = x.custkey AND d.nation = 5)"
+          rd-1t (duckdb-bench conn sql :threads 1)
+          rd (duckdb-bench conn sql)]
+      (println (format "  DuckDB  (1T): %s" (fmt-ms (:median rd-1t))))
+      (println (format "  DuckDB  (NT): %s" (fmt-ms (:median rd))))
+      (println (format "  Ratio 1T: %s" (fmt-ratio (:median r-1t) (:median rd-1t))))
+      ;; Validate
+      (let [duck-r (duckdb-query-results conn
+                     "SELECT SUM(x.v1) AS sv, COUNT(*) AS cnt FROM semi_fact x WHERE EXISTS (SELECT 1 FROM semi_dim d WHERE d.cust_key = x.custkey AND d.nation = 5)")
+            [ds dc] (first (:rows duck-r))
+            sv (:sum (first v))
+            sc (:count (first v))]
+        (if (and (== (long sv) (long ds)) (== sc dc))
+          (println "  ✓ SEMI-Q1: PASS")
+          (println (format "  ✗ SEMI-Q1: FAIL (Stratum=%d,%d DuckDB=%d,%d)" sv sc ds dc))))
+      {:stratum-1t (:median r-1t) :stratum (:median r)
+       :duckdb-1t (:median rd-1t) :duckdb (:median rd)})))
+
+(defn- bench-semi-q2
+  "SEMI-Q2: SUM(v1) GROUP BY id4 WHERE EXISTS customer(nation=5).
+   Bitmap semi-join + fact-side group-by."
+  [h2o semi ^Connection conn]
+  (println "\nSEMI-Q2: SUM(v1) GROUP BY id4 WHERE EXISTS customer(nation=5)")
+  (let [^longs dk (:dim-key semi)
+        ^longs dn (:dim-nation semi)
+        n-dim (int (:n-dim semi))
+        filtered-keys (let [ks (java.util.ArrayList.)]
+                        (dotimes [i n-dim]
+                          (when (== 5 (aget dn i))
+                            (.add ks (aget dk i))))
+                        (let [a (long-array (.size ks))]
+                          (dotimes [i (.size ks)] (aset a i (long (.get ks i))))
+                          a))
+        q {:from {:custkey {:type :int64 :data (:fact-fk semi)}
+                  :v1 (:v1 h2o)
+                  :id4 (:id4 h2o)}
+           :join [{:with {:dk {:type :int64 :data filtered-keys}}
+                   :on [:= :custkey :dk]
+                   :type :inner}]
+           :group [:id4]
+           :agg [[:sum :v1] [:count]]}
+        r-1t (bench-1t #(q/q q))
+        r (bench #(q/q q))
+        v (q/q q)]
+    (println (format "  Stratum (1T): %s (%d groups)" (fmt-ms (:median r-1t)) (count v)))
+    (println (format "  Stratum (NT): %s" (fmt-ms (:median r))))
+    (let [sql "SELECT x.id4, SUM(x.v1), COUNT(*) FROM semi_fact x WHERE EXISTS (SELECT 1 FROM semi_dim d WHERE d.cust_key = x.custkey AND d.nation = 5) GROUP BY x.id4"
+          rd-1t (duckdb-bench conn sql :threads 1)
+          rd (duckdb-bench conn sql)]
+      (println (format "  DuckDB  (1T): %s" (fmt-ms (:median rd-1t))))
+      (println (format "  DuckDB  (NT): %s" (fmt-ms (:median rd))))
+      (println (format "  Ratio 1T: %s" (fmt-ratio (:median r-1t) (:median rd-1t))))
+      (validate-query "SEMI-Q2" conn
+        "SELECT x.id4, SUM(x.v1) AS sum, COUNT(*) AS count FROM semi_fact x WHERE EXISTS (SELECT 1 FROM semi_dim d WHERE d.cust_key = x.custkey AND d.nation = 5) GROUP BY x.id4"
+        v [:id4])
+      {:stratum-1t (:median r-1t) :stratum (:median r)
+       :duckdb-1t (:median rd-1t) :duckdb (:median rd)})))
+
+(defn- bench-semi-q3
+  "SEMI-Q3: COUNT(*) WHERE EXISTS customer(nation=5) — simplest semi-join."
+  [h2o semi ^Connection conn]
+  (println "\nSEMI-Q3: COUNT(*) WHERE EXISTS customer(nation=5)")
+  (let [^longs dk (:dim-key semi)
+        ^longs dn (:dim-nation semi)
+        n-dim (int (:n-dim semi))
+        filtered-keys (let [ks (java.util.ArrayList.)]
+                        (dotimes [i n-dim]
+                          (when (== 5 (aget dn i))
+                            (.add ks (aget dk i))))
+                        (let [a (long-array (.size ks))]
+                          (dotimes [i (.size ks)] (aset a i (long (.get ks i))))
+                          a))
+        q {:from {:custkey {:type :int64 :data (:fact-fk semi)}
+                  :v1 (:v1 h2o)}
+           :join [{:with {:dk {:type :int64 :data filtered-keys}}
+                   :on [:= :custkey :dk]
+                   :type :inner}]
+           :agg [[:count]]}
+        r-1t (bench-1t #(q/q q))
+        r (bench #(q/q q))
+        v (q/q q)]
+    (println (format "  Stratum (1T): %s  (cnt=%d)" (fmt-ms (:median r-1t)) (long (:count (first v)))))
+    (println (format "  Stratum (NT): %s" (fmt-ms (:median r))))
+    (let [sql "SELECT COUNT(*) FROM semi_fact x WHERE EXISTS (SELECT 1 FROM semi_dim d WHERE d.cust_key = x.custkey AND d.nation = 5)"
+          rd-1t (duckdb-bench conn sql :threads 1)
+          rd (duckdb-bench conn sql)]
+      (println (format "  DuckDB  (1T): %s" (fmt-ms (:median rd-1t))))
+      (println (format "  DuckDB  (NT): %s" (fmt-ms (:median rd))))
+      (println (format "  Ratio 1T: %s" (fmt-ratio (:median r-1t) (:median rd-1t))))
+      (let [duck-r (duckdb-query-results conn
+                     "SELECT COUNT(*) AS cnt FROM semi_fact x WHERE EXISTS (SELECT 1 FROM semi_dim d WHERE d.cust_key = x.custkey AND d.nation = 5)")
+            dc (first (first (:rows duck-r)))
+            sc (:count (first v))]
+        (if (== sc dc)
+          (println "  ✓ SEMI-Q3: PASS")
+          (println (format "  ✗ SEMI-Q3: FAIL (Stratum=%d DuckDB=%d)" sc dc))))
+      {:stratum-1t (:median r-1t) :stratum (:median r)
+       :duckdb-1t (:median rd-1t) :duckdb (:median rd)})))
+
+;; ============================================================================
 ;; Tier 3: SSB Q1.2 — Tighter Filter + Sum-Product
 ;; ============================================================================
 
@@ -2258,6 +2420,10 @@
                     [:h2o-j1 "H2O-J1: JOIN small, SUM(v1)+SUM(v2)"]
                     [:h2o-j2 "H2O-J2: JOIN medium 2-col, SUM"]
                     [:h2o-j3 "H2O-J3: LEFT JOIN medium, SUM"]
+                    [:section "Bitmap Semi-Join"]
+                    [:semi-q1 "SEMI-Q1: SUM WHERE EXISTS (nation=5)"]
+                    [:semi-q2 "SEMI-Q2: SUM GB id4 WHERE EXISTS"]
+                    [:semi-q3 "SEMI-Q3: COUNT WHERE EXISTS"]
                     [:section "Tier 3: ClickBench"]
                     [:cb-q1 "CB-Q1: COUNT WHERE AdvEngineID!=0"]
                     [:cb-q2 "CB-Q2: SUM+COUNT+AVG (multi-agg)"]
@@ -2776,6 +2942,14 @@
                 (when (run-q? "j1") (gc!) (swap! all-results merge-best {:h2o-j1 (bench-h2o-j1 arrays dims conn)}))
                 (when (run-q? "j2") (gc!) (swap! all-results merge-best {:h2o-j2 (bench-h2o-j2 arrays dims conn)}))
                 (when (run-q? "j3") (gc!) (swap! all-results merge-best {:h2o-j3 (bench-h2o-j3 arrays dims conn)}))))
+            ;; Semi-join benchmarks
+            (when (or (run-q? "semi-q1") (run-q? "semi-q2") (run-q? "semi-q3"))
+              (println "\n  --- Bitmap Semi-Join Queries ---")
+              (let [semi (generate-semi-join-data n)]
+                (duckdb-setup-semi-join conn semi arrays n)
+                (when (run-q? "semi-q1") (gc!) (swap! all-results merge-best {:semi-q1 (bench-semi-q1 arrays semi conn)}))
+                (when (run-q? "semi-q2") (gc!) (swap! all-results merge-best {:semi-q2 (bench-semi-q2 arrays semi conn)}))
+                (when (run-q? "semi-q3") (gc!) (swap! all-results merge-best {:semi-q3 (bench-semi-q3 arrays semi conn)}))))
             (finally (.close conn)))))
 
       ;; === Tier 3: ClickBench ===
