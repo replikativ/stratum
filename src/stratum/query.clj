@@ -47,7 +47,7 @@
             [stratum.specification :as spec]
             [stratum.column :as column]
             [stratum.dataset :as dataset])
-  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsChunked ColumnOpsChunkedSimd ColumnOpsAnalytics]
+  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsChunked ColumnOpsChunkedSimd ColumnOpsChunkedLong ColumnOpsAnalytics]
            [stratum.index ChunkEntry]))
 
 (set! *warn-on-reflection* true)
@@ -443,12 +443,19 @@
                       (vec (range n-chunks)))
         n-simd (count simd-chunks)
 
+        ;; Check if aggregate column is int64 — use native long SIMD path if so
+        agg-col-long? (and agg-col1-name
+                           (not= :sum-product agg-type-kw)
+                           (= :int64 (:type (get columns agg-col1-name))))
+
         ;; Pre-extract chunk arrays only for SIMD chunks (typed 3D arrays for JIT)
         chunk-lengths    (int-array n-simd)
         long-pred-arrs   (make-array expr/long-array-class n-long n-simd)
         dbl-pred-arrs    (make-array expr/double-array-class n-dbl n-simd)
-        agg-arr1s        (make-array Double/TYPE n-simd 0)
-        agg-arr2s        (make-array Double/TYPE n-simd 0)]
+        ;; Long path: long[][] for aggregate arrays; Double path: double[][]
+        agg-arr1s-long   (when agg-col-long? (make-array Long/TYPE n-simd 0))
+        agg-arr1s        (when-not agg-col-long? (make-array Double/TYPE n-simd 0))
+        agg-arr2s        (when-not agg-col-long? (make-array Double/TYPE n-simd 0))]
 
     ;; Fill arrays only for SIMD chunks
     (dotimes [s n-simd]
@@ -464,14 +471,17 @@
               ^ChunkEntry entry (nth (get col-entries col-name) (nth simd-chunks s))]
           (aset ^objects (aget ^"[[[D" dbl-pred-arrs p) s (chunk/chunk-as-doubles (.chunk entry)))))
       (when agg-col1-name
-        (let [^ChunkEntry entry (nth (get col-entries agg-col1-name) (nth simd-chunks s))
-              arr (chunk/chunk-as-doubles (.chunk entry))]
-          ;; chunk-as-doubles returns long[] for int64 chunks — convert to double[]
-          (aset ^objects agg-arr1s s
-                (if (expr/long-array? arr)
-                  (ColumnOps/longToDouble ^longs arr (alength ^longs arr))
-                  arr))))
-      (when agg-col2-name
+        (let [^ChunkEntry entry (nth (get col-entries agg-col1-name) (nth simd-chunks s))]
+          (if agg-col-long?
+            ;; Long path: extract native long[] — zero copy
+            (aset ^objects agg-arr1s-long s (chunk/chunk-as-longs (.chunk entry)))
+            ;; Double path: convert if needed
+            (let [arr (chunk/chunk-as-doubles (.chunk entry))]
+              (aset ^objects agg-arr1s s
+                    (if (expr/long-array? arr)
+                      (ColumnOps/longToDouble ^longs arr (alength ^longs arr))
+                      arr))))))
+      (when (and agg-col2-name (not agg-col-long?))
         (let [^ChunkEntry entry (nth (get col-entries agg-col2-name) (nth simd-chunks s))
               arr (chunk/chunk-as-doubles (.chunk entry))]
           (aset ^objects agg-arr2s s
@@ -502,32 +512,54 @@
                            0.0)]
           {:result result-val :count (long stats-count)})
 
-        ;; Process SIMD chunks via Java
-        (let [^doubles result
-              (ColumnOpsChunkedSimd/fusedSimdChunkedParallel
-               (int n-long) ^ints long-pred-types
-               ^"[[[J" long-pred-arrs ^longs long-lo ^longs long-hi
-               (int n-dbl) ^ints dbl-pred-types
-               ^"[[[D" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
-               (int agg-type) ^"[[D" agg-arr1s ^"[[D" agg-arr2s
-               ^ints chunk-lengths (int n-simd))
-              simd-result (aget result 0)
-              simd-count (long (aget result 1))
-              total-count (+ simd-count (long stats-count))]
-          ;; Merge SIMD result with stats accumulation
-          (if (zero? (long stats-count))
-            {:result simd-result :count total-count}
-            {:result (case agg-type-kw
-                       :count (double total-count)
-                       :sum (+ simd-result (double stats-sum))
-                       :min (if (zero? simd-count)
-                              (double stats-min)
-                              (Math/min simd-result (double stats-min)))
-                       :max (if (zero? simd-count)
-                              (double stats-max)
+        ;; Process SIMD chunks via Java — long or double path
+        (if agg-col-long?
+          ;; Native long SIMD path — zero-copy from chunks, long arithmetic
+          (let [^longs result
+                (ColumnOpsChunkedLong/fusedSimdChunkedLongParallel
+                 (int n-long) ^ints long-pred-types
+                 ^"[[[J" long-pred-arrs ^longs long-lo ^longs long-hi
+                 (int n-dbl) ^ints dbl-pred-types
+                 ^"[[[D" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
+                 (int agg-type) ^"[[J" agg-arr1s-long
+                 ^ints chunk-lengths (int n-simd))
+                simd-result (aget result 0)
+                simd-count (aget result 1)
+                total-count (+ simd-count (long stats-count))]
+            (if (zero? (long stats-count))
+              {:result simd-result :count total-count}
+              {:result (case agg-type-kw
+                         :count total-count
+                         :sum (+ simd-result (long stats-sum))
+                         :min (if (zero? simd-count) (long stats-min) (Math/min simd-result (long stats-min)))
+                         :max (if (zero? simd-count) (long stats-max) (Math/max simd-result (long stats-max)))
+                         simd-result)
+               :count total-count}))
+          ;; Double SIMD path (original)
+          (let [^doubles result
+                (ColumnOpsChunkedSimd/fusedSimdChunkedParallel
+                 (int n-long) ^ints long-pred-types
+                 ^"[[[J" long-pred-arrs ^longs long-lo ^longs long-hi
+                 (int n-dbl) ^ints dbl-pred-types
+                 ^"[[[D" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
+                 (int agg-type) ^"[[D" agg-arr1s ^"[[D" agg-arr2s
+                 ^ints chunk-lengths (int n-simd))
+                simd-result (aget result 0)
+                simd-count (long (aget result 1))
+                total-count (+ simd-count (long stats-count))]
+            (if (zero? (long stats-count))
+              {:result simd-result :count total-count}
+              {:result (case agg-type-kw
+                         :count (double total-count)
+                         :sum (+ simd-result (double stats-sum))
+                         :min (if (zero? simd-count)
+                                (double stats-min)
+                                (Math/min simd-result (double stats-min)))
+                         :max (if (zero? simd-count)
+                                (double stats-max)
                               (Math/max simd-result (double stats-max)))
                        simd-result)
-             :count total-count}))))))
+             :count total-count})))))))
 
 (defn- execute-chunked-fused-count
   "JIT-isolated chunked COUNT for index inputs.
