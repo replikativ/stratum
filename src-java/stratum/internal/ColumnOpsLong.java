@@ -557,15 +557,18 @@ public final class ColumnOpsLong {
             int m = ColumnOps.evaluatePredicates(numLongPreds, longPredTypes, longCols, longLo, longHi,
                                                   numDblPreds, dblPredTypes, dblCols, dblLo, dblHi, i) ? 1 : 0;
 
-            // Compute key unconditionally (same pattern as ColumnOps dense path)
-            int key = (int)(gc0[i] * gm0);
-            if (numGroupCols > 1) key += (int)(gc1[i] * gm1);
-            if (numGroupCols > 2) key += (int)(gc2[i] * gm2);
-            if (numGroupCols > 3) key += (int)(gc3[i] * gm3);
-            if (numGroupCols > 4) key += (int)(gc4[i] * gm4);
-            if (numGroupCols > 5) key += (int)(gc5[i] * gm5);
-            for (int g = 6; g < numGroupCols; g++) {
-                key += (int)(groupCols[g][i] * groupMuls[g]);
+            // Compute group key — 0 group cols means global aggregate (single bucket)
+            int key = 0;
+            if (numGroupCols > 0) {
+                key = (int)(gc0[i] * gm0);
+                if (numGroupCols > 1) key += (int)(gc1[i] * gm1);
+                if (numGroupCols > 2) key += (int)(gc2[i] * gm2);
+                if (numGroupCols > 3) key += (int)(gc3[i] * gm3);
+                if (numGroupCols > 4) key += (int)(gc4[i] * gm4);
+                if (numGroupCols > 5) key += (int)(gc5[i] * gm5);
+                for (int g = 6; g < numGroupCols; g++) {
+                    key += (int)(groupCols[g][i] * groupMuls[g]);
+                }
             }
 
             int base = key * accSize;

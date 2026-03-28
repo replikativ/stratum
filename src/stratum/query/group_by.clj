@@ -2418,6 +2418,9 @@
         ;; When max-key overflows, key-overflow? signals that composite positional encoding
         ;; would produce wrong results — the hash path must use multi-key hashing instead.
         {:keys [group-muls max-key use-dense? key-overflow?]}
+        (if (zero? n-group)
+          ;; Global aggregate — single bucket, no group keys
+          {:group-muls (long-array 0) :max-key 1 :use-dense? true :key-overflow? false}
         (let [muls (long-array n-group)
               _ (aset muls (dec n-group) 1)
               muls-ok? (try
@@ -2447,7 +2450,7 @@
                    :use-dense? false :key-overflow? true})))
             ;; Even strides overflow — key space is enormous
             {:group-muls (long-array n-group) :max-key Long/MAX_VALUE
-             :use-dense? false :key-overflow? true}))]
+             :use-dense? false :key-overflow? true})))]
     {:group-arrays group-arrays :group-muls group-muls :group-maxes group-maxes
      :group-dicts group-dicts :group-offsets group-offsets :max-key max-key
      :use-dense? use-dense? :n-group n-group :key-overflow? (boolean key-overflow?)
