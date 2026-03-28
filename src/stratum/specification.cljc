@@ -77,7 +77,7 @@
    Symbol forms (e.g. '< '=) are normalized to keywords by the query engine before dispatch."
   #{:< :> :<= :>= := :!= :not= :between :range :not-range
     :like :not-like :ilike :not-ilike :contains :starts-with :ends-with
-    :in :not-in :is-null :is-not-null :or :and :not})
+    :in :not-in :is-null :is-not-null :or :and :not :fn})
 
 (def expr-op-set
   "All recognized expression operators (keywords only).
