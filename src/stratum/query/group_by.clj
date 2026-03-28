@@ -77,8 +77,36 @@
 ;; Predicate Bound Preparation
 ;; ============================================================================
 
+(defn- dict-code-for
+  "Look up a value in a dict array, returning its code (index) or -1 if not found.
+   The value is compared as a string (via str) against dict entries."
+  ^long [^"[Ljava.lang.String;" dict val]
+  (let [target (str val)
+        n (alength dict)]
+    (loop [i (int 0)]
+      (if (>= i n)
+        -1
+        (if (= target (aget dict i))
+          (long i)
+          (recur (unchecked-inc-int i)))))))
+
+(defn- resolve-long-arg
+  "Resolve a predicate argument to a long value. For dict-encoded columns,
+   looks up the argument string in the dictionary to get the code.
+   For numeric columns, casts directly."
+  ^long [arg col-info]
+  (if (number? arg)
+    (long arg)
+    ;; Non-numeric arg (keyword/string) on a dict-encoded column: look up code
+    (if-let [^"[Ljava.lang.String;" dict (:dict col-info)]
+      (dict-code-for dict arg)
+      ;; No dict — try direct cast (will throw if truly invalid)
+      (long arg))))
+
 (defn prepare-pred-bounds
   "Split predicates by column type and prepare bound arrays for Java fused filter.
+   For dict-encoded columns, translates keyword/string arguments to dict codes
+   so the SIMD path can compare longs directly.
    Returns {:long-preds :dbl-preds :n-long :n-dbl
             :long-pred-types :long-lo :long-hi
             :dbl-pred-types :dbl-lo :dbl-hi}."
@@ -88,15 +116,16 @@
         n-long      (count long-preds)
         n-dbl       (count dbl-preds)
         long-pred-types (int-array (mapv #(get qc/op->pred-type (second %)) long-preds))
-        long-lo (long-array (mapv (fn [[_col op & args]]
+        long-lo (long-array (mapv (fn [[col op & args]]
                                     (case op
-                                      (:range :not-range :gt :eq :gte :neq) (long (first args))
+                                      (:range :not-range :gt :eq :gte :neq)
+                                      (resolve-long-arg (first args) (get columns col))
                                       0))
                                   long-preds))
-        long-hi (long-array (mapv (fn [[_col op & args]]
+        long-hi (long-array (mapv (fn [[col op & args]]
                                     (case op
-                                      (:range :not-range) (long (second args))
-                                      (:lt :lte) (long (first args))
+                                      (:range :not-range) (resolve-long-arg (second args) (get columns col))
+                                      (:lt :lte) (resolve-long-arg (first args) (get columns col))
                                       0))
                                   long-preds))
         dbl-pred-types (int-array (mapv #(get qc/op->pred-type (second %)) dbl-preds))
@@ -446,19 +475,6 @@
 ;; ============================================================================
 ;; Scalar Fallback Execution
 ;; ============================================================================
-
-(defn- dict-code-for
-  "Look up a value in a dict array, returning its code (index) or -1 if not found.
-   The value is compared as a string (via str) against dict entries."
-  ^long [^"[Ljava.lang.String;" dict val]
-  (let [target (str val)
-        n (alength dict)]
-    (loop [i (int 0)]
-      (if (>= i n)
-        -1
-        (if (= target (aget dict i))
-          (long i)
-          (recur (unchecked-inc-int i)))))))
 
 (defn preprocess-preds
   "Pre-encode dict-column predicate arguments to dict codes so the per-row
