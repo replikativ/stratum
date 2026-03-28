@@ -163,12 +163,20 @@
       ;; Function predicate: [:col :fn f :fn-sym sym]
       ;; The fn object is bound to the symbol at index 3 of the pred vector
       ;; by compile-pred-mask (appended during compilation).
+      ;; Uses primitive IFn$LO/IFn$DO when the fn supports it (type-hinted arg),
+      ;; falls back to boxed IFn.invoke otherwise.
       :fn
-      (let [fn-sym (nth pred 3)
+      (let [pred-fn (nth pred 2)
+            fn-sym (nth pred 3)
             sym (get col-syms col)
-            long-col? (= :int64 (:type (get columns col)))]
-        (if long-col?
-          `(~fn-sym (aget ~sym (int ~'i)))
+            long-col? (= :int64 (:type (get columns col)))
+            has-prim? (if long-col?
+                        (instance? clojure.lang.IFn$LO pred-fn)
+                        (instance? clojure.lang.IFn$DO pred-fn))]
+        (if has-prim?
+          (if long-col?
+            `(.invokePrim ~(with-meta fn-sym {:tag 'clojure.lang.IFn$LO}) (aget ~sym (int ~'i)))
+            `(.invokePrim ~(with-meta fn-sym {:tag 'clojure.lang.IFn$DO}) (aget ~sym (int ~'i))))
           `(~fn-sym (aget ~sym (int ~'i)))))
 
       ;; Unknown op — throw at compile time

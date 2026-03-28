@@ -59,6 +59,38 @@
  [(fn [plan]
     (contains? plan :strategy))])
 
+;; ### Custom Function Predicates
+;;
+;; Use `[:fn :col pred-fn]` to filter with an arbitrary function.
+;; The function receives each column value and returns truthy/falsy.
+;; It's compiled into the same bytecode loop as built-in predicates,
+;; so JIT can inline it after warmup.
+;;
+;; For numeric columns, type-hint the argument (`^long` or `^double`)
+;; to avoid boxing in the hot loop:
+
+(st/q {:from data
+       :where [[:fn :qty (fn [^double v] (> v 25))]]
+       :agg [[:sum :qty] [:count]]})
+
+(kind/test-last
+ [(fn [result]
+    (and (= 1 (count result))
+         (== 120.0 (:sum (first result)))  ;; 30 + 40 + 50
+         (= 3 (:count (first result)))))])
+
+;; Combine with standard predicates — the `:fn` pred runs in the
+;; compiled mask path while SIMD predicates run natively:
+
+(st/q {:from data
+       :where [[:fn :product (fn [v] (= "A" v))]
+               [:> :qty 15]]
+       :agg [[:sum :qty]]})
+
+(kind/test-last
+ [(fn [result]
+    (== 80.0 (:sum (first result))))])  ;; 30 + 50
+
 ;; ---
 ;;
 ;; ## Data Import
