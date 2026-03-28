@@ -47,7 +47,7 @@
             [stratum.specification :as spec]
             [stratum.column :as column]
             [stratum.dataset :as dataset])
-  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsChunked ColumnOpsChunkedSimd ColumnOpsAnalytics]
+  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsChunked ColumnOpsChunkedSimd ColumnOpsChunkedLong ColumnOpsAnalytics]
            [stratum.index ChunkEntry]))
 
 (set! *warn-on-reflection* true)
@@ -375,6 +375,70 @@
   [columns surviving-indices]
   (into {} (map (fn [[k v]] [k (materialize-column-pruned v surviving-indices)])) columns))
 
+(defn- execute-chunked-multi-agg
+  "Execute multiple aggregates in one pass over index chunks, no materialization.
+   Uses ColumnOpsChunkedLong/fusedSimdChunkedMultiLongParallel for up to 4 aggs.
+   Avg is decomposed to sum/count and divided after."
+  [preds aggs columns length]
+  (let [;; Decompose avg into sum (Java accumulates sum, we divide after)
+        decomposed (mapv (fn [a] (if (= :avg (:op a)) (assoc a :op :sum :_was-avg true) a)) aggs)
+        {:keys [n-long long-pred-types long-lo long-hi
+                n-dbl dbl-pred-types dbl-lo dbl-hi
+                long-preds dbl-preds]} (gb/prepare-pred-bounds preds columns)
+        long-col-names (mapv first long-preds)
+        dbl-col-names (mapv first dbl-preds)
+        n-aggs (count decomposed)
+        agg-types (int-array (mapv (fn [a] (case (:op a)
+                                             :sum ColumnOps/AGG_SUM :count ColumnOps/AGG_COUNT
+                                             :min ColumnOps/AGG_MIN :max ColumnOps/AGG_MAX))
+                                   decomposed))
+        ;; Collect chunk entries
+        col-entries (into {} (map (fn [[k v]] [k (gb/collect-chunk-entries (:index v))])) columns)
+        first-col-entries (val (first col-entries))
+        n-chunks (count first-col-entries)
+        ;; Pre-extract arrays
+        chunk-lengths (int-array n-chunks)
+        long-pred-arrs (make-array expr/long-array-class n-long n-chunks)
+        dbl-pred-arrs (make-array expr/double-array-class n-dbl n-chunks)
+        ;; aggChunkArrays: [numAggs][nChunks] → long[]
+        agg-chunk-arrs (make-array expr/long-array-class n-aggs n-chunks)]
+    ;; Fill arrays
+    (dotimes [c n-chunks]
+      (let [^ChunkEntry ref (nth first-col-entries c)]
+        (aset chunk-lengths c (int (chunk/chunk-length (.chunk ref)))))
+      (dotimes [p n-long]
+        (let [^ChunkEntry e (nth (get col-entries (nth long-col-names p)) c)]
+          (aset ^objects (aget ^"[[[J" long-pred-arrs p) c (chunk/chunk-as-longs (.chunk e)))))
+      (dotimes [p n-dbl]
+        (let [^ChunkEntry e (nth (get col-entries (nth dbl-col-names p)) c)]
+          (aset ^objects (aget ^"[[[D" dbl-pred-arrs p) c (chunk/chunk-as-doubles (.chunk e)))))
+      (dotimes [a n-aggs]
+        (when-let [col-name (:col (nth decomposed a))]
+          (let [^ChunkEntry e (nth (get col-entries col-name) c)]
+            (aset ^objects (aget ^"[[[J" agg-chunk-arrs a) c (chunk/chunk-as-longs (.chunk e)))))))
+    ;; Call Java multi-agg
+    (let [^longs result
+          (ColumnOpsChunkedLong/fusedSimdChunkedMultiLongParallel
+           (int n-long) ^ints long-pred-types
+           ^"[[[J" long-pred-arrs ^longs long-lo ^longs long-hi
+           (int n-dbl) ^ints dbl-pred-types
+           ^"[[[D" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
+           (int n-aggs) ^ints agg-types ^"[[[J" agg-chunk-arrs
+           ^ints chunk-lengths (int n-chunks))
+          cnt (aget result 1)]
+      [(into {:_count cnt}
+             (map-indexed
+              (fn [i a]
+                (let [val (aget result (* i 2))
+                      alias (or (:as a) (:op (nth aggs i)))]
+                  [alias
+                   (cond
+                     (zero? cnt) nil
+                     (:_was-avg a) (/ (double val) (double cnt))
+                     (= :count (:op a)) cnt
+                     :else val)]))
+              decomposed))])))
+
 (defn- execute-chunked-fused
   "Execute fused filter+aggregate by streaming over aligned chunks.
 
@@ -443,12 +507,19 @@
                       (vec (range n-chunks)))
         n-simd (count simd-chunks)
 
+        ;; Check if aggregate column is int64 — use native long SIMD path if so
+        agg-col-long? (and agg-col1-name
+                           (not= :sum-product agg-type-kw)
+                           (= :int64 (:type (get columns agg-col1-name))))
+
         ;; Pre-extract chunk arrays only for SIMD chunks (typed 3D arrays for JIT)
         chunk-lengths    (int-array n-simd)
         long-pred-arrs   (make-array expr/long-array-class n-long n-simd)
         dbl-pred-arrs    (make-array expr/double-array-class n-dbl n-simd)
-        agg-arr1s        (make-array Double/TYPE n-simd 0)
-        agg-arr2s        (make-array Double/TYPE n-simd 0)]
+        ;; Long path: long[][] for aggregate arrays; Double path: double[][]
+        agg-arr1s-long   (when agg-col-long? (make-array Long/TYPE n-simd 0))
+        agg-arr1s        (when-not agg-col-long? (make-array Double/TYPE n-simd 0))
+        agg-arr2s        (when-not agg-col-long? (make-array Double/TYPE n-simd 0))]
 
     ;; Fill arrays only for SIMD chunks
     (dotimes [s n-simd]
@@ -465,10 +536,22 @@
           (aset ^objects (aget ^"[[[D" dbl-pred-arrs p) s (chunk/chunk-as-doubles (.chunk entry)))))
       (when agg-col1-name
         (let [^ChunkEntry entry (nth (get col-entries agg-col1-name) (nth simd-chunks s))]
-          (aset ^objects agg-arr1s s (chunk/chunk-as-doubles (.chunk entry)))))
-      (when agg-col2-name
-        (let [^ChunkEntry entry (nth (get col-entries agg-col2-name) (nth simd-chunks s))]
-          (aset ^objects agg-arr2s s (chunk/chunk-as-doubles (.chunk entry))))))
+          (if agg-col-long?
+            ;; Long path: extract native long[] — zero copy
+            (aset ^objects agg-arr1s-long s (chunk/chunk-as-longs (.chunk entry)))
+            ;; Double path: convert if needed
+            (let [arr (chunk/chunk-as-doubles (.chunk entry))]
+              (aset ^objects agg-arr1s s
+                    (if (expr/long-array? arr)
+                      (ColumnOps/longToDouble ^longs arr (alength ^longs arr))
+                      arr))))))
+      (when (and agg-col2-name (not agg-col-long?))
+        (let [^ChunkEntry entry (nth (get col-entries agg-col2-name) (nth simd-chunks s))
+              arr (chunk/chunk-as-doubles (.chunk entry))]
+          (aset ^objects agg-arr2s s
+                (if (expr/long-array? arr)
+                  (ColumnOps/longToDouble ^longs arr (alength ^longs arr))
+                  arr)))))
 
     ;; Accumulate stats-only chunks
     (let [stats-init (if classifications
@@ -493,32 +576,54 @@
                            0.0)]
           {:result result-val :count (long stats-count)})
 
-        ;; Process SIMD chunks via Java
-        (let [^doubles result
-              (ColumnOpsChunkedSimd/fusedSimdChunkedParallel
-               (int n-long) ^ints long-pred-types
-               ^"[[[J" long-pred-arrs ^longs long-lo ^longs long-hi
-               (int n-dbl) ^ints dbl-pred-types
-               ^"[[[D" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
-               (int agg-type) ^"[[D" agg-arr1s ^"[[D" agg-arr2s
-               ^ints chunk-lengths (int n-simd))
-              simd-result (aget result 0)
-              simd-count (long (aget result 1))
-              total-count (+ simd-count (long stats-count))]
-          ;; Merge SIMD result with stats accumulation
-          (if (zero? (long stats-count))
-            {:result simd-result :count total-count}
-            {:result (case agg-type-kw
-                       :count (double total-count)
-                       :sum (+ simd-result (double stats-sum))
-                       :min (if (zero? simd-count)
-                              (double stats-min)
-                              (Math/min simd-result (double stats-min)))
-                       :max (if (zero? simd-count)
-                              (double stats-max)
+        ;; Process SIMD chunks via Java — long or double path
+        (if agg-col-long?
+          ;; Native long SIMD path — zero-copy from chunks, long arithmetic
+          (let [^longs result
+                (ColumnOpsChunkedLong/fusedSimdChunkedLongParallel
+                 (int n-long) ^ints long-pred-types
+                 ^"[[[J" long-pred-arrs ^longs long-lo ^longs long-hi
+                 (int n-dbl) ^ints dbl-pred-types
+                 ^"[[[D" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
+                 (int agg-type) ^"[[J" agg-arr1s-long
+                 ^ints chunk-lengths (int n-simd))
+                simd-result (aget result 0)
+                simd-count (aget result 1)
+                total-count (+ simd-count (long stats-count))]
+            (if (zero? (long stats-count))
+              {:result simd-result :count total-count}
+              {:result (case agg-type-kw
+                         :count total-count
+                         :sum (+ simd-result (long stats-sum))
+                         :min (if (zero? simd-count) (long stats-min) (Math/min simd-result (long stats-min)))
+                         :max (if (zero? simd-count) (long stats-max) (Math/max simd-result (long stats-max)))
+                         simd-result)
+               :count total-count}))
+          ;; Double SIMD path (original)
+          (let [^doubles result
+                (ColumnOpsChunkedSimd/fusedSimdChunkedParallel
+                 (int n-long) ^ints long-pred-types
+                 ^"[[[J" long-pred-arrs ^longs long-lo ^longs long-hi
+                 (int n-dbl) ^ints dbl-pred-types
+                 ^"[[[D" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
+                 (int agg-type) ^"[[D" agg-arr1s ^"[[D" agg-arr2s
+                 ^ints chunk-lengths (int n-simd))
+                simd-result (aget result 0)
+                simd-count (long (aget result 1))
+                total-count (+ simd-count (long stats-count))]
+            (if (zero? (long stats-count))
+              {:result simd-result :count total-count}
+              {:result (case agg-type-kw
+                         :count (double total-count)
+                         :sum (+ simd-result (double stats-sum))
+                         :min (if (zero? simd-count)
+                                (double stats-min)
+                                (Math/min simd-result (double stats-min)))
+                         :max (if (zero? simd-count)
+                                (double stats-max)
                               (Math/max simd-result (double stats-max)))
                        simd-result)
-             :count total-count}))))))
+             :count total-count})))))))
 
 (defn- execute-chunked-fused-count
   "JIT-isolated chunked COUNT for index inputs.
@@ -1089,13 +1194,23 @@
                                         (pred/materialize-string-preds preds mat-cols length))
                                       [preds columns])
 
-        ;; Resolve string equality/inequality on dict-encoded columns
+        ;; Resolve string/keyword equality/inequality on dict-encoded columns
         ;; Converts [:col :eq "Alice"] → [:col :eq 0] using dict codes
-                    preds (if (some #(and (pred/dict-resolvable-ops (second %))
-                                          (>= (count %) 3)
-                                          (string? (nth % 2))) preds)
-                            (pred/resolve-dict-equality-preds preds columns)
-                            preds)
+        ;; Keywords are converted to (str kw) to match dict storage
+                    preds (let [has-dict-pred? (some #(and (pred/dict-resolvable-ops (second %))
+                                                           (>= (count %) 3)
+                                                           (let [v (nth % 2)]
+                                                             (or (string? v) (keyword? v)))) preds)]
+                            (if has-dict-pred?
+                              ;; Convert keyword args to strings before dict resolution
+                              (pred/resolve-dict-equality-preds
+                               (mapv (fn [pred]
+                                       (if (and (>= (count pred) 3) (keyword? (nth pred 2)))
+                                         (assoc pred 2 (str (nth pred 2)))
+                                         pred))
+                                     preds)
+                               columns)
+                              preds))
 
         ;; Pre-materialize string-producing expressions (UPPER, LOWER, SUBSTR, etc.)
         ;; into dict-encoded temp columns. This must happen before group-by pre-computation
@@ -1429,6 +1544,7 @@
                                    (assoc row alias (long length) :_count length)
                                    (let [entries (gb/collect-chunk-entries (:index (get columns (:col agg))))
                                          n-chunks (count entries)
+                                         col-long? (= :int64 (:type (get columns (:col agg))))
                                          [sum cnt mn mx]
                                          (loop [i 0 sum 0.0 cnt (long 0) mn Double/MAX_VALUE mx (- Double/MAX_VALUE)]
                                            (if (>= i n-chunks)
@@ -1442,9 +1558,11 @@
                                                       (Math/max mx (double (:max-val cs)))))))]
                                      (assoc row alias
                                             (case (:op agg)
-                                              :sum (if (zero? cnt) nil sum)
-                                              :min (if (zero? cnt) nil mn)
-                                              :max (if (zero? cnt) nil mx)
+                                              ;; For int64 columns, cast min/max back to Long
+                                              ;; (lossless since original values were longs)
+                                              :sum (if (zero? cnt) nil (if col-long? (long sum) sum))
+                                              :min (if (zero? cnt) nil (if col-long? (long mn) mn))
+                                              :max (if (zero? cnt) nil (if col-long? (long mx) mx))
                                               :avg (if (zero? cnt) nil (/ sum (double cnt))))
                                             :_count cnt)))))
                              {}
@@ -1518,22 +1636,13 @@
                       (let [mat-cols (materialize-columns columns)]
                         (execute-fused-multi-sum preds aggs mat-cols length))
 
-          ;; Multiple simple aggs with MIN/MAX — fall back to N separate SIMD passes
+          ;; Multiple aggs without GROUP BY — single-pass global aggregate via
+          ;; group-by with 0 group columns (materializes, then one-pass Java SIMD).
                       (and (seq aggs)
                            (not (seq group))
                            (pred/multi-agg-simd-eligible? preds aggs columns length))
-                      (let [mat-cols (materialize-columns columns)
-                            agg-results (mapv (fn [a] (execute-fused preds a mat-cols length)) aggs)
-                            cnt (:count (first agg-results))]
-                        [(into {:_count cnt}
-                               (map (fn [a r]
-                                      [(or (:as a) (:op a))
-                                       (case (:op a)
-                                         (:count :count-non-null) (long (:count r))
-                                         (:min :max :sum :sum-product) (if (zero? (:count r)) nil (:result r))
-                                         :avg (if (zero? (:count r)) nil (:result r))
-                                         (:result r))])
-                                    aggs agg-results))])
+                      (let [mat-cols (materialize-columns columns)]
+                        (execute-group-by preds aggs [] mat-cols length false))
 
           ;; Fast path for ungrouped percentile/median/approx-quantile — bypass Clojure scalar loop
                       (and (seq aggs)

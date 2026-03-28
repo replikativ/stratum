@@ -184,8 +184,8 @@
       ;; Verify query results
       (is (= 1 (count result)))
       (is (= 4 (:_count (first result))))
-      (is (= 1000.0 (:sum_price (first result))))
-      (is (= 100.0 (:sum_qty (first result))))))
+      (is (== 1000.0 (:sum_price (first result))))
+      (is (== 100 (:sum_qty (first result))))))
 
   (testing "Query execution with filtering on Dataset"
     (let [price-idx (idx/index-from-seq :float64 [100.0 200.0 300.0 400.0])

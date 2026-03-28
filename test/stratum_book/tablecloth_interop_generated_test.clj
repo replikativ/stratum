@@ -341,8 +341,8 @@
    ((fn
       [result]
       (and
-       (= 1000.0 (:sum_price (first result)))
-       (= 100.0 (:sum_qty (first result)))))
+       (== 1000.0 (:sum_price (first result)))
+       (== 100 (:sum_qty (first result)))))
     v62_l283)))
 
 (def

@@ -77,8 +77,36 @@
 ;; Predicate Bound Preparation
 ;; ============================================================================
 
+(defn- dict-code-for
+  "Look up a value in a dict array, returning its code (index) or -1 if not found.
+   The value is compared as a string (via str) against dict entries."
+  ^long [^"[Ljava.lang.String;" dict val]
+  (let [target (str val)
+        n (alength dict)]
+    (loop [i (int 0)]
+      (if (>= i n)
+        -1
+        (if (= target (aget dict i))
+          (long i)
+          (recur (unchecked-inc-int i)))))))
+
+(defn- resolve-long-arg
+  "Resolve a predicate argument to a long value. For dict-encoded columns,
+   looks up the argument string in the dictionary to get the code.
+   For numeric columns, casts directly."
+  ^long [arg col-info]
+  (if (number? arg)
+    (long arg)
+    ;; Non-numeric arg (keyword/string) on a dict-encoded column: look up code
+    (if-let [^"[Ljava.lang.String;" dict (:dict col-info)]
+      (dict-code-for dict arg)
+      ;; No dict — try direct cast (will throw if truly invalid)
+      (long arg))))
+
 (defn prepare-pred-bounds
   "Split predicates by column type and prepare bound arrays for Java fused filter.
+   For dict-encoded columns, translates keyword/string arguments to dict codes
+   so the SIMD path can compare longs directly.
    Returns {:long-preds :dbl-preds :n-long :n-dbl
             :long-pred-types :long-lo :long-hi
             :dbl-pred-types :dbl-lo :dbl-hi}."
@@ -88,15 +116,16 @@
         n-long      (count long-preds)
         n-dbl       (count dbl-preds)
         long-pred-types (int-array (mapv #(get qc/op->pred-type (second %)) long-preds))
-        long-lo (long-array (mapv (fn [[_col op & args]]
+        long-lo (long-array (mapv (fn [[col op & args]]
                                     (case op
-                                      (:range :not-range :gt :eq :gte :neq) (long (first args))
+                                      (:range :not-range :gt :eq :gte :neq)
+                                      (resolve-long-arg (first args) (get columns col))
                                       0))
                                   long-preds))
-        long-hi (long-array (mapv (fn [[_col op & args]]
+        long-hi (long-array (mapv (fn [[col op & args]]
                                     (case op
-                                      (:range :not-range) (long (second args))
-                                      (:lt :lte) (long (first args))
+                                      (:range :not-range) (resolve-long-arg (second args) (get columns col))
+                                      (:lt :lte) (resolve-long-arg (first args) (get columns col))
                                       0))
                                   long-preds))
         dbl-pred-types (int-array (mapv #(get qc/op->pred-type (second %)) dbl-preds))
@@ -447,9 +476,43 @@
 ;; Scalar Fallback Execution
 ;; ============================================================================
 
+(defn preprocess-preds
+  "Pre-encode dict-column predicate arguments to dict codes so the per-row
+   eval-pred-scalar only compares longs. Called once before the row loop.
+   Returns preprocessed preds vector (original preds for non-dict columns)."
+  [preds col-arrays]
+  (if-not expr/*columns-meta*
+    preds
+    (mapv (fn [pred]
+            (let [col-ref (first pred)
+                  op (second pred)]
+              (if (= :or op)
+                pred ;; TODO: preprocess OR sub-preds
+                (if-let [col-meta (when (keyword? col-ref) (get expr/*columns-meta* col-ref))]
+                  (if-let [^"[Ljava.lang.String;" dict (:dict col-meta)]
+                    ;; Dict column: replace argument with dict code
+                    ;; Skip if already numeric (already resolved by resolve-dict-equality-preds)
+                    (let [args (subvec pred 2)]
+                      (if (number? (first args))
+                        pred ;; Already a dict code — don't re-resolve
+                        (case op
+                          (:eq :neq)
+                          (let [code (dict-code-for dict (first args))]
+                            [col-ref op (long code)])
+                        (:in :not-in)
+                        (let [codes (into #{} (map #(dict-code-for dict %)) (first args))]
+                          [col-ref op codes])
+                        ;; Other ops: leave as-is
+                        pred)))
+                    pred)
+                  pred))))
+          preds)))
+
 (defn eval-pred-scalar
   "Evaluate a single predicate for a row.
-   Handles standard comparisons, IN, NOT-IN, NOT-RANGE, and OR."
+   Handles standard comparisons, IN, NOT-IN, NOT-RANGE, and OR.
+   Expects dict-column predicates to be preprocessed via preprocess-preds
+   (arguments already encoded to dict codes for long comparison)."
   [col-arrays ^long i pred]
   (let [col-ref (first pred)
         op (second pred)]
@@ -460,44 +523,46 @@
                 (let [sub-col (first sub-pred)]
                   (eval-pred-scalar col-arrays i sub-pred)))
               sub-preds))
-      ;; Standard predicate
+      ;; Standard predicate — all arguments are numeric (dict args pre-encoded)
       (let [col-data (if (keyword? col-ref) (get col-arrays col-ref) col-ref)
             v (if (expr/long-array? col-data)
                 (aget ^longs col-data i)
                 (aget ^doubles col-data i))
             args (subvec pred 2)]
         (case op
-          :lt    (< (double v) (double (first args)))
-          :gt    (> (double v) (double (first args)))
-          :lte   (<= (double v) (double (first args)))
-          :gte   (>= (double v) (double (first args)))
-          :eq    (== (double v) (double (first args)))
-          :neq   (not (== (double v) (double (first args))))
-          :range (let [lo (double (first args))
-                       hi (double (second args))]
-                   (and (>= (double v) lo) (<= (double v) hi)))
-          :not-range (let [lo (double (first args))
-                           hi (double (second args))]
-                       (or (< (double v) lo) (> (double v) hi)))
-          :in    (let [s (first args)]
-                   (if (every? number? s)
-                     (contains? s (double v))
-                     (contains? s v)))
-          :not-in (let [s (first args)]
-                    (if (every? number? s)
-                      (not (contains? s (double v)))
-                      (not (contains? s v))))
-          :is-null (if (expr/long-array? col-data)
-                     (== (long v) Long/MIN_VALUE)
-                     (Double/isNaN (double v)))
-          :is-not-null (if (expr/long-array? col-data)
-                         (not= (long v) Long/MIN_VALUE)
-                         (not (Double/isNaN (double v)))))))))
+            :lt    (< (double v) (double (first args)))
+            :gt    (> (double v) (double (first args)))
+            :lte   (<= (double v) (double (first args)))
+            :gte   (>= (double v) (double (first args)))
+            :eq    (== (double v) (double (first args)))
+            :neq   (not (== (double v) (double (first args))))
+            :range (let [lo (double (first args))
+                         hi (double (second args))]
+                     (and (>= (double v) lo) (<= (double v) hi)))
+            :not-range (let [lo (double (first args))
+                             hi (double (second args))]
+                         (or (< (double v) lo) (> (double v) hi)))
+            :in    (let [s (first args)]
+                     (if (every? number? s)
+                       (contains? s (double v))
+                       (contains? s v)))
+            :not-in (let [s (first args)]
+                      (if (every? number? s)
+                        (not (contains? s (double v)))
+                        (not (contains? s v))))
+            :is-null (if (expr/long-array? col-data)
+                       (== (long v) Long/MIN_VALUE)
+                       (Double/isNaN (double v)))
+            :is-not-null (if (expr/long-array? col-data)
+                           (not= (long v) Long/MIN_VALUE)
+                           (not (Double/isNaN (double v)))))))))
 
 (defn execute-scalar-aggs
   "Execute aggregations over matching rows using scalar loop."
   [preds aggs columns length]
   (let [col-arrays (into {} (map (fn [[k v]] [k (:data v)])) columns)
+        ;; Pre-encode dict-column predicate arguments to dict codes
+        preds (preprocess-preds preds col-arrays)
         ;; Find matching indices
         matching (transient [])
         _ (dotimes [i length]
@@ -2356,6 +2421,9 @@
         ;; When max-key overflows, key-overflow? signals that composite positional encoding
         ;; would produce wrong results — the hash path must use multi-key hashing instead.
         {:keys [group-muls max-key use-dense? key-overflow?]}
+        (if (zero? n-group)
+          ;; Global aggregate — single bucket, no group keys
+          {:group-muls (long-array 0) :max-key 1 :use-dense? true :key-overflow? false}
         (let [muls (long-array n-group)
               _ (aset muls (dec n-group) 1)
               muls-ok? (try
@@ -2385,7 +2453,7 @@
                    :use-dense? false :key-overflow? true})))
             ;; Even strides overflow — key space is enormous
             {:group-muls (long-array n-group) :max-key Long/MAX_VALUE
-             :use-dense? false :key-overflow? true}))]
+             :use-dense? false :key-overflow? true})))]
     {:group-arrays group-arrays :group-muls group-muls :group-maxes group-maxes
      :group-dicts group-dicts :group-offsets group-offsets :max-key max-key
      :use-dense? use-dense? :n-group n-group :key-overflow? (boolean key-overflow?)
@@ -3137,6 +3205,7 @@
                      dense-limit (long (or *dense-group-limit* 100000))]
                  (when (<= max-key dense-limit)
                    (let [col-arrays (into {} (map (fn [[k v]] [k (:data v)])) columns)
+                         preds (preprocess-preds preds col-arrays)
                          ;; Build pred mask if needed
                          ^longs mask (when (seq preds)
                                        (let [m (long-array length)]
@@ -3176,6 +3245,7 @@
       fast-result
     ;; Clojure scalar fallback
       (let [col-arrays (into {} (map (fn [[k v]] [k (:data v)])) columns)
+            preds (preprocess-preds preds col-arrays)
             ^java.util.HashMap groups (java.util.HashMap.)
           ;; Detect if we need collection-based accumulators
             collection-agg-indices (into {}
