@@ -1572,22 +1572,14 @@
                       (let [mat-cols (materialize-columns columns)]
                         (execute-fused-multi-sum preds aggs mat-cols length))
 
-          ;; Multiple simple aggs with MIN/MAX — fall back to N separate SIMD passes
+          ;; Multiple aggs without GROUP BY — single-pass global aggregate via group-by
+          ;; with zero group columns. The Java dense path handles numGroupCols=0 as
+          ;; a single-bucket global aggregate, processing all aggs in one pass.
                       (and (seq aggs)
                            (not (seq group))
                            (pred/multi-agg-simd-eligible? preds aggs columns length))
-                      (let [mat-cols (materialize-columns columns)
-                            agg-results (mapv (fn [a] (execute-fused preds a mat-cols length)) aggs)
-                            cnt (:count (first agg-results))]
-                        [(into {:_count cnt}
-                               (map (fn [a r]
-                                      [(or (:as a) (:op a))
-                                       (case (:op a)
-                                         (:count :count-non-null) (long (:count r))
-                                         (:min :max :sum :sum-product) (if (zero? (:count r)) nil (:result r))
-                                         :avg (if (zero? (:count r)) nil (:result r))
-                                         (:result r))])
-                                    aggs agg-results))])
+                      (let [mat-cols (materialize-columns columns)]
+                        (execute-group-by preds aggs [] mat-cols length false))
 
           ;; Fast path for ungrouped percentile/median/approx-quantile — bypass Clojure scalar loop
                       (and (seq aggs)
