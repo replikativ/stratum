@@ -491,16 +491,19 @@
                 (if-let [col-meta (when (keyword? col-ref) (get expr/*columns-meta* col-ref))]
                   (if-let [^"[Ljava.lang.String;" dict (:dict col-meta)]
                     ;; Dict column: replace argument with dict code
+                    ;; Skip if already numeric (already resolved by resolve-dict-equality-preds)
                     (let [args (subvec pred 2)]
-                      (case op
-                        (:eq :neq)
-                        (let [code (dict-code-for dict (first args))]
-                          [col-ref op (long code)])
+                      (if (number? (first args))
+                        pred ;; Already a dict code — don't re-resolve
+                        (case op
+                          (:eq :neq)
+                          (let [code (dict-code-for dict (first args))]
+                            [col-ref op (long code)])
                         (:in :not-in)
                         (let [codes (into #{} (map #(dict-code-for dict %)) (first args))]
                           [col-ref op codes])
                         ;; Other ops: leave as-is
-                        pred))
+                        pred)))
                     pred)
                   pred))))
           preds)))
