@@ -464,11 +464,20 @@
               ^ChunkEntry entry (nth (get col-entries col-name) (nth simd-chunks s))]
           (aset ^objects (aget ^"[[[D" dbl-pred-arrs p) s (chunk/chunk-as-doubles (.chunk entry)))))
       (when agg-col1-name
-        (let [^ChunkEntry entry (nth (get col-entries agg-col1-name) (nth simd-chunks s))]
-          (aset ^objects agg-arr1s s (chunk/chunk-as-doubles (.chunk entry)))))
+        (let [^ChunkEntry entry (nth (get col-entries agg-col1-name) (nth simd-chunks s))
+              arr (chunk/chunk-as-doubles (.chunk entry))]
+          ;; chunk-as-doubles returns long[] for int64 chunks — convert to double[]
+          (aset ^objects agg-arr1s s
+                (if (expr/long-array? arr)
+                  (ColumnOps/longToDouble ^longs arr (alength ^longs arr))
+                  arr))))
       (when agg-col2-name
-        (let [^ChunkEntry entry (nth (get col-entries agg-col2-name) (nth simd-chunks s))]
-          (aset ^objects agg-arr2s s (chunk/chunk-as-doubles (.chunk entry))))))
+        (let [^ChunkEntry entry (nth (get col-entries agg-col2-name) (nth simd-chunks s))
+              arr (chunk/chunk-as-doubles (.chunk entry))]
+          (aset ^objects agg-arr2s s
+                (if (expr/long-array? arr)
+                  (ColumnOps/longToDouble ^longs arr (alength ^longs arr))
+                  arr)))))
 
     ;; Accumulate stats-only chunks
     (let [stats-init (if classifications
@@ -1089,13 +1098,23 @@
                                         (pred/materialize-string-preds preds mat-cols length))
                                       [preds columns])
 
-        ;; Resolve string equality/inequality on dict-encoded columns
+        ;; Resolve string/keyword equality/inequality on dict-encoded columns
         ;; Converts [:col :eq "Alice"] → [:col :eq 0] using dict codes
-                    preds (if (some #(and (pred/dict-resolvable-ops (second %))
-                                          (>= (count %) 3)
-                                          (string? (nth % 2))) preds)
-                            (pred/resolve-dict-equality-preds preds columns)
-                            preds)
+        ;; Keywords are converted to (str kw) to match dict storage
+                    preds (let [has-dict-pred? (some #(and (pred/dict-resolvable-ops (second %))
+                                                           (>= (count %) 3)
+                                                           (let [v (nth % 2)]
+                                                             (or (string? v) (keyword? v)))) preds)]
+                            (if has-dict-pred?
+                              ;; Convert keyword args to strings before dict resolution
+                              (pred/resolve-dict-equality-preds
+                               (mapv (fn [pred]
+                                       (if (and (>= (count pred) 3) (keyword? (nth pred 2)))
+                                         (assoc pred 2 (str (nth pred 2)))
+                                         pred))
+                                     preds)
+                               columns)
+                              preds))
 
         ;; Pre-materialize string-producing expressions (UPPER, LOWER, SUBSTR, etc.)
         ;; into dict-encoded temp columns. This must happen before group-by pre-computation
