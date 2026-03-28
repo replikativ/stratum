@@ -1480,6 +1480,7 @@
                                    (assoc row alias (long length) :_count length)
                                    (let [entries (gb/collect-chunk-entries (:index (get columns (:col agg))))
                                          n-chunks (count entries)
+                                         col-long? (= :int64 (:type (get columns (:col agg))))
                                          [sum cnt mn mx]
                                          (loop [i 0 sum 0.0 cnt (long 0) mn Double/MAX_VALUE mx (- Double/MAX_VALUE)]
                                            (if (>= i n-chunks)
@@ -1493,9 +1494,11 @@
                                                       (Math/max mx (double (:max-val cs)))))))]
                                      (assoc row alias
                                             (case (:op agg)
-                                              :sum (if (zero? cnt) nil sum)
-                                              :min (if (zero? cnt) nil mn)
-                                              :max (if (zero? cnt) nil mx)
+                                              ;; For int64 columns, cast min/max back to Long
+                                              ;; (lossless since original values were longs)
+                                              :sum (if (zero? cnt) nil (if col-long? (long sum) sum))
+                                              :min (if (zero? cnt) nil (if col-long? (long mn) mn))
+                                              :max (if (zero? cnt) nil (if col-long? (long mx) mx))
                                               :avg (if (zero? cnt) nil (/ sum (double cnt))))
                                             :_count cnt)))))
                              {}
