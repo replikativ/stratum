@@ -375,6 +375,70 @@
   [columns surviving-indices]
   (into {} (map (fn [[k v]] [k (materialize-column-pruned v surviving-indices)])) columns))
 
+(defn- execute-chunked-multi-agg
+  "Execute multiple aggregates in one pass over index chunks, no materialization.
+   Uses ColumnOpsChunkedLong/fusedSimdChunkedMultiLongParallel for up to 4 aggs.
+   Avg is decomposed to sum/count and divided after."
+  [preds aggs columns length]
+  (let [;; Decompose avg into sum (Java accumulates sum, we divide after)
+        decomposed (mapv (fn [a] (if (= :avg (:op a)) (assoc a :op :sum :_was-avg true) a)) aggs)
+        {:keys [n-long long-pred-types long-lo long-hi
+                n-dbl dbl-pred-types dbl-lo dbl-hi
+                long-preds dbl-preds]} (gb/prepare-pred-bounds preds columns)
+        long-col-names (mapv first long-preds)
+        dbl-col-names (mapv first dbl-preds)
+        n-aggs (count decomposed)
+        agg-types (int-array (mapv (fn [a] (case (:op a)
+                                             :sum ColumnOps/AGG_SUM :count ColumnOps/AGG_COUNT
+                                             :min ColumnOps/AGG_MIN :max ColumnOps/AGG_MAX))
+                                   decomposed))
+        ;; Collect chunk entries
+        col-entries (into {} (map (fn [[k v]] [k (gb/collect-chunk-entries (:index v))])) columns)
+        first-col-entries (val (first col-entries))
+        n-chunks (count first-col-entries)
+        ;; Pre-extract arrays
+        chunk-lengths (int-array n-chunks)
+        long-pred-arrs (make-array expr/long-array-class n-long n-chunks)
+        dbl-pred-arrs (make-array expr/double-array-class n-dbl n-chunks)
+        ;; aggChunkArrays: [numAggs][nChunks] → long[]
+        agg-chunk-arrs (make-array expr/long-array-class n-aggs n-chunks)]
+    ;; Fill arrays
+    (dotimes [c n-chunks]
+      (let [^ChunkEntry ref (nth first-col-entries c)]
+        (aset chunk-lengths c (int (chunk/chunk-length (.chunk ref)))))
+      (dotimes [p n-long]
+        (let [^ChunkEntry e (nth (get col-entries (nth long-col-names p)) c)]
+          (aset ^objects (aget ^"[[[J" long-pred-arrs p) c (chunk/chunk-as-longs (.chunk e)))))
+      (dotimes [p n-dbl]
+        (let [^ChunkEntry e (nth (get col-entries (nth dbl-col-names p)) c)]
+          (aset ^objects (aget ^"[[[D" dbl-pred-arrs p) c (chunk/chunk-as-doubles (.chunk e)))))
+      (dotimes [a n-aggs]
+        (when-let [col-name (:col (nth decomposed a))]
+          (let [^ChunkEntry e (nth (get col-entries col-name) c)]
+            (aset ^objects (aget ^"[[[J" agg-chunk-arrs a) c (chunk/chunk-as-longs (.chunk e)))))))
+    ;; Call Java multi-agg
+    (let [^longs result
+          (ColumnOpsChunkedLong/fusedSimdChunkedMultiLongParallel
+           (int n-long) ^ints long-pred-types
+           ^"[[[J" long-pred-arrs ^longs long-lo ^longs long-hi
+           (int n-dbl) ^ints dbl-pred-types
+           ^"[[[D" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
+           (int n-aggs) ^ints agg-types ^"[[[J" agg-chunk-arrs
+           ^ints chunk-lengths (int n-chunks))
+          cnt (aget result 1)]
+      [(into {:_count cnt}
+             (map-indexed
+              (fn [i a]
+                (let [val (aget result (* i 2))
+                      alias (or (:as a) (:op (nth aggs i)))]
+                  [alias
+                   (cond
+                     (zero? cnt) nil
+                     (:_was-avg a) (/ (double val) (double cnt))
+                     (= :count (:op a)) cnt
+                     :else val)]))
+              decomposed))])))
+
 (defn- execute-chunked-fused
   "Execute fused filter+aggregate by streaming over aligned chunks.
 
@@ -1572,9 +1636,8 @@
                       (let [mat-cols (materialize-columns columns)]
                         (execute-fused-multi-sum preds aggs mat-cols length))
 
-          ;; Multiple aggs without GROUP BY — single-pass global aggregate via group-by
-          ;; with zero group columns. The Java dense path handles numGroupCols=0 as
-          ;; a single-bucket global aggregate, processing all aggs in one pass.
+          ;; Multiple aggs without GROUP BY — single-pass global aggregate via
+          ;; group-by with 0 group columns (materializes, then one-pass Java SIMD).
                       (and (seq aggs)
                            (not (seq group))
                            (pred/multi-agg-simd-eligible? preds aggs columns length))
