@@ -160,6 +160,17 @@
           `(not= (aget ~sym (int ~'i)) Long/MIN_VALUE)
           `(not (Double/isNaN (aget ~sym (int ~'i))))))
 
+      ;; Function predicate: [:col :fn f :fn-sym sym]
+      ;; The fn object is bound to the symbol at index 3 of the pred vector
+      ;; by compile-pred-mask (appended during compilation).
+      :fn
+      (let [fn-sym (nth pred 3)
+            sym (get col-syms col)
+            long-col? (= :int64 (:type (get columns col)))]
+        (if long-col?
+          `(~fn-sym (aget ~sym (int ~'i)))
+          `(~fn-sym (aget ~sym (int ~'i)))))
+
       ;; Unknown op — throw at compile time
       (throw (ex-info (str "Cannot compile predicate op: " op) {:pred pred})))))
 
@@ -169,6 +180,7 @@
    optimize the entire mask materialization as one unit — eliminates 1M IFn.invoke
    calls compared to the per-row approach.
    Arrays are passed via a closure over an object array (not embedded in code).
+   Supports :fn predicates — function objects are passed in the same object array.
    Returns nil if no non-SIMD predicates."
   [non-simd-preds columns]
   (when (seq non-simd-preds)
@@ -178,6 +190,7 @@
                       (let [op (second p)]
                         (case op
                           :or (doseq [sub (subvec p 2)] (walk-pred sub))
+                          :fn (swap! all-cols conj (first p))
                           (:in :not-in) (swap! all-cols conj (first p))
                           (when (keyword? (first p)) (swap! all-cols conj (first p))))))]
               (doseq [p non-simd-preds] (walk-pred p)))
@@ -186,18 +199,39 @@
           ;; Create unique symbols for each column
           col-syms (into {} (map (fn [k] [k (gensym (str (name k) "_"))]) needed-cols))
 
-          ;; Build the code that extracts arrays from an object array parameter
-          extract-bindings (vec (mapcat
-                                 (fn [idx k]
-                                   (let [sym (col-syms k)
-                                         col-info (get columns k)]
-                                     (if (= :int64 (:type col-info))
-                                       [(with-meta sym {:tag 'longs}) `(aget ~'cols ~idx)]
-                                       [(with-meta sym {:tag 'doubles}) `(aget ~'cols ~idx)])))
-                                 (range) needed-cols))
+          ;; Collect :fn predicates — assign gensyms and annotate preds with them
+          fn-preds (filterv #(= :fn (second %)) non-simd-preds)
+          fn-syms (mapv (fn [_] (gensym "pred_fn_")) fn-preds)
+          fn-pred-sym-map (zipmap (mapv #(nth % 2) fn-preds) fn-syms)  ;; fn-obj → sym
 
-          ;; Generate predicate code
-          pred-codes (mapv #(pred->code % col-syms columns) non-simd-preds)
+          ;; Annotate :fn preds with their bound symbol (appended at index 3)
+          annotated-preds (mapv (fn [p]
+                                  (if (= :fn (second p))
+                                    (conj (vec p) (get fn-pred-sym-map (nth p 2)))
+                                    p))
+                                non-simd-preds)
+
+          ;; Build the code that extracts arrays from an object array parameter
+          ;; First: column data arrays (indices 0..n-1)
+          ;; Then: fn objects (indices n..n+m-1)
+          n-cols (count needed-cols)
+          extract-bindings (vec (concat
+                                 (mapcat
+                                   (fn [idx k]
+                                     (let [sym (col-syms k)
+                                           col-info (get columns k)]
+                                       (if (= :int64 (:type col-info))
+                                         [(with-meta sym {:tag 'longs}) `(aget ~'cols ~idx)]
+                                         [(with-meta sym {:tag 'doubles}) `(aget ~'cols ~idx)])))
+                                   (range) needed-cols)
+                                 (mapcat
+                                   (fn [idx fn-sym]
+                                     [(with-meta fn-sym {:tag 'clojure.lang.IFn})
+                                      `(aget ~'cols ~(+ n-cols idx))])
+                                   (range) fn-syms)))
+
+          ;; Generate predicate code (using annotated preds with fn-syms)
+          pred-codes (mapv #(pred->code % col-syms columns) annotated-preds)
 
           ;; Compile entire loop: (fn [^objects cols ^long len] -> long[])
           ;; Loop is inside compiled code so JIT optimizes it as one unit
@@ -208,8 +242,10 @@
                                    (aset ~'mask ~'i (long (if (and ~@pred-codes) 1 0))))
                                  ~'mask)))
 
-          ;; Build the object array of column data
-          col-data-arr (object-array (mapv #(:data (get columns %)) needed-cols))]
+          ;; Build the object array: column data arrays + fn objects
+          col-data-arr (object-array
+                         (concat (mapv #(:data (get columns %)) needed-cols)
+                                 (mapv #(nth % 2) fn-preds)))]
 
       ;; Return (fn [^long length] -> long[]) that closes over the data
       (fn [^long length] ^longs (compiled-fn col-data-arr length)))))

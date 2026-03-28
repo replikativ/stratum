@@ -901,7 +901,8 @@
         ;; Skip OR/NOT combinators — their sub-preds will be checked recursively
         (when-not (or (= :or op-raw) (= 'or op-raw)
                       (= :not op-raw) (= 'not op-raw)
-                      (= :in op-raw) (= 'in op-raw))
+                      (= :in op-raw) (= 'in op-raw)
+                      (= :fn op-raw) (= 'fn op-raw))
           (let [col-ref (norm/strip-ns (second items))]
             (when (and (keyword? col-ref)
                        (not (contains? col-names col-ref)))
@@ -1244,6 +1245,7 @@
                                                                         (let [op (second p)]
                                                                           (case op
                                                                             :or (doseq [sub (subvec p 2)] (walk sub))
+                                                                            :fn (swap! ks conj (first p))
                                                                             (:in :not-in) (swap! ks conj (first p))
                                                                             (when (keyword? (first p)) (swap! ks conj (first p))))))]
                                                                 (doseq [p non-simd-preds] (walk p)))

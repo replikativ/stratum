@@ -4020,3 +4020,57 @@
       ;; 300 rows match (vals in {0,1,2}), distributed across 3 categories → 100 each
       (is (= 3 (count result)))
       (is (every? #(= 100 (:count %)) result)))))
+
+(deftest fn-predicate-test
+  (testing "Function predicate with array-backed columns"
+    (let [eid (long-array [1 2 3 4 5])
+          salary (double-array [50000 60000 70000 80000 90000])
+          dept (long-array [0 0 1 1 0])
+          ;; Filter: only entities {1, 3, 5}
+          target-set #{1 3 5}
+          result (q/q {:from {:eid eid :salary salary :dept dept}
+                       :where [[:fn :eid (fn [v] (contains? target-set (long v)))]]
+                       :agg [[:sum :salary] [:count]]})]
+      (is (= 1 (count result)))
+      ;; 50000 + 70000 + 90000 = 210000
+      (is (== 210000.0 (:sum (first result))))
+      (is (= 3 (:count (first result))))))
+
+  (testing "Function predicate with group-by"
+    (let [eid (long-array [1 2 3 4 5])
+          salary (double-array [50000 60000 70000 80000 90000])
+          dept (long-array [0 0 1 1 0])
+          target-set #{1 2 3 4 5}
+          result (q/q {:from {:eid eid :salary salary :dept dept}
+                       :where [[:fn :eid (fn [v] (contains? target-set (long v)))]]
+                       :group [:dept]
+                       :agg [[:sum :salary] [:count]]})]
+      (is (= 2 (count result)))
+      (let [by-dept (into {} (map (fn [r] [(:dept r) r])) result)]
+        ;; dept 0: 50+60+90=200k, dept 1: 70+80=150k
+        (is (== 200000.0 (:sum (get by-dept 0))))
+        (is (== 150000.0 (:sum (get by-dept 1)))))))
+
+  (testing "Function predicate with index-backed columns"
+    (let [eid-idx (index/index-from-seq :int64 [10 20 30 40 50])
+          val-idx (index/index-from-seq :float64 [1.0 2.0 3.0 4.0 5.0])
+          ;; Filter: even eids only
+          result (q/q {:from {:eid eid-idx :val val-idx}
+                       :where [[:fn :eid (fn [v] (zero? (mod (long v) 20)))]]
+                       :agg [[:sum :val] [:count]]})]
+      (is (= 1 (count result)))
+      ;; eids 20, 40 → vals 2.0, 4.0 → sum 6.0
+      (is (== 6.0 (:sum (first result))))
+      (is (= 2 (:count (first result))))))
+
+  (testing "Function predicate combined with SIMD predicate"
+    (let [eid (long-array [1 2 3 4 5])
+          salary (double-array [50000 60000 70000 80000 90000])
+          target-set #{1 2 3 4 5}
+          result (q/q {:from {:eid eid :salary salary}
+                       :where [[:fn :eid (fn [v] (contains? target-set (long v)))]
+                               [:> :salary 65000]]
+                       :agg [[:count]]})]
+      ;; salaries > 65000: 70k, 80k, 90k = 3 rows, all eids in set
+      (is (= 3 (:count (first result)))))))
+

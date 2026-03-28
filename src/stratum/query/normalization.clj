@@ -194,6 +194,11 @@
       (or (= :starts-with op-raw) (= 'starts-with op-raw)) [(second items) :starts-with (nth items 2)]
       (or (= :ends-with op-raw)   (= 'ends-with op-raw))   [(second items) :ends-with   (nth items 2)]
 
+      ;; Function predicate: [:fn :col f] → [:col :fn f]
+      ;; f is (fn [^long value] boolean) applied per row on the column value.
+      (or (= :fn op-raw) (= 'fn op-raw))
+      [(strip-ns (second items)) :fn (nth items 2)]
+
       (keyword? op-raw)
       (let [op   (get keyword->pred-op op-raw op-raw)
             col  (second items)
