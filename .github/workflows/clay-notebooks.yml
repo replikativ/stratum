@@ -49,7 +49,7 @@ jobs:
             ${{ runner.os }}-maven-
 
       - name: Compile Java sources
-        run: clj -T:build compile-java
+        run: clojure -T:build compile-java
 
       - name: Download Clojure dependencies
         run: clojure -P -M:dev
