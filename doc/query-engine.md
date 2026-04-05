@@ -183,9 +183,81 @@ The `q` function processes a query through these stages:
 
 8. **Post-processing**: Apply `:having`, `:order`, `:limit`, `:offset`, `:distinct`.
 
-## Dispatch Decision Tree
+## Query Planner
 
-The engine selects the fastest execution strategy based on query shape:
+The query planner (`stratum.query.plan`) transforms declarative queries into optimized physical execution plans through a multi-pass pipeline. It replaces the legacy single-pass dispatch with a structured IR that enables cross-operator optimizations.
+
+### Architecture
+
+```
+Query Map
+  → build-logical-plan     (logical IR: LScan, LFilter, LJoin, LAgg, ...)
+  → optimize                (logical → physical, multi-pass)
+    → strategy-selection    (choose physical operators: PScan, PSIMDFilter, PDenseGroupBy, ...)
+    → predicate-pushdown    (push filters below joins, fixpoint loop)
+    → expression-materialize (pre-compute expressions referenced by aggs)
+    → operator-fusion       (merge adjacent operators into fused nodes)
+  → execute-physical        (walk tree bottom-up, dispatch to Java SIMD)
+```
+
+### Optimization Passes
+
+**Strategy Selection** — Chooses physical operators based on query shape and data characteristics. Uses three-tier selectivity estimation (zone-map → sample → heuristic) to inform decisions:
+- Zone-map estimation: classifies index chunks as full-pass/full-fail/partial using ChunkStats min/max (~5μs)
+- Sample-based estimation: strides through 4 random chunks, 32 values each, applies predicate (~3.6μs)
+- Heuristic fallback: fixed constants when no column data is available (e.g., equality = 0.02, range = 0.33)
+
+**Predicate Pushdown** — Pushes filter predicates below joins to reduce input sizes. Runs as a fixpoint loop (`pushdown-once` until stable, max 10 iterations) to handle chained joins:
+```
+Before: LFilter[cat > 15] → LJoin → (LScan fact, LScan dim)
+After:  LJoin → (LScan fact, LFilter[cat > 15] → LScan dim)
+```
+Predicates are pushed to whichever side of the join contains their referenced columns. Multi-level chains (fact → dim1 → dim2) are handled by recursive `scan-columns` resolution.
+
+**Expression Materialization** — Pre-computes expression columns (e.g., `[:* :price :qty]`) into temporary arrays before aggregation, unlocking SIMD-fused paths that require simple column references.
+
+**Operator Fusion** — Merges adjacent physical operators into fused nodes that execute in a single Java pass:
+- `PDenseGroupBy` over `PHashJoin` → `PFusedJoinGroupAgg` (probe + gather + group + aggregate)
+- `PFusedSIMDAgg` over `PHashJoin` → `PFusedJoinGlobalAgg` (probe + accumulate)
+- Any node over `PHashJoin` where dim columns are unused → `PBitmapSemiJoin` (BitSet existence check, no hash table)
+
+**Adaptive Re-selection** — After filter execution, the actual number of surviving rows is counted from the mask. If significantly fewer rows survive than estimated, downstream operators (e.g., dense group-by) tighten their memory allocation.
+
+### Physical Plan Nodes
+
+| Node | Description |
+|------|-------------|
+| `PScan` / `PChunkedScan` | Column scan (array or index-backed) |
+| `PSIMDFilter` / `PMaskFilter` | Predicate filter (SIMD-compatible or compiled mask) |
+| `PFusedSIMDAgg` | Single-agg fused filter+aggregate (SIMD) |
+| `PFusedSIMDCount` | Fused filter+COUNT |
+| `PFusedMultiSum` | Multi-column SUM with LongVector accumulators |
+| `PDenseGroupBy` / `PHashGroupBy` | Group-by (dense array or hash-based) |
+| `PChunkedDenseGroupBy` | Streaming chunked group-by over index |
+| `PHashJoin` / `PPerfectHashJoin` | Hash join (standard or direct-array-indexed) |
+| `PFusedJoinGroupAgg` | Fused join + group-by + aggregate |
+| `PFusedJoinGlobalAgg` | Fused join + global aggregate |
+| `PBitmapSemiJoin` | Existence-only join via BitSet probe |
+| `PMaterializeExpr` | Pre-computed expression column |
+| `PProject` / `PWindow` / `PHaving` / `PSort` / `PDistinct` / `PLimit` | Post-processing |
+
+### EXPLAIN
+
+```clojure
+(println (plan/explain (plan/optimize (plan/build-logical-plan query))))
+;; PDenseGroupBy  groups=[:fk] aggs=[:sum] max-key=3 sel=0.667 est-rows=6
+;;   PBitmapSemiJoin
+;;     PScan  cols=[:fk :amount] len=10
+;;     dim:
+;;       PSIMDFilter
+;;         PScan  cols=[:id :category] len=3
+```
+
+The explain output shows the physical plan tree with selectivity estimates, operator types, and data flow. Each node includes relevant metadata (group keys, aggregation ops, estimated rows).
+
+## Legacy Dispatch Decision Tree
+
+The legacy engine (used when `*use-planner*` is false) selects the fastest execution strategy based on query shape:
 
 ```
 Is this a projection-only query (no agg, no group)?

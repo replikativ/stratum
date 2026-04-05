@@ -249,8 +249,10 @@
 
 (defn execute-fused-join-group-agg
   "Execute fused join+group+aggregate in Java — single pass, no intermediate arrays.
-   Returns decoded results in same format as gb/execute-group-by-java."
-  [from-columns fact-length join-spec group-cols aggs columnar?]
+   Returns decoded results in same format as gb/execute-group-by-java.
+   Optional probe-mask/build-mask: long[] masks from pushed-down predicates."
+  [from-columns fact-length join-spec group-cols aggs columnar?
+   & {:keys [probe-mask build-mask]}]
   (let [fact-length (long fact-length)
         {:keys [with on-pairs type]} (normalize-join-spec join-spec)
         right-columns (cols/materialize-columns with)
@@ -264,8 +266,9 @@
         (unify-all-dict-keys left-columns right-columns on-pairs fact-length right-length)
         ;; Build-side keys
         right-keys (compute-join-key right-columns right-key-cols right-length)
-        ;; Check perfect hash eligibility
-        perfect-info (perfect-hash-eligible? right-keys right-length)
+        ;; Check perfect hash eligibility (skip when build-mask present — no build-mask overload)
+        perfect-info (when-not build-mask
+                       (perfect-hash-eligible? right-keys right-length))
         ;; Probe keys from fact (left) side
         probe-keys (compute-join-key left-columns left-key-cols fact-length)
         ;; Prepare group columns — these come from dim (right) side
@@ -331,19 +334,19 @@
                 is-unique (boolean (aget ^objects pht 2))]
             (ColumnOpsExt/perfectJoinGroupAggregateDenseParallel
              pf pn is-unique (long min-key) (int key-range)
-             ^longs probe-keys (int fact-length)
+             ^longs probe-keys probe-mask (int fact-length)
              (int n-group) group-arrays group-muls
              (int n-aggs) agg-types ^"[[D" agg-cols
              (int (inc max-key))))
           ;; Hash table fallback
-          (let [ht (ColumnOps/hashJoinBuild right-keys (int right-length))
+          (let [ht (ColumnOps/hashJoinBuild right-keys build-mask (int right-length))
                 ^longs ht-keys (aget ^objects ht 0)
                 ^ints ht-first (aget ^objects ht 1)
                 ^ints ht-next (aget ^objects ht 2)
                 capacity (int (aget ^objects ht 3))]
             (ColumnOps/fusedJoinGroupAggregateDenseParallel
              ht-keys ht-first ht-next capacity
-             ^longs probe-keys (int fact-length)
+             ^longs probe-keys probe-mask (int fact-length)
              (int n-group) group-arrays group-muls
              (int n-aggs) agg-types ^"[[D" agg-cols
              (int (inc max-key)))))
@@ -368,8 +371,10 @@
 
 (defn execute-fused-join-global-agg
   "Execute fused join+global-aggregate — single pass probe+accumulate, no gather.
-   Returns a single-row result vector [{alias1 val1, alias2 val2, :_count N}]."
-  [from-columns fact-length join-spec aggs]
+   Returns a single-row result vector [{alias1 val1, alias2 val2, :_count N}].
+   Optional probe-mask/build-mask: long[] masks from pushed-down predicates."
+  [from-columns fact-length join-spec aggs
+   & {:keys [probe-mask build-mask]}]
   (let [fact-length (long fact-length)
         {:keys [with on-pairs type]} (normalize-join-spec join-spec)
         join-type (or type :inner)
@@ -397,8 +402,9 @@
                       (into-array expr/long-array-class right-key-col-arrays)
                       shared-muls (int right-length))
                      (compute-join-key right-columns right-key-cols right-length))
-        ;; Check perfect hash eligibility
-        perfect-info (perfect-hash-eligible? right-keys right-length)
+        ;; Check perfect hash eligibility (skip when build-mask present — no build-mask overload)
+        perfect-info (when-not build-mask
+                       (perfect-hash-eligible? right-keys right-length))
         ;; Determine which side each agg column comes from
         left-col-keys (set (keys left-columns))
         right-col-keys (set (keys right-columns))
@@ -445,14 +451,14 @@
                pf pn is-unique (long min-key) (int key-range)
                (into-array expr/long-array-class left-key-col-arrays)
                ^longs shared-muls (int (count on-pairs))
-               (int fact-length)
+               probe-mask (int fact-length)
                (int n-aggs) agg-types
                ^"[Ljava.lang.Object;" fact-agg-raw ^"[Ljava.lang.Object;" dim-agg-raw
                is-left)
               (let [probe-keys (compute-join-key left-columns left-key-cols fact-length)]
                 (ColumnOpsExt/perfectJoinGlobalAggregateMixedParallel
                  pf pn is-unique (long min-key) (int key-range)
-                 ^longs probe-keys (int fact-length)
+                 ^longs probe-keys probe-mask (int fact-length)
                  (int n-aggs) agg-types
                  ^"[Ljava.lang.Object;" fact-agg-raw ^"[Ljava.lang.Object;" dim-agg-raw
                  is-left))))
@@ -471,7 +477,7 @@
                                                      (gb/prepare-agg-source-col-premul agg right-col-arrays right-length conv-cache-right)
                                                      nil)))
                                                aggs))
-                ht (ColumnOps/hashJoinBuild right-keys (int right-length))
+                ht (ColumnOps/hashJoinBuild right-keys build-mask (int right-length))
                 ^longs ht-keys (aget ^objects ht 0)
                 ^ints ht-first (aget ^objects ht 1)
                 ^ints ht-next (aget ^objects ht 2)
@@ -481,14 +487,14 @@
                ht-keys ht-first ht-next capacity
                (into-array expr/long-array-class left-key-col-arrays)
                ^longs shared-muls (int (count on-pairs))
-               (int fact-length)
+               probe-mask (int fact-length)
                (int n-aggs) agg-types
                ^"[[D" fact-agg-cols ^"[[D" dim-agg-cols
                is-left)
               (let [probe-keys (compute-join-key left-columns left-key-cols fact-length)]
                 (ColumnOpsExt/hashJoinGlobalAggregateParallel
                  ht-keys ht-first ht-next capacity
-                 ^longs probe-keys (int fact-length)
+                 ^longs probe-keys probe-mask (int fact-length)
                  (int n-aggs) agg-types
                  ^"[[D" fact-agg-cols ^"[[D" dim-agg-cols
                  is-left)))))
@@ -510,9 +516,12 @@
       (map-indexed vector aggs))]))
 
 (defn execute-join
-  "Execute a single join: left columns + join spec → merged columns + new length."
-  [left-columns ^long left-length join-spec]
-  (let [{:keys [with on-pairs type]} join-spec
+  "Execute a single join: left columns + join spec → merged columns + new length.
+   Optional probe-mask/build-mask: long[] masks from pushed-down predicates."
+  [left-columns left-length join-spec
+   & {:keys [probe-mask build-mask]}]
+  (let [left-length (long left-length)
+        {:keys [with on-pairs type]} join-spec
         right-columns (cols/materialize-columns with)
         right-length (column-length (val (first right-columns)))
         ;; Get left/right key column names
@@ -533,13 +542,18 @@
           :left  [left-keys right-keys left-length right-length false]
           :right [right-keys left-keys right-length left-length true]
           :full  [left-keys right-keys left-length right-length false])
-        ;; Check perfect hash eligibility on build side
-        perfect-info (when (not= :full type)
+        ;; Resolve masks: when sides are swapped, swap the masks too
+        [probe-side-mask build-side-mask]
+        (if swap?
+          [build-mask probe-mask]
+          [probe-mask build-mask])
+        ;; Check perfect hash eligibility (skip when build-mask present — no build-mask overload)
+        perfect-info (when (and (not= :full type) (not build-side-mask))
                        (perfect-hash-eligible? build-keys build-length))
         ;; Build + Probe
         probe-result
         (if perfect-info
-          ;; Perfect hash: O(1) probe
+          ;; Perfect hash: O(1) probe (mask-aware)
           (let [{:keys [min-key key-range]} perfect-info
                 pht (ColumnOpsExt/perfectHashJoinBuild build-keys (int build-length) (long min-key) (int key-range))
                 ^ints pf (aget ^objects pht 0)
@@ -547,28 +561,30 @@
                 is-unique (boolean (aget ^objects pht 2))]
             (case type
               :inner (ColumnOpsExt/perfectJoinProbeInner pf pn is-unique
-                                                         probe-keys (int probe-length)
+                                                         probe-keys probe-side-mask
+                                                         (int probe-length)
                                                          (long min-key) (int key-range))
               (:left :right)
               (ColumnOpsExt/perfectJoinProbeLeft pf pn is-unique
-                                                 probe-keys (int probe-length)
+                                                 probe-keys probe-side-mask
+                                                 (int probe-length)
                                                  (long min-key) (int key-range)
                                                  (int build-length))))
-          ;; Hash table fallback
-          (let [ht (ColumnOps/hashJoinBuild build-keys (int build-length))
+          ;; Hash table fallback (mask-aware)
+          (let [ht (ColumnOps/hashJoinBuild build-keys build-side-mask (int build-length))
                 ^longs ht-keys (aget ^objects ht 0)
                 ^ints ht-first (aget ^objects ht 1)
                 ^ints ht-next (aget ^objects ht 2)
                 capacity (int (aget ^objects ht 3))]
             (case type
               :inner (ColumnOps/hashJoinProbeInner ht-keys ht-first ht-next capacity
-                                                   probe-keys (int probe-length))
+                                                   probe-keys probe-side-mask (int probe-length))
               (:left :right)
               (ColumnOps/hashJoinProbeLeft ht-keys ht-first ht-next capacity
-                                           probe-keys (int probe-length) (int build-length))
+                                           probe-keys probe-side-mask (int probe-length) (int build-length))
               :full
               (ColumnOps/hashJoinProbeLeft ht-keys ht-first ht-next capacity
-                                           probe-keys (int probe-length) (int build-length)))))
+                                           probe-keys probe-side-mask (int probe-length) (int build-length)))))
         ^ints probe-indices (aget ^objects probe-result 0)
         ^ints build-indices (aget ^objects probe-result 1)
         result-length (int (aget ^objects probe-result 2))

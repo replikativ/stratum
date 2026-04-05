@@ -3260,6 +3260,14 @@ public final class ColumnOps {
      *         htNext[row]   = next row with same key (-1 = end of chain)
      */
     public static Object[] hashJoinBuild(long[] keys, int length) {
+        return hashJoinBuild(keys, null, length);
+    }
+
+    /**
+     * Build hash table with optional mask. Rows where buildMask[i] == 0 are skipped.
+     * Pass null for buildMask to include all rows.
+     */
+    public static Object[] hashJoinBuild(long[] keys, long[] buildMask, int length) {
         int capacity = nextPow2((int) Math.min((long) length * 2, Integer.MAX_VALUE - 8)); // 50% load factor
         int mask = capacity - 1;
         long[] htKeys = new long[capacity];
@@ -3270,6 +3278,7 @@ public final class ColumnOps {
         java.util.Arrays.fill(htNext, -1);
 
         for (int i = 0; i < length; i++) {
+            if (buildMask != null && buildMask[i] == 0) continue;
             long key = keys[i];
             // Skip NULL keys (SQL: NULL ≠ NULL)
             if (key == Long.MIN_VALUE) continue;
@@ -3300,6 +3309,16 @@ public final class ColumnOps {
     public static Object[] hashJoinProbeInner(
             long[] htKeys, int[] htFirst, int[] htNext, int capacity,
             long[] probeKeys, int probeLength) {
+        return hashJoinProbeInner(htKeys, htFirst, htNext, capacity, probeKeys, null, probeLength);
+    }
+
+    /**
+     * Probe hash table for INNER join with optional probe-side mask.
+     * Rows where probeMask[i] == 0 are skipped. Pass null for no mask.
+     */
+    public static Object[] hashJoinProbeInner(
+            long[] htKeys, int[] htFirst, int[] htNext, int capacity,
+            long[] probeKeys, long[] probeMask, int probeLength) {
         int mask = capacity - 1;
         int outCap = probeLength;
         int[] leftOut = new int[outCap];
@@ -3307,6 +3326,7 @@ public final class ColumnOps {
         int outLen = 0;
 
         for (int i = 0; i < probeLength; i++) {
+            if (probeMask != null && probeMask[i] == 0) continue;
             long key = probeKeys[i];
             if (key == Long.MIN_VALUE) continue; // skip NULL
 
@@ -3344,6 +3364,17 @@ public final class ColumnOps {
     public static Object[] hashJoinProbeLeft(
             long[] htKeys, int[] htFirst, int[] htNext, int capacity,
             long[] probeKeys, int probeLength, int buildLength) {
+        return hashJoinProbeLeft(htKeys, htFirst, htNext, capacity, probeKeys, null, probeLength, buildLength);
+    }
+
+    /**
+     * Probe hash table for LEFT OUTER join with optional probe-side mask.
+     * Rows where probeMask[i] == 0 are skipped entirely (not emitted as unmatched).
+     * Pass null for no mask.
+     */
+    public static Object[] hashJoinProbeLeft(
+            long[] htKeys, int[] htFirst, int[] htNext, int capacity,
+            long[] probeKeys, long[] probeMask, int probeLength, int buildLength) {
         int mask = capacity - 1;
         int outCap = probeLength;
         int[] leftOut = new int[outCap];
@@ -3352,6 +3383,7 @@ public final class ColumnOps {
         int outLen = 0;
 
         for (int i = 0; i < probeLength; i++) {
+            if (probeMask != null && probeMask[i] == 0) continue;
             long key = probeKeys[i];
             boolean matched = false;
 
@@ -3451,7 +3483,21 @@ public final class ColumnOps {
             int maxKey) {
         return fusedJoinGroupAggregateDenseRange(
                 htKeys, htFirst, htNext, capacity,
-                probeKeys, probeLength,
+                probeKeys, null, probeLength,
+                numGroupCols, dimGroupCols, dimGroupMuls,
+                numAggs, aggTypes, factAggCols,
+                0, probeLength, maxKey);
+    }
+
+    public static double[] fusedJoinGroupAggregateDense(
+            long[] htKeys, int[] htFirst, int[] htNext, int capacity,
+            long[] probeKeys, long[] probeMask, int probeLength,
+            int numGroupCols, long[][] dimGroupCols, long[] dimGroupMuls,
+            int numAggs, int[] aggTypes, double[][] factAggCols,
+            int maxKey) {
+        return fusedJoinGroupAggregateDenseRange(
+                htKeys, htFirst, htNext, capacity,
+                probeKeys, probeMask, probeLength,
                 numGroupCols, dimGroupCols, dimGroupMuls,
                 numAggs, aggTypes, factAggCols,
                 0, probeLength, maxKey);
@@ -3463,7 +3509,7 @@ public final class ColumnOps {
      */
     private static double[] fusedJoinGroupAggregateDenseRange(
             long[] htKeys, int[] htFirst, int[] htNext, int capacity,
-            long[] probeKeys, int probeLength,
+            long[] probeKeys, long[] probeMask, int probeLength,
             int numGroupCols, long[][] dimGroupCols, long[] dimGroupMuls,
             int numAggs, int[] aggTypes, double[][] factAggCols,
             int start, int end, int maxKey) {
@@ -3495,6 +3541,7 @@ public final class ColumnOps {
         final long gm5 = numGroupCols > 5 ? dimGroupMuls[5] : 0;
 
         for (int factIdx = start; factIdx < end; factIdx++) {
+            if (probeMask != null && probeMask[factIdx] == 0) continue;
             long fk = probeKeys[factIdx];
             if (fk == Long.MIN_VALUE) continue; // NULL FK
 
@@ -3561,11 +3608,28 @@ public final class ColumnOps {
             int numGroupCols, long[][] dimGroupCols, long[] dimGroupMuls,
             int numAggs, int[] aggTypes, double[][] factAggCols,
             int maxKey) {
+        return fusedJoinGroupAggregateDenseParallel(
+                htKeys, htFirst, htNext, capacity,
+                probeKeys, null, probeLength,
+                numGroupCols, dimGroupCols, dimGroupMuls,
+                numAggs, aggTypes, factAggCols, maxKey);
+    }
+
+    /**
+     * Parallel fused join+group+aggregate with optional probe-side mask.
+     * Rows where probeMask[factIdx] == 0 are skipped. Pass null for no mask.
+     */
+    public static double[] fusedJoinGroupAggregateDenseParallel(
+            long[] htKeys, int[] htFirst, int[] htNext, int capacity,
+            long[] probeKeys, long[] probeMask, int probeLength,
+            int numGroupCols, long[][] dimGroupCols, long[] dimGroupMuls,
+            int numAggs, int[] aggTypes, double[][] factAggCols,
+            int maxKey) {
 
         if (probeLength < PARALLEL_THRESHOLD) {
             return fusedJoinGroupAggregateDense(
                     htKeys, htFirst, htNext, capacity,
-                    probeKeys, probeLength,
+                    probeKeys, probeMask, probeLength,
                     numGroupCols, dimGroupCols, dimGroupMuls,
                     numAggs, aggTypes, factAggCols, maxKey);
         }
@@ -3576,7 +3640,7 @@ public final class ColumnOps {
         if (nThreads <= 1) {
             return fusedJoinGroupAggregateDense(
                     htKeys, htFirst, htNext, capacity,
-                    probeKeys, probeLength,
+                    probeKeys, probeMask, probeLength,
                     numGroupCols, dimGroupCols, dimGroupMuls,
                     numAggs, aggTypes, factAggCols, maxKey);
         }
@@ -3593,7 +3657,7 @@ public final class ColumnOps {
             futures[t] = POOL.submit(() -> {
                 return fusedJoinGroupAggregateDenseRange(
                         htKeys, htFirst, htNext, capacity,
-                        probeKeys, probeLength,
+                        probeKeys, probeMask, probeLength,
                         numGroupCols, dimGroupCols, dimGroupMuls,
                         numAggs, aggTypes, factAggCols,
                         threadStart, threadEnd, maxKey);

@@ -225,18 +225,18 @@
           n-cols (count needed-cols)
           extract-bindings (vec (concat
                                  (mapcat
-                                   (fn [idx k]
-                                     (let [sym (col-syms k)
-                                           col-info (get columns k)]
-                                       (if (= :int64 (:type col-info))
-                                         [(with-meta sym {:tag 'longs}) `(aget ~'cols ~idx)]
-                                         [(with-meta sym {:tag 'doubles}) `(aget ~'cols ~idx)])))
-                                   (range) needed-cols)
+                                  (fn [idx k]
+                                    (let [sym (col-syms k)
+                                          col-info (get columns k)]
+                                      (if (= :int64 (:type col-info))
+                                        [(with-meta sym {:tag 'longs}) `(aget ~'cols ~idx)]
+                                        [(with-meta sym {:tag 'doubles}) `(aget ~'cols ~idx)])))
+                                  (range) needed-cols)
                                  (mapcat
-                                   (fn [idx fn-sym]
-                                     [(with-meta fn-sym {:tag 'clojure.lang.IFn})
-                                      `(aget ~'cols ~(+ n-cols idx))])
-                                   (range) fn-syms)))
+                                  (fn [idx fn-sym]
+                                    [(with-meta fn-sym {:tag 'clojure.lang.IFn})
+                                     `(aget ~'cols ~(+ n-cols idx))])
+                                  (range) fn-syms)))
 
           ;; Generate predicate code (using annotated preds with fn-syms)
           pred-codes (mapv #(pred->code % col-syms columns) annotated-preds)
@@ -252,8 +252,8 @@
 
           ;; Build the object array: column data arrays + fn objects
           col-data-arr (object-array
-                         (concat (mapv #(:data (get columns %)) needed-cols)
-                                 (mapv #(nth % 2) fn-preds)))]
+                        (concat (mapv #(:data (get columns %)) needed-cols)
+                                (mapv #(nth % 2) fn-preds)))]
 
       ;; Return (fn [^long length] -> long[]) that closes over the data
       (fn [^long length] ^longs (compiled-fn col-data-arr length)))))
@@ -374,11 +374,14 @@
   #{:sum :sum-product :count :count-non-null :min :max :avg})
 
 (defn simd-preds-ok?
-  "Check if predicates are SIMD-eligible (all ops native, within count limits, min data size)."
+  "Check if predicates can work with SIMD agg paths. Allows non-SIMD preds
+   (OR/IN/NOT) that get mask-compiled — the mask adds 1 long pred slot."
   [preds columns length]
-  (let [{:keys [n-long n-dbl]} (count-pred-types preds columns)]
-    (and (<= n-long 4) (<= n-dbl 4)
-         (every? #(simd-pred? % columns) preds)
+  (let [{simd-preds true non-simd-preds false}
+        (group-by #(simd-pred? % columns) preds)
+        mask-slots (if (seq non-simd-preds) 1 0)
+        {:keys [n-long n-dbl]} (count-pred-types (vec (or simd-preds [])) columns)]
+    (and (<= (+ n-long mask-slots) 4) (<= n-dbl 4)
          (>= (or length 0) 1000))))
 
 (defn simd-eligible?
