@@ -1108,6 +1108,12 @@
 ;; Materialization Utilities (for Datahike integration)
 ;; ============================================================================
 
+(defn results->columns
+  "Convert a vector of result maps into a column map {:col-name array, ...}.
+   Delegates to stratum.query.execution/results->columns."
+  [results]
+  (x/results->columns results))
+
 (defn tuples->columns
   "Convert positional tuples into a column map suitable for Stratum queries.
 

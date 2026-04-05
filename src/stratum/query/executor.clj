@@ -458,6 +458,19 @@
               (range n-grouped)))
       results)))
 
+;; --- Expression materialization ----------------------------------------------
+
+(defn- execute-materialize-expr [node]
+  (let [ctx (execute-node (:input node))
+        columns (ctx-columns ctx)
+        length  (ctx-length ctx)
+        mat-cols (cols/materialize-columns columns)
+        col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)
+        cache (java.util.HashMap.)
+        arr (expr/eval-expr-vectorized (:expr node) col-arrays length cache)]
+    (assoc ctx :columns (assoc mat-cols (:col-name node)
+                               {:type (or (:target node) :float64) :data arr}))))
+
 ;; --- Post-processing --------------------------------------------------------
 
 (defn- execute-having [node results]
@@ -515,6 +528,9 @@
      (instance? PPerfectHashJoin node)      (execute-hash-join node) ;; same API, perfect hash is internal
      (instance? PFusedJoinGroupAgg node)    (execute-fused-join-group-agg node columnar?)
      (instance? PFusedJoinGlobalAgg node)   (execute-fused-join-global-agg node columnar?)
+
+     ;; Expression materialization
+     (instance? PMaterializeExpr node) (execute-materialize-expr node)
 
      ;; Projection
      (instance? PProject node)  (execute-project node columnar?)

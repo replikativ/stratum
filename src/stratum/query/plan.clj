@@ -271,29 +271,77 @@
 ;; Pass 3: Expression materialization
 ;; ============================================================================
 
-(defn- expr-group-keys
-  "Identify group-keys that are expressions (not plain keywords)."
-  [group-keys]
-  (keep-indexed (fn [i g] (when (not (keyword? g)) [i g])) group-keys))
-
-(defn- expr-aggs
-  "Identify aggs with :expr fields that need pre-materialization."
+(defn- rewrite-expr-aggs
+  "For aggs with non-nil :expr, create PMaterializeExpr nodes and rewrite aggs.
+   Returns [new-aggs mat-nodes]."
   [aggs]
-  (keep-indexed (fn [i a] (when (:expr a) [i a])) aggs))
+  (loop [idx 0, new-aggs [], mat-nodes []]
+    (if (>= idx (count aggs))
+      [new-aggs mat-nodes]
+      (let [agg (nth aggs idx)]
+        (if-let [e (:expr agg)]
+          (let [cn (keyword (str "__expr_" idx))]
+            (recur (inc idx)
+                   (conj new-aggs (-> agg (dissoc :expr) (assoc :col cn)))
+                   (conj mat-nodes (ir/->PMaterializeExpr cn e :float64 nil))))
+          (recur (inc idx) (conj new-aggs agg) mat-nodes))))))
+
+(defn- rewrite-expr-group-keys
+  "For group-keys that are expressions (not keywords), create PMaterializeExpr
+   nodes and rewrite the keys. Returns [new-keys mat-nodes]."
+  [group-keys]
+  (loop [idx 0, new-keys [], mat-nodes []]
+    (if (>= idx (count group-keys))
+      [new-keys mat-nodes]
+      (let [gk (nth group-keys idx)]
+        (if (keyword? gk)
+          (recur (inc idx) (conj new-keys gk) mat-nodes)
+          (let [cn (keyword (str "__gk_expr_" idx))]
+            (recur (inc idx)
+                   (conj new-keys cn)
+                   (conj mat-nodes (ir/->PMaterializeExpr cn gk :float64 nil)))))))))
+
+(defn- chain-materialize
+  "Chain PMaterializeExpr nodes on top of an input node (innermost first)."
+  [mat-nodes input]
+  (reduce (fn [in mat] (assoc mat :input in)) input mat-nodes))
 
 (defn expr-materialization
-  "Insert PMaterializeExpr nodes for expressions in group-keys, agg columns,
-   select items, and predicate LHS.
-
-   After this pass, all group-keys are plain keywords, all agg :col fields
-   reference real columns, and expression predicates reference temp columns.
-   This decouples expression evaluation from the physical strategy choice."
+  "Insert PMaterializeExpr nodes for expressions in agg :expr fields
+   and non-keyword group-keys. After this pass, all agg :expr fields
+   are nil and all group-keys are plain keywords. This decouples expression
+   evaluation from the physical strategy choice, enabling SIMD paths for
+   expression aggs that previously fell to scalar."
   [plan]
-  ;; For now, expression materialization stays in the executor (mirrors current
-  ;; behavior). This pass is a hook for incrementally extracting that logic.
-  ;; The key insight: once expressions are materialized, the strategy router
-  ;; sees only plain column references, making eligibility checks simpler.
-  plan)
+  (ir/walk-plan plan
+    (fn [node]
+      (cond
+        (instance? LGlobalAgg node)
+        (if (some :expr (:aggs node))
+          (let [[new-aggs mat-nodes] (rewrite-expr-aggs (:aggs node))]
+            (assoc node
+                   :aggs new-aggs
+                   :input (chain-materialize mat-nodes (:input node))))
+          node)
+
+        (instance? LGroupBy node)
+        (let [has-expr-aggs? (some :expr (:aggs node))
+              has-expr-keys? (some #(not (keyword? %)) (:group-keys node))]
+          (if (or has-expr-aggs? has-expr-keys?)
+            (let [[new-aggs agg-mats] (if has-expr-aggs?
+                                        (rewrite-expr-aggs (:aggs node))
+                                        [(:aggs node) []])
+                  [new-keys key-mats] (if has-expr-keys?
+                                        (rewrite-expr-group-keys (:group-keys node))
+                                        [(:group-keys node) []])
+                  all-mats (into agg-mats key-mats)]
+              (assoc node
+                     :aggs new-aggs
+                     :group-keys new-keys
+                     :input (chain-materialize all-mats (:input node))))
+            node))
+
+        :else node))))
 
 ;; ============================================================================
 ;; Pass 4: Strategy selection (logical → physical)
@@ -321,20 +369,26 @@
         first-agg  (first aggs)
         no-preds?  (empty? preds)
         no-expr?   (nil? (:expr first-agg))
-        simd-ok?   (pred/simd-eligible? preds aggs columns length)]
+        simd-ok?   (pred/simd-eligible? preds aggs columns length)
+        ;; After expr-materialization, agg :col may reference temp columns
+        ;; that don't exist in the scan. Stats-only and chunked paths need
+        ;; real index-backed columns.
+        agg-cols-in-scan? (every? #(or (= :count (:op %))
+                                       (contains? columns (:col %)))
+                                  aggs)]
     (cond
       ;; 1. Unfiltered COUNT
       (and (= 1 n-aggs) (= :count (:op first-agg)) no-preds?)
       (ir/->PFusedSIMDCount [] scan)
 
-      ;; 2. Stats-only
-      (and (seq aggs) no-preds? all-idx?
+      ;; 2. Stats-only (needs chunk statistics → real columns only)
+      (and (seq aggs) no-preds? all-idx? agg-cols-in-scan?
            (every? #(and (#{:sum :min :max :avg :count} (:op %))
                          (nil? (:expr %))) aggs))
       (ir/->PStatsOnlyAgg aggs scan)
 
-      ;; 3. Chunked SIMD (single agg, index-backed)
-      (and all-idx? (= 1 n-aggs) simd-ok? no-expr?)
+      ;; 3. Chunked SIMD (single agg, index-backed → real columns only)
+      (and all-idx? agg-cols-in-scan? (= 1 n-aggs) simd-ok? no-expr?)
       (if (= :count (:op first-agg))
         (ir/->PChunkedSIMDCount preds scan)
         (ir/->PChunkedSIMDAgg preds first-agg scan))
@@ -407,6 +461,29 @@
     ;; For now, emit PHashJoin and let fusion upgrade it.
     (ir/->PHashJoin join-type on-pairs right left)))
 
+(defn- peel-materialize
+  "Peel off PMaterializeExpr nodes from an input chain.
+   Returns [mat-chain inner-node] where mat-chain is innermost-first."
+  [node]
+  (loop [n node, chain []]
+    (if (instance? PMaterializeExpr n)
+      (recur (:input n) (conj chain n))
+      [chain n])))
+
+(defn- rechain-materialize
+  "Re-insert PMaterializeExpr chain on top of a base input."
+  [mat-chain base-input]
+  (reduce (fn [in mat] (assoc mat :input in)) base-input mat-chain))
+
+(defn- peel-filter-scan
+  "Extract predicates and scan from a (possibly filter-wrapped) input."
+  [input]
+  (cond
+    (instance? LFilter input)     [(:predicates input) (:input input)]
+    (instance? PSIMDFilter input)  [(:predicates input) (:input input)]
+    (instance? PMaskFilter input)  [(:predicates input) (:input input)]
+    :else                          [[] input]))
+
 (defn strategy-selection
   "Replace logical nodes with physical nodes based on data characteristics.
 
@@ -423,32 +500,23 @@
             (with-meta (ir/->PChunkedScan (:columns node) (:length node) nil) m)
             (with-meta (ir/->PScan (:columns node) (:length node)) m)))
 
-        ;; LGlobalAgg
+        ;; LGlobalAgg — peel through PMaterializeExpr to find filter/scan
         (instance? LGlobalAgg node)
-        (let [input (:input node)
-              ;; Collect predicates from filter child (logical or already-physical)
-              [preds scan] (cond
-                             (instance? LFilter input)
-                             [(:predicates input) (:input input)]
-                             (instance? PSIMDFilter input)
-                             [(:predicates input) (:input input)]
-                             (instance? PMaskFilter input)
-                             [(:predicates input) (:input input)]
-                             :else [[] input])]
-          (select-global-agg-strategy node scan preds))
+        (let [[mat-chain inner] (peel-materialize (:input node))
+              [preds scan] (peel-filter-scan inner)
+              phys (select-global-agg-strategy node scan preds)]
+          (if (seq mat-chain)
+            (assoc phys :input (rechain-materialize mat-chain (:input phys)))
+            phys))
 
-        ;; LGroupBy
+        ;; LGroupBy — same peeling
         (instance? LGroupBy node)
-        (let [input (:input node)
-              [preds scan] (cond
-                             (instance? LFilter input)
-                             [(:predicates input) (:input input)]
-                             (instance? PSIMDFilter input)
-                             [(:predicates input) (:input input)]
-                             (instance? PMaskFilter input)
-                             [(:predicates input) (:input input)]
-                             :else [[] input])]
-          (select-group-by-strategy node scan preds))
+        (let [[mat-chain inner] (peel-materialize (:input node))
+              [preds scan] (peel-filter-scan inner)
+              phys (select-group-by-strategy node scan preds)]
+          (if (seq mat-chain)
+            (assoc phys :input (rechain-materialize mat-chain (:input phys)))
+            phys))
 
         ;; LJoin
         (instance? LJoin node)
@@ -632,6 +700,9 @@
     (instance? PChunkedScan node)
     (str "cols=" (vec (keys (:columns node))) " len=" (:length node)
          " zone-pruned=" (some? (:surviving-chunks node)))
+
+    (instance? PMaterializeExpr node)
+    (str "col=" (:col-name node) " expr=" (:expr node))
 
     :else ""))
 
