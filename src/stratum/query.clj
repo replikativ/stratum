@@ -77,35 +77,6 @@
    See stratum.column/encode-column for details."
   column/encode-column)
 
-;; Re-export engine primitives from stratum.query.execution for backward compat
-(def prepare-columns x/prepare-columns)
-(def get-column-length x/get-column-length)
-(def materialize-column x/materialize-column)
-(def materialize-columns x/materialize-columns)
-(def all-indices? x/all-indices?)
-(def any-index? x/any-index?)
-
-(def execute-group-by
-  "Bridge to execution/execute-group-by. Callers should bind gb/*dense-group-limit*."
-  x/execute-group-by)
-(def materialize-computed-preds x/materialize-computed-preds)
-(def agg->compiler-spec x/agg->compiler-spec)
-(def execute-fused x/execute-fused)
-
-(def ensure-doubles x/ensure-doubles)
-
-(def execute-fused-multi-sum x/execute-fused-multi-sum)
-(def accumulate-stats-chunk x/accumulate-stats-chunk)
-(def compute-surviving-chunks x/compute-surviving-chunks)
-(def materialize-column-pruned x/materialize-column-pruned)
-(def materialize-columns-pruned x/materialize-columns-pruned)
-(def execute-chunked-multi-agg x/execute-chunked-multi-agg)
-(def execute-chunked-fused x/execute-chunked-fused)
-(def execute-chunked-fused-count x/execute-chunked-fused-count)
-(def normalize-select-item x/normalize-select-item)
-(def aget-col-decoded x/aget-col-decoded)
-(def execute-projection x/execute-projection)
-(def results->columns x/results->columns)
 
 (defn ^:no-doc validate-query
   "Validate query inputs. Throws ex-info with descriptive message on error.
@@ -291,7 +262,7 @@
   ;; Maps need normalization via prepare-columns
       (let [columns (if (satisfies? dataset/IDataset from)
                       (dataset/columns from)  ;; Already normalized
-                      (prepare-columns from))
+                      (x/prepare-columns from))
         ;; Strip SQL table-qualifier namespaces from group/order/window keywords
             group (when group (mapv #(if (keyword? %) (norm/strip-ns %) %) group))
             order (when order (mapv (fn [[c dir]] [(norm/strip-ns c) dir]) order))
@@ -321,7 +292,7 @@
                                                            (catch Exception _ nil)))
                                                        (or where []))))]
                             (when (jn/bitmap-semi-join-eligible? (first join) used-cols (some? select))
-                              (let [fact-length (get-column-length (val (first columns)))
+                              (let [fact-length (x/get-column-length (val (first columns)))
                                     result (jn/execute-bitmap-semi-join columns fact-length (first join))]
                                 result))))
         ;; If bitmap semi-join fired, remove join and inject mask predicate
@@ -335,7 +306,7 @@
             (when (and (seq join) (seq group) (seq agg) (empty? (or where [])) (nil? select))
               (let [norm-aggs (norm/auto-alias-aggs (mapv norm/normalize-agg agg))]
                 (when (jn/fused-join-group-agg-eligible? join group norm-aggs columns)
-                  (let [fact-length (get-column-length (val (first columns)))
+                  (let [fact-length (x/get-column-length (val (first columns)))
                         columnar? (= :columns result)]
                     (jn/execute-fused-join-group-agg
                      columns fact-length (first join) group norm-aggs columnar?)))))
@@ -347,7 +318,7 @@
                        (empty? (or where [])) (nil? select))
               (let [norm-aggs (norm/auto-alias-aggs (mapv norm/normalize-agg agg))]
                 (when (jn/fused-join-global-agg-eligible? join norm-aggs)
-                  (let [fact-length (get-column-length (val (first columns)))]
+                  (let [fact-length (x/get-column-length (val (first columns)))]
                     (jn/execute-fused-join-global-agg
                      columns fact-length (first join) norm-aggs)))))
             fused-any (or fused-result fused-global-join-result)]
@@ -370,7 +341,7 @@
           (let [;; JOIN PHASE: bitmap semi-join already handled above; remaining joins use hash
                 [columns length]
                 (if (seq join)
-                  (let [initial-length (get-column-length (val (first columns)))
+                  (let [initial-length (x/get-column-length (val (first columns)))
                         result (jn/execute-joins columns initial-length join)]
                     [(:columns result) (long (:length result))])
                   [columns nil])]
@@ -381,21 +352,21 @@
                     aggs (norm/auto-alias-aggs (mapv norm/normalize-agg (or agg [])))
         ;; Determine data length from first column (use join length if available)
                     length (long (or length
-                                     (get-column-length (val (first columns)))))
+                                     (x/get-column-length (val (first columns)))))
 
         ;; Zone map pruning: compute surviving chunks for index-sourced columns.
         ;; This must happen before any materialization to avoid double work.
         ;; Only applies when ALL columns are from indices AND we have simple predicates.
-                    surviving-chunks (when (and (any-index? columns)
+                    surviving-chunks (when (and (x/any-index? columns)
                                                 (seq preds)
                                                 (not (some #(map? (first %)) preds)))
-                                       (try (compute-surviving-chunks preds columns)
+                                       (try (x/compute-surviving-chunks preds columns)
                                             (catch Exception _ nil)))
 
         ;; Apply pruned materialization: replace index columns with shorter arrays
         ;; containing only the chunks that survive zone map filtering.
                     [columns length] (if surviving-chunks
-                                       (let [pruned (materialize-columns-pruned columns surviving-chunks)
+                                       (let [pruned (x/materialize-columns-pruned columns surviving-chunks)
                                              first-data (:data (val (first pruned)))
                                              new-len (cond
                                                        (expr/long-array? first-data) (alength ^longs first-data)
@@ -425,12 +396,12 @@
 
         ;; Pre-compute expression predicates (e.g., [:> [:* :a :b] 1000])
                     [preds columns] (if (some #(map? (first %)) preds)
-                                      (materialize-computed-preds preds columns length)
+                                      (x/materialize-computed-preds preds columns length)
                                       [preds columns])
 
         ;; Materialize string predicates (LIKE, CONTAINS, etc.) into mask columns
                     [preds columns] (if (some #(pred/string-pred-ops (second %)) preds)
-                                      (let [mat-cols (materialize-columns columns)]
+                                      (let [mat-cols (x/materialize-columns columns)]
                                         (pred/materialize-string-preds preds mat-cols length))
                                       [preds columns])
 
@@ -492,7 +463,7 @@
                                               ;; Only materialize those columns, keep others as indices
                                               partial-mat (reduce (fn [cols k]
                                                                     (if-let [c (get cols k)]
-                                                                      (assoc cols k (materialize-column c))
+                                                                      (assoc cols k (x/materialize-column c))
                                                                       cols))
                                                                   columns pred-col-keys)
                                               mask-fn (pred/compile-pred-mask non-simd-preds partial-mat)
@@ -524,7 +495,7 @@
                     [group columns] (if (and (seq group)
                                              (not fused-extract?)
                                              (some #(not (keyword? %)) group))
-                                      (let [mat-cols (materialize-columns columns)
+                                      (let [mat-cols (x/materialize-columns columns)
                                             col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)
                                             cache (java.util.HashMap.)]
                                         (loop [idx 0, new-group [], new-cols columns]
@@ -547,7 +518,7 @@
         ;; to preserve chunked index streaming eligibility.
                     [aggs columns] (if (and (seq aggs) (not (seq group))
                                             (some :expr aggs))
-                                     (let [mat-cols (materialize-columns columns)
+                                     (let [mat-cols (x/materialize-columns columns)
                                            col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)
                                            cache (java.util.HashMap.)]
                                        (loop [idx 0, new-aggs [], new-cols columns]
@@ -567,7 +538,7 @@
 
         ;; Normalize select items if present
                     select-items (when (seq select)
-                                   (vec (map-indexed #(normalize-select-item %2 %1) select)))
+                                   (vec (map-indexed #(x/normalize-select-item %2 %1) select)))
 
         ;; Pre-materialize string-producing expressions in SELECT into temp columns
                     [select-items columns]
@@ -677,7 +648,7 @@
                     (cond
           ;; Projection (SELECT without aggregation)
                       (and (seq select-items) (empty? aggs) (not (seq group)))
-                      (execute-projection preds select-items columns length (= :columns result))
+                      (x/execute-projection preds select-items columns length (= :columns result))
 
           ;; Fused extract + COUNT group-by: extract inline, no intermediate array
                       fused-extract?
@@ -735,7 +706,7 @@
                       (seq group)
                       (let [columnar? (= :columns result)]
                         (or (gb/execute-chunked-group-by preds aggs group columns length columnar?)
-                            (let [mat-cols (materialize-columns columns)
+                            (let [mat-cols (x/materialize-columns columns)
                                   ;; Pre-compute expression aggs after materialization so
                                   ;; chunked streaming is tried first with raw indices.
                                   [aggs mat-cols]
@@ -756,7 +727,7 @@
                                                        (assoc new-cols col-name {:type :float64 :data result-arr})))
                                               (recur (inc idx) (conj new-aggs agg) new-cols))))))
                                     [aggs mat-cols])]
-                              (execute-group-by preds aggs group mat-cols length columnar?))))
+                              (x/execute-group-by preds aggs group mat-cols length columnar?))))
 
           ;; Unfiltered COUNT — short-circuit to avoid JIT poisoning.
           ;; fusedSimdCountRange compiled with numPreds=0 marks predicate branches
@@ -773,7 +744,7 @@
                       (and (seq aggs)
                            (empty? preds)
                            (not (seq group))
-                           (all-indices? columns)
+                           (x/all-indices? columns)
                            (every? (fn [a] (and (#{:sum :min :max :avg :count} (:op a))
                                                 (nil? (:expr a))))
                                    aggs))
@@ -813,18 +784,18 @@
           ;; Chunk-streaming SIMD: all inputs are indices + simd-eligible
           ;; COUNT uses JIT-isolated fusedSimdChunkedCountParallel in ColumnOpsExt
           ;; to avoid fusedSimdChunkBatch aggType interference (B5 idx: 2ms→27ms).
-                      (and (all-indices? columns)
+                      (and (x/all-indices? columns)
                            (= 1 (count aggs))
                            (pred/simd-eligible? preds aggs columns length)
                            (nil? (:expr (first aggs))))
                       (let [agg (first aggs)]
                         (if (= :count (:op agg))
               ;; COUNT: JIT-isolated chunked count (no agg columns, no aggType switch)
-                          (let [result (execute-chunked-fused-count preds columns length)]
+                          (let [result (x/execute-chunked-fused-count preds columns length)]
                             (post/format-fused-result result agg))
                           (if (= :avg (:op agg))
                 ;; avg = sum / count via chunked path
-                            (let [sum-result (execute-chunked-fused
+                            (let [sum-result (x/execute-chunked-fused
                                               preds {:op :sum :col (:col agg) :as nil}
                                               columns length)
                                   cnt (:count sum-result)]
@@ -833,17 +804,17 @@
                                    {:result (/ (:result sum-result) (double cnt)) :count cnt})
                                agg))
                             (post/format-fused-result
-                             (execute-chunked-fused preds agg columns length)
+                             (x/execute-chunked-fused preds agg columns length)
                              agg))))
 
           ;; Block-skip COUNT on arrays: skip blocks via min/max statistics
                       (and (= 1 (count aggs))
                            (= :count (:op (first aggs)))
                            (seq preds)
-                           (not (all-indices? columns))
+                           (not (x/all-indices? columns))
                            (pred/simd-eligible? preds aggs columns length)
                            (nil? (:expr (first aggs))))
-                      (let [mat-cols (materialize-columns columns)
+                      (let [mat-cols (x/materialize-columns columns)
                             pp (gb/prepare-pred-arrays preds mat-cols)
                             ^doubles r (ColumnOpsExt/fusedSimdCountBlockSkipParallel
                                         (int (:n-long pp))
@@ -863,9 +834,9 @@
                       (and (= 1 (count aggs))
                            (pred/simd-eligible? preds aggs columns length)
                            (nil? (:expr (first aggs))))
-                      (let [mat-cols (materialize-columns columns)]
+                      (let [mat-cols (x/materialize-columns columns)]
                         (post/format-fused-result
-                         (execute-fused preds (first aggs) mat-cols length)
+                         (x/execute-fused preds (first aggs) mat-cols length)
                          (first aggs)))
 
           ;; Multiple SUM-like aggs — single-pass via fusedSimdMultiSum (1 pass vs N)
@@ -874,22 +845,22 @@
                            (pred/multi-agg-simd-eligible? preds aggs columns length)
                            (every? #(#{:sum :sum-product :count :avg} (:op %)) aggs)
                            (<= (count (filterv #(not= :count (:op %)) aggs)) 4))
-                      (let [mat-cols (materialize-columns columns)]
-                        (execute-fused-multi-sum preds aggs mat-cols length))
+                      (let [mat-cols (x/materialize-columns columns)]
+                        (x/execute-fused-multi-sum preds aggs mat-cols length))
 
           ;; Multiple aggs without GROUP BY — single-pass global aggregate via
           ;; group-by with 0 group columns (materializes, then one-pass Java SIMD).
                       (and (seq aggs)
                            (not (seq group))
                            (pred/multi-agg-simd-eligible? preds aggs columns length))
-                      (let [mat-cols (materialize-columns columns)]
-                        (execute-group-by preds aggs [] mat-cols length false))
+                      (let [mat-cols (x/materialize-columns columns)]
+                        (x/execute-group-by preds aggs [] mat-cols length false))
 
           ;; Fast path for ungrouped percentile/median/approx-quantile — bypass Clojure scalar loop
                       (and (seq aggs)
                            (not (seq group))
                            (every? #(#{:median :percentile :approx-quantile} (:op %)) aggs))
-                      (let [mat-cols (materialize-columns columns)
+                      (let [mat-cols (x/materialize-columns columns)
                             col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)
                 ;; Build predicate mask (long[]) if predicates exist
                             mask (when (seq preds)
@@ -946,12 +917,12 @@
 
           ;; Multiple or complex aggregations - scalar path
                       (seq aggs)
-                      (let [mat-cols (materialize-columns columns)]
+                      (let [mat-cols (x/materialize-columns columns)]
                         [(gb/execute-scalar-aggs preds aggs mat-cols length)])
 
           ;; Filter only (no aggregation) - just count
                       :else
-                      (let [mat-cols (materialize-columns columns)
+                      (let [mat-cols (x/materialize-columns columns)
                             col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)]
                         [{:_count (loop [i 0 cnt 0]
                                     (if (>= i length)
@@ -965,7 +936,7 @@
                   results
                   (let [;; Post-GROUP-BY window execution: run windows on aggregated results
                         results (if (and (seq window) (seq group) (seq results))
-                                  (let [grouped-cols (results->columns results)
+                                  (let [grouped-cols (x/results->columns results)
                                         n-grouped (count results)
                                         with-windows (win/execute-window-functions grouped-cols n-grouped window)
                                         all-ks (keys with-windows)]
@@ -1005,14 +976,14 @@
   "Compile a query for repeated execution. Returns a zero-arg function.
    Use when the same query will be executed multiple times on the same data."
   [{:keys [from where agg] :as query}]
-  (let [columns (prepare-columns from)
+  (let [columns (x/prepare-columns from)
         preds (mapv norm/normalize-pred (or where []))
         aggs (mapv norm/normalize-agg (or agg []))
-        length (get-column-length (val (first columns)))]
+        length (x/get-column-length (val (first columns)))]
     (cond
       ;; Chunk-streaming path: all indices + simd-eligible
       ;; COUNT uses JIT-isolated fusedSimdChunkedCountParallel
-      (and (all-indices? columns)
+      (and (x/all-indices? columns)
            (= 1 (count aggs))
            (pred/simd-eligible? preds aggs columns length)
            (nil? (:expr (first aggs)))
@@ -1020,8 +991,8 @@
       (let [agg (first aggs)]
         (fn []
           (if (= :count (:op agg))
-            (post/format-fused-result (execute-chunked-fused-count preds columns length) agg)
-            (let [result (execute-chunked-fused preds agg columns length)]
+            (post/format-fused-result (x/execute-chunked-fused-count preds columns length) agg)
+            (let [result (x/execute-chunked-fused preds agg columns length)]
               (if (= :avg (:op agg))
                 (let [cnt (:count result)]
                   [{(keyword (or (:as agg) :avg))
@@ -1034,9 +1005,9 @@
            (pred/simd-eligible? preds aggs columns length)
            (nil? (:expr (first aggs)))
            (nil? (:group query)))
-      (let [mat-cols (materialize-columns columns)
+      (let [mat-cols (x/materialize-columns columns)
             agg (first aggs)
-            compiler-agg (agg->compiler-spec agg)
+            compiler-agg (x/agg->compiler-spec agg)
             compiled (qc/compile-query
                       {:columns mat-cols
                        :predicates preds
@@ -1067,11 +1038,11 @@
   [{:keys [from join where select agg group] :as query} & {:keys [tree?]}]
   (if (or *use-planner* tree?)
     (exec/explain-query query)
-    (let [columns (prepare-columns from)
+    (let [columns (x/prepare-columns from)
           preds (mapv norm/normalize-pred (or where []))
           aggs (norm/auto-alias-aggs (mapv norm/normalize-agg (or agg [])))
-          length (get-column-length (val (first columns)))
-          data-source (if (all-indices? columns) :index :array)
+          length (x/get-column-length (val (first columns)))
+          data-source (if (x/all-indices? columns) :index :array)
           has-join? (seq join)
           has-group? (seq group)
           has-select? (seq select)
@@ -1096,7 +1067,7 @@
                          :dense-count-group-by
                          :dense-group-by))
 
-                     (and (all-indices? columns)
+                     (and (x/all-indices? columns)
                           (= 1 (count aggs))
                           (pred/simd-eligible? preds aggs columns length)
                           (nil? (:expr (first aggs))))
