@@ -583,6 +583,13 @@
         physical (plan/optimize logical)]
     (execute-physical physical columnar?)))
 
+(defn compile-physical
+  "Build and optimize a physical plan for a query. The plan captures all
+   data references and can be executed repeatedly via execute-physical."
+  [query]
+  (let [logical  (plan/build-logical-plan query)]
+    (plan/optimize logical)))
+
 (defn explain-query
   "Build and explain a physical plan."
   [query]

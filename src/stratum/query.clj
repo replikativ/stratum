@@ -976,54 +976,60 @@
   "Compile a query for repeated execution. Returns a zero-arg function.
    Use when the same query will be executed multiple times on the same data."
   [{:keys [from where agg] :as query}]
-  (let [columns (x/prepare-columns from)
-        preds (mapv norm/normalize-pred (or where []))
-        aggs (mapv norm/normalize-agg (or agg []))
-        length (x/get-column-length (val (first columns)))]
-    (cond
-      ;; Chunk-streaming path: all indices + simd-eligible
-      ;; COUNT uses JIT-isolated fusedSimdChunkedCountParallel
-      (and (x/all-indices? columns)
-           (= 1 (count aggs))
-           (pred/simd-eligible? preds aggs columns length)
-           (nil? (:expr (first aggs)))
-           (nil? (:group query)))
-      (let [agg (first aggs)]
-        (fn []
-          (if (= :count (:op agg))
-            (post/format-fused-result (x/execute-chunked-fused-count preds columns length) agg)
-            (let [result (x/execute-chunked-fused preds agg columns length)]
+  (if *use-planner*
+    ;; Planner path: build plan once, execute plan each invocation.
+    ;; The physical plan captures columns/predicates/aggs — pure data.
+    (let [physical (exec/compile-physical query)]
+      (fn [] (exec/execute-physical physical false)))
+    ;; Original compiled paths
+    (let [columns (x/prepare-columns from)
+          preds (mapv norm/normalize-pred (or where []))
+          aggs (mapv norm/normalize-agg (or agg []))
+          length (x/get-column-length (val (first columns)))]
+      (cond
+        ;; Chunk-streaming path: all indices + simd-eligible
+        ;; COUNT uses JIT-isolated fusedSimdChunkedCountParallel
+        (and (x/all-indices? columns)
+             (= 1 (count aggs))
+             (pred/simd-eligible? preds aggs columns length)
+             (nil? (:expr (first aggs)))
+             (nil? (:group query)))
+        (let [agg (first aggs)]
+          (fn []
+            (if (= :count (:op agg))
+              (post/format-fused-result (x/execute-chunked-fused-count preds columns length) agg)
+              (let [result (x/execute-chunked-fused preds agg columns length)]
+                (if (= :avg (:op agg))
+                  (let [cnt (:count result)]
+                    [{(keyword (or (:as agg) :avg))
+                      (if (zero? cnt) Double/NaN (/ (:result result) (double cnt)))
+                      :_count cnt}])
+                  (post/format-fused-result result agg))))))
+
+        ;; Array-based SIMD path
+        (and (= 1 (count aggs))
+             (pred/simd-eligible? preds aggs columns length)
+             (nil? (:expr (first aggs)))
+             (nil? (:group query)))
+        (let [mat-cols (x/materialize-columns columns)
+              agg (first aggs)
+              compiler-agg (x/agg->compiler-spec agg)
+              compiled (qc/compile-query
+                        {:columns mat-cols
+                         :predicates preds
+                         :aggregate compiler-agg
+                         :length length})]
+          (fn []
+            (let [result (compiled)]
               (if (= :avg (:op agg))
                 (let [cnt (:count result)]
                   [{(keyword (or (:as agg) :avg))
                     (if (zero? cnt) Double/NaN (/ (:result result) (double cnt)))
                     :_count cnt}])
-                (post/format-fused-result result agg))))))
-
-      ;; Array-based SIMD path
-      (and (= 1 (count aggs))
-           (pred/simd-eligible? preds aggs columns length)
-           (nil? (:expr (first aggs)))
-           (nil? (:group query)))
-      (let [mat-cols (x/materialize-columns columns)
-            agg (first aggs)
-            compiler-agg (x/agg->compiler-spec agg)
-            compiled (qc/compile-query
-                      {:columns mat-cols
-                       :predicates preds
-                       :aggregate compiler-agg
-                       :length length})]
-        (fn []
-          (let [result (compiled)]
-            (if (= :avg (:op agg))
-              (let [cnt (:count result)]
-                [{(keyword (or (:as agg) :avg))
-                  (if (zero? cnt) Double/NaN (/ (:result result) (double cnt)))
-                  :_count cnt}])
-              (post/format-fused-result result agg)))))
-      ;; Fall back to interpreted execution
-      :else
-      (fn [] (q query)))))
+                (post/format-fused-result result agg)))))
+        ;; Fall back to interpreted execution
+        :else
+        (fn [] (q query))))))
 
 (defn explain
   "Show execution plan without running the query.
