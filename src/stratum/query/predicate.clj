@@ -374,11 +374,14 @@
   #{:sum :sum-product :count :count-non-null :min :max :avg})
 
 (defn simd-preds-ok?
-  "Check if predicates are SIMD-eligible (all ops native, within count limits, min data size)."
+  "Check if predicates can work with SIMD agg paths. Allows non-SIMD preds
+   (OR/IN/NOT) that get mask-compiled — the mask adds 1 long pred slot."
   [preds columns length]
-  (let [{:keys [n-long n-dbl]} (count-pred-types preds columns)]
-    (and (<= n-long 4) (<= n-dbl 4)
-         (every? #(simd-pred? % columns) preds)
+  (let [{simd-preds true non-simd-preds false}
+        (group-by #(simd-pred? % columns) preds)
+        mask-slots (if (seq non-simd-preds) 1 0)
+        {:keys [n-long n-dbl]} (count-pred-types (vec (or simd-preds [])) columns)]
+    (and (<= (+ n-long mask-slots) 4) (<= n-dbl 4)
          (>= (or length 0) 1000))))
 
 (defn simd-eligible?
