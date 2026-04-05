@@ -1469,7 +1469,7 @@ public final class ColumnOpsExt {
      */
     private static double[] hashJoinGlobalAggregateRange(
             long[] htKeys, int[] htFirst, int[] htNext, int capacity,
-            long[] probeKeys,
+            long[] probeKeys, long[] probeMask,
             int numAggs, int[] aggTypes,
             double[][] factAggCols, double[][] dimAggCols,
             boolean isLeft, int start, int end) {
@@ -1483,6 +1483,7 @@ public final class ColumnOpsExt {
         }
 
         for (int factIdx = start; factIdx < end; factIdx++) {
+            if (probeMask != null && probeMask[factIdx] == 0) continue;
             long fk = probeKeys[factIdx];
 
             if (fk == Long.MIN_VALUE) {
@@ -1577,11 +1578,28 @@ public final class ColumnOpsExt {
             int numAggs, int[] aggTypes,
             double[][] factAggCols, double[][] dimAggCols,
             boolean isLeft) {
+        return hashJoinGlobalAggregateParallel(
+                htKeys, htFirst, htNext, capacity,
+                probeKeys, null, probeLength,
+                numAggs, aggTypes, factAggCols, dimAggCols, isLeft);
+    }
+
+    /**
+     * Parallel fused join + global aggregate with optional probe-side mask.
+     * Rows where probeMask[factIdx] == 0 are skipped. Pass null for no mask.
+     */
+    @SuppressWarnings("unchecked")
+    public static double[] hashJoinGlobalAggregateParallel(
+            long[] htKeys, int[] htFirst, int[] htNext, int capacity,
+            long[] probeKeys, long[] probeMask, int probeLength,
+            int numAggs, int[] aggTypes,
+            double[][] factAggCols, double[][] dimAggCols,
+            boolean isLeft) {
 
         if (probeLength < ColumnOps.PARALLEL_THRESHOLD) {
             return hashJoinGlobalAggregateRange(
                     htKeys, htFirst, htNext, capacity,
-                    probeKeys,
+                    probeKeys, probeMask,
                     numAggs, aggTypes, factAggCols, dimAggCols,
                     isLeft, 0, probeLength);
         }
@@ -1599,7 +1617,7 @@ public final class ColumnOpsExt {
             futures[t] = POOL.submit(() -> {
                 return hashJoinGlobalAggregateRange(
                         htKeys, htFirst, htNext, capacity,
-                        probeKeys,
+                        probeKeys, probeMask,
                         numAggs, aggTypes, factAggCols, dimAggCols,
                         isLeft, threadStart, threadEnd);
             });
@@ -1620,6 +1638,7 @@ public final class ColumnOpsExt {
     private static double[] hashJoinGlobalAggregateInlineKeyRange(
             long[] htKeys, int[] htFirst, int[] htNext, int capacity,
             long[][] factKeyCols, long[] keyMuls, int numKeyCols,
+            long[] probeMask,
             int numAggs, int[] aggTypes,
             double[][] factAggCols, double[][] dimAggCols,
             boolean isLeft, int start, int end) {
@@ -1637,6 +1656,7 @@ public final class ColumnOpsExt {
             final long[] kc0 = factKeyCols[0], kc1 = factKeyCols[1];
             final long km0 = keyMuls[0], km1 = keyMuls[1];
             for (int factIdx = start; factIdx < end; factIdx++) {
+                if (probeMask != null && probeMask[factIdx] == 0) continue;
                 long v0 = kc0[factIdx], v1 = kc1[factIdx];
                 if (v0 == Long.MIN_VALUE || v1 == Long.MIN_VALUE) {
                     if (isLeft) accumulateFactOnly(accs, numAggs, aggTypes, factAggCols, factIdx);
@@ -1649,6 +1669,7 @@ public final class ColumnOpsExt {
         } else {
             // General N-column path
             for (int factIdx = start; factIdx < end; factIdx++) {
+                if (probeMask != null && probeMask[factIdx] == 0) continue;
                 boolean hasNull = false;
                 long fk = 0;
                 for (int c = 0; c < numKeyCols; c++) {
@@ -1741,6 +1762,7 @@ public final class ColumnOpsExt {
 
     /**
      * Parallel fused join + global aggregate with inline composite keys.
+     * Backward-compat overload without probeMask.
      */
     @SuppressWarnings("unchecked")
     public static double[] hashJoinGlobalAggregateInlineKeyParallel(
@@ -1750,11 +1772,31 @@ public final class ColumnOpsExt {
             int numAggs, int[] aggTypes,
             double[][] factAggCols, double[][] dimAggCols,
             boolean isLeft) {
+        return hashJoinGlobalAggregateInlineKeyParallel(
+                htKeys, htFirst, htNext, capacity,
+                factKeyCols, keyMuls, numKeyCols,
+                null, probeLength,
+                numAggs, aggTypes, factAggCols, dimAggCols,
+                isLeft);
+    }
+
+    /**
+     * Parallel fused join + global aggregate with inline composite keys.
+     */
+    @SuppressWarnings("unchecked")
+    public static double[] hashJoinGlobalAggregateInlineKeyParallel(
+            long[] htKeys, int[] htFirst, int[] htNext, int capacity,
+            long[][] factKeyCols, long[] keyMuls, int numKeyCols,
+            long[] probeMask, int probeLength,
+            int numAggs, int[] aggTypes,
+            double[][] factAggCols, double[][] dimAggCols,
+            boolean isLeft) {
 
         if (probeLength < ColumnOps.PARALLEL_THRESHOLD) {
             return hashJoinGlobalAggregateInlineKeyRange(
                     htKeys, htFirst, htNext, capacity,
                     factKeyCols, keyMuls, numKeyCols,
+                    probeMask,
                     numAggs, aggTypes, factAggCols, dimAggCols,
                     isLeft, 0, probeLength);
         }
@@ -1773,6 +1815,7 @@ public final class ColumnOpsExt {
                 return hashJoinGlobalAggregateInlineKeyRange(
                         htKeys, htFirst, htNext, capacity,
                         factKeyCols, keyMuls, numKeyCols,
+                        probeMask,
                         numAggs, aggTypes, factAggCols, dimAggCols,
                         isLeft, threadStart, threadEnd);
             });
@@ -1862,10 +1905,22 @@ public final class ColumnOpsExt {
     /**
      * Perfect hash probe for INNER join.
      * O(1) lookup per probe key — no hash function, no linear probing.
+     * Backward-compat overload without probeMask.
      */
     public static Object[] perfectJoinProbeInner(
             int[] perfectFirst, int[] perfectNext, boolean isUnique,
             long[] probeKeys, int probeLength, long minKey, int keyRange) {
+        return perfectJoinProbeInner(perfectFirst, perfectNext, isUnique,
+                probeKeys, null, probeLength, minKey, keyRange);
+    }
+
+    /**
+     * Perfect hash probe for INNER join.
+     * O(1) lookup per probe key — no hash function, no linear probing.
+     */
+    public static Object[] perfectJoinProbeInner(
+            int[] perfectFirst, int[] perfectNext, boolean isUnique,
+            long[] probeKeys, long[] probeMask, int probeLength, long minKey, int keyRange) {
 
         int outCap = probeLength;
         int[] leftOut = new int[outCap];
@@ -1873,6 +1928,7 @@ public final class ColumnOpsExt {
         int outLen = 0;
 
         for (int i = 0; i < probeLength; i++) {
+            if (probeMask != null && probeMask[i] == 0) continue;
             long key = probeKeys[i];
             if (key == Long.MIN_VALUE) continue;
 
@@ -1911,10 +1967,23 @@ public final class ColumnOpsExt {
     /**
      * Perfect hash probe for LEFT OUTER join.
      * Unmatched probe rows emit rightIdx = -1.
+     * Backward-compat overload without probeMask.
      */
     public static Object[] perfectJoinProbeLeft(
             int[] perfectFirst, int[] perfectNext, boolean isUnique,
             long[] probeKeys, int probeLength, long minKey, int keyRange,
+            int buildLength) {
+        return perfectJoinProbeLeft(perfectFirst, perfectNext, isUnique,
+                probeKeys, null, probeLength, minKey, keyRange, buildLength);
+    }
+
+    /**
+     * Perfect hash probe for LEFT OUTER join.
+     * Unmatched probe rows emit rightIdx = -1.
+     */
+    public static Object[] perfectJoinProbeLeft(
+            int[] perfectFirst, int[] perfectNext, boolean isUnique,
+            long[] probeKeys, long[] probeMask, int probeLength, long minKey, int keyRange,
             int buildLength) {
 
         int outCap = probeLength;
@@ -1924,6 +1993,7 @@ public final class ColumnOpsExt {
         int outLen = 0;
 
         for (int i = 0; i < probeLength; i++) {
+            if (probeMask != null && probeMask[i] == 0) continue;
             long key = probeKeys[i];
             boolean matched = false;
 
@@ -2346,7 +2416,7 @@ public final class ColumnOpsExt {
     private static double[] perfectJoinGlobalAggregateMixedRange(
             int[] perfectFirst, int[] perfectNext, boolean isUnique,
             long minKey, int keyRange,
-            long[] probeKeys,
+            long[] probeKeys, long[] probeMask,
             int numAggs, int[] aggTypes,
             Object[] factAggCols, Object[] dimAggCols,
             boolean isLeft, int start, int end) {
@@ -2371,6 +2441,7 @@ public final class ColumnOpsExt {
         }
 
         for (int factIdx = start; factIdx < end; factIdx++) {
+            if (probeMask != null && probeMask[factIdx] == 0) continue;
             long fk = probeKeys[factIdx];
 
             if (fk == Long.MIN_VALUE) {
@@ -2468,6 +2539,7 @@ public final class ColumnOpsExt {
 
     /**
      * Parallel perfect hash join + global aggregate with mixed-type columns.
+     * Backward-compat overload without probeMask.
      */
     @SuppressWarnings("unchecked")
     public static double[] perfectJoinGlobalAggregateMixedParallel(
@@ -2477,12 +2549,31 @@ public final class ColumnOpsExt {
             int numAggs, int[] aggTypes,
             Object[] factAggCols, Object[] dimAggCols,
             boolean isLeft) {
+        return perfectJoinGlobalAggregateMixedParallel(
+                perfectFirst, perfectNext, isUnique,
+                minKey, keyRange,
+                probeKeys, null, probeLength,
+                numAggs, aggTypes, factAggCols, dimAggCols,
+                isLeft);
+    }
+
+    /**
+     * Parallel perfect hash join + global aggregate with mixed-type columns.
+     */
+    @SuppressWarnings("unchecked")
+    public static double[] perfectJoinGlobalAggregateMixedParallel(
+            int[] perfectFirst, int[] perfectNext, boolean isUnique,
+            long minKey, int keyRange,
+            long[] probeKeys, long[] probeMask, int probeLength,
+            int numAggs, int[] aggTypes,
+            Object[] factAggCols, Object[] dimAggCols,
+            boolean isLeft) {
 
         if (probeLength < ColumnOps.PARALLEL_THRESHOLD) {
             return perfectJoinGlobalAggregateMixedRange(
                     perfectFirst, perfectNext, isUnique,
                     minKey, keyRange,
-                    probeKeys,
+                    probeKeys, probeMask,
                     numAggs, aggTypes, factAggCols, dimAggCols,
                     isLeft, 0, probeLength);
         }
@@ -2501,7 +2592,7 @@ public final class ColumnOpsExt {
                 return perfectJoinGlobalAggregateMixedRange(
                         perfectFirst, perfectNext, isUnique,
                         minKey, keyRange,
-                        probeKeys,
+                        probeKeys, probeMask,
                         numAggs, aggTypes, factAggCols, dimAggCols,
                         isLeft, threadStart, threadEnd);
             });
@@ -2517,6 +2608,7 @@ public final class ColumnOpsExt {
             int[] perfectFirst, int[] perfectNext, boolean isUnique,
             long minKey, int keyRange,
             long[][] factKeyCols, long[] keyMuls, int numKeyCols,
+            long[] probeMask,
             int numAggs, int[] aggTypes,
             Object[] factAggCols, Object[] dimAggCols,
             boolean isLeft, int start, int end) {
@@ -2544,6 +2636,7 @@ public final class ColumnOpsExt {
             final long[] kc0 = factKeyCols[0], kc1 = factKeyCols[1];
             final long km0 = keyMuls[0], km1 = keyMuls[1];
             for (int factIdx = start; factIdx < end; factIdx++) {
+                if (probeMask != null && probeMask[factIdx] == 0) continue;
                 long v0 = kc0[factIdx], v1 = kc1[factIdx];
                 if (v0 == Long.MIN_VALUE || v1 == Long.MIN_VALUE) {
                     if (isLeft) {
@@ -2622,6 +2715,7 @@ public final class ColumnOpsExt {
             }
         } else {
             for (int factIdx = start; factIdx < end; factIdx++) {
+                if (probeMask != null && probeMask[factIdx] == 0) continue;
                 boolean hasNull = false;
                 long fk = 0;
                 for (int c = 0; c < numKeyCols; c++) {
@@ -2710,6 +2804,7 @@ public final class ColumnOpsExt {
 
     /**
      * Parallel perfect hash join + global aggregate with inline composite keys and mixed types.
+     * Backward-compat overload without probeMask.
      */
     @SuppressWarnings("unchecked")
     public static double[] perfectJoinGlobalAggregateMixedInlineKeyParallel(
@@ -2720,12 +2815,34 @@ public final class ColumnOpsExt {
             int numAggs, int[] aggTypes,
             Object[] factAggCols, Object[] dimAggCols,
             boolean isLeft) {
+        return perfectJoinGlobalAggregateMixedInlineKeyParallel(
+                perfectFirst, perfectNext, isUnique,
+                minKey, keyRange,
+                factKeyCols, keyMuls, numKeyCols,
+                null, probeLength,
+                numAggs, aggTypes, factAggCols, dimAggCols,
+                isLeft);
+    }
+
+    /**
+     * Parallel perfect hash join + global aggregate with inline composite keys and mixed types.
+     */
+    @SuppressWarnings("unchecked")
+    public static double[] perfectJoinGlobalAggregateMixedInlineKeyParallel(
+            int[] perfectFirst, int[] perfectNext, boolean isUnique,
+            long minKey, int keyRange,
+            long[][] factKeyCols, long[] keyMuls, int numKeyCols,
+            long[] probeMask, int probeLength,
+            int numAggs, int[] aggTypes,
+            Object[] factAggCols, Object[] dimAggCols,
+            boolean isLeft) {
 
         if (probeLength < ColumnOps.PARALLEL_THRESHOLD) {
             return perfectJoinGlobalAggregateMixedInlineKeyRange(
                     perfectFirst, perfectNext, isUnique,
                     minKey, keyRange,
                     factKeyCols, keyMuls, numKeyCols,
+                    probeMask,
                     numAggs, aggTypes, factAggCols, dimAggCols,
                     isLeft, 0, probeLength);
         }
@@ -2745,6 +2862,7 @@ public final class ColumnOpsExt {
                         perfectFirst, perfectNext, isUnique,
                         minKey, keyRange,
                         factKeyCols, keyMuls, numKeyCols,
+                        probeMask,
                         numAggs, aggTypes, factAggCols, dimAggCols,
                         isLeft, threadStart, threadEnd);
             });
@@ -2764,7 +2882,7 @@ public final class ColumnOpsExt {
     private static double[] perfectJoinGroupAggregateDenseRange(
             int[] perfectFirst, int[] perfectNext, boolean isUnique,
             long minKey, int keyRange,
-            long[] probeKeys, int probeLength,
+            long[] probeKeys, long[] probeMask, int probeLength,
             int numGroupCols, long[][] dimGroupCols, long[] dimGroupMuls,
             int numAggs, int[] aggTypes, double[][] factAggCols,
             int start, int end, int maxKey) {
@@ -2794,6 +2912,7 @@ public final class ColumnOpsExt {
         final long gm5 = numGroupCols > 5 ? dimGroupMuls[5] : 0;
 
         for (int factIdx = start; factIdx < end; factIdx++) {
+            if (probeMask != null && probeMask[factIdx] == 0) continue;
             long fk = probeKeys[factIdx];
             if (fk == Long.MIN_VALUE) continue;
 
@@ -2870,6 +2989,7 @@ public final class ColumnOpsExt {
     /**
      * Parallel perfect hash join + group-by + aggregate.
      * Same L3-adaptive thread capping as fusedJoinGroupAggregateDenseParallel.
+     * Backward-compat overload without probeMask.
      */
     @SuppressWarnings("unchecked")
     public static double[] perfectJoinGroupAggregateDenseParallel(
@@ -2879,12 +2999,33 @@ public final class ColumnOpsExt {
             int numGroupCols, long[][] dimGroupCols, long[] dimGroupMuls,
             int numAggs, int[] aggTypes, double[][] factAggCols,
             int maxKey) {
+        return perfectJoinGroupAggregateDenseParallel(
+                perfectFirst, perfectNext, isUnique,
+                minKey, keyRange,
+                probeKeys, null, probeLength,
+                numGroupCols, dimGroupCols, dimGroupMuls,
+                numAggs, aggTypes, factAggCols,
+                maxKey);
+    }
+
+    /**
+     * Parallel perfect hash join + group-by + aggregate.
+     * Same L3-adaptive thread capping as fusedJoinGroupAggregateDenseParallel.
+     */
+    @SuppressWarnings("unchecked")
+    public static double[] perfectJoinGroupAggregateDenseParallel(
+            int[] perfectFirst, int[] perfectNext, boolean isUnique,
+            long minKey, int keyRange,
+            long[] probeKeys, long[] probeMask, int probeLength,
+            int numGroupCols, long[][] dimGroupCols, long[] dimGroupMuls,
+            int numAggs, int[] aggTypes, double[][] factAggCols,
+            int maxKey) {
 
         if (probeLength < ColumnOps.PARALLEL_THRESHOLD) {
             return perfectJoinGroupAggregateDenseRange(
                     perfectFirst, perfectNext, isUnique,
                     minKey, keyRange,
-                    probeKeys, probeLength,
+                    probeKeys, probeMask, probeLength,
                     numGroupCols, dimGroupCols, dimGroupMuls,
                     numAggs, aggTypes, factAggCols,
                     0, probeLength, maxKey);
@@ -2896,7 +3037,7 @@ public final class ColumnOpsExt {
             return perfectJoinGroupAggregateDenseRange(
                     perfectFirst, perfectNext, isUnique,
                     minKey, keyRange,
-                    probeKeys, probeLength,
+                    probeKeys, probeMask, probeLength,
                     numGroupCols, dimGroupCols, dimGroupMuls,
                     numAggs, aggTypes, factAggCols,
                     0, probeLength, maxKey);
@@ -2914,7 +3055,7 @@ public final class ColumnOpsExt {
                 return perfectJoinGroupAggregateDenseRange(
                         perfectFirst, perfectNext, isUnique,
                         minKey, keyRange,
-                        probeKeys, probeLength,
+                        probeKeys, probeMask, probeLength,
                         numGroupCols, dimGroupCols, dimGroupMuls,
                         numAggs, aggTypes, factAggCols,
                         threadStart, threadEnd, maxKey);

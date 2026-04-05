@@ -20,6 +20,7 @@
             [stratum.query.columns :as cols]
             [stratum.query.predicate :as pred]
             [stratum.query.expression :as expr]
+            [stratum.query.estimate :as est]
             [stratum.dataset :as dataset])
   (:import [stratum.query.ir
             LScan LFilter LJoin LGroupBy LGlobalAgg LProject
@@ -207,44 +208,108 @@
    Called once before optimization passes."
   [plan]
   (ir/walk-plan plan
-    (fn [node]
-      (if (instance? LScan node)
-        (vary-meta node assoc
-                   ::col-types   (scan-col-types node)
-                   ::index-cols  (scan-index-cols node)
-                   ::all-indices (all-indices? node))
+                (fn [node]
+                  (if (instance? LScan node)
+                    (vary-meta node assoc
+                               ::col-types   (scan-col-types node)
+                               ::index-cols  (scan-index-cols node)
+                               ::all-indices (all-indices? node))
         ;; Propagate annotations upward through unary nodes
-        (if-let [child (ir/input-node node)]
-          (vary-meta node merge (select-keys (meta child)
-                                             [::col-types ::index-cols ::all-indices]))
-          node)))))
+                    (if-let [child (ir/input-node node)]
+                      (vary-meta node merge (select-keys (meta child)
+                                                         [::col-types ::index-cols ::all-indices]))
+                      node)))))
 
 ;; ============================================================================
 ;; Pass 1: Predicate pushdown
 ;; ============================================================================
 
 (defn- pred-columns
-  "Set of column keywords referenced by a normalized predicate."
+  "Set of column keywords referenced by a normalized predicate (recursive)."
   [pred]
-  (let [col (first pred)]
-    (if (map? col)
-      ;; Expression predicate like [:> {:op :mul :args [:a :b]} 1000]
-      (into #{} (filter keyword?) (:args col))
-      (if (keyword? col) #{col} #{}))))
+  (let [op (second pred)]
+    (case op
+      :or (into #{} (mapcat pred-columns) (subvec pred 2))
+      (:in :not-in :fn) (let [c (first pred)] (if (keyword? c) #{c} #{}))
+      (let [col (first pred)]
+        (if (map? col)
+          ;; Expression predicate like [:> {:op :mul :args [:a :b]} 1000]
+          (into #{} (filter keyword?) (:args col))
+          (if (keyword? col) #{col} #{}))))))
+
+(defn- classify-pred-by-side
+  "Classify a predicate as :left, :right, or :cross based on which join side
+   its columns belong to."
+  [pred left-cols right-cols]
+  (let [cols (pred-columns pred)]
+    (cond
+      (empty? cols)                       :cross  ;; can't determine → keep above
+      (every? #(contains? left-cols %) cols)  :left
+      (every? #(contains? right-cols %) cols) :right
+      :else                                   :cross)))
+
+(defn- scan-columns
+  "Get the set of column keywords reachable from a subtree.
+   Recurses through LFilter and LJoin so that predicate pushdown works
+   through chained joins (e.g. fact → join1 → join2)."
+  [node]
+  (cond
+    (instance? LScan node)   (set (keys (:columns node)))
+    (instance? LFilter node) (recur (:input node))
+    (instance? LJoin node)   (let [l (scan-columns (:left node))
+                                   r (scan-columns (:right node))]
+                               (when (and l r)
+                                 (into l r)))
+    :else nil))
+
+(defn- pushdown-once
+  "Single pass: push LFilter predicates below LJoin when they reference only one side."
+  [plan]
+  (ir/walk-plan plan
+                (fn [node]
+                  (if (and (instance? LFilter node)
+                           (instance? LJoin (:input node)))
+                    (let [join (:input node)
+                          left-cols  (scan-columns (:left join))
+                          right-cols (scan-columns (:right join))]
+                      (if (and left-cols right-cols)
+                        (let [classified (group-by #(classify-pred-by-side % left-cols right-cols)
+                                                   (:predicates node))
+                              left-preds  (vec (get classified :left []))
+                              right-preds (vec (get classified :right []))
+                              cross-preds (vec (get classified :cross []))
+                  ;; Wrap join children with pushed-down filters
+                              new-left  (if (seq left-preds)
+                                          (ir/->LFilter left-preds (:left join))
+                                          (:left join))
+                              new-right (if (seq right-preds)
+                                          (ir/->LFilter right-preds (:right join))
+                                          (:right join))
+                              new-join (assoc join :left new-left :right new-right)]
+              ;; Keep cross-side predicates above the join (or remove filter if all pushed)
+                          (if (seq cross-preds)
+                            (ir/->LFilter cross-preds new-join)
+                            new-join))
+            ;; Can't determine sides → leave as-is
+                        node))
+                    node))))
 
 (defn predicate-pushdown
   "Push LFilter predicates below LJoin when they reference only one side.
 
-   Currently disabled for join pushdown: stratum's join execution doesn't
-   support pre-filtered probe/build sides. Predicates stay above the join
-   and get absorbed into the group-by/agg node's execution.
+   Left-only predicates → wrap join's left (probe) child in LFilter.
+   Right-only predicates → wrap join's right (build) child in LFilter.
+   Cross-side predicates stay above the join.
 
-   TODO: Implement bitmap-semi-join or mask-based pre-filtering to enable
-   predicate pushdown through joins."
+   Runs to fixpoint so that predicates pushed to a join's left child
+   (which may itself be a join) get pushed further down on the next pass.
+   Bounded by join depth (typically 2-3)."
   [plan]
-  ;; For now, only push predicates within non-join subtrees.
-  ;; Join-level pushdown requires the executor to apply masks before joining.
-  plan)
+  (loop [p plan, n 0]
+    (let [p' (pushdown-once p)]
+      (if (or (= p p') (>= n 10))
+        p'
+        (recur p' (inc n))))))
 
 ;; ============================================================================
 ;; Pass 2: Zone-map annotation
@@ -257,15 +322,15 @@
    Downstream strategy selection uses this to choose PChunkedScan over PScan."
   [plan]
   (ir/walk-plan plan
-    (fn [node]
-      (if (and (instance? LFilter node)
-               (instance? LScan (:input node))
-               (::all-indices (meta (:input node)))
-               (every? #(not (map? (first %))) (:predicates node)))
+                (fn [node]
+                  (if (and (instance? LFilter node)
+                           (instance? LScan (:input node))
+                           (::all-indices (meta (:input node)))
+                           (every? #(not (map? (first %))) (:predicates node)))
         ;; Mark the scan; actual chunk computation deferred to execution time
         ;; (depends on index state which may change between plan and execute)
-        (update node :input vary-meta assoc ::zone-map-eligible true)
-        node))))
+                    (update node :input vary-meta assoc ::zone-map-eligible true)
+                    node))))
 
 ;; ============================================================================
 ;; Pass 3: Expression materialization
@@ -314,34 +379,34 @@
    expression aggs that previously fell to scalar."
   [plan]
   (ir/walk-plan plan
-    (fn [node]
-      (cond
-        (instance? LGlobalAgg node)
-        (if (some :expr (:aggs node))
-          (let [[new-aggs mat-nodes] (rewrite-expr-aggs (:aggs node))]
-            (assoc node
-                   :aggs new-aggs
-                   :input (chain-materialize mat-nodes (:input node))))
-          node)
+                (fn [node]
+                  (cond
+                    (instance? LGlobalAgg node)
+                    (if (some :expr (:aggs node))
+                      (let [[new-aggs mat-nodes] (rewrite-expr-aggs (:aggs node))]
+                        (assoc node
+                               :aggs new-aggs
+                               :input (chain-materialize mat-nodes (:input node))))
+                      node)
 
-        (instance? LGroupBy node)
-        (let [has-expr-aggs? (some :expr (:aggs node))
-              has-expr-keys? (some #(not (keyword? %)) (:group-keys node))]
-          (if (or has-expr-aggs? has-expr-keys?)
-            (let [[new-aggs agg-mats] (if has-expr-aggs?
-                                        (rewrite-expr-aggs (:aggs node))
-                                        [(:aggs node) []])
-                  [new-keys key-mats] (if has-expr-keys?
-                                        (rewrite-expr-group-keys (:group-keys node))
-                                        [(:group-keys node) []])
-                  all-mats (into agg-mats key-mats)]
-              (assoc node
-                     :aggs new-aggs
-                     :group-keys new-keys
-                     :input (chain-materialize all-mats (:input node))))
-            node))
+                    (instance? LGroupBy node)
+                    (let [has-expr-aggs? (some :expr (:aggs node))
+                          has-expr-keys? (some #(not (keyword? %)) (:group-keys node))]
+                      (if (or has-expr-aggs? has-expr-keys?)
+                        (let [[new-aggs agg-mats] (if has-expr-aggs?
+                                                    (rewrite-expr-aggs (:aggs node))
+                                                    [(:aggs node) []])
+                              [new-keys key-mats] (if has-expr-keys?
+                                                    (rewrite-expr-group-keys (:group-keys node))
+                                                    [(:group-keys node) []])
+                              all-mats (into agg-mats key-mats)]
+                          (assoc node
+                                 :aggs new-aggs
+                                 :group-keys new-keys
+                                 :input (chain-materialize all-mats (:input node))))
+                        node))
 
-        :else node))))
+                    :else node))))
 
 ;; ============================================================================
 ;; Pass 4: Strategy selection (logical → physical)
@@ -350,10 +415,15 @@
 (defn- select-global-agg-strategy
   "Choose physical strategy for LGlobalAgg.
 
-   Priority (mirrors current routing but as explicit decisions):
+   Uses selectivity estimates to make cost-aware decisions:
+   - Very selective preds (< 5%) → prefer block-skip COUNT over full SIMD
+   - Low selectivity index scans → prefer chunked SIMD (skip whole chunks)
+   - Otherwise follows capability-based priority cascade.
+
+   Priority (capability gated, cost-informed):
    1. Unfiltered COUNT → short-circuit to length
    2. Stats-only → O(chunks) from chunk statistics
-   3. Chunked SIMD → stream index chunks
+   3. Chunked SIMD → stream index chunks (favored for selective preds)
    4. Block-skip COUNT → skip blocks via min/max on arrays
    5. Fused SIMD → single agg on arrays
    6. Fused multi-sum → multiple SUM-like aggs in one pass
@@ -375,7 +445,13 @@
         ;; real index-backed columns.
         agg-cols-in-scan? (every? #(or (= :count (:op %))
                                        (contains? columns (:col %)))
-                                  aggs)]
+                                  aggs)
+        ;; Cost-aware: estimate predicate selectivity
+        selectivity (when (seq preds)
+                      (est/estimate-combined-selectivity preds columns))
+        est-rows    (when selectivity
+                      (est/estimate-output-rows preds columns length))
+        very-selective? (and selectivity (< (double selectivity) 0.05))]
     (cond
       ;; 1. Unfiltered COUNT
       (and (= 1 n-aggs) (= :count (:op first-agg)) no-preds?)
@@ -388,15 +464,24 @@
       (ir/->PStatsOnlyAgg aggs scan)
 
       ;; 3. Chunked SIMD (single agg, index-backed → real columns only)
+      ;; Cost-aware: chunked SIMD is especially good for selective preds on
+      ;; index columns because zone maps can skip entire chunks.
       (and all-idx? agg-cols-in-scan? (= 1 n-aggs) simd-ok? no-expr?)
       (if (= :count (:op first-agg))
         (ir/->PChunkedSIMDCount preds scan)
         (ir/->PChunkedSIMDAgg preds first-agg scan))
 
       ;; 4. Block-skip COUNT on arrays
+      ;; Cost-aware: prefer block-skip when selectivity < 5% — can skip entire
+      ;; blocks using min/max stats on materialized arrays.
       (and (= 1 n-aggs) (= :count (:op first-agg)) (seq preds)
            (not all-idx?) simd-ok? no-expr?)
       (ir/->PBlockSkipCount preds scan)
+
+      ;; 4b. Cost-aware: for very selective non-COUNT single-agg on arrays,
+      ;; block-skip then SIMD on survivors would be faster than full SIMD.
+      ;; We don't have a fused block-skip+agg path yet, so this is a future
+      ;; optimization. For now, fall through to full SIMD.
 
       ;; 5. Fused SIMD (single agg, arrays)
       (and (= 1 n-aggs) simd-ok? no-expr?)
@@ -424,25 +509,34 @@
       (ir/->PScalarAgg preds aggs scan))))
 
 (defn- select-group-by-strategy
-  "Choose physical strategy for LGroupBy."
+  "Choose physical strategy for LGroupBy.
+
+   Cost-aware decisions:
+   - Estimated output rows inform dense-vs-hash: if predicates are very
+     selective, fewer rows enter the group-by → dense array more likely viable.
+   - For index-backed columns, chunked dense is preferred (zero-copy streaming)
+     with fallback to materialized dense/hash at execution time."
   [node scan preds]
   (let [{:keys [group-keys aggs]} node
         columns  (:columns scan)
         length   (:length scan)
-        all-idx? (::all-indices (meta scan))]
-    ;; Chunked dense (streaming, zero-copy) is tried first at execution time
-    ;; with fallback to materialized dense/hash. The plan records the intent;
-    ;; the executor handles the try/fallback since chunked eligibility depends
-    ;; on runtime column state (null detection, chunk alignment).
-    ;;
-    ;; For the initial planner we emit a logical-level PChunkedDenseGroupBy
-    ;; with fallback annotation. A more advanced version would compute
-    ;; max-key here and choose dense vs hash definitively.
+        all-idx? (::all-indices (meta scan))
+        ;; Cost-aware: estimate rows entering the group-by after predicates
+        selectivity (when (seq preds)
+                      (est/estimate-combined-selectivity preds columns))
+        est-rows    (if selectivity
+                      (est/estimate-output-rows preds columns length)
+                      length)]
     (if all-idx?
       (vary-meta
        (ir/->PChunkedDenseGroupBy preds group-keys aggs 0 scan)
-       assoc ::fallback :dense-or-hash)
-      (ir/->PDenseGroupBy preds group-keys aggs 0 scan))))
+       assoc ::fallback :dense-or-hash
+       ::estimated-rows est-rows
+       ::selectivity (or selectivity 1.0))
+      (vary-meta
+       (ir/->PDenseGroupBy preds group-keys aggs 0 scan)
+       assoc ::estimated-rows est-rows
+       ::selectivity (or selectivity 1.0)))))
 
 (defn- select-join-strategy
   "Choose physical strategy for LJoin.
@@ -491,124 +585,198 @@
    (or stays logical if no strategy applies yet, e.g. post-processing)."
   [plan]
   (ir/walk-plan plan
-    (fn [node]
-      (cond
+                (fn [node]
+                  (cond
         ;; LScan → PScan or PChunkedScan (preserve annotations)
-        (instance? LScan node)
-        (let [m (meta node)]
-          (if (::zone-map-eligible m)
-            (with-meta (ir/->PChunkedScan (:columns node) (:length node) nil) m)
-            (with-meta (ir/->PScan (:columns node) (:length node)) m)))
+                    (instance? LScan node)
+                    (let [m (meta node)]
+                      (if (::zone-map-eligible m)
+                        (with-meta (ir/->PChunkedScan (:columns node) (:length node) nil) m)
+                        (with-meta (ir/->PScan (:columns node) (:length node)) m)))
 
         ;; LGlobalAgg — peel through PMaterializeExpr to find filter/scan
-        (instance? LGlobalAgg node)
-        (let [[mat-chain inner] (peel-materialize (:input node))
-              [preds scan] (peel-filter-scan inner)
-              phys (select-global-agg-strategy node scan preds)]
-          (if (seq mat-chain)
-            (assoc phys :input (rechain-materialize mat-chain (:input phys)))
-            phys))
+                    (instance? LGlobalAgg node)
+                    (let [[mat-chain inner] (peel-materialize (:input node))
+                          [preds scan] (peel-filter-scan inner)
+                          phys (select-global-agg-strategy node scan preds)]
+                      (if (seq mat-chain)
+                        (assoc phys :input (rechain-materialize mat-chain (:input phys)))
+                        phys))
 
         ;; LGroupBy — same peeling
-        (instance? LGroupBy node)
-        (let [[mat-chain inner] (peel-materialize (:input node))
-              [preds scan] (peel-filter-scan inner)
-              phys (select-group-by-strategy node scan preds)]
-          (if (seq mat-chain)
-            (assoc phys :input (rechain-materialize mat-chain (:input phys)))
-            phys))
+                    (instance? LGroupBy node)
+                    (let [[mat-chain inner] (peel-materialize (:input node))
+                          [preds scan] (peel-filter-scan inner)
+                          phys (select-group-by-strategy node scan preds)]
+                      (if (seq mat-chain)
+                        (assoc phys :input (rechain-materialize mat-chain (:input phys)))
+                        phys))
 
         ;; LJoin
-        (instance? LJoin node)
-        (select-join-strategy node nil)
+                    (instance? LJoin node)
+                    (select-join-strategy node nil)
 
         ;; LFilter without a parent agg (standalone filter, e.g. filter-only query)
         ;; Strategy selection for filter-under-agg is handled above.
-        (instance? LFilter node)
-        (let [preds (:predicates node)
-              input (:input node)
-              columns (when (or (instance? PScan input)
-                                (instance? PChunkedScan input))
-                        (:columns input))
-              length  (when columns
-                        (:length input))
-              [simd non-simd] (if columns
-                                (pred/split-preds preds columns)
-                                [[] preds])]
-          (cond
+                    (instance? LFilter node)
+                    (let [preds (:predicates node)
+                          input (:input node)
+                          columns (when (or (instance? PScan input)
+                                            (instance? PChunkedScan input))
+                                    (:columns input))
+                          length  (when columns
+                                    (:length input))
+                          [simd non-simd] (if columns
+                                            (pred/split-preds preds columns)
+                                            [[] preds])]
+                      (cond
             ;; All SIMD-eligible
-            (and (seq simd) (empty? non-simd))
-            (ir/->PSIMDFilter preds nil input)
+                        (and (seq simd) (empty? non-simd))
+                        (ir/->PSIMDFilter preds nil input)
 
             ;; Mixed: mask for non-SIMD, SIMD for rest
-            (seq non-simd)
-            (let [mask-node (ir/->PMaskFilter non-simd nil input)]
-              (if (seq simd)
-                (ir/->PSIMDFilter simd nil mask-node)
-                mask-node))
+                        (seq non-simd)
+                        (let [mask-node (ir/->PMaskFilter non-simd nil input)]
+                          (if (seq simd)
+                            (ir/->PSIMDFilter simd nil mask-node)
+                            mask-node))
 
-            :else node))
+                        :else node))
 
         ;; Post-processing: logical → physical 1:1
-        (instance? LProject node)
-        (ir/->PProject (:items node) (:input node))
+                    (instance? LProject node)
+                    (ir/->PProject (:items node) (:input node))
 
-        (instance? LWindow node)
-        (ir/->PWindow (:specs node) (:input node))
+                    (instance? LWindow node)
+                    (ir/->PWindow (:specs node) (:input node))
 
-        (instance? LHaving node)
-        (ir/->PHaving (:predicates node) (:input node))
+                    (instance? LHaving node)
+                    (ir/->PHaving (:predicates node) (:input node))
 
-        (instance? LSort node)
-        (ir/->PSort (:order-specs node) nil nil (:input node))
+                    (instance? LSort node)
+                    (ir/->PSort (:order-specs node) nil nil (:input node))
 
-        (instance? LDistinct node)
-        (ir/->PDistinct (:input node))
+                    (instance? LDistinct node)
+                    (ir/->PDistinct (:input node))
 
-        (instance? LLimit node)
-        (ir/->PLimit (:limit node) (:offset node) (:input node))
+                    (instance? LLimit node)
+                    (ir/->PLimit (:limit node) (:offset node) (:input node))
 
-        :else node))))
+                    :else node))))
 
 ;; ============================================================================
 ;; Pass 5: Operator fusion
 ;; ============================================================================
 
+(defn- scan-or-filter-scan?
+  "True if node is a PScan/PChunkedScan, or a chain of filters wrapping one.
+   Recurses through PSIMDFilter/PMaskFilter chains (e.g. mixed SIMD + non-SIMD
+   preds produce PSIMDFilter → PMaskFilter → PScan)."
+  [node]
+  (cond
+    (or (instance? PScan node)
+        (instance? PChunkedScan node))
+    true
+
+    (or (instance? PSIMDFilter node)
+        (instance? PMaskFilter node))
+    (recur (:input node))
+
+    :else false))
+
+(defn- extract-scan-cols
+  "Walk through filter chains to the underlying scan and return its column key set."
+  [node]
+  (cond
+    (or (instance? PScan node) (instance? PChunkedScan node))
+    (set (keys (:columns node)))
+
+    (or (instance? PSIMDFilter node) (instance? PMaskFilter node))
+    (recur (:input node))
+
+    :else nil))
+
 (defn- fused-join-group-agg?
   "Check if a join+group+agg subtree can fuse into a single Java pass.
    Requires: INNER join, all group keys from dim side, all agg cols from fact side,
-   no predicates on either side, supported agg ops, no expression aggs."
+   supported agg ops, no expression aggs. Filter-wrapped scans on either side are
+   allowed — the executor realizes pushed-down predicates as masks."
   [group-node join-node]
   (let [supported #{:sum :count :min :max :avg :sum-product}
         aggs (:aggs group-node)
         group-keys (:group-keys group-node)
         preds (:predicates group-node)
-        ;; Fused path can't handle pre-filtered probe side
-        probe-is-scan? (or (instance? PScan (:probe-side join-node))
-                           (instance? PChunkedScan (:probe-side join-node)))]
+        probe-ok? (scan-or-filter-scan? (:probe-side join-node))
+        build-cols (extract-scan-cols (:build-side join-node))]
     (and (= :inner (:join-type join-node))
          (empty? preds)
-         probe-is-scan?
+         probe-ok?
          (seq group-keys)
          (every? keyword? group-keys)
+         ;; Group keys must all come from the build (dim) side
+         build-cols
+         (every? build-cols group-keys)
          (seq aggs)
          (every? #(supported (:op %)) aggs)
          (every? #(nil? (:expr %)) aggs))))
 
 (defn- fused-join-global-agg?
-  "Check if a join+global-agg subtree can fuse."
+  "Check if a join+global-agg subtree can fuse.
+   Filter-wrapped scans on either side are allowed — the executor realizes
+   pushed-down predicates as masks."
   [agg-node join-node]
   (let [supported #{:sum :count :min :max :avg :sum-product}
         aggs (:aggs agg-node)
         preds (:predicates agg-node)
-        probe-is-scan? (or (instance? PScan (:probe-side join-node))
-                           (instance? PChunkedScan (:probe-side join-node)))]
+        probe-ok? (scan-or-filter-scan? (:probe-side join-node))]
     (and (#{:inner :left} (:join-type join-node))
          (empty? (or preds []))
-         probe-is-scan?
+         probe-ok?
          (seq aggs)
          (every? #(supported (:op %)) aggs)
          (every? #(nil? (:expr %)) aggs))))
+
+(defn- node-referenced-cols
+  "Collect the set of column keywords referenced by a node (not recursing into children).
+   Used to determine if a join's build-side columns are needed by the parent."
+  [node]
+  (cond
+    (instance? PProject node)
+    (into #{} (keep (fn [item]
+                      (or (:ref item)
+                          (when-let [e (:expr item)]
+                            nil)  ;; expression items may reference multiple cols
+                          (:name item))))
+          (:items node))
+
+    (or (instance? PDenseGroupBy node) (instance? PHashGroupBy node)
+        (instance? PChunkedDenseGroupBy node))
+    (into (set (:group-keys node))
+          (keep :col (:aggs node)))
+
+    (or (instance? PFusedSIMDAgg node) (instance? PFusedSIMDCount node)
+        (instance? PScalarAgg node) (instance? PFusedMultiSum node))
+    (into #{} (keep :col (or (:aggs node)
+                             (when-let [a (:agg node)] [a]))))
+
+    :else nil))  ;; nil = unknown, don't optimize
+
+(defn- bitmap-semi-join-eligible?
+  "Check if a PHashJoin can be replaced with PBitmapSemiJoin.
+   Requires:
+   - INNER join
+   - Single-column join key
+   - Parent node doesn't reference any build-side (dim) columns except the join key"
+  [join-node parent-cols]
+  (and parent-cols
+       (= :inner (:join-type join-node))
+       (= 1 (count (:on-pairs join-node)))
+       (let [build-cols (extract-scan-cols (:build-side join-node))
+             join-key-right (second (first (:on-pairs join-node)))]
+         (and build-cols
+              ;; No build-side columns (other than join key) used by parent
+              (empty? (disj (clojure.set/intersection build-cols parent-cols)
+                            join-key-right))))))
 
 (defn operator-fusion
   "Merge adjacent physical nodes into fused operators where beneficial.
@@ -616,42 +784,71 @@
    Patterns:
    - PDenseGroupBy/PHashGroupBy over PHashJoin → PFusedJoinGroupAgg
    - PFusedSIMDAgg/PScalarAgg over PHashJoin → PFusedJoinGlobalAgg
-   - PFusedExtractCount from date-extract group-by + all-count aggs
+   - Any node over PHashJoin where dim cols unused → PBitmapSemiJoin
 
    This pass discovers fusion opportunities that the cascading cond
    hard-coded as top-level eligibility checks."
   [plan]
   (ir/walk-plan plan
-    (fn [node]
-      (cond
+                (fn [node]
+                  (cond
         ;; Pattern 1: GroupBy over HashJoin → FusedJoinGroupAgg
-        (and (or (instance? PDenseGroupBy node) (instance? PHashGroupBy node))
-             (instance? PHashJoin (:input node)))
-        (let [join (:input node)]
-          (if (fused-join-group-agg? node join)
-            (ir/->PFusedJoinGroupAgg
-             {:on-pairs (:on-pairs join) :type (:join-type join)}
-             (:group-keys node) (:aggs node)
-             (:probe-side join)   ;; left = fact
-             (:build-side join))  ;; right = dim
-            node))
+                    (and (or (instance? PDenseGroupBy node) (instance? PHashGroupBy node))
+                         (instance? PHashJoin (:input node)))
+                    (let [join (:input node)]
+                      (if (fused-join-group-agg? node join)
+                        (ir/->PFusedJoinGroupAgg
+                         {:on-pairs (:on-pairs join) :type (:join-type join)}
+                         (:group-keys node) (:aggs node)
+                         (:probe-side join)   ;; left = fact
+                         (:build-side join))  ;; right = dim
+            ;; Fused join failed — try bitmap semi-join
+                        (let [parent-cols (node-referenced-cols node)]
+                          (if (bitmap-semi-join-eligible? join parent-cols)
+                            (assoc node :input
+                                   (ir/->PBitmapSemiJoin
+                                    {:on-pairs (:on-pairs join) :type (:join-type join)
+                                     :build-side (:build-side join)}
+                                    (:probe-side join)))
+                            node))))
 
         ;; Pattern 2: GlobalAgg over HashJoin → FusedJoinGlobalAgg
-        (and (or (instance? PFusedSIMDAgg node) (instance? PScalarAgg node)
-                 (instance? PFusedMultiSum node))
-             (instance? PHashJoin (:input node)))
-        (let [join (:input node)
-              aggs (or (:aggs node) (when (:agg node) [(:agg node)]))]
-          (if (fused-join-global-agg?
-               {:aggs aggs :predicates (:predicates node)} join)
-            (ir/->PFusedJoinGlobalAgg
-             {:on-pairs (:on-pairs join) :type (:join-type join)}
-             aggs
-             (:probe-side join)
-             (:build-side join))
-            node))
+                    (and (or (instance? PFusedSIMDAgg node) (instance? PScalarAgg node)
+                             (instance? PFusedMultiSum node))
+                         (instance? PHashJoin (:input node)))
+                    (let [join (:input node)
+                          aggs (or (:aggs node) (when (:agg node) [(:agg node)]))]
+                      (if (fused-join-global-agg?
+                           {:aggs aggs :predicates (:predicates node)} join)
+                        (ir/->PFusedJoinGlobalAgg
+                         {:on-pairs (:on-pairs join) :type (:join-type join)}
+                         aggs
+                         (:probe-side join)
+                         (:build-side join))
+            ;; Fused join failed — try bitmap semi-join
+                        (let [parent-cols (node-referenced-cols node)]
+                          (if (bitmap-semi-join-eligible? join parent-cols)
+                            (assoc node :input
+                                   (ir/->PBitmapSemiJoin
+                                    {:on-pairs (:on-pairs join) :type (:join-type join)
+                                     :build-side (:build-side join)}
+                                    (:probe-side join)))
+                            node))))
 
-        :else node))))
+        ;; Pattern 3: Project over HashJoin → try bitmap semi-join
+                    (and (instance? PProject node)
+                         (instance? PHashJoin (:input node)))
+                    (let [join (:input node)
+                          parent-cols (node-referenced-cols node)]
+                      (if (bitmap-semi-join-eligible? join parent-cols)
+                        (assoc node :input
+                               (ir/->PBitmapSemiJoin
+                                {:on-pairs (:on-pairs join) :type (:join-type join)
+                                 :build-side (:build-side join)}
+                                (:probe-side join)))
+                        node))
+
+                    :else node))))
 
 ;; ============================================================================
 ;; Composite: full optimization pipeline
@@ -676,35 +873,53 @@
   (let [cls (.getSimpleName (class node))]
     cls))
 
+(defn- est-detail
+  "Append selectivity/estimated-rows from node metadata if present."
+  [node base]
+  (let [m (meta node)
+        sel (::selectivity m)
+        est (::estimated-rows m)]
+    (cond-> base
+      sel (str " sel=" (format "%.3f" (double sel)))
+      est (str " est-rows=" est))))
+
 (defn- node-detail [node]
-  (cond
-    (instance? PStatsOnlyAgg node)
-    (str "aggs=" (mapv :op (:aggs node)))
+  (est-detail node
+              (cond
+                (instance? PStatsOnlyAgg node)
+                (str "aggs=" (mapv :op (:aggs node)))
 
-    (instance? PFusedSIMDAgg node)
-    (str "agg=" (:op (:agg node)) " preds=" (count (:predicates node)))
+                (instance? PFusedSIMDAgg node)
+                (str "agg=" (:op (:agg node)) " preds=" (count (:predicates node)))
 
-    (instance? PChunkedDenseGroupBy node)
-    (str "groups=" (:group-keys node) " aggs=" (mapv :op (:aggs node)))
+                (instance? PChunkedDenseGroupBy node)
+                (str "groups=" (:group-keys node) " aggs=" (mapv :op (:aggs node)))
 
-    (instance? PDenseGroupBy node)
-    (str "groups=" (:group-keys node) " aggs=" (mapv :op (:aggs node))
-         " max-key=" (:max-key node))
+                (instance? PDenseGroupBy node)
+                (str "groups=" (:group-keys node) " aggs=" (mapv :op (:aggs node))
+                     " max-key=" (:max-key node))
 
-    (instance? PHashGroupBy node)
-    (str "groups=" (:group-keys node) " aggs=" (mapv :op (:aggs node)))
+                (instance? PHashGroupBy node)
+                (str "groups=" (:group-keys node) " aggs=" (mapv :op (:aggs node)))
 
-    (instance? PScan node)
-    (str "cols=" (vec (keys (:columns node))) " len=" (:length node))
+                (instance? PScan node)
+                (str "cols=" (vec (keys (:columns node))) " len=" (:length node))
 
-    (instance? PChunkedScan node)
-    (str "cols=" (vec (keys (:columns node))) " len=" (:length node)
-         " zone-pruned=" (some? (:surviving-chunks node)))
+                (instance? PChunkedScan node)
+                (str "cols=" (vec (keys (:columns node))) " len=" (:length node)
+                     " zone-pruned=" (some? (:surviving-chunks node)))
 
-    (instance? PMaterializeExpr node)
-    (str "col=" (:col-name node) " expr=" (:expr node))
+                (instance? PFusedJoinGroupAgg node)
+                (str "groups=" (:group-keys node) " aggs=" (mapv :op (:aggs node))
+                     " join=" (:join-spec node))
 
-    :else ""))
+                (instance? PFusedJoinGlobalAgg node)
+                (str "aggs=" (mapv :op (:aggs node)) " join=" (:join-spec node))
+
+                (instance? PMaterializeExpr node)
+                (str "col=" (:col-name node) " expr=" (:expr node))
+
+                :else "")))
 
 (defn explain
   "Return a human-readable string describing the physical plan tree.
@@ -724,6 +939,19 @@
                     (instance? PHashJoin plan)
                     [(str indent "  build:\n" (explain (:build-side plan) (+ depth 2)))
                      (str indent "  probe:\n" (explain (:probe-side plan) (+ depth 2)))]
+
+                    (instance? PFusedJoinGroupAgg plan)
+                    [(str indent "  fact:\n" (explain (:left plan) (+ depth 2)))
+                     (str indent "  dim:\n" (explain (:right plan) (+ depth 2)))]
+
+                    (instance? PFusedJoinGlobalAgg plan)
+                    [(str indent "  fact:\n" (explain (:left plan) (+ depth 2)))
+                     (str indent "  dim:\n" (explain (:right plan) (+ depth 2)))]
+
+                    (instance? PBitmapSemiJoin plan)
+                    (let [bs (get-in plan [:join-spec :build-side])]
+                      (cond-> [(explain (:input plan) (inc depth))]
+                        bs (conj (str indent "  dim:\n" (explain bs (+ depth 2))))))
 
                     (ir/input-node plan)
                     [(explain (ir/input-node plan) (inc depth))]

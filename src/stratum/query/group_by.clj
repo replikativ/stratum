@@ -499,11 +499,11 @@
                           (:eq :neq)
                           (let [code (dict-code-for dict (first args))]
                             [col-ref op (long code)])
-                        (:in :not-in)
-                        (let [codes (into #{} (map #(dict-code-for dict %)) (first args))]
-                          [col-ref op codes])
+                          (:in :not-in)
+                          (let [codes (into #{} (map #(dict-code-for dict %)) (first args))]
+                            [col-ref op codes])
                         ;; Other ops: leave as-is
-                        pred)))
+                          pred)))
                     pred)
                   pred))))
           preds)))
@@ -530,32 +530,32 @@
                 (aget ^doubles col-data i))
             args (subvec pred 2)]
         (case op
-            :lt    (< (double v) (double (first args)))
-            :gt    (> (double v) (double (first args)))
-            :lte   (<= (double v) (double (first args)))
-            :gte   (>= (double v) (double (first args)))
-            :eq    (== (double v) (double (first args)))
-            :neq   (not (== (double v) (double (first args))))
-            :range (let [lo (double (first args))
-                         hi (double (second args))]
-                     (and (>= (double v) lo) (<= (double v) hi)))
-            :not-range (let [lo (double (first args))
-                             hi (double (second args))]
-                         (or (< (double v) lo) (> (double v) hi)))
-            :in    (let [s (first args)]
-                     (if (every? number? s)
-                       (contains? s (double v))
-                       (contains? s v)))
-            :not-in (let [s (first args)]
-                      (if (every? number? s)
-                        (not (contains? s (double v)))
-                        (not (contains? s v))))
-            :is-null (if (expr/long-array? col-data)
-                       (== (long v) Long/MIN_VALUE)
-                       (Double/isNaN (double v)))
-            :is-not-null (if (expr/long-array? col-data)
-                           (not= (long v) Long/MIN_VALUE)
-                           (not (Double/isNaN (double v)))))))))
+          :lt    (< (double v) (double (first args)))
+          :gt    (> (double v) (double (first args)))
+          :lte   (<= (double v) (double (first args)))
+          :gte   (>= (double v) (double (first args)))
+          :eq    (== (double v) (double (first args)))
+          :neq   (not (== (double v) (double (first args))))
+          :range (let [lo (double (first args))
+                       hi (double (second args))]
+                   (and (>= (double v) lo) (<= (double v) hi)))
+          :not-range (let [lo (double (first args))
+                           hi (double (second args))]
+                       (or (< (double v) lo) (> (double v) hi)))
+          :in    (let [s (first args)]
+                   (if (every? number? s)
+                     (contains? s (double v))
+                     (contains? s v)))
+          :not-in (let [s (first args)]
+                    (if (every? number? s)
+                      (not (contains? s (double v)))
+                      (not (contains? s v))))
+          :is-null (if (expr/long-array? col-data)
+                     (== (long v) Long/MIN_VALUE)
+                     (Double/isNaN (double v)))
+          :is-not-null (if (expr/long-array? col-data)
+                         (not= (long v) Long/MIN_VALUE)
+                         (not (Double/isNaN (double v)))))))))
 
 (defn execute-scalar-aggs
   "Execute aggregations over matching rows using scalar loop."
@@ -2424,36 +2424,36 @@
         (if (zero? n-group)
           ;; Global aggregate — single bucket, no group keys
           {:group-muls (long-array 0) :max-key 1 :use-dense? true :key-overflow? false}
-        (let [muls (long-array n-group)
-              _ (aset muls (dec n-group) 1)
-              muls-ok? (try
-                         (loop [i (- n-group 2)]
-                           (when (>= i 0)
-                             (aset muls i (Math/multiplyExact
-                                           (inc (long (nth group-maxes (inc i))))
-                                           (aget muls (inc i))))
-                             (recur (dec i))))
-                         true
-                         (catch ArithmeticException _ false))]
-          (if muls-ok?
+          (let [muls (long-array n-group)
+                _ (aset muls (dec n-group) 1)
+                muls-ok? (try
+                           (loop [i (- n-group 2)]
+                             (when (>= i 0)
+                               (aset muls i (Math/multiplyExact
+                                             (inc (long (nth group-maxes (inc i))))
+                                             (aget muls (inc i))))
+                               (recur (dec i))))
+                           true
+                           (catch ArithmeticException _ false))]
+            (if muls-ok?
             ;; Muls computed OK — check if max-key fits
-            (let [group-muls (long-array (vec muls))]
-              (try
-                (let [max-key (long (reduce (fn [^long acc i]
-                                              (Math/addExact acc
-                                                             (Math/multiplyExact (long (nth group-maxes i))
-                                                                                 (aget group-muls i))))
-                                            (long 0) (range n-group)))]
-                  {:group-muls group-muls :max-key max-key
-                   :use-dense? (<= (inc max-key) dense-limit)
-                   :key-overflow? false})
-                (catch ArithmeticException _
+              (let [group-muls (long-array (vec muls))]
+                (try
+                  (let [max-key (long (reduce (fn [^long acc i]
+                                                (Math/addExact acc
+                                                               (Math/multiplyExact (long (nth group-maxes i))
+                                                                                   (aget group-muls i))))
+                                              (long 0) (range n-group)))]
+                    {:group-muls group-muls :max-key max-key
+                     :use-dense? (<= (inc max-key) dense-limit)
+                     :key-overflow? false})
+                  (catch ArithmeticException _
                   ;; Muls are correct but max-key overflows — composite keys will wrap
-                  {:group-muls group-muls :max-key Long/MAX_VALUE
-                   :use-dense? false :key-overflow? true})))
+                    {:group-muls group-muls :max-key Long/MAX_VALUE
+                     :use-dense? false :key-overflow? true})))
             ;; Even strides overflow — key space is enormous
-            {:group-muls (long-array n-group) :max-key Long/MAX_VALUE
-             :use-dense? false :key-overflow? true})))]
+              {:group-muls (long-array n-group) :max-key Long/MAX_VALUE
+               :use-dense? false :key-overflow? true})))]
     {:group-arrays group-arrays :group-muls group-muls :group-maxes group-maxes
      :group-dicts group-dicts :group-offsets group-offsets :max-key max-key
      :use-dense? use-dense? :n-group n-group :key-overflow? (boolean key-overflow?)

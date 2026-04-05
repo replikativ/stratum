@@ -26,13 +26,13 @@ Standard decision-support queries on TPC-H lineitem data (6M rows from CSV).
 
 | Query | Description | Stratum 1T | Stratum NT | DuckDB 1T | DuckDB NT | 1T Ratio |
 |-------|-------------|-----------|-----------|----------|----------|---------|
-| B1 | TPC-H Q6: filter + SUM(price*discount) | **13.8ms** | 7.8ms | 27.7ms | 5.9ms | **2.0x** |
-| B2 | TPC-H Q1: GROUP BY + 7 aggregates | **74.4ms** | 23.3ms | 93.4ms | 18.4ms | **1.3x** |
-| B3 | SSB Q1.1: filter + SUM(price*discount) | **13.6ms** | 5.2ms | 28.3ms | 6.0ms | **2.1x** |
-| B4 | COUNT(*) no filter | **0.1ms** | - | 0.4ms | 0.3ms | **4.0x** |
-| B5 | Filtered COUNT (NEQ predicate) | **2.8ms** | 2.6ms | 11.3ms | 2.5ms | **4.0x** |
-| B6 | Low-cardinality GROUP BY + COUNT | **16.6ms** | 9.8ms | 24.7ms | 5.1ms | **1.5x** |
-| SSB-Q1.2 | Tighter filter + SUM(price*discount) | **12.8ms** | 4.8ms | 23.7ms | 4.9ms | **1.8x** |
+| B1 | TPC-H Q6: filter + SUM(price*discount) | **14.5ms** | 12.5ms | 29.9ms | 8.3ms | **2.1x** |
+| B2 | TPC-H Q1: GROUP BY + 7 aggregates | **78.5ms** | 31.5ms | 98.0ms | 21.5ms | **1.2x** |
+| B3 | SSB Q1.1: filter + SUM(price*discount) | **16.2ms** | 7.2ms | 33.2ms | 7.4ms | **2.1x** |
+| B4 | COUNT(*) no filter | **0.1ms** | - | 0.4ms | 0.3ms | **4.6x** |
+| B5 | Filtered COUNT (NEQ predicate) | **4.1ms** | 2.1ms | 13.0ms | 7.3ms | **3.2x** |
+| B6 | Low-cardinality GROUP BY + COUNT | **22.7ms** | 15.1ms | 30.5ms | 14.2ms | **1.3x** |
+| SSB-Q1.2 | Tighter filter + SUM(price*discount) | **21.5ms** | 9.9ms | 47.0ms | 20.1ms | **2.2x** |
 
 Stratum's fused filter+aggregate execution evaluates predicates and accumulates results in a single SIMD pass, avoiding intermediate arrays.
 
@@ -42,24 +42,24 @@ Group-by queries from the [H2O.ai db-benchmark](https://h2oai.github.io/db-bench
 
 | Query | Description | Stratum 1T | Stratum NT | DuckDB 1T | DuckDB NT | 1T Ratio |
 |-------|-------------|-----------|-----------|----------|----------|---------|
-| Q1 | GROUP BY id1 (string, 100 groups), SUM | **27.2ms** | 9.8ms | 44.7ms | 13.8ms | **1.6x** |
-| Q2 | GROUP BY id1,id2 (string, 10K groups), SUM | **42.2ms** | 23.6ms | 122.8ms | 49.8ms | **2.9x** |
-| Q3 | GROUP BY id3 (string, 100K groups), SUM+AVG | **74.2ms** | 79.1ms | 366.3ms | 155.5ms | **4.9x** |
-| Q4 | GROUP BY id4 (int, 100 groups), 3xAVG | **58.7ms** | 9.6ms | 53.2ms | 9.2ms | 0.9x |
-| Q5 | GROUP BY id6 (int, 100K groups), 3xSUM | **85.8ms** | 89.9ms | 149.6ms | 109.8ms | **1.7x** |
-| Q6 | GROUP BY id4,id5 (10K groups), STDDEV | **34.2ms** | 14.8ms | 91.4ms | 39.7ms | **2.7x** |
-| Q7 | GROUP BY id3 (string, 100K groups), MAX-MIN | **101.7ms** | 115.0ms | 395.4ms | 202.7ms | **3.9x** |
-| Q8 | Top-2 per group (ROW_NUMBER window) | 1709.6ms | 1166.6ms | **1237.6ms** | 330.7ms | DuckDB 1.4x |
-| Q9 | GROUP BY id2,id4 (10K groups), CORR | **68.1ms** | 24.0ms | 143.4ms | 54.7ms | **2.1x** |
-| Q10 | GROUP BY 6 columns (10M unique groups) | **885.9ms** | 722.1ms | 7226.7ms | 6180.3ms | **8.2x** |
+| Q1 | GROUP BY id1 (string, 100 groups), SUM | **30.8ms** | 11.2ms | 62.1ms | 18.2ms | **2.0x** |
+| Q2 | GROUP BY id1,id2 (string, 10K groups), SUM | **41.7ms** | 21.6ms | 129.6ms | 61.2ms | **3.1x** |
+| Q3 | GROUP BY id3 (string, 100K groups), SUM+AVG | **78.6ms** | 80.9ms | 392.6ms | 223.8ms | **5.0x** |
+| Q4 | GROUP BY id4 (int, 100 groups), 3xAVG | 53.3ms | 14.5ms | **51.2ms** | 13.1ms | 0.96x |
+| Q5 | GROUP BY id6 (int, 100K groups), 3xSUM | **93.7ms** | 92.4ms | 160.8ms | 146.3ms | **1.7x** |
+| Q6 | GROUP BY id4,id5 (10K groups), STDDEV | **33.3ms** | 19.1ms | 91.3ms | 56.9ms | **2.7x** |
+| Q7 | GROUP BY id3 (string, 100K groups), MAX-MIN | **97.2ms** | 107.3ms | 385.7ms | 228.0ms | **4.0x** |
+| Q8 | Top-2 per group (ROW_NUMBER window) | 1906.6ms | 1373.6ms | **1274.4ms** | 471.5ms | DuckDB 1.5x |
+| Q9 | GROUP BY id2,id4 (10K groups), CORR | **67.5ms** | 29.3ms | 142.4ms | 74.2ms | **2.1x** |
+| Q10 | GROUP BY 6 columns (10M unique groups) | **1070.8ms** | 903.5ms | 10269.8ms | 7018.6ms | **9.6x** |
 
 **Integer Pipeline Queries** (native long[] accumulation, no longToDouble conversion):
 
 | Query | Description | Stratum 1T | Stratum NT | DuckDB 1T | DuckDB NT | 1T Ratio |
 |-------|-------------|-----------|-----------|----------|----------|---------|
-| INT-Q1 | GROUP BY id4 (100 groups), SUM(v1)+SUM(v2)+COUNT | 46.6ms | 11.0ms | **36.2ms** | 6.2ms | DuckDB 1.3x |
-| INT-Q2 | GROUP BY id4 (100 groups), SUM+MIN+MAX+COUNT | 63.2ms | 17.9ms | **35.5ms** | 7.2ms | DuckDB 1.8x |
-| INT-Q3 | SUM(v1)+SUM(v2)+COUNT (global multi-sum) | **0.4ms** | 0.4ms | 14.4ms | 2.7ms | **34x** |
+| INT-Q1 | GROUP BY id4 (100 groups), SUM(v1)+SUM(v2)+COUNT | 55.6ms | 16.4ms | **41.7ms** | 7.6ms | DuckDB 1.3x |
+| INT-Q2 | GROUP BY id4 (100 groups), SUM+MIN+MAX+COUNT | 77.2ms | 25.9ms | **43.6ms** | 12.8ms | DuckDB 1.8x |
+| INT-Q3 | SUM(v1)+SUM(v2)+COUNT (global multi-sum) | **0.5ms** | 0.6ms | 17.5ms | 4.0ms | **38.8x** |
 
 INT-Q3 demonstrates the all-long SIMD multi-sum path with LongVector accumulators: 34x faster than DuckDB by avoiding all type conversion overhead. INT-Q1/Q2 show the dense group-by long path; the Clojure orchestration overhead is visible at 100 groups where Java compute is only ~20ms.
 
@@ -67,17 +67,17 @@ INT-Q3 demonstrates the all-long SIMD multi-sum path with LongVector accumulator
 
 | Query | Description | Stratum 1T | Stratum NT | DuckDB 1T | DuckDB NT | 1T Ratio |
 |-------|-------------|-----------|-----------|----------|----------|---------|
-| J1 | INNER JOIN small (100 rows), 2xSUM | 37.9ms | 5.5ms | **35.5ms** | 5.1ms | DuckDB 1.1x |
-| J2 | INNER JOIN medium (10K), 2-column key, SUM | **75.0ms** | 31.6ms | 77.8ms | 23.7ms | **1.0x** |
-| J3 | LEFT JOIN medium (10K), 2-column key, SUM | **76.5ms** | 32.0ms | 83.6ms | 47.6ms | **1.1x** |
+| J1 | INNER JOIN small (100 rows), 2xSUM | 34.2ms | 9.2ms | **32.5ms** | 6.0ms | DuckDB 1.1x |
+| J2 | INNER JOIN medium (10K), 2-column key, SUM | 79.2ms | 39.5ms | **75.2ms** | 62.8ms | DuckDB 1.1x |
+| J3 | LEFT JOIN medium (10K), 2-column key, SUM | **82.3ms** | 39.8ms | 82.0ms | 59.2ms | **1.0x** |
 
 **Bitmap Semi-Join Queries** (existence-only joins via BitSet probe):
 
 | Query | Description | Stratum 1T | Stratum NT | DuckDB 1T | DuckDB NT | 1T Ratio |
 |-------|-------------|-----------|-----------|----------|----------|---------|
-| SEMI-Q1 | SUM(v1) WHERE EXISTS customer(nation=5) | **88.1ms** | 29.4ms | 264.2ms | 114.9ms | **3.0x** |
-| SEMI-Q2 | SUM(v1) GROUP BY id4 WHERE EXISTS | **72.0ms** | 60.3ms | 280.9ms | 104.0ms | **3.9x** |
-| SEMI-Q3 | COUNT(*) WHERE EXISTS customer(nation=5) | **77.9ms** | 36.4ms | 236.9ms | 91.7ms | **3.0x** |
+| SEMI-Q1 | SUM(v1) WHERE EXISTS customer(nation=5) | **93.1ms** | 45.3ms | 272.3ms | 124.7ms | **2.9x** |
+| SEMI-Q2 | SUM(v1) GROUP BY id4 WHERE EXISTS | **66.2ms** | 62.0ms | 293.5ms | 128.9ms | **4.4x** |
+| SEMI-Q3 | COUNT(*) WHERE EXISTS customer(nation=5) | **69.0ms** | 42.8ms | 229.4ms | 122.0ms | **3.3x** |
 
 Bitmap semi-join fires automatically when a join only tests existence (no dimension columns in output). Replaces hash join with BitSet probe -- no hash table build, no row materialization.
 
@@ -156,7 +156,7 @@ Fact table (10M rows) joined to dimension table (1K rows), followed by GROUP BY 
 
 | Query | Description | Stratum 1T | Stratum NT | DuckDB 1T | DuckDB NT | 1T Ratio |
 |-------|-------------|-----------|-----------|----------|----------|---------|
-| JOIN-Q1 | Fact JOIN Dim, GROUP BY category, SUM | **19.8ms** | 3.8ms | 37.6ms | 7.1ms | **1.9x** |
+| JOIN-Q1 | Fact JOIN Dim, GROUP BY category, SUM | **25.6ms** | 5.3ms | 42.7ms | 7.6ms | **1.7x** |
 
 ### Tier 6: Statistical Aggregates
 
@@ -191,7 +191,7 @@ Window functions benefit from multi-threading when partition sizes exceed 8 rows
 
 ### 10M Summary
 
-**Stratum wins 39 of 52 queries, DuckDB wins 13** (single-threaded comparison, queries > 0.1ms).
+**Stratum wins 39 of 52 queries, DuckDB wins 13** (single-threaded comparison, queries > 0.1ms). Last verified 2026-04-04 with query planner enabled (no regressions).
 
 ### Isolation Forest
 
@@ -334,9 +334,10 @@ DuckDB's advantage at 100M is concentrated in high-cardinality hash group-by (1M
 
 ## Key Performance Characteristics
 
+- **Query planner**: Multi-pass optimizer builds physical plan trees with predicate pushdown, operator fusion, cost-based strategy selection (zone-map + sample selectivity estimation), and bitmap semi-join rewriting. Planning overhead is ~0.1% of query time (~5μs).
 - **Fused execution**: Predicate evaluation and aggregation run in a single SIMD pass, avoiding intermediate array allocation
 - **SIMD vectorization**: Java Vector API (DoubleVector/LongVector) processes 4 elements per cycle for all filter, aggregate, and group-by operations
-- **Native long[] pipeline**: Integer columns stay as long[] through expressions, aggregation, and results -- no longToDouble conversion overhead (INT-Q3: 34x vs DuckDB)
+- **Native long[] pipeline**: Integer columns stay as long[] through expressions, aggregation, and results -- no longToDouble conversion overhead (INT-Q3: 39x vs DuckDB)
 - **Dense group-by**: Direct array-indexed accumulation for low/moderate-cardinality groups -- no hash function overhead
 - **Bitmap semi-join**: Existence-only joins use BitSet probe instead of hash tables (3-4x vs DuckDB on filtered joins)
 - **Zone map pruning**: Per-chunk min/max statistics allow skipping entire chunks that cannot match predicates

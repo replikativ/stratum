@@ -553,9 +553,9 @@
                                 (Math/min simd-result (double stats-min)))
                          :max (if (zero? simd-count)
                                 (double stats-max)
-                              (Math/max simd-result (double stats-max)))
-                       simd-result)
-             :count total-count})))))))
+                                (Math/max simd-result (double stats-max)))
+                         simd-result)
+               :count total-count})))))))
 
 (defn execute-chunked-fused-count
   "JIT-isolated chunked COUNT for index inputs.

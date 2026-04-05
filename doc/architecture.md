@@ -21,8 +21,14 @@ Stratum is a SIMD-accelerated columnar analytics engine for the JVM, written in 
                  └────────────┬────────────┘
                               │
                     ┌─────────▼──────────┐
-                    │     query.clj      │
-                    │  Dispatch + Compile │
+                    │      plan.clj      │
+                    │  Query Planner     │
+                    │  (logical → phys)  │
+                    └─────────┬──────────┘
+                              │ Physical IR tree
+                    ┌─────────▼──────────┐
+                    │    executor.clj    │
+                    │  Plan Execution    │
                     └─────────┬──────────┘
                               │
           ┌───────────────────┼───────────────────┐
@@ -76,7 +82,11 @@ Indices support O(1) fork via structural sharing and copy-on-write on mutation. 
 | File | Responsibility | Size |
 |------|---------------|------|
 | `src/stratum/api.clj` | Public API (q, explain, from-csv, from-parquet, server, iforest) | ~235 LOC |
-| `src/stratum/query.clj` | Query compilation, dispatch, execution | ~6600 LOC |
+| `src/stratum/query.clj` | Query compilation, dispatch, execution (legacy path) | ~6600 LOC |
+| `src/stratum/query/plan.clj` | Query planner: logical→physical IR, optimization passes | ~970 LOC |
+| `src/stratum/query/executor.clj` | Physical plan executor: walks IR tree, dispatches to Java | ~700 LOC |
+| `src/stratum/query/ir.clj` | IR record definitions (30+ physical/logical node types) | ~300 LOC |
+| `src/stratum/query/estimate.clj` | Selectivity estimation: zone-map, sample, heuristic | ~390 LOC |
 | `src/stratum/sql.clj` | JSqlParser AST → query map / DDL translation (SELECT, INSERT, UPDATE, DELETE, UPSERT) | ~1570 LOC |
 | `src/stratum/server.clj` | PostgreSQL wire protocol (pgwire) server with DML execution | ~720 LOC |
 | `src/stratum/csv.clj` | CSV import with auto type detection | ~160 LOC |
@@ -108,13 +118,17 @@ Query: _Sum revenue where shipdate in 1994, discount between 0.05-0.07, quantity
           :agg [[:sum [:* :price :discount]]]})
 ```
 
-**Step-by-step execution:**
+**Step-by-step execution (planner path):**
 
-1. **prepare-columns**: Resolve column references to typed arrays. Detect 2 long predicates + 1 double predicate, 1 SUM_PRODUCT aggregation.
+1. **build-logical-plan**: Parse query map into logical IR: `LGlobalAgg → LFilter → LScan`.
 
-2. **Dispatch**: Single aggregation with ≤4L+4D predicates on ≥1000 rows → fused SIMD path.
+2. **optimize**: Multi-pass pipeline:
+   - **Strategy selection**: Estimate selectivity (~2% pass rate from zone-map min/max on 3 predicates). Choose `PFusedSIMDAgg` (single agg, SIMD-compatible preds, ≥1000 rows).
+   - **Predicate pushdown**: Predicates absorbed into the fused agg node.
+   - **Expression materialization**: `[:* :price :discount]` pre-computed to `PMaterializeExpr`.
+   - Physical plan: `PFusedSIMDAgg[sum-product] → PScan`
 
-3. **query-compiler**: Build parallel arrays for Java: `longPredTypes=[PRED_RANGE, PRED_LT]`, `longCols=[shipdate, quantity]`, bounds arrays, `aggType=AGG_SUM_PRODUCT`, `aggCol1=price`, `aggCol2=discount`.
+3. **execute-physical**: Walk IR tree bottom-up. `PScan` materializes columns. `PFusedSIMDAgg` compiles predicates and dispatches to `fusedSimdParallel`.
 
 4. **fusedSimdParallel** (Java): Morsel-driven parallel execution:
    - Split 6M rows into 64K morsels across N threads
@@ -123,12 +137,12 @@ Query: _Sum revenue where shipdate in 1994, discount between 0.05-0.07, quantity
 
 5. **Result**: `[{:sum 1234567.89 :_count 114160}]`
 
-Total time: ~4ms single-threaded, ~1ms multi-threaded (6M rows).
+Total time: ~14ms single-threaded, ~7ms multi-threaded (6M rows, index mode).
 
 ## Related Documentation
 
 - [SIMD Internals](simd-internals.md) - Java Vector API patterns, fused filter+aggregate, morsel-driven parallelism
-- [Query Engine](query-engine.md) - Dispatch logic, expression evaluation, optimization
+- [Query Engine](query-engine.md) - Query planner, dispatch logic, expression evaluation, optimization
 - [Storage and Indices](storage-and-indices.md) - Chunks, CoW semantics, zone maps, Konserve
 - [Benchmarks](benchmarks.md) - Methodology, results, reproducing
 - [SQL Interface](sql-interface.md) - PgWire server, SQL translation, supported subset

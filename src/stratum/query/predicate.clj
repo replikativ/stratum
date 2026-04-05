@@ -225,18 +225,18 @@
           n-cols (count needed-cols)
           extract-bindings (vec (concat
                                  (mapcat
-                                   (fn [idx k]
-                                     (let [sym (col-syms k)
-                                           col-info (get columns k)]
-                                       (if (= :int64 (:type col-info))
-                                         [(with-meta sym {:tag 'longs}) `(aget ~'cols ~idx)]
-                                         [(with-meta sym {:tag 'doubles}) `(aget ~'cols ~idx)])))
-                                   (range) needed-cols)
+                                  (fn [idx k]
+                                    (let [sym (col-syms k)
+                                          col-info (get columns k)]
+                                      (if (= :int64 (:type col-info))
+                                        [(with-meta sym {:tag 'longs}) `(aget ~'cols ~idx)]
+                                        [(with-meta sym {:tag 'doubles}) `(aget ~'cols ~idx)])))
+                                  (range) needed-cols)
                                  (mapcat
-                                   (fn [idx fn-sym]
-                                     [(with-meta fn-sym {:tag 'clojure.lang.IFn})
-                                      `(aget ~'cols ~(+ n-cols idx))])
-                                   (range) fn-syms)))
+                                  (fn [idx fn-sym]
+                                    [(with-meta fn-sym {:tag 'clojure.lang.IFn})
+                                     `(aget ~'cols ~(+ n-cols idx))])
+                                  (range) fn-syms)))
 
           ;; Generate predicate code (using annotated preds with fn-syms)
           pred-codes (mapv #(pred->code % col-syms columns) annotated-preds)
@@ -252,8 +252,8 @@
 
           ;; Build the object array: column data arrays + fn objects
           col-data-arr (object-array
-                         (concat (mapv #(:data (get columns %)) needed-cols)
-                                 (mapv #(nth % 2) fn-preds)))]
+                        (concat (mapv #(:data (get columns %)) needed-cols)
+                                (mapv #(nth % 2) fn-preds)))]
 
       ;; Return (fn [^long length] -> long[]) that closes over the data
       (fn [^long length] ^longs (compiled-fn col-data-arr length)))))

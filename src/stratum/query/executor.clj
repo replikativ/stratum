@@ -12,6 +12,7 @@
             [stratum.query.plan :as plan]
             [stratum.query.normalization :as norm]
             [stratum.query.predicate :as pred]
+            [stratum.query.estimate :as est]
             [stratum.query.expression :as expr]
             [stratum.query.columns :as cols]
             [stratum.query.group-by :as gb]
@@ -121,15 +122,30 @@
         {:columns pruned :length (long new-len)})
       {:columns columns :length length})))
 
+(defn- count-mask-hits
+  "Count how many rows pass a compiled mask (if present in preds).
+   Returns nil if no mask available."
+  ^Long [preds columns ^long length]
+  (when-let [mask-col (get columns :__mask)]
+    (let [^longs mask (:data mask-col)]
+      (when mask
+        (loop [i 0 cnt 0]
+          (if (>= i length)
+            cnt
+            (recur (inc i) (if (== 1 (aget mask i)) (inc cnt) cnt))))))))
+
 (defn- execute-filter [node]
   ;; Filters modify the column context (potentially adding mask columns)
   ;; but don't reduce rows — the actual filtering happens in the agg/project node.
   ;; This matches how stratum currently works: preds are passed to the Java methods.
   (let [ctx (execute-node (:input node))
         {:keys [preds columns length]} (prepare-preds (:predicates node)
-                                                       (ctx-columns ctx)
-                                                       (ctx-length ctx))]
-    {:columns columns :length length :preds preds}))
+                                                      (ctx-columns ctx)
+                                                      (ctx-length ctx))
+        ;; Adaptive: compute actual mask count for downstream use
+        actual-count (count-mask-hits preds columns length)]
+    (cond-> {:columns columns :length length :preds preds}
+      actual-count (assoc :actual-surviving-rows actual-count))))
 
 (defn- get-preds-and-ctx
   "Extract predicates and column context from a child node.
@@ -142,13 +158,16 @@
 
 (defn- prepare-node-preds
   "For a physical node that carries its own predicates (absorbed from filter),
-   run the predicate preparation pipeline and return [preds columns length]."
+   run the predicate preparation pipeline and return [preds columns length].
+   Also merges any context-level :preds (e.g. from a bitmap semi-join child)."
   [node-preds ctx]
-  (if (seq node-preds)
-    (let [{:keys [preds columns length]}
-          (prepare-preds node-preds (ctx-columns ctx) (ctx-length ctx))]
-      [preds columns length])
-    [[] (ctx-columns ctx) (ctx-length ctx)]))
+  (let [ctx-preds (or (:preds ctx) [])
+        all-preds (into (vec ctx-preds) node-preds)]
+    (if (seq all-preds)
+      (let [{:keys [preds columns length]}
+            (prepare-preds all-preds (ctx-columns ctx) (ctx-length ctx))]
+        [preds columns length])
+      [[] (ctx-columns ctx) (ctx-length ctx)])))
 
 ;; --- Global aggregation strategies ------------------------------------------
 
@@ -214,7 +233,7 @@
         agg (:agg node)]
     (if (= :avg (:op agg))
       (let [sum-result (x/execute-chunked-fused preds {:op :sum :col (:col agg) :as nil}
-                                                 columns length)
+                                                columns length)
             cnt (:count sum-result)]
         (post/format-fused-result
          (if (zero? cnt) {:result Double/NaN :count 0}
@@ -366,47 +385,138 @@
                              (conj new-aggs (-> agg (dissoc :expr) (assoc :col cn)))
                              (assoc new-cols cn {:type :float64 :data arr})))
                     (recur (inc idx) (conj new-aggs agg) new-cols))))))
-          [aggs mat-cols])]
-    (x/execute-group-by preds aggs group-keys mat-cols length columnar?)))
+          [aggs mat-cols])
+        ;; Adaptive: if filter context reports actual surviving rows, use it
+        ;; to decide dense-group-limit. Very few surviving rows → tighter limit
+        ;; avoids over-allocating the dense accumulator array.
+        actual-rows (:actual-surviving-rows ctx)
+        est-rows    (::plan/estimated-rows (meta node))]
+    (if (and actual-rows (< actual-rows 1000))
+      ;; Very few rows survive — reduce dense limit to save memory
+      (binding [gb/*dense-group-limit* (max 10000 (* 10 (long actual-rows)))]
+        (x/execute-group-by preds aggs group-keys mat-cols length columnar?))
+      (x/execute-group-by preds aggs group-keys mat-cols length columnar?))))
 
 (defn- execute-hash-group-by [node columnar?]
   ;; Same as dense — execute-group-by internally decides dense vs hash
   (execute-dense-group-by node columnar?))
+
+;; --- Mask realization -------------------------------------------------------
+
+(defn- realize-mask
+  "If a child context has :preds from pushed-down predicates, compile them
+   into a long[] mask. Returns nil if no preds."
+  [ctx]
+  (when-let [preds (seq (:preds ctx))]
+    (let [columns (:columns ctx)
+          length (long (:length ctx))
+          ;; Materialize columns referenced by preds
+          pred-col-keys (into #{} (keep (fn [p]
+                                          (let [c (first p)]
+                                            (when (keyword? c) c))))
+                              preds)
+          mat-cols (reduce (fn [cs k]
+                             (if-let [c (get cs k)]
+                               (assoc cs k (cols/materialize-column c))
+                               cs))
+                           columns pred-col-keys)
+          ;; Check for already-compiled __mask column (from prepare-preds)
+          mask-pred (first (filter #(= :__mask (first %)) preds))]
+      (if mask-pred
+        ;; Already have a compiled mask column
+        ^longs (:data (get mat-cols :__mask))
+        ;; Compile predicates to mask via pred/compile-pred-mask
+        (let [mask-fn (pred/compile-pred-mask (vec preds) mat-cols)]
+          (mask-fn length))))))
 
 ;; --- Join strategies --------------------------------------------------------
 
 (defn- execute-hash-join [node]
   (let [build-ctx (execute-node (:build-side node))
         probe-ctx (execute-node (:probe-side node))
-        ;; Reconstruct join spec for jn/execute-joins
+        ;; Realize masks from pushed-down predicates
+        probe-mask (realize-mask probe-ctx)
+        build-mask (realize-mask build-ctx)
         build-cols (ctx-columns build-ctx)
         probe-cols (ctx-columns probe-ctx)
         probe-length (ctx-length probe-ctx)
         join-spec {:with build-cols
                    :on (mapv (fn [[l r]] [:= l r]) (:on-pairs node))
                    :type (:join-type node)}
-        result (jn/execute-joins probe-cols probe-length [join-spec])]
+        spec (jn/normalize-join-spec join-spec)
+        result (jn/execute-join (cols/materialize-columns probe-cols)
+                                probe-length spec
+                                :probe-mask probe-mask
+                                :build-mask build-mask)]
     {:columns (:columns result) :length (long (:length result))}))
+
+(defn- execute-bitmap-semi-join-node [node]
+  (let [;; Execute probe (fact) side
+        probe-ctx (execute-node (:input node))
+        probe-cols (cols/materialize-columns (ctx-columns probe-ctx))
+        probe-length (ctx-length probe-ctx)
+        ;; Execute build (dim) side
+        join-spec (:join-spec node)
+        build-ctx (execute-node (:build-side join-spec))
+        build-cols (cols/materialize-columns (ctx-columns build-ctx))
+        build-mask (realize-mask build-ctx)
+        ;; Extract join key columns
+        [left-key right-key] (first (:on-pairs join-spec))
+        ^longs dim-keys (:data (get build-cols right-key))
+        dim-length (ctx-length build-ctx)
+        ;; Build BitSet from (filtered) dim rows
+        max-key (long (ColumnOps/arrayMaxLong dim-keys (int dim-length)))
+        ^java.util.BitSet bs (java.util.BitSet. (int (inc max-key)))]
+    (if build-mask
+      ;; Only add dim rows that pass the mask
+      (let [^longs bm build-mask]
+        (dotimes [i dim-length]
+          (let [k (aget dim-keys i)]
+            (when (and (not (zero? (aget bm i)))
+                       (>= k 0) (<= k max-key))
+              (.set bs (int k))))))
+      ;; No mask — add all dim rows
+      (dotimes [i dim-length]
+        (let [k (aget dim-keys i)]
+          (when (and (>= k 0) (<= k max-key))
+            (.set bs (int k))))))
+    ;; Probe fact rows → build mask column
+    (let [^longs fact-keys (:data (get probe-cols left-key))
+          ^longs mask (long-array probe-length)]
+      (dotimes [i probe-length]
+        (let [k (aget fact-keys i)]
+          (aset mask i (if (and (>= k 0) (<= k max-key) (.get bs (int k))) 1 0))))
+      ;; Return probe columns + mask, plus probe-side preds forwarded
+      (cond-> {:columns (assoc probe-cols :__semi_mask {:type :int64 :data mask})
+               :length probe-length
+               :preds (vec (concat (or (:preds probe-ctx) [])
+                                   [[:__semi_mask :eq 1.0]]))}))))
 
 (defn- execute-fused-join-group-agg [node columnar?]
   (let [left-ctx  (execute-node (:left node))
         right-ctx (execute-node (:right node))
+        ;; Realize masks from pushed-down predicates
+        probe-mask (realize-mask left-ctx)
+        build-mask (realize-mask right-ctx)
         fact-cols  (ctx-columns left-ctx)
         fact-length (ctx-length left-ctx)
         dim-cols   (ctx-columns right-ctx)
         join-spec (:join-spec node)
         group-keys (:group-keys node)
         aggs (:aggs node)
-        ;; Build the join spec expected by jn/execute-fused-join-group-agg
         jn-spec {:with dim-cols
                  :on (mapv (fn [[l r]] [:= l r]) (:on-pairs join-spec))
                  :type (:type join-spec)}]
     (jn/execute-fused-join-group-agg
-     fact-cols fact-length jn-spec group-keys aggs columnar?)))
+     fact-cols fact-length jn-spec group-keys aggs columnar?
+     :probe-mask probe-mask :build-mask build-mask)))
 
 (defn- execute-fused-join-global-agg [node columnar?]
   (let [left-ctx  (execute-node (:left node))
         right-ctx (execute-node (:right node))
+        ;; Realize masks from pushed-down predicates
+        probe-mask (realize-mask left-ctx)
+        build-mask (realize-mask right-ctx)
         fact-cols  (ctx-columns left-ctx)
         fact-length (ctx-length left-ctx)
         dim-cols   (ctx-columns right-ctx)
@@ -416,7 +526,8 @@
                  :on (mapv (fn [[l r]] [:= l r]) (:on-pairs join-spec))
                  :type (:type join-spec)}]
     (jn/execute-fused-join-global-agg
-     fact-cols fact-length jn-spec aggs)))
+     fact-cols fact-length jn-spec aggs
+     :probe-mask probe-mask :build-mask build-mask)))
 
 ;; --- Projection -------------------------------------------------------------
 
@@ -511,7 +622,7 @@
      (instance? PFusedSIMDAgg node)    (execute-fused-simd-agg node columnar?)
      (instance? PFusedSIMDCount node)  (execute-fused-simd-count node columnar?)
      (instance? PChunkedSIMDAgg node)  (execute-chunked-simd-agg node columnar?)
-     (instance? PChunkedSIMDCount node)(execute-chunked-simd-count node columnar?)
+     (instance? PChunkedSIMDCount node) (execute-chunked-simd-count node columnar?)
      (instance? PBlockSkipCount node)  (execute-block-skip-count node columnar?)
      (instance? PFusedMultiSum node)   (execute-fused-multi-sum node columnar?)
      (instance? PPercentileAgg node)   (execute-percentile-agg node columnar?)
@@ -526,6 +637,7 @@
      ;; Join
      (instance? PHashJoin node)             (execute-hash-join node)
      (instance? PPerfectHashJoin node)      (execute-hash-join node) ;; same API, perfect hash is internal
+     (instance? PBitmapSemiJoin node)       (execute-bitmap-semi-join-node node)
      (instance? PFusedJoinGroupAgg node)    (execute-fused-join-group-agg node columnar?)
      (instance? PFusedJoinGlobalAgg node)   (execute-fused-join-global-agg node columnar?)
 

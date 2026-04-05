@@ -19,51 +19,51 @@
   ;; Leaf node: columnar data source.
   ;; columns — {kw -> {:type :int64/:float64 :data array :index idx :dict str[]}}
   ;; length  — row count (long)
-  [columns length])
+           [columns length])
 
 (defrecord LFilter
   ;; Row-level predicates (AND-combined).
   ;; predicates — vec of normalized preds: [col-kw op & args]
-  [predicates input])
+           [predicates input])
 
 (defrecord LJoin
   ;; Equi-join between left (fact) and right (dimension).
   ;; join-type — :inner | :left | :right | :full
   ;; on-pairs  — [[left-col right-col] ...]
   ;; right     — LScan of dimension columns
-  [join-type on-pairs left right])
+           [join-type on-pairs left right])
 
 (defrecord LGroupBy
   ;; Group-by aggregation.
   ;; group-keys — vec of keywords or normalized exprs
   ;; aggs       — vec of normalized aggs {:op :col :cols :expr :as}
-  [group-keys aggs input])
+           [group-keys aggs input])
 
 (defrecord LGlobalAgg
   ;; Aggregation without grouping.
   ;; aggs — vec of normalized aggs
-  [aggs input])
+           [aggs input])
 
 (defrecord LProject
   ;; Column projection (SELECT without aggregation).
   ;; items — vec of {:name kw :ref kw :expr normalized-expr}
-  [items input])
+           [items input])
 
 (defrecord LWindow
   ;; Window functions applied to input rows or grouped output.
   ;; specs — vec of {:op :col :as :partition-by :order-by}
-  [specs input])
+           [specs input])
 
 (defrecord LHaving
   ;; Post-aggregation filter.
   ;; predicates — vec of normalized preds on agg aliases
-  [predicates input])
+           [predicates input])
 
 (defrecord LDistinct [input])
 
 (defrecord LSort
   ;; order-specs — [[col-kw :asc/:desc] ...]
-  [order-specs input])
+           [order-specs input])
 
 (defrecord LLimit [limit offset input])
 
@@ -72,7 +72,7 @@
   ;; op      — :union | :intersect | :except
   ;; queries — vec of sub-query maps (each built into its own plan)
   ;; all?    — boolean (UNION ALL)
-  [op queries all?])
+           [op queries all?])
 
 ;; ============================================================================
 ;; Annotations — attached to logical nodes by analysis passes
@@ -99,12 +99,12 @@
 
 (defrecord PScan
   ;; Materialized scan: all columns as arrays.
-  [columns length])
+           [columns length])
 
 (defrecord PChunkedScan
   ;; Streaming scan: columns stay as PersistentColumnIndex, processed per-chunk.
   ;; surviving-chunks — nil (all) or vec of chunk indices after zone-map pruning
-  [columns length surviving-chunks])
+           [columns length surviving-chunks])
 
 ;; --- Filter strategies ------------------------------------------------------
 
@@ -112,58 +112,58 @@
   ;; SIMD-eligible predicates compiled to Java fused filter.
   ;; prep — {:n-long :long-pred-types :long-cols :long-lo :long-hi
   ;;          :n-dbl  :dbl-pred-types  :dbl-cols  :dbl-lo  :dbl-hi}
-  [predicates prep input])
+           [predicates prep input])
 
 (defrecord PMaskFilter
   ;; Non-SIMD predicates compiled to a long[] mask column via eval.
   ;; mask-fn — fn(length) -> long[]
-  [predicates mask-fn input])
+           [predicates mask-fn input])
 
 ;; --- Global aggregation strategies ------------------------------------------
 
 (defrecord PStatsOnlyAgg
   ;; O(chunks) aggregation from chunk-level statistics. No materialization.
   ;; Requires: all columns from indices, no predicates, simple aggs.
-  [aggs input])
+           [aggs input])
 
 (defrecord PFusedSIMDAgg
   ;; Single fused SIMD filter+aggregate on materialized arrays.
   ;; Targets: ColumnOps/fusedSimdParallel, fusedFilterAggregate
-  [predicates agg input])
+           [predicates agg input])
 
 (defrecord PFusedSIMDCount
   ;; JIT-isolated COUNT path (avoids JIT poisoning from aggType switch).
   ;; Targets: ColumnOps/fusedSimdCountParallel
-  [predicates input])
+           [predicates input])
 
 (defrecord PChunkedSIMDAgg
   ;; Stream index chunks with SIMD filter+aggregate.
   ;; Targets: ColumnOpsChunkedSimd methods
-  [predicates agg input])
+           [predicates agg input])
 
 (defrecord PChunkedSIMDCount
   ;; JIT-isolated chunked COUNT.
   ;; Targets: ColumnOpsExt/fusedSimdChunkedCountParallel
-  [predicates input])
+           [predicates input])
 
 (defrecord PBlockSkipCount
   ;; Block-skip COUNT on arrays using min/max statistics.
   ;; Targets: ColumnOpsExt/fusedSimdCountBlockSkipParallel
-  [predicates input])
+           [predicates input])
 
 (defrecord PFusedMultiSum
   ;; Single-pass multiple SUM/AVG/COUNT aggs (<= 4 non-COUNT).
   ;; Targets: ColumnOpsExt fusedSimdMultiSumParallel
-  [predicates aggs input])
+           [predicates aggs input])
 
 (defrecord PPercentileAgg
   ;; Two-pass percentile/median/approx-quantile.
   ;; Targets: ColumnOps/percentile, ColumnOpsAnalytics/tdigestApproxQuantileParallel
-  [predicates aggs input])
+           [predicates aggs input])
 
 (defrecord PScalarAgg
   ;; Clojure scalar loop for complex/unsupported agg combinations.
-  [predicates aggs input])
+           [predicates aggs input])
 
 ;; --- Group-by strategies ----------------------------------------------------
 
@@ -171,48 +171,48 @@
   ;; Stream index chunks with dense accumulator array. Zero-copy.
   ;; Targets: ColumnOpsChunked/fusedGroupAggregateDenseChunkedParallel
   ;; Requires: all columns from indices, key-space <= dense-limit
-  [predicates group-keys aggs max-key input])
+           [predicates group-keys aggs max-key input])
 
 (defrecord PDenseGroupBy
   ;; Materialized dense group-by with direct array indexing.
   ;; Targets: ColumnOps/fusedFilterGroupAggregateDenseParallel
-  [predicates group-keys aggs max-key input])
+           [predicates group-keys aggs max-key input])
 
 (defrecord PHashGroupBy
   ;; Hash-based group-by for large/sparse key spaces.
   ;; Targets: ColumnOps/fusedFilterGroupAggregateParallel
-  [predicates group-keys aggs input])
+           [predicates group-keys aggs input])
 
 (defrecord PFusedExtractCount
   ;; Fused date extraction + COUNT dense group-by. No intermediate array.
   ;; Targets: ColumnOpsExt/fusedExtractCountDenseParallel
-  [extract-op extract-col aggs input])
+           [extract-op extract-col aggs input])
 
 ;; --- Join strategies --------------------------------------------------------
 
 (defrecord PBitmapSemiJoin
   ;; Semi-join materialized as a mask column, injected as a predicate.
   ;; After this, the join is eliminated and the mask acts as a filter.
-  [join-spec input])
+           [join-spec input])
 
 (defrecord PHashJoin
   ;; Standard hash join: build on dim side, probe on fact side.
   ;; Targets: ColumnOpsExt/hashJoinBuild + hashJoinProbe
-  [join-type on-pairs build-side probe-side])
+           [join-type on-pairs build-side probe-side])
 
 (defrecord PPerfectHashJoin
   ;; Direct-array-indexing join when build-key range is small.
   ;; Targets: ColumnOpsExt/perfectHashJoinBuild + perfectJoinProbeInner
-  [join-type on-pairs min-key key-range build-side probe-side])
+           [join-type on-pairs min-key key-range build-side probe-side])
 
 (defrecord PFusedJoinGroupAgg
   ;; Single Java pass: probe + gather + group-by + aggregate.
   ;; Requires: single INNER join, group on dim cols, agg on fact cols, no WHERE.
-  [join-spec group-keys aggs left right])
+           [join-spec group-keys aggs left right])
 
 (defrecord PFusedJoinGlobalAgg
   ;; Single Java pass: probe + accumulate (no group-by).
-  [join-spec aggs left right])
+           [join-spec aggs left right])
 
 ;; --- Post-processing (same logical and physical) ----------------------------
 
@@ -230,7 +230,7 @@
   ;; col-name — generated keyword for the temp column
   ;; expr     — normalized expression to evaluate
   ;; target   — :int64 | :float64 | :dict-string
-  [col-name expr target input])
+           [col-name expr target input])
 
 ;; ============================================================================
 ;; Utilities
@@ -272,6 +272,17 @@
 
     (instance? PPerfectHashJoin node)
     (-> node (update :build-side f) (update :probe-side f))
+
+    (instance? PFusedJoinGroupAgg node)
+    (-> node (update :left f) (update :right f))
+
+    (instance? PFusedJoinGlobalAgg node)
+    (-> node (update :left f) (update :right f))
+
+    (instance? PBitmapSemiJoin node)
+    (-> node
+        (update :input f)
+        (update-in [:join-spec :build-side] f))
 
     (:input node)
     (update node :input f)
