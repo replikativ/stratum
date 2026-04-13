@@ -177,7 +177,7 @@ Every Stratum dataset is a copy-on-write value. Fork one in O(1) to create an is
 
 **Ad-hoc file queries**: `read_csv()`, `read_parquet()`
 
-**Analytics**: ANOMALY_SCORE, ANOMALY_PREDICT (isolation forest via SQL)
+**Analytics**: CREATE MODEL, ANOMALY_SCORE, ANOMALY_PREDICT (isolation forest via SQL)
 
 **Other**: EXPLAIN, SELECT DISTINCT, LIMIT/OFFSET, IS NULL/IS NOT NULL
 
@@ -250,7 +250,7 @@ All share copy-on-write semantics and can be branched together via Yggdrasil.
 - **Persistence**: O(1) CoW snapshots, branching, time-travel, lazy loading from storage
 - **Data**: CSV/Parquet import, dictionary-encoded strings, PostgreSQL NULL semantics, ad-hoc file queries
 - **Integration**: tablecloth/tech.ml.dataset interop, Datahike, Yggdrasil
-- **Analytics**: Isolation forest anomaly detection (training, scoring, online rotation)
+- **Analytics**: Isolation forest anomaly detection (SQL model management, scoring, online rotation)
 
 ## Architecture
 

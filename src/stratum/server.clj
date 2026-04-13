@@ -104,6 +104,12 @@
    :anomaly-proba      iforest/predict-proba
    :anomaly-confidence iforest/predict-confidence})
 
+(def ^:private model-type-map
+  "Extensible registry of model types for CREATE MODEL.
+   Each entry maps an uppercase type name to {:train-fn, :default-opts}."
+  {"ISOLATION_FOREST" {:train-fn    iforest/train
+                       :default-opts {:n-trees 100 :sample-size 256 :seed 42}}})
+
 (defn- anomaly-expr?
   "True if form is an anomaly function call like [:anomaly-score \"model\" :col1 ...]."
   [form]
@@ -161,7 +167,12 @@
                  (if model
                    (let [feature-names (:feature-names model)
                          from (:from q)
-                         data (select-keys from feature-names)
+                         ;; Unwrap encoded columns {:type T :data arr} → raw arr
+                         data (into {}
+                                    (map (fn [k]
+                                           (let [v (get from k)]
+                                             [k (if (and (map? v) (:data v)) (:data v) v)])))
+                                    feature-names)
                          compute-fn (get anomaly-op->fn op)
                          result (compute-fn model data)
                          col-name (keyword (str "__" (name op) "_" model-name))]
@@ -308,6 +319,42 @@
                 :drop-table
                 (do (swap! table-registry-atom dissoc table)
                     (PgWireServer$QueryResult/empty "DROP TABLE"))
+
+                :create-model
+                (let [{:keys [model-name model-type options training-sql]} ddl
+                      type-config (get model-type-map model-type)]
+                  (when-not type-config
+                    (throw (ex-info (str "Unknown model type: " model-type
+                                         ". Available: " (str/join ", " (keys model-type-map)))
+                                    {:model-type model-type})))
+                  (let [;; Execute the training SELECT to get data
+                        parsed-training (sql/parse-sql training-sql registry)
+                        _ (when (:error parsed-training)
+                            (throw (ex-info (str "Error in training query: " (:error parsed-training))
+                                            {:sql training-sql})))
+                        training-result (q/q (:query parsed-training))
+                        training-cols (q/results->columns training-result)
+                        ;; Merge defaults with user options
+                        train-opts (merge (:default-opts type-config)
+                                          options
+                                          {:from training-cols})
+                        ;; Train the model
+                        train-fn (:train-fn type-config)
+                        model (assoc (train-fn train-opts) :model-type model-type)]
+                    (swap! table-registry-atom assoc-in ["__models__" model-name] model)
+                    (println (str "Created model '" model-name "' (" model-type ") with "
+                                  (:n-features model) " features"))
+                    (PgWireServer$QueryResult/empty "CREATE MODEL")))
+
+                :drop-model
+                (let [{:keys [model-name if-exists?]} ddl
+                      models (get @table-registry-atom "__models__")]
+                  (when (and (not if-exists?) (not (get models model-name)))
+                    (throw (ex-info (str "Model not found: " model-name)
+                                    {:model model-name
+                                     :available (keys models)})))
+                  (swap! table-registry-atom update "__models__" dissoc model-name)
+                  (PgWireServer$QueryResult/empty "DROP MODEL"))
 
                 :insert
                 (let [existing (get @table-registry-atom table)]

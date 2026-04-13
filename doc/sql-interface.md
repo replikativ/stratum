@@ -203,6 +203,7 @@ Translates to:
 | Statistical aggregates | `MEDIAN, PERCENTILE_CONT, APPROX_QUANTILE` |
 | COUNT(DISTINCT col) | `SELECT COUNT(DISTINCT region)` |
 | Anomaly detection | `ANOMALY_SCORE, ANOMALY_PREDICT, ANOMALY_PROBA, ANOMALY_CONFIDENCE` |
+| Model management | `CREATE MODEL, DROP MODEL, SHOW MODELS, DESCRIBE MODEL` |
 | GROUP BY | `GROUP BY col1, col2` |
 | HAVING | `HAVING COUNT(*) > 10` |
 | ORDER BY | `ORDER BY col ASC, col2 DESC`, `ORDER BY a * b DESC` |
@@ -246,15 +247,23 @@ FROM orders GROUP BY region;
 
 ### Anomaly Detection
 
-Isolation forest scoring is available as SQL functions. Models must be registered via the Clojure API:
+Train and manage isolation forest models entirely from SQL:
 
-```clojure
-;; Register model with server
-(def model (st/train-iforest {:from data :contamination 0.05}))
-(st/register-model! srv "fraud_model" model)
+```sql
+-- Train a model on your data
+CREATE MODEL fraud_model
+  TYPE ISOLATION_FOREST
+  OPTIONS (n_trees = 200, sample_size = 256, contamination = 0.05)
+  AS SELECT amount, freq FROM transactions;
+
+-- Manage models
+SHOW MODELS;
+DESCRIBE MODEL fraud_model;
+DROP MODEL fraud_model;
+DROP MODEL IF EXISTS fraud_model;
 ```
 
-Then query via SQL:
+Query with trained models:
 
 ```sql
 -- Raw anomaly score [0, 1]
@@ -273,6 +282,8 @@ FROM transactions;
 SELECT *, ANOMALY_CONFIDENCE('fraud_model', amount, freq) AS conf
 FROM transactions;
 ```
+
+See [Anomaly Detection](anomaly-detection.md) for full details on model options and the Clojure API.
 
 ### Window Functions
 

@@ -1738,9 +1738,97 @@
 ;; System queries (psql/DBeaver compatibility)
 ;; ============================================================================
 
+(defn- parse-model-options
+  "Parse model OPTIONS string into a keyword map.
+   \"n_trees = 200, sample_size = 256, contamination = 0.01\"
+   → {:n-trees 200, :sample-size 256, :contamination 0.01}"
+  [^String opts-str]
+  (when opts-str
+    (into {}
+          (keep (fn [pair]
+                  (let [pair (str/trim pair)]
+                    (when-not (str/blank? pair)
+                      (let [[k v] (str/split pair #"\s*=\s*" 2)
+                            k (keyword (str/replace (str/trim k) "_" "-"))
+                            v (str/trim v)]
+                        [k (cond
+                             (re-matches #"-?\d+" v) (Long/parseLong v)
+                             (re-matches #"-?\d+\.\d+" v) (Double/parseDouble v)
+                             :else v)])))))
+          (str/split opts-str #","))))
+
 (def ^:private system-query-patterns
-  "Patterns for system queries that clients send on connect."
-  [{:pattern #"(?i)^\s*SET\s+"
+  "Patterns for system queries that clients send on connect.
+   Model management patterns (CREATE/DROP/SHOW/DESCRIBE MODEL) must precede
+   the generic SHOW handler."
+  [;; --- Model management (before generic SHOW) ---
+   {:pattern #"(?is)^\s*CREATE\s+MODEL\s+"
+    :handler (fn [sql _reg]
+               (if-let [[_ model-name model-type opts-str training-sql]
+                        (re-matches #"(?is)^\s*CREATE\s+MODEL\s+(\S+)\s+TYPE\s+(\S+)\s+OPTIONS\s*\(([^)]*)\)\s+AS\s+(SELECT\s+.+?)\s*;?\s*$" sql)]
+                 {:ddl {:op :create-model
+                        :model-name model-name
+                        :model-type (str/upper-case model-type)
+                        :options (parse-model-options opts-str)
+                        :training-sql training-sql}}
+                 ;; Try without OPTIONS clause
+                 (if-let [[_ model-name model-type training-sql]
+                          (re-matches #"(?is)^\s*CREATE\s+MODEL\s+(\S+)\s+TYPE\s+(\S+)\s+AS\s+(SELECT\s+.+?)\s*;?\s*$" sql)]
+                   {:ddl {:op :create-model
+                          :model-name model-name
+                          :model-type (str/upper-case model-type)
+                          :options {}
+                          :training-sql training-sql}}
+                   {:error "Invalid CREATE MODEL syntax. Expected: CREATE MODEL <name> TYPE <type> [OPTIONS (...)] AS SELECT ..."})))}
+
+   {:pattern #"(?i)^\s*DROP\s+MODEL\s+"
+    :handler (fn [sql _reg]
+               (let [if-exists? (boolean (re-find #"(?i)IF\s+EXISTS" sql))
+                     model-name (if if-exists?
+                                  (second (re-find #"(?i)DROP\s+MODEL\s+IF\s+EXISTS\s+(\S+)" sql))
+                                  (second (re-find #"(?i)DROP\s+MODEL\s+(\S+)" sql)))]
+                 {:ddl {:op :drop-model
+                        :model-name (str/replace (or model-name "") #"(?i)\s*;?\s*$" "")
+                        :if-exists? if-exists?}}))}
+
+   {:pattern #"(?i)^\s*SHOW\s+MODELS\s*;?\s*$"
+    :handler (fn [_sql reg]
+               (let [models (get reg "__models__")]
+                 {:system true
+                  :result {:columns ["name" "type" "n_features" "n_trees" "sample_size"]
+                           :oids [25 25 20 20 20]
+                           :rows (vec (map (fn [[name model]]
+                                             [name
+                                              (or (:model-type model) "ISOLATION_FOREST")
+                                              (str (:n-features model))
+                                              (str (:n-trees model))
+                                              (str (:sample-size model))])
+                                           models))}
+                  :tag "SHOW MODELS"}))}
+
+   {:pattern #"(?i)^\s*DESCRIBE\s+MODEL\s+(\S+)\s*;?\s*$"
+    :handler (fn [sql reg]
+               (let [model-name (str/replace
+                                 (second (re-find #"(?i)DESCRIBE\s+MODEL\s+(\S+)" sql))
+                                 #"(?i)\s*;?\s*$" "")
+                     model (get-in reg ["__models__" model-name])]
+                 (if model
+                   {:system true
+                    :result {:columns ["property" "value"]
+                             :oids [25 25]
+                             :rows [["model_name" model-name]
+                                    ["model_type" (or (:model-type model) "ISOLATION_FOREST")]
+                                    ["n_trees" (str (:n-trees model))]
+                                    ["sample_size" (str (:sample-size model))]
+                                    ["n_features" (str (:n-features model))]
+                                    ["features" (str/join ", " (map name (:feature-names model)))]
+                                    ["contamination" (str (or (:contamination model) "not set"))]
+                                    ["threshold" (str (or (:threshold model) "not set"))]]}
+                    :tag "DESCRIBE MODEL"}
+                   {:error (str "Model not found: " model-name)})))}
+
+   ;; --- Standard system queries ---
+   {:pattern #"(?i)^\s*SET\s+"
     :handler (fn [_sql _reg] {:system true :tag "SET"})}
    {:pattern #"(?i)^\s*SHOW\s+"
     :handler (fn [sql _reg]

@@ -146,14 +146,45 @@ Anomaly scores can be used as regular columns in queries:
 
 ## SQL Interface
 
-Register a model with the pgwire server, then use SQL functions:
+Models can be created, managed, and queried entirely from SQL — no Clojure needed.
 
-```clojure
-;; Server setup
-(def srv (st/start-server {:port 5432}))
-(st/register-table! srv "transactions" tx-data)
-(st/register-model! srv "fraud_model" model)
+### Creating Models
+
+```sql
+-- Train an isolation forest on the training query results
+CREATE MODEL fraud_model
+  TYPE ISOLATION_FOREST
+  OPTIONS (n_trees = 200, sample_size = 256, contamination = 0.05)
+  AS SELECT amount, freq FROM transactions;
 ```
+
+The `AS SELECT ...` query defines the training data. Any valid SELECT is supported (including WHERE filters, JOINs, expressions). Column names from the SELECT become the model's feature names.
+
+**OPTIONS** (all optional):
+| Option | Default | Description |
+|--------|---------|-------------|
+| `n_trees` | 100 | Number of isolation trees |
+| `sample_size` | 256 | Rows subsampled per tree |
+| `seed` | 42 | Random seed for reproducibility |
+| `contamination` | not set | Expected anomaly fraction (0, 0.5]. Sets threshold automatically |
+
+### Managing Models
+
+```sql
+-- List all registered models
+SHOW MODELS;
+
+-- Show model details (features, hyperparameters, threshold)
+DESCRIBE MODEL fraud_model;
+
+-- Remove a model
+DROP MODEL fraud_model;
+
+-- Remove only if it exists (no error if missing)
+DROP MODEL IF EXISTS fraud_model;
+```
+
+### Querying with Models
 
 ```sql
 -- Raw anomaly score [0, 1]
@@ -174,7 +205,20 @@ SELECT *, ANOMALY_CONFIDENCE('fraud_model', amount, freq) AS conf
 FROM transactions;
 ```
 
-The column arguments must match the feature names used during training (in order).
+The column arguments must match the feature names from the training SELECT (in order).
+
+### Alternative: Clojure API Registration
+
+Models can also be trained via the Clojure API and registered with the server:
+
+```clojure
+(def srv (st/start-server {:port 5432}))
+(st/register-table! srv "transactions" tx-data)
+(def model (st/train-iforest {:from tx-data :contamination 0.05}))
+(st/register-model! srv "fraud_model" model)
+```
+
+This is useful for programmatic workflows, custom training pipelines, or model rotation.
 
 ## Implementation Details
 
