@@ -35,39 +35,44 @@
 
 (defn- auc-roc
   "Compute AUC-ROC from scores and binary labels.
-   Uses trapezoidal rule on sorted thresholds."
+   Uses trapezoidal rule on sorted thresholds. Primitive arrays only — no boxing."
   [^doubles scores ^longs labels ^long n]
-  (let [;; Create index array sorted by score descending
-        indices (int-array n)
-        _ (dotimes [i n] (aset indices i i))
-        ;; Sort by score descending (manual insertion sort — fine for tests)
-        pairs (sort-by first > (mapv (fn [i] [(aget scores i) (aget labels i)]) (range n)))
-        n-pos (areduce labels i s (long 0) (+ s (aget labels i)))
+  (let [n-pos (areduce labels i s (long 0) (+ s (aget labels i)))
         n-neg (- n n-pos)]
     (if (or (zero? n-pos) (zero? n-neg))
       Double/NaN
-      (loop [tp 0.0, fp 0.0, prev-tp 0.0, prev-fp 0.0, auc 0.0, idx 0]
-        (if (>= idx n)
-          ;; Final trapezoid
-          (let [tpr (/ tp n-pos)
-                fpr (/ fp n-neg)
-                prev-tpr (/ prev-tp n-pos)
-                prev-fpr (/ prev-fp n-neg)]
-            (+ auc (* 0.5 (- fpr prev-fpr) (+ tpr prev-tpr))))
-          (let [[_ label] (nth pairs idx)
-                new-tp (if (== label 1) (inc tp) tp)
-                new-fp (if (== label 0) (inc fp) fp)]
-            ;; Add trapezoid area when score changes or at end
-            (if (or (= idx (dec n))
-                    (not= (first (nth pairs idx))
-                          (first (nth pairs (min (inc idx) (dec n))))))
-              (let [tpr (/ new-tp n-pos)
-                    fpr (/ new-fp n-neg)
-                    prev-tpr (/ prev-tp n-pos)
-                    prev-fpr (/ prev-fp n-neg)
-                    area (* 0.5 (- fpr prev-fpr) (+ tpr prev-tpr))]
-                (recur new-tp new-fp new-tp new-fp (+ auc area) (inc idx)))
-              (recur new-tp new-fp prev-tp prev-fp auc (inc idx)))))))))
+      (let [^"[Ljava.lang.Integer;" idx-box
+            (let [^"[Ljava.lang.Integer;" a (make-array Integer n)]
+              (dotimes [i n] (aset a i (Integer/valueOf i)))
+              (java.util.Arrays/sort a
+                                     (reify java.util.Comparator
+                                       (compare [_ a b]
+                                         (Double/compare (aget scores (int b)) (aget scores (int a))))))
+              a)
+            sorted-scores (double-array n)
+            sorted-labels (long-array n)
+            _ (dotimes [i n]
+                (let [ix (int (aget idx-box i))]
+                  (aset sorted-scores i (aget scores ix))
+                  (aset sorted-labels i (aget labels ix))))
+            inv-n-pos (/ 1.0 (double n-pos))
+            inv-n-neg (/ 1.0 (double n-neg))]
+        (loop [tp 0.0, fp 0.0, prev-tp 0.0, prev-fp 0.0, auc 0.0, i (int 0)]
+          (if (>= i n)
+            (let [tpr (* tp inv-n-pos) fpr (* fp inv-n-neg)
+                  prev-tpr (* prev-tp inv-n-pos) prev-fpr (* prev-fp inv-n-neg)]
+              (+ auc (* 0.5 (- fpr prev-fpr) (+ tpr prev-tpr))))
+            (let [label (aget sorted-labels i)
+                  new-tp (if (== label 1) (+ tp 1.0) tp)
+                  new-fp (if (== label 0) (+ fp 1.0) fp)
+                  next-i (unchecked-inc-int i)]
+              (if (or (>= next-i n)
+                      (not= (aget sorted-scores i) (aget sorted-scores next-i)))
+                (let [tpr (* new-tp inv-n-pos) fpr (* new-fp inv-n-neg)
+                      prev-tpr (* prev-tp inv-n-pos) prev-fpr (* prev-fp inv-n-neg)
+                      area (* 0.5 (- fpr prev-fpr) (+ tpr prev-tpr))]
+                  (recur new-tp new-fp new-tp new-fp (+ auc area) next-i))
+                (recur new-tp new-fp prev-tp prev-fp auc next-i)))))))))
 
 ;; ============================================================================
 ;; CSV Data Loading for ODDS Datasets

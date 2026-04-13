@@ -40,29 +40,45 @@
      :p90 (nth sorted (int (* iters 0.9)))}))
 
 (defn- auc-roc
-  "AUC-ROC via trapezoidal rule."
+  "AUC-ROC via trapezoidal rule. Primitive arrays only — no boxing."
   [^doubles scores ^longs labels ^long n]
-  (let [pairs (sort-by first > (mapv (fn [i] [(aget scores i) (aget labels i)]) (range n)))
-        n-pos (areduce labels i s (long 0) (+ s (aget labels i)))
+  (let [n-pos (areduce labels i s (long 0) (+ s (aget labels i)))
         n-neg (- n n-pos)]
     (if (or (zero? n-pos) (zero? n-neg))
       Double/NaN
-      (loop [tp 0.0, fp 0.0, prev-tp 0.0, prev-fp 0.0, auc 0.0, idx 0]
-        (if (>= idx n)
-          (let [tpr (/ tp n-pos) fpr (/ fp n-neg)
-                prev-tpr (/ prev-tp n-pos) prev-fpr (/ prev-fp n-neg)]
-            (+ auc (* 0.5 (- fpr prev-fpr) (+ tpr prev-tpr))))
-          (let [[_ label] (nth pairs idx)
-                new-tp (if (== label 1) (inc tp) tp)
-                new-fp (if (== label 0) (inc fp) fp)]
-            (if (or (= idx (dec n))
-                    (not= (first (nth pairs idx))
-                           (first (nth pairs (min (inc idx) (dec n))))))
-              (let [tpr (/ new-tp n-pos) fpr (/ new-fp n-neg)
-                    prev-tpr (/ prev-tp n-pos) prev-fpr (/ prev-fp n-neg)
-                    area (* 0.5 (- fpr prev-fpr) (+ tpr prev-tpr))]
-                (recur new-tp new-fp new-tp new-fp (+ auc area) (inc idx)))
-              (recur new-tp new-fp prev-tp prev-fp auc (inc idx)))))))))
+      ;; Build sorted-scores and sorted-labels arrays (descending by score)
+      (let [^"[Ljava.lang.Integer;" idx-box
+            (let [^"[Ljava.lang.Integer;" a (make-array Integer n)]
+              (dotimes [i n] (aset a i (Integer/valueOf i)))
+              (java.util.Arrays/sort a
+                (reify java.util.Comparator
+                  (compare [_ a b]
+                    (Double/compare (aget scores (int b)) (aget scores (int a))))))
+              a)
+            sorted-scores (double-array n)
+            sorted-labels (long-array n)
+            _ (dotimes [i n]
+                (let [ix (int (aget idx-box i))]
+                  (aset sorted-scores i (aget scores ix))
+                  (aset sorted-labels i (aget labels ix))))
+            inv-n-pos (/ 1.0 (double n-pos))
+            inv-n-neg (/ 1.0 (double n-neg))]
+        (loop [tp 0.0, fp 0.0, prev-tp 0.0, prev-fp 0.0, auc 0.0, i (int 0)]
+          (if (>= i n)
+            (let [tpr (* tp inv-n-pos) fpr (* fp inv-n-neg)
+                  prev-tpr (* prev-tp inv-n-pos) prev-fpr (* prev-fp inv-n-neg)]
+              (+ auc (* 0.5 (- fpr prev-fpr) (+ tpr prev-tpr))))
+            (let [label (aget sorted-labels i)
+                  new-tp (if (== label 1) (+ tp 1.0) tp)
+                  new-fp (if (== label 0) (+ fp 1.0) fp)
+                  next-i (unchecked-inc-int i)]
+              (if (or (>= next-i n)
+                      (not= (aget sorted-scores i) (aget sorted-scores next-i)))
+                (let [tpr (* new-tp inv-n-pos) fpr (* new-fp inv-n-neg)
+                      prev-tpr (* prev-tp inv-n-pos) prev-fpr (* prev-fp inv-n-neg)
+                      area (* 0.5 (- fpr prev-fpr) (+ tpr prev-tpr))]
+                  (recur new-tp new-fp new-tp new-fp (+ auc area) next-i))
+                (recur new-tp new-fp prev-tp prev-fp auc next-i)))))))))
 
 (defn- load-odds-csv
   "Load ODDS CSV (last col = label)."
@@ -76,8 +92,8 @@
           first-fields (str/split (first data-lines) #",")
           n-cols (count first-fields)
           d (dec n-cols)
-          features (into-array (Class/forName "[D")
-                     (mapv (fn [_] (double-array n)) (range d)))
+          ^"[[D" features (into-array (Class/forName "[D")
+                          (mapv (fn [_] (double-array n)) (range d)))
           labels (long-array n)]
       (doseq [[i line] (map-indexed vector data-lines)]
         (let [fields (str/split line #",")]
@@ -129,6 +145,7 @@
 (defn- bench-odds-dataset [name path expected-auc]
   (if-let [{:keys [features labels n d]} (load-odds-csv path)]
     (let [fmap (features->map features)
+          ^longs labels labels
           t0 (System/nanoTime)
           model (iforest/train {:from fmap :n-trees 100 :sample-size 256 :seed 42})
           train-ms (/ (- (System/nanoTime) t0) 1e6)
@@ -140,9 +157,25 @@
       {:name name :auc auc :n n :d d})
     (println (format "  %-15s SKIPPED (not found: %s)" name path))))
 
+(defn- ensure-odds-data
+  "Download ODDS datasets if not present. Requires python3 with scipy in PATH."
+  []
+  (when-not (.exists (io/file "data/odds/shuttle.csv"))
+    (println "  ODDS data not found — downloading via bin/download-odds ...")
+    (let [script (io/file "bin/download-odds")]
+      (if (.exists script)
+        (let [^ProcessBuilder pb (ProcessBuilder. ^"[Ljava.lang.String;"
+                                   (into-array String ["bash" "bin/download-odds"]))
+              _ (.inheritIO pb)
+              proc (.start pb)
+              exit (.waitFor proc)]
+          (when-not (zero? exit)
+            (println "  WARNING: download-odds failed (exit" exit "). Install scipy: pip install scipy")))
+        (println "  WARNING: bin/download-odds not found")))))
+
 (defn- bench-odds []
   (println "\n=== ODDS Dataset Accuracy ===")
-  (println "  (Run bin/download-odds to fetch datasets)")
+  (ensure-odds-data)
   (bench-odds-dataset "Shuttle"      "data/odds/shuttle.csv"      0.95)
   (bench-odds-dataset "Http"         "data/odds/http.csv"         0.95)
   (bench-odds-dataset "ForestCover"  "data/odds/forestcover.csv"  0.80)
@@ -155,9 +188,22 @@
 ;; ============================================================================
 
 (defn- run-pyod-comparison [dataset-path dataset-name]
-  "Run PyOD IsolationForest on the same dataset and compare AUC."
-  (when (.exists (io/file dataset-path))
-    (let [py-script (str "
+  "Run Stratum and PyOD IsolationForest on the same dataset, print side by side."
+  (if-not (.exists (io/file dataset-path))
+    (println (format "  %-15s SKIPPED (no data: %s — run bin/download-odds)" dataset-name dataset-path))
+    (let [{:keys [features labels n d]} (load-odds-csv dataset-path)
+          fmap (features->map features)
+          ^longs labels labels
+          ;; Stratum
+          t0 (System/nanoTime)
+          model (iforest/train {:from fmap :n-trees 100 :sample-size 256 :seed 42})
+          stratum-train-ms (/ (- (System/nanoTime) t0) 1e6)
+          t1 (System/nanoTime)
+          stratum-scores (iforest/score model fmap)
+          stratum-score-ms (/ (- (System/nanoTime) t1) 1e6)
+          stratum-auc (auc-roc stratum-scores labels n)
+          ;; PyOD
+          py-script (str "
 import sys, time
 import numpy as np
 from sklearn.metrics import roc_auc_score
@@ -173,7 +219,7 @@ clf = IForest(n_estimators=100, max_samples=256, random_state=42)
 clf.fit(X)
 train_time = (time.time() - t0) * 1000
 t0 = time.time()
-scores = clf.decision_scores_
+scores = clf.decision_function(X)
 score_time = (time.time() - t0) * 1000
 auc = roc_auc_score(y, scores)
 print(f'{auc:.4f},{train_time:.1f},{score_time:.1f}')
@@ -183,24 +229,27 @@ print(f'{auc:.4f},{train_time:.1f},{score_time:.1f}')
                                (into-array String ["python3" "-c" py-script]))
           _ (.redirectErrorStream pb true)
           proc (.start pb)
-          output (slurp (.getInputStream proc))
+          output (str/trim (slurp (.getInputStream proc)))
           _ (.waitFor proc)]
-      (let [output (str/trim output)]
-        (cond
-          (str/includes? output "PYOD_NOT_INSTALLED")
-          (println (format "    PyOD %-12s SKIPPED (pip install pyod)" dataset-name))
+      (println (format "  %-15s n=%,7d d=%2d" dataset-name n d))
+      (println (format "    Stratum      AUC=%.4f  train=%s  score=%s"
+                       stratum-auc (fmt-ms stratum-train-ms) (fmt-ms stratum-score-ms)))
+      (cond
+        (str/includes? output "PYOD_NOT_INSTALLED")
+        (println "    PyOD         SKIPPED (pip install pyod)")
 
-          (str/includes? output ",")
-          (let [[auc train score] (str/split output #",")]
-            (println (format "    PyOD %-12s AUC=%.4f train=%sms score=%sms"
-                             dataset-name (Double/parseDouble auc) train score)))
+        (str/includes? output ",")
+        (let [[auc train score] (str/split output #",")]
+          (println (format "    PyOD         AUC=%.4f  train=%7sms  score=%7sms"
+                           (Double/parseDouble auc) (str/trim train) (str/trim score))))
 
-          :else
-          (println (format "    PyOD %-12s ERROR: %s" dataset-name output)))))))
+        :else
+        (println (format "    PyOD         ERROR: %s" output))))))
 
 (defn- bench-pyod []
-  (println "\n=== PyOD Comparison ===")
-  (println "  (pip install pyod scikit-learn to enable)")
+  (println "\n=== Stratum vs PyOD Comparison ===")
+  (println "  (100 trees, 256 sample size, same seed)")
+  (ensure-odds-data)
   (run-pyod-comparison "data/odds/shuttle.csv"     "Shuttle")
   (run-pyod-comparison "data/odds/http.csv"        "Http")
   (run-pyod-comparison "data/odds/forestcover.csv" "ForestCover")
@@ -219,13 +268,13 @@ print(f'{auc:.4f},{train_time:.1f},{score_time:.1f}')
         rng (Random. 42)
         ;; First half: outliers at [10,10,10]
         ;; Second half: outliers shift to [-10,-10,-10]
-        features (into-array (Class/forName "[D")
-                   (mapv (fn [_]
-                           (let [arr (double-array n)]
-                             (dotimes [i n]
-                               (aset arr i (.nextGaussian ^Random rng)))
-                             arr))
-                         (range d)))
+        ^"[[D" features (into-array (Class/forName "[D")
+                        (mapv (fn [_]
+                                (let [arr (double-array n)]
+                                  (dotimes [i n]
+                                    (aset arr i (.nextGaussian ^Random rng)))
+                                  arr))
+                              (range d)))
         labels (long-array n)
         ;; Inject outliers: 1% rate
         _ (dotimes [i 500]
