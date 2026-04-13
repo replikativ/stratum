@@ -184,10 +184,10 @@
             (assoc :select (rewrite-anomaly-exprs (:select q) expr->col))
             (cond->
               ;; WHERE/HAVING filter on :from columns (pre-projection) → use synthetic name
-              (:where q)  (assoc :where (rewrite-anomaly-exprs (:where q) expr->col))
-              (:having q) (assoc :having (rewrite-anomaly-exprs (:having q) expr->col))
+             (:where q)  (assoc :where (rewrite-anomaly-exprs (:where q) expr->col))
+             (:having q) (assoc :having (rewrite-anomaly-exprs (:having q) expr->col))
               ;; ORDER BY sorts result rows (post-projection) → use alias when available
-              (:order q)  (assoc :order (rewrite-anomaly-exprs (:order q) expr->col-other))))))))
+             (:order q)  (assoc :order (rewrite-anomaly-exprs (:order q) expr->col-other))))))))
 
 (defn- resolve-live-tables
   "Resolve any live table entries in the registry by loading fresh from storage."
@@ -1040,7 +1040,7 @@
         ;; Train anomaly model on taxi numeric features
         (let [taxi (get tables "taxi")
               model (iforest/train {:from (select-keys taxi [:fare_amount :tip_amount :total_amount
-                                                            :passenger_count :pickup_hour])
+                                                             :passenger_count :pickup_hour])
                                     :n-trees 100 :sample-size 256 :seed 42
                                     :contamination 0.01})]
           (register-model! srv "taxi_anomaly" model))))
