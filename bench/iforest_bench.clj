@@ -179,7 +179,7 @@
   (bench-odds-dataset "Shuttle"      "data/odds/shuttle.csv"      0.95)
   (bench-odds-dataset "Http"         "data/odds/http.csv"         0.95)
   (bench-odds-dataset "ForestCover"  "data/odds/forestcover.csv"  0.80)
-  (bench-odds-dataset "Mammography"  "data/odds/mammography.csv"  0.70)
+  (bench-odds-dataset "Mammography"  "data/odds/mammography.csv"  0.80)
   (bench-odds-dataset "Pima"         "data/odds/pima.csv"         0.55)
   (bench-odds-dataset "CreditCard"   "data/odds/creditcard.csv"   0.90))
 

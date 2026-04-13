@@ -197,7 +197,7 @@
             scores (iforest/score model feature-map)
             auc (auc-roc scores labels n)]
         (println (format "  Mammography: n=%d, d=%d, AUC=%.4f" n d auc))
-        (is (> auc 0.70) (format "Mammography AUC should be > 0.70, got %.4f" auc))))))
+        (is (> auc 0.80) (format "Mammography AUC should be > 0.80, got %.4f" auc))))))
 
 (deftest odds-creditcard-test
   (testing "Credit Card fraud dataset (if available)"
