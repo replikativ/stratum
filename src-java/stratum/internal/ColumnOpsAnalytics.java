@@ -492,6 +492,7 @@ public final class ColumnOpsAnalytics {
         int[] featArr = new int[maxNodes];
         double[] splitArr = new double[maxNodes];
         int[] sizeArr = new int[maxNodes];
+        int[] featPerm = new int[nFeatures]; // reused per-node for feature retry
 
         // Pool for Fisher-Yates sampling without replacement
         int[] pool = new int[nRows];
@@ -539,15 +540,27 @@ public final class ColumnOpsAnalytics {
                     continue;
                 }
 
-                int feat = rng.nextInt(nFeatures);
-                double minVal = Double.POSITIVE_INFINITY, maxVal = Double.NEGATIVE_INFINITY;
-                for (int i = start; i < end; i++) {
-                    double v = sample[feat][indices[i]];
-                    if (v < minVal) minVal = v;
-                    if (v > maxVal) maxVal = v;
+                // Try random features until we find one with variance (matches sklearn behavior).
+                // Fisher-Yates lazy shuffle: only shuffle as many positions as needed.
+                for (int f = 0; f < nFeatures; f++) featPerm[f] = f;
+                int feat = -1;
+                double minVal = 0, maxVal = 0;
+                boolean foundSplit = false;
+                for (int fi = 0; fi < nFeatures; fi++) {
+                    int fj = fi + rng.nextInt(nFeatures - fi);
+                    int tmp = featPerm[fi]; featPerm[fi] = featPerm[fj]; featPerm[fj] = tmp;
+                    feat = featPerm[fi];
+                    minVal = Double.POSITIVE_INFINITY;
+                    maxVal = Double.NEGATIVE_INFINITY;
+                    for (int i = start; i < end; i++) {
+                        double v = sample[feat][indices[i]];
+                        if (v < minVal) minVal = v;
+                        if (v > maxVal) maxVal = v;
+                    }
+                    if (minVal < maxVal) { foundSplit = true; break; }
                 }
 
-                if (minVal >= maxVal) {
+                if (!foundSplit) {
                     featArr[node] = -1;
                     sizeArr[node] = size;
                     continue;
