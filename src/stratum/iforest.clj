@@ -31,6 +31,41 @@
 
 (set! *warn-on-reflection* true)
 
+(defn- tree-max-nodes
+  "Compute the number of nodes per tree (complete binary tree of required depth)."
+  ^long [^long sample-size]
+  (if (<= sample-size 1)
+    1
+    (let [max-depth (int (Math/ceil (/ (Math/log sample-size) (Math/log 2.0))))]
+      (dec (bit-shift-left 1 (inc max-depth))))))
+
+(defn- col-length
+  "Get the length of a column array, or throw if not a recognized array type."
+  ^long [col col-name]
+  (cond
+    (instance? (Class/forName "[D") col) (alength ^doubles col)
+    (instance? (Class/forName "[J") col) (alength ^longs col)
+    (nil? col) (throw (ex-info (str "Column " col-name " not found in data")
+                               {:col col-name}))
+    :else (throw (ex-info (str "Column " col-name " must be double[] or long[], got "
+                               (.getSimpleName (class col)))
+                          {:col col-name :type (class col)}))))
+
+(defn- validate-column-lengths
+  "Validate that all columns in the data map have the same length. Returns the row count."
+  ^long [from feature-names]
+  (let [first-name (first feature-names)
+        first-col (get from first-name)
+        n (col-length first-col first-name)]
+    (doseq [col-name (rest feature-names)]
+      (let [col (get from col-name)
+            len (col-length col col-name)]
+        (when (not= len n)
+          (throw (ex-info (str "Column length mismatch: " first-name " has " n
+                               " rows but " col-name " has " len " rows")
+                          {:col col-name :expected n :actual len})))))
+    n))
+
 (defn- prepare-features
   "Extract double[][] features array from a column map, converting long[] → double[] as needed."
   [from feature-names]
@@ -45,18 +80,14 @@
                             (dotimes [i (alength la)]
                               (aset da i (double (aget la i))))
                             da)
-                          :else (throw (ex-info "Column must be double[] or long[]"
-                                                {:col col-name})))))
+                          (nil? col)
+                          (throw (ex-info (str "Column " col-name " not found in data")
+                                          {:col col-name
+                                           :available (vec (keys from))}))
+                          :else (throw (ex-info (str "Column " col-name " must be double[] or long[], got "
+                                                     (.getSimpleName (class col)))
+                                                {:col col-name :type (class col)})))))
                     feature-names)))
-
-(defn- count-rows
-  "Get row count from first column of a data map."
-  ^long [from feature-names]
-  (let [first-col (get from (first feature-names))]
-    (cond
-      (instance? (Class/forName "[D") first-col) (alength ^doubles first-col)
-      (instance? (Class/forName "[J") first-col) (alength ^longs first-col)
-      :else (throw (ex-info "Columns must be double[] or long[]" {:col (first feature-names)})))))
 
 (defn score
   "Score rows using a trained isolation forest.
@@ -69,7 +100,7 @@
    data     — map of keyword → double[] columns (same features as training)"
   [model data]
   (let [{:keys [forest n-trees sample-size feature-names n-features]} model
-        n-rows (count-rows data feature-names)
+        n-rows (validate-column-lengths data feature-names)
         features (prepare-features data feature-names)]
     (ColumnOpsAnalytics/iforestScoreParallel ^longs forest (int n-trees) (int sample-size)
                                              features (int n-rows) (int n-features))))
@@ -102,7 +133,9 @@
   (spec/validate! spec/STrainOpts opts {:op :train})
   (let [feature-names (vec (keys from))
         n-features (count feature-names)
-        n-rows (count-rows from feature-names)
+        n-rows (validate-column-lengths from feature-names)
+        ;; Cap sample-size to n-rows (matches scikit-learn, avoids degenerate trees)
+        sample-size (max 1 (min sample-size n-rows))
         features (prepare-features from feature-names)
         forest (ColumnOpsAnalytics/iforestTrain features n-rows n-features
                                                 (int n-trees) (int sample-size) (long seed))
@@ -180,7 +213,7 @@
    - High variance = trees disagree → uncertain classification"
   [model data]
   (let [{:keys [forest n-trees sample-size feature-names n-features]} model
-        n-rows (count-rows data feature-names)
+        n-rows (validate-column-lengths data feature-names)
         features (prepare-features data feature-names)
         ^"[[D" result (ColumnOpsAnalytics/iforestScoreAndVarianceParallel
                        ^longs forest (int n-trees) (int sample-size)
@@ -232,8 +265,7 @@
   ([model new-data] (rotate-forest model new-data (max 1 (quot (:n-trees model) 10))))
   ([model new-data k]
    (let [{:keys [forest n-trees sample-size]} model
-         max-nodes (dec (* 2 sample-size))
-         tree-size max-nodes  ;; packed: 1 long per node
+         tree-size (tree-max-nodes sample-size)
          new-model (train {:from new-data
                            :n-trees k
                            :sample-size sample-size
@@ -260,10 +292,11 @@
    Tree 0 is oldest, tree n-1 is newest."
   [model data ^double decay]
   (let [{:keys [forest n-trees sample-size feature-names n-features]} model
-        n-rows (count-rows data feature-names)
+        n-rows (validate-column-lengths data feature-names)
         features (prepare-features data feature-names)
-        max-nodes (dec (* 2 sample-size))
-        max-depth (int (Math/ceil (/ (Math/log sample-size) (Math/log 2))))
+        max-nodes (tree-max-nodes sample-size)
+        max-depth (if (<= sample-size 1) 0
+                      (int (Math/ceil (/ (Math/log sample-size) (Math/log 2.0)))))
         ^longs forest-arr forest
         c-psi (expected-path-length sample-size)
         scores (double-array n-rows)

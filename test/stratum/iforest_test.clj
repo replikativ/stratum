@@ -390,3 +390,72 @@
       (println (format "  IForest scoring: %d rows × 100 trees in %.1fms" n elapsed-ms))
       ;; Should be well under 1 second for 100K rows
       (is (< elapsed-ms 5000) (format "Scoring should be < 5s, took %.1fms" elapsed-ms)))))
+
+;; ============================================================================
+;; Edge Case Tests
+;; ============================================================================
+
+(deftest single-row-test
+  (testing "Single row does not produce NaN"
+    (let [data {:f0 (double-array [42.0])}
+          model (iforest/train {:from data :n-trees 10 :sample-size 256 :seed 42})
+          ^doubles scores (iforest/score model data)]
+      (is (= 1 (alength scores)))
+      (is (Double/isFinite (aget scores 0)) "Score should not be NaN or Infinite")
+      ;; sample-size should be capped to 1
+      (is (= 1 (:sample-size model))))))
+
+(deftest two-rows-test
+  (testing "Two rows produce finite scores"
+    (let [data {:f0 (double-array [1.0 100.0])}
+          model (iforest/train {:from data :n-trees 50 :sample-size 256 :seed 42})
+          ^doubles scores (iforest/score model data)]
+      (is (= 2 (alength scores)))
+      (is (every? #(Double/isFinite %) (seq scores)))
+      (is (= 2 (:sample-size model))))))
+
+(deftest sample-size-capped-test
+  (testing "sample-size is capped to n-rows"
+    (let [data {:f0 (double-array [1 2 3 4 5])}
+          model (iforest/train {:from data :n-trees 10 :sample-size 256 :seed 42})]
+      (is (= 5 (:sample-size model)) "sample-size should be capped to 5"))))
+
+(deftest mismatched-column-lengths-test
+  (testing "Mismatched column lengths throw clear error"
+    (is (thrown-with-msg? Exception #"Column length mismatch"
+                          (iforest/train {:from {:a (double-array [1 2 3])
+                                                 :b (double-array [1 2])}})))))
+
+(deftest missing-feature-name-score-test
+  (testing "Scoring with missing feature names gives clear error"
+    (let [data {:amount (double-array [1 2 3 4 5])
+                :freq   (double-array [1 2 3 4 5])}
+          model (iforest/train {:from data :n-trees 10 :sample-size 4 :seed 42})]
+      (is (thrown-with-msg? Exception #"not found in data"
+                            (iforest/score model {:x (double-array [1 2 3 4 5])
+                                                  :y (double-array [1 2 3 4 5])}))))))
+
+(deftest wrong-column-type-test
+  (testing "Non-array column type gives clear error"
+    (is (thrown-with-msg? Exception #"must be double\[\] or long\[\]"
+                          (iforest/train {:from {:a [1 2 3]}})))))
+
+(deftest nan-input-test
+  (testing "NaN in input produces finite scores (NaN goes to left child consistently)"
+    (let [data {:f0 (double-array [1 2 3 Double/NaN 5 6 7 8 9 100])}
+          model (iforest/train {:from data :n-trees 100 :sample-size 8 :seed 42})
+          ^doubles scores (iforest/score model data)]
+      (is (every? #(Double/isFinite %) (seq scores))
+          "All scores should be finite even with NaN input"))))
+
+(deftest sampling-without-replacement-test
+  (testing "Sampling without replacement produces diverse trees on small data"
+    ;; With 10 rows and sample-size=10, without-replacement means each tree
+    ;; sees all rows exactly once. Trees should differ only in split choices.
+    (let [data {:f0 (double-array [1 2 3 4 5 6 7 8 9 100])
+                :f1 (double-array [1 2 3 4 5 6 7 8 9 100])}
+          model (iforest/train {:from data :n-trees 200 :sample-size 10 :seed 42})
+          ^doubles scores (iforest/score model data)]
+      ;; Outlier (100) should have clearly highest score
+      (is (> (aget scores 9) (apply max (take 9 (seq scores))))
+          "Outlier should score highest"))))

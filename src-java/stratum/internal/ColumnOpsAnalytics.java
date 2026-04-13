@@ -475,9 +475,15 @@ public final class ColumnOpsAnalytics {
      */
     public static long[] iforestTrain(double[][] features, int nRows, int nFeatures,
                                        int nTrees, int sampleSize, long seed) {
-        int maxNodes = 2 * sampleSize - 1;
+        // Cap sample size to number of rows (matches scikit-learn behavior)
+        sampleSize = Math.min(sampleSize, nRows);
+        if (sampleSize < 1) sampleSize = 1;
+
+        int maxDepth = sampleSize <= 1 ? 0
+            : (int) Math.ceil(Math.log(sampleSize) / Math.log(2));
+        // Use complete binary tree size to ensure scoring traversal stays in bounds
+        int maxNodes = (1 << (maxDepth + 1)) - 1;
         long[] forest = new long[nTrees * maxNodes];
-        int maxDepth = (int) Math.ceil(Math.log(sampleSize) / Math.log(2));
         java.util.Random rng = new java.util.Random(seed);
 
         double[] eplCache = new double[sampleSize + 1];
@@ -487,12 +493,19 @@ public final class ColumnOpsAnalytics {
         double[] splitArr = new double[maxNodes];
         int[] sizeArr = new int[maxNodes];
 
+        // Pool for Fisher-Yates sampling without replacement
+        int[] pool = new int[nRows];
+
         for (int t = 0; t < nTrees; t++) {
             int treeOffset = t * maxNodes;
 
+            // Reset pool and sample WITHOUT replacement via partial Fisher-Yates shuffle
+            for (int i = 0; i < nRows; i++) pool[i] = i;
             int[] sampleIndices = new int[sampleSize];
             for (int i = 0; i < sampleSize; i++) {
-                sampleIndices[i] = rng.nextInt(nRows);
+                int j = i + rng.nextInt(nRows - i);
+                sampleIndices[i] = pool[j];
+                pool[j] = pool[i];
             }
 
             double[][] sample = new double[nFeatures][sampleSize];
@@ -678,10 +691,12 @@ public final class ColumnOpsAnalytics {
     private static double[] iforestScoreRange(long[] forest, int nTrees, int sampleSize,
                                                double[][] features, int nRows, int nFeatures,
                                                int start, int end) {
-        int maxNodes = 2 * sampleSize - 1;
-        int maxDepth = (int) Math.ceil(Math.log(sampleSize) / Math.log(2));
+        int maxDepth = sampleSize <= 1 ? 0
+            : (int) Math.ceil(Math.log(sampleSize) / Math.log(2));
+        int maxNodes = (1 << (maxDepth + 1)) - 1;
         double cPsi = expectedPathLength(sampleSize);
-        double factor = Math.log(2.0) / (nTrees * cPsi);
+        // Guard against cPsi=0 (sampleSize<=1): all scores become 0.5
+        double factor = cPsi > 0 ? Math.log(2.0) / (nTrees * cPsi) : 0.0;
 
         double[] pathLengths = new double[nRows];
         final int morsel = IF_MORSEL_SIZE;
@@ -711,10 +726,11 @@ public final class ColumnOpsAnalytics {
             return iforestScore(forest, nTrees, sampleSize, features, nRows, nFeatures);
         }
 
-        int maxNodes = 2 * sampleSize - 1;
-        int maxDepth = (int) Math.ceil(Math.log(sampleSize) / Math.log(2));
+        int maxDepth = sampleSize <= 1 ? 0
+            : (int) Math.ceil(Math.log(sampleSize) / Math.log(2));
+        int maxNodes = (1 << (maxDepth + 1)) - 1;
         double cPsi = expectedPathLength(sampleSize);
-        double factor = Math.log(2.0) / (nTrees * cPsi);
+        double factor = cPsi > 0 ? Math.log(2.0) / (nTrees * cPsi) : 0.0;
 
         double[] pathLengths = new double[nRows];
         double[] scores = new double[nRows];
@@ -778,10 +794,11 @@ public final class ColumnOpsAnalytics {
      */
     public static double[][] iforestScoreAndVarianceParallel(long[] forest, int nTrees, int sampleSize,
                                                               double[][] features, int nRows, int nFeatures) {
-        int maxNodes = 2 * sampleSize - 1;
-        int maxDepth = (int) Math.ceil(Math.log(sampleSize) / Math.log(2));
+        int maxDepth = sampleSize <= 1 ? 0
+            : (int) Math.ceil(Math.log(sampleSize) / Math.log(2));
+        int maxNodes = (1 << (maxDepth + 1)) - 1;
         double cPsi = expectedPathLength(sampleSize);
-        double factor = Math.log(2.0) / (nTrees * cPsi);
+        double factor = cPsi > 0 ? Math.log(2.0) / (nTrees * cPsi) : 0.0;
         double invTrees = 1.0 / nTrees;
 
         double[] pathLengths = new double[nRows];
