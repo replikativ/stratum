@@ -104,49 +104,90 @@
    :anomaly-proba      iforest/predict-proba
    :anomaly-confidence iforest/predict-confidence})
 
+(defn- anomaly-expr?
+  "True if form is an anomaly function call like [:anomaly-score \"model\" :col1 ...]."
+  [form]
+  (and (vector? form) (seq form) (contains? anomaly-ops (first form))))
+
+(defn- collect-anomaly-exprs
+  "Walk a nested structure and collect all unique anomaly expressions as a set."
+  [form]
+  (cond
+    (anomaly-expr? form) #{form}
+    (sequential? form) (reduce into #{} (map collect-anomaly-exprs form))
+    :else #{}))
+
+(defn- rewrite-anomaly-exprs
+  "Replace anomaly expressions in a nested form with their synthetic column keywords."
+  [form expr->col]
+  (cond
+    (contains? expr->col form) (get expr->col form)
+    (vector? form) (mapv #(rewrite-anomaly-exprs % expr->col) form)
+    :else form))
+
+(defn- select-alias-map
+  "Build a map from anomaly expression → alias keyword for aliased SELECT items.
+   E.g. [:as [:anomaly-score \"m\" :c1] :score] → {[:anomaly-score \"m\" :c1] :score}"
+  [select-items]
+  (into {}
+        (keep (fn [item]
+                (when (and (sequential? item) (= :as (first item))
+                           (sequential? (second item))
+                           (contains? anomaly-ops (first (second item))))
+                  [(second item) (nth item 2)])))
+        select-items))
+
 (defn- resolve-anomaly-expressions
-  "Resolve anomaly detection expressions in :select.
-   Computes scores/predictions using the registered model and injects as columns in :from."
+  "Resolve anomaly detection expressions throughout the query.
+   Finds ANOMALY_SCORE/PREDICT/PROBA/CONFIDENCE calls in SELECT, WHERE, HAVING,
+   and ORDER BY. Computes each unique call once, injects as a column in :from,
+   and rewrites all references to point to the synthetic column.
+   When an anomaly expression has a SELECT alias, WHERE/ORDER BY/HAVING
+   use the alias (the query engine sorts by result-row key names)."
   [query registry]
-  (if-let [select-items (:select query)]
-    (let [anomaly-selects (filter (fn [item]
-                                    (and (sequential? item)
-                                         (or (contains? anomaly-ops (first item))
-                                             (and (= :as (first item))
-                                                  (sequential? (second item))
-                                                  (contains? anomaly-ops (first (second item)))))))
-                                  select-items)]
-      (if (empty? anomaly-selects)
-        query
-        (reduce
-         (fn [q sel]
-           (let [expr (if (= :as (first sel)) (second sel) sel)
-                 op (first expr)
-                 model-name (second expr)
-                 model-name (if (string? model-name) model-name (name model-name))
-                 model (get-in registry ["__models__" model-name])]
-             (if model
-               (let [feature-names (:feature-names model)
-                     from (:from q)
-                     data (select-keys from feature-names)
-                     compute-fn (get anomaly-op->fn op)
-                     result (compute-fn model data)
-                     col-name (keyword (str "__" (name op) "_" model-name))]
-                 (-> q
-                     (assoc-in [:from col-name] result)
-                     (update :select (fn [sels]
-                                       (mapv (fn [s]
-                                               (if (= s sel)
-                                                 (if (= :as (first sel))
-                                                   [:as col-name (nth sel 2)]
-                                                   col-name)
-                                                 s))
-                                             sels)))))
-               (throw (ex-info (str "Unknown model: " model-name)
-                               {:model model-name
-                                :available (keys (get registry "__models__"))})))))
-         query anomaly-selects)))
-    query))
+  (let [all-exprs (reduce into #{}
+                          (map #(collect-anomaly-exprs (get query %))
+                               [:select :where :having :order]))]
+    (if (empty? all-exprs)
+      query
+      (let [aliases (select-alias-map (:select query))
+            {:keys [q expr->col]}
+            (reduce
+             (fn [{:keys [q expr->col]} expr]
+               (let [op (first expr)
+                     model-name (second expr)
+                     model-name (if (string? model-name) model-name (name model-name))
+                     model (get-in registry ["__models__" model-name])]
+                 (if model
+                   (let [feature-names (:feature-names model)
+                         from (:from q)
+                         data (select-keys from feature-names)
+                         compute-fn (get anomaly-op->fn op)
+                         result (compute-fn model data)
+                         col-name (keyword (str "__" (name op) "_" model-name))]
+                     {:q (assoc-in q [:from col-name] result)
+                      :expr->col (assoc expr->col expr col-name)})
+                   (throw (ex-info (str "Unknown model: " model-name)
+                                   {:model model-name
+                                    :available (keys (get registry "__models__"))})))))
+             {:q query :expr->col {}}
+             all-exprs)
+            ;; For non-SELECT clauses, prefer the alias if one exists in SELECT
+            ;; (the query engine sorts/filters by result-row key names)
+            expr->alias (into {}
+                              (keep (fn [[expr col-name]]
+                                      (when-let [a (get aliases expr)]
+                                        [expr a])))
+                              expr->col)
+            expr->col-other (merge expr->col expr->alias)]
+        (-> q
+            (assoc :select (rewrite-anomaly-exprs (:select q) expr->col))
+            (cond->
+              ;; WHERE/HAVING filter on :from columns (pre-projection) → use synthetic name
+              (:where q)  (assoc :where (rewrite-anomaly-exprs (:where q) expr->col))
+              (:having q) (assoc :having (rewrite-anomaly-exprs (:having q) expr->col))
+              ;; ORDER BY sorts result rows (post-projection) → use alias when available
+              (:order q)  (assoc :order (rewrite-anomaly-exprs (:order q) expr->col-other))))))))
 
 (defn- resolve-live-tables
   "Resolve any live table entries in the registry by loading fresh from storage."
@@ -890,7 +931,16 @@
               (aset passengers i (long (inc (.nextInt rng 6))))
               (aset ^"[Ljava.lang.String;" payment-type i
                     (nth pt-vals (.nextInt rng 4)))
-              (aset pickup-hour i (long (.nextInt rng 24)))))]
+              (aset pickup-hour i (long (.nextInt rng 24)))))
+        ;; Inject 50 anomalies: extremely high fares, zero tips, late-night
+        _ (dotimes [j 50]
+            (let [i (- n 50 (- j))]
+              (aset fare i (+ 500.0 (* (.nextDouble rng) 500.0)))
+              (aset tip i 0.0)
+              (aset total i (aget fare i))
+              (aset passengers i 1)
+              (aset ^"[Ljava.lang.String;" payment-type i "Cash")
+              (aset pickup-hour i (long (+ 2 (.nextInt rng 3))))))]
     {"lineitem" {:shipdate shipdate :discount discount :quantity quantity
                  :price price :tax tax :returnflag returnflag :linestatus linestatus}
      "taxi" {:fare_amount fare :tip_amount tip :total_amount total
@@ -986,7 +1036,14 @@
       (println "Loading demo tables...")
       (let [tables (generate-demo-tables)]
         (doseq [[table-name columns] tables]
-          (register-table! srv table-name columns))))
+          (register-table! srv table-name columns))
+        ;; Train anomaly model on taxi numeric features
+        (let [taxi (get tables "taxi")
+              model (iforest/train {:from (select-keys taxi [:fare_amount :tip_amount :total_amount
+                                                            :passenger_count :pickup_hour])
+                                    :n-trees 100 :sample-size 256 :seed 42
+                                    :contamination 0.01})]
+          (register-model! srv "taxi_anomaly" model))))
 
     ;; JIT warmup — exercise all Java hot paths so the C2 compiler sees every
     ;; code shape before real queries arrive, preventing deoptimization cliffs.
@@ -1008,11 +1065,15 @@
     (when demo
       (println)
       (println "Demo tables loaded: lineitem (100K rows), taxi (100K rows)")
+      (println "Anomaly model 'taxi_anomaly' trained on taxi (fare_amount, tip_amount, total_amount, passenger_count, pickup_hour)")
       (println)
       (println "Try:")
       (println "  SELECT payment_type, AVG(tip_amount), COUNT(*) FROM taxi GROUP BY payment_type;")
       (println "  SELECT returnflag, linestatus, SUM(price * discount) FROM lineitem GROUP BY returnflag, linestatus;")
-      (println "  EXPLAIN SELECT SUM(price) FROM lineitem WHERE quantity < 24;"))
+      (println "  EXPLAIN SELECT SUM(price) FROM lineitem WHERE quantity < 24;")
+      (println)
+      (println "Anomaly detection:")
+      (println "  SELECT fare_amount, tip_amount, pickup_hour, ANOMALY_SCORE('taxi_anomaly', fare_amount, tip_amount, total_amount, passenger_count, pickup_hour) AS score FROM taxi WHERE ANOMALY_SCORE('taxi_anomaly', fare_amount, tip_amount, total_amount, passenger_count, pickup_hour) > 0.7 LIMIT 20;"))
 
     (println)
     (println "Ad-hoc file queries (auto-indexed on first access):")

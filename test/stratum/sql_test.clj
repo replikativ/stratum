@@ -945,6 +945,49 @@
           {:keys [query]} (sql/parse-sql "SELECT ANOMALY_CONFIDENCE('mymodel', price, quantity) FROM orders" reg)]
       (is (some #(and (sequential? %) (= :anomaly-confidence (first %))) (:select query))))))
 
+(deftest sql-anomaly-resolution-test
+  (testing "ANOMALY_SCORE in WHERE clause filters correctly"
+    (let [n 100
+          fare (double-array n)
+          tip (double-array n)
+          rng (java.util.Random. 42)]
+      (dotimes [i n]
+        (aset fare i (+ 5.0 (* (.nextDouble rng) 45.0)))
+        (aset tip i (* (aget fare i) 0.15)))
+      ;; Inject 5 anomalies
+      (dotimes [i 5]
+        (aset fare (- n 1 i) 500.0)
+        (aset tip (- n 1 i) 0.0))
+      (let [data {:fare_amount fare :tip_amount tip}
+            model (require '[stratum.iforest :as iforest])
+            model ((requiring-resolve 'stratum.iforest/train)
+                   {:from data :n-trees 50 :sample-size 64 :seed 42 :contamination 0.05})
+            registry {"test" data "__models__" {"test_model" model}}
+            resolve-fn @(resolve 'stratum.server/resolve-anomaly-expressions)]
+        ;; WHERE filter
+        (let [{:keys [query]} (sql/parse-sql
+                               "SELECT fare_amount, ANOMALY_SCORE('test_model', fare_amount, tip_amount) AS score FROM test WHERE ANOMALY_SCORE('test_model', fare_amount, tip_amount) > 0.6"
+                               registry)
+              resolved (resolve-fn query registry)
+              result (q/q resolved)]
+          (is (= 5 (count result)) "Should find exactly 5 anomalies")
+          (is (every? #(= 500.0 (:fare_amount %)) result) "All should be the injected anomalies"))
+        ;; ORDER BY with alias
+        (let [{:keys [query]} (sql/parse-sql
+                               "SELECT fare_amount, ANOMALY_SCORE('test_model', fare_amount, tip_amount) AS score FROM test ORDER BY ANOMALY_SCORE('test_model', fare_amount, tip_amount) DESC LIMIT 5"
+                               registry)
+              resolved (resolve-fn query registry)
+              result (q/q resolved)]
+          (is (= 5 (count result)))
+          (is (every? #(= 500.0 (:fare_amount %)) result) "Top 5 by score should all be anomalies"))
+        ;; Deduplication: same expression in SELECT + WHERE computed once
+        (let [{:keys [query]} (sql/parse-sql
+                               "SELECT ANOMALY_SCORE('test_model', fare_amount, tip_amount) AS score FROM test WHERE ANOMALY_SCORE('test_model', fare_amount, tip_amount) > 0.6"
+                               registry)
+              resolved (resolve-fn query registry)
+              injected (filterv #(clojure.string/starts-with? (name %) "__") (keys (:from resolved)))]
+          (is (= 1 (count injected)) "Same anomaly expr in SELECT + WHERE should inject only once"))))))
+
 ;; ============================================================================
 ;; Window Function Tests
 ;; ============================================================================
