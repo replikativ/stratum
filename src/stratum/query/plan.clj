@@ -392,23 +392,23 @@
         (aset dp 0 {:cost 0.0 :order [] :rows (double fact-rows)})
         (doseq [mask (range 1 (inc full))]
           (let [best (reduce
-                       (fn [best i]
-                         (if (zero? (bit-and mask (bit-shift-left 1 i)))
-                           best
-                           (let [prev-mask (bit-xor mask (bit-shift-left 1 i))
-                                 i-deps (nth deps i)]
+                      (fn [best i]
+                        (if (zero? (bit-and mask (bit-shift-left 1 i)))
+                          best
+                          (let [prev-mask (bit-xor mask (bit-shift-left 1 i))
+                                i-deps (nth deps i)]
                              ;; Check deps: all dependencies must be in prev-mask
-                             (if (not (every? #(pos? (bit-and prev-mask (bit-shift-left 1 %))) i-deps))
-                               best
-                               (let [prev (aget dp (int prev-mask))]
-                                 (when prev
-                                   (let [new-cost (+ (double (:cost prev)) (double (:rows prev)))
-                                         new-rows (* (double (:rows prev)) (double (nth sels i)))]
-                                     (if (or (nil? best) (< new-cost (double (:cost best))))
-                                       {:cost new-cost :order (conj (:order prev) i) :rows new-rows}
-                                       best))))))))
-                       nil
-                       (range n))]
+                            (if (not (every? #(pos? (bit-and prev-mask (bit-shift-left 1 %))) i-deps))
+                              best
+                              (let [prev (aget dp (int prev-mask))]
+                                (when prev
+                                  (let [new-cost (+ (double (:cost prev)) (double (:rows prev)))
+                                        new-rows (* (double (:rows prev)) (double (nth sels i)))]
+                                    (if (or (nil? best) (< new-cost (double (:cost best))))
+                                      {:cost new-cost :order (conj (:order prev) i) :rows new-rows}
+                                      best))))))))
+                      nil
+                      (range n))]
             (aset dp (int mask) best)))
         (or (:order (aget dp (int full)))
             (vec (range n)))))))
@@ -417,11 +417,11 @@
   "Rebuild a left-deep join tree from fact-node and reordered dims."
   [fact-node dims order]
   (reduce
-    (fn [left idx]
-      (let [{:keys [node on-pairs join-type]} (nth dims idx)]
-        (ir/->LJoin join-type on-pairs left node)))
-    fact-node
-    order))
+   (fn [left idx]
+     (let [{:keys [node on-pairs join-type]} (nth dims idx)]
+       (ir/->LJoin join-type on-pairs left node)))
+   fact-node
+   order))
 
 (defn join-reorder
   "Reorder left-deep INNER join chains for optimal execution cost.
@@ -430,18 +430,18 @@
    Only reorders chains of all-INNER joins (outer joins stay in place)."
   [plan]
   (ir/walk-plan plan
-    (fn [node]
-      (if (instance? LJoin node)
-        (let [[fact-node dims] (extract-join-chain node)]
-          (if-let [fact-cols (and (>= (count dims) 2)
-                                  (every? #(= :inner (:join-type %)) dims)
-                                  (scan-columns fact-node))]
-            (let [order (dp-join-order (estimate-node-rows fact-node) fact-cols dims)]
-              (if (= order (vec (range (count dims))))
-                node
-                (rebuild-join-chain fact-node dims order)))
-            node))
-        node))))
+                (fn [node]
+                  (if (instance? LJoin node)
+                    (let [[fact-node dims] (extract-join-chain node)]
+                      (if-let [fact-cols (and (>= (count dims) 2)
+                                              (every? #(= :inner (:join-type %)) dims)
+                                              (scan-columns fact-node))]
+                        (let [order (dp-join-order (estimate-node-rows fact-node) fact-cols dims)]
+                          (if (= order (vec (range (count dims))))
+                            node
+                            (rebuild-join-chain fact-node dims order)))
+                        node))
+                    node))))
 
 ;; ============================================================================
 ;; Pass 2: Zone-map annotation
@@ -1041,9 +1041,9 @@
    Attaches ::estimated-rows metadata to each node."
   [plan]
   (ir/walk-plan plan
-    (fn [node]
-      (let [est (propagate-est-rows node)]
-        (vary-meta node assoc ::estimated-rows est)))))
+                (fn [node]
+                  (let [est (propagate-est-rows node)]
+                    (vary-meta node assoc ::estimated-rows est)))))
 
 ;; ============================================================================
 ;; Pass 7: Column pruning
@@ -1054,49 +1054,49 @@
   [plan]
   (let [refs (volatile! (transient #{}))]
     (ir/walk-plan plan
-      (fn [node]
+                  (fn [node]
         ;; Predicates
-        (when-let [preds (:predicates node)]
-          (doseq [p preds
-                  c (pred-columns p)]
-            (vswap! refs conj! c)))
+                    (when-let [preds (:predicates node)]
+                      (doseq [p preds
+                              c (pred-columns p)]
+                        (vswap! refs conj! c)))
         ;; Group keys
-        (when-let [gks (:group-keys node)]
-          (doseq [gk gks] (when (keyword? gk) (vswap! refs conj! gk))))
+                    (when-let [gks (:group-keys node)]
+                      (doseq [gk gks] (when (keyword? gk) (vswap! refs conj! gk))))
         ;; Aggs
-        (when-let [aggs (:aggs node)]
-          (doseq [a aggs]
-            (when-let [c (:col a)] (vswap! refs conj! c))
-            (when-let [cs (:cols a)] (doseq [c cs] (when (keyword? c) (vswap! refs conj! c))))))
-        (when-let [agg (:agg node)]
-          (when-let [c (:col agg)] (vswap! refs conj! c)))
+                    (when-let [aggs (:aggs node)]
+                      (doseq [a aggs]
+                        (when-let [c (:col a)] (vswap! refs conj! c))
+                        (when-let [cs (:cols a)] (doseq [c cs] (when (keyword? c) (vswap! refs conj! c))))))
+                    (when-let [agg (:agg node)]
+                      (when-let [c (:col agg)] (vswap! refs conj! c)))
         ;; Project items
-        (when-let [items (:items node)]
-          (doseq [item items]
-            (when-let [r (:ref item)] (vswap! refs conj! r))
-            (when-let [n (:name item)] (vswap! refs conj! n))))
+                    (when-let [items (:items node)]
+                      (doseq [item items]
+                        (when-let [r (:ref item)] (vswap! refs conj! r))
+                        (when-let [n (:name item)] (vswap! refs conj! n))))
         ;; Join on-pairs
-        (when-let [on (:on-pairs node)]
-          (doseq [[l r] on] (vswap! refs conj! l) (vswap! refs conj! r)))
-        (when-let [js (:join-spec node)]
-          (doseq [[l r] (:on-pairs js)] (vswap! refs conj! l) (vswap! refs conj! r)))
+                    (when-let [on (:on-pairs node)]
+                      (doseq [[l r] on] (vswap! refs conj! l) (vswap! refs conj! r)))
+                    (when-let [js (:join-spec node)]
+                      (doseq [[l r] (:on-pairs js)] (vswap! refs conj! l) (vswap! refs conj! r)))
         ;; Window specs
-        (when-let [specs (:specs node)]
-          (doseq [s specs]
-            (when-let [c (:col s)] (vswap! refs conj! c))
-            (when-let [pb (:partition-by s)] (doseq [c pb] (vswap! refs conj! c)))
-            (when-let [ob (:order-by s)] (doseq [[c _] ob] (vswap! refs conj! c)))))
+                    (when-let [specs (:specs node)]
+                      (doseq [s specs]
+                        (when-let [c (:col s)] (vswap! refs conj! c))
+                        (when-let [pb (:partition-by s)] (doseq [c pb] (vswap! refs conj! c)))
+                        (when-let [ob (:order-by s)] (doseq [[c _] ob] (vswap! refs conj! c)))))
         ;; Sort
-        (when-let [os (:order-specs node)]
-          (doseq [[c _] os] (vswap! refs conj! c)))
+                    (when-let [os (:order-specs node)]
+                      (doseq [[c _] os] (vswap! refs conj! c)))
         ;; Extract
-        (when-let [ec (:extract-col node)]
-          (vswap! refs conj! ec))
+                    (when-let [ec (:extract-col node)]
+                      (vswap! refs conj! ec))
         ;; Materialized expressions
-        (when-let [e (:expr node)]
-          (when (map? e)
-            (doseq [a (:args e)] (when (keyword? a) (vswap! refs conj! a)))))
-        node))
+                    (when-let [e (:expr node)]
+                      (when (map? e)
+                        (doseq [a (:args e)] (when (keyword? a) (vswap! refs conj! a)))))
+                    node))
     (persistent! @refs)))
 
 (defn column-pruning
@@ -1104,14 +1104,14 @@
   [plan]
   (let [all-refs (collect-all-refs plan)]
     (ir/walk-plan plan
-      (fn [node]
-        (if (or (instance? PScan node) (instance? PChunkedScan node))
-          (let [cols (:columns node)
-                pruned (select-keys cols all-refs)]
-            (if (< (count pruned) (count cols))
-              (assoc node :columns pruned)
-              node))
-          node)))))
+                  (fn [node]
+                    (if (or (instance? PScan node) (instance? PChunkedScan node))
+                      (let [cols (:columns node)
+                            pruned (select-keys cols all-refs)]
+                        (if (< (count pruned) (count cols))
+                          (assoc node :columns pruned)
+                          node))
+                      node)))))
 
 ;; ============================================================================
 ;; Composite: full optimization pipeline
