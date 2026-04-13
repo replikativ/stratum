@@ -188,11 +188,22 @@
 ;; ============================================================================
 
 (defn- run-pyod-comparison [dataset-path dataset-name]
-  "Run PyOD IsolationForest on the same dataset and compare AUC."
+  "Run Stratum and PyOD IsolationForest on the same dataset, print side by side."
   (if-not (.exists (io/file dataset-path))
-    (println (format "    PyOD %-12s SKIPPED (no data: %s — run bin/download-odds)" dataset-name dataset-path))
-    (do
-    (let [py-script (str "
+    (println (format "  %-15s SKIPPED (no data: %s — run bin/download-odds)" dataset-name dataset-path))
+    (let [{:keys [features labels n d]} (load-odds-csv dataset-path)
+          fmap (features->map features)
+          ^longs labels labels
+          ;; Stratum
+          t0 (System/nanoTime)
+          model (iforest/train {:from fmap :n-trees 100 :sample-size 256 :seed 42})
+          stratum-train-ms (/ (- (System/nanoTime) t0) 1e6)
+          t1 (System/nanoTime)
+          stratum-scores (iforest/score model fmap)
+          stratum-score-ms (/ (- (System/nanoTime) t1) 1e6)
+          stratum-auc (auc-roc stratum-scores labels n)
+          ;; PyOD
+          py-script (str "
 import sys, time
 import numpy as np
 from sklearn.metrics import roc_auc_score
@@ -208,7 +219,7 @@ clf = IForest(n_estimators=100, max_samples=256, random_state=42)
 clf.fit(X)
 train_time = (time.time() - t0) * 1000
 t0 = time.time()
-scores = clf.decision_scores_
+scores = clf.decision_function(X)
 score_time = (time.time() - t0) * 1000
 auc = roc_auc_score(y, scores)
 print(f'{auc:.4f},{train_time:.1f},{score_time:.1f}')
@@ -218,24 +229,26 @@ print(f'{auc:.4f},{train_time:.1f},{score_time:.1f}')
                                (into-array String ["python3" "-c" py-script]))
           _ (.redirectErrorStream pb true)
           proc (.start pb)
-          output (slurp (.getInputStream proc))
+          output (str/trim (slurp (.getInputStream proc)))
           _ (.waitFor proc)]
-      (let [output (str/trim output)]
-        (cond
-          (str/includes? output "PYOD_NOT_INSTALLED")
-          (println (format "    PyOD %-12s SKIPPED (pip install pyod)" dataset-name))
+      (println (format "  %-15s n=%,7d d=%2d" dataset-name n d))
+      (println (format "    Stratum      AUC=%.4f  train=%s  score=%s"
+                       stratum-auc (fmt-ms stratum-train-ms) (fmt-ms stratum-score-ms)))
+      (cond
+        (str/includes? output "PYOD_NOT_INSTALLED")
+        (println "    PyOD         SKIPPED (pip install pyod)")
 
-          (str/includes? output ",")
-          (let [[auc train score] (str/split output #",")]
-            (println (format "    PyOD %-12s AUC=%.4f train=%sms score=%sms"
-                             dataset-name (Double/parseDouble auc) train score)))
+        (str/includes? output ",")
+        (let [[auc train score] (str/split output #",")]
+          (println (format "    PyOD         AUC=%.4f  train=%7sms  score=%7sms"
+                           (Double/parseDouble auc) (str/trim train) (str/trim score))))
 
-          :else
-          (println (format "    PyOD %-12s ERROR: %s" dataset-name output))))))))
+        :else
+        (println (format "    PyOD         ERROR: %s" output))))))
 
 (defn- bench-pyod []
-  (println "\n=== PyOD Comparison ===")
-  (println "  (pip install pyod scikit-learn to enable)")
+  (println "\n=== Stratum vs PyOD Comparison ===")
+  (println "  (100 trees, 256 sample size, same seed)")
   (ensure-odds-data)
   (run-pyod-comparison "data/odds/shuttle.csv"     "Shuttle")
   (run-pyod-comparison "data/odds/http.csv"        "Http")

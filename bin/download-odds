@@ -82,9 +82,30 @@ if [ ! -f "$DATADIR/pima.csv" ]; then
   rm -f "$DATADIR/pima.mat"
 fi
 
+# Credit Card Fraud dataset (284807 rows, 30 features, 0.17% anomalies)
+# Source: OpenML mirror of Kaggle mlg-ulb/creditcardfraud
+if [ ! -f "$DATADIR/creditcard.csv" ]; then
+  echo -n "  creditcard: "
+  curl -sL "https://www.openml.org/data/v1/get_csv/1673544" -o "$DATADIR/creditcard_raw.csv"
+  python3 -c "
+import numpy as np, csv
+with open('$DATADIR/creditcard_raw.csv') as f:
+    reader = csv.reader(f)
+    header = next(reader)
+    rows = list(reader)
+n = len(rows)
+d = len(header) - 1  # last col is Class
+data = np.empty((n, d + 1))
+for i, row in enumerate(rows):
+    for j in range(d):
+        data[i, j] = float(row[j])
+    data[i, d] = float(row[d].strip(\"'\"))
+np.savetxt('$DATADIR/creditcard.csv', data, delimiter=',', fmt='%.6f')
+n_anom = int(data[:, -1].sum())
+print(f'  {n} rows, {d} features, {n_anom} anomalies ({100*n_anom/n:.2f}%)')
+"
+  rm -f "$DATADIR/creditcard_raw.csv"
+fi
+
 echo ""
 echo "Done. ODDS datasets saved to $DATADIR/"
-echo ""
-echo "Optional: For Credit Card fraud dataset (Kaggle, 284K rows, 28 features):"
-echo "  1. Download from https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud"
-echo "  2. Place creditcard.csv in $DATADIR/"
