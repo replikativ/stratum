@@ -943,7 +943,14 @@
   (testing "ANOMALY_CONFIDENCE parses correctly"
     (let [reg (make-test-registry)
           {:keys [query]} (sql/parse-sql "SELECT ANOMALY_CONFIDENCE('mymodel', price, quantity) FROM orders" reg)]
-      (is (some #(and (sequential? %) (= :anomaly-confidence (first %))) (:select query))))))
+      (is (some #(and (sequential? %) (= :anomaly-confidence (first %))) (:select query)))))
+
+  (testing "Short form ANOMALY_SCORE('model') parses to 1-arg vector"
+    (let [reg (make-test-registry)
+          {:keys [query]} (sql/parse-sql "SELECT ANOMALY_SCORE('mymodel') FROM orders" reg)]
+      (is (some #(and (sequential? %) (= :anomaly-score (first %)) (= "mymodel" (second %)) (= 2 (count %)))
+                (:select query))
+          "Short form should produce [:anomaly-score \"mymodel\"] with no extra args"))))
 
 (deftest sql-anomaly-resolution-test
   (testing "ANOMALY_SCORE in WHERE clause filters correctly"
@@ -959,34 +966,37 @@
         (aset fare (- n 1 i) 500.0)
         (aset tip (- n 1 i) 0.0))
       (let [data {:fare_amount fare :tip_amount tip}
-            model (require '[stratum.iforest :as iforest])
             model ((requiring-resolve 'stratum.iforest/train)
                    {:from data :n-trees 50 :sample-size 64 :seed 42 :contamination 0.05})
-            registry {"test" data "__models__" {"test_model" model}}
-            resolve-fn @(resolve 'stratum.server/resolve-anomaly-expressions)]
-        ;; WHERE filter
-        (let [{:keys [query]} (sql/parse-sql
+            models {"test_model" model}
+            attach-fn @(resolve 'stratum.server/attach-anomaly-models)]
+        ;; WHERE filter — anomaly resolution now happens inside q/q via :_anomaly-models
+        (let [registry {"test" data "__models__" models}
+              {:keys [query]} (sql/parse-sql
                                "SELECT fare_amount, ANOMALY_SCORE('test_model', fare_amount, tip_amount) AS score FROM test WHERE ANOMALY_SCORE('test_model', fare_amount, tip_amount) > 0.6"
                                registry)
-              resolved (resolve-fn query registry)
-              result (q/q resolved)]
+              query (attach-fn query registry)
+              result (q/q query)]
           (is (= 5 (count result)) "Should find exactly 5 anomalies")
           (is (every? #(= 500.0 (:fare_amount %)) result) "All should be the injected anomalies"))
         ;; ORDER BY with alias
-        (let [{:keys [query]} (sql/parse-sql
+        (let [registry {"test" data "__models__" models}
+              {:keys [query]} (sql/parse-sql
                                "SELECT fare_amount, ANOMALY_SCORE('test_model', fare_amount, tip_amount) AS score FROM test ORDER BY ANOMALY_SCORE('test_model', fare_amount, tip_amount) DESC LIMIT 5"
                                registry)
-              resolved (resolve-fn query registry)
-              result (q/q resolved)]
+              query (attach-fn query registry)
+              result (q/q query)]
           (is (= 5 (count result)))
           (is (every? #(= 500.0 (:fare_amount %)) result) "Top 5 by score should all be anomalies"))
-        ;; Deduplication: same expression in SELECT + WHERE computed once
-        (let [{:keys [query]} (sql/parse-sql
-                               "SELECT ANOMALY_SCORE('test_model', fare_amount, tip_amount) AS score FROM test WHERE ANOMALY_SCORE('test_model', fare_amount, tip_amount) > 0.6"
+        ;; Short form: ANOMALY_SCORE('model') uses feature names from model
+        (let [registry {"test" data "__models__" models}
+              {:keys [query]} (sql/parse-sql
+                               "SELECT fare_amount, ANOMALY_SCORE('test_model') AS score FROM test ORDER BY score DESC LIMIT 5"
                                registry)
-              resolved (resolve-fn query registry)
-              injected (filterv #(clojure.string/starts-with? (name %) "__") (keys (:from resolved)))]
-          (is (= 1 (count injected)) "Same anomaly expr in SELECT + WHERE should inject only once"))))))
+              query (attach-fn query registry)
+              result (q/q query)]
+          (is (= 5 (count result)))
+          (is (every? #(= 500.0 (:fare_amount %)) result) "Short form: top 5 should all be anomalies"))))))
 
 ;; ============================================================================
 ;; Window Function Tests
@@ -1748,3 +1758,227 @@
           results (q/q query)]
       (is (= 5 (count results)))
       (is (every? #(> (:min %) 5.0) results)))))
+
+;; ============================================================================
+;; SQL Model Management Tests (CREATE/DROP/SHOW/DESCRIBE MODEL)
+;; ============================================================================
+
+(deftest parse-create-model-test
+  (testing "CREATE MODEL with OPTIONS"
+    (let [reg (make-test-registry)
+          result (sql/parse-sql
+                  "CREATE MODEL my_model TYPE ISOLATION_FOREST OPTIONS (n_trees = 50, sample_size = 128) AS SELECT price, quantity FROM orders"
+                  reg)]
+      (is (contains? result :ddl))
+      (is (= :create-model (get-in result [:ddl :op])))
+      (is (= "my_model" (get-in result [:ddl :model-name])))
+      (is (= "ISOLATION_FOREST" (get-in result [:ddl :model-type])))
+      (is (= {:n-trees 50 :sample-size 128} (get-in result [:ddl :options])))
+      (is (string? (get-in result [:ddl :training-sql])))))
+
+  (testing "CREATE MODEL without OPTIONS"
+    (let [reg (make-test-registry)
+          result (sql/parse-sql
+                  "CREATE MODEL m2 TYPE ISOLATION_FOREST AS SELECT price FROM orders"
+                  reg)]
+      (is (= :create-model (get-in result [:ddl :op])))
+      (is (= "m2" (get-in result [:ddl :model-name])))
+      (is (= {} (get-in result [:ddl :options])))))
+
+  (testing "CREATE MODEL case insensitive"
+    (let [reg (make-test-registry)
+          result (sql/parse-sql
+                  "create model m3 type isolation_forest as select price from orders"
+                  reg)]
+      (is (= :create-model (get-in result [:ddl :op])))
+      (is (= "ISOLATION_FOREST" (get-in result [:ddl :model-type])))))
+
+  (testing "CREATE MODEL with contamination option"
+    (let [reg (make-test-registry)
+          result (sql/parse-sql
+                  "CREATE MODEL m4 TYPE ISOLATION_FOREST OPTIONS (contamination = 0.05) AS SELECT price, quantity FROM orders"
+                  reg)]
+      (is (= {:contamination 0.05} (get-in result [:ddl :options]))))))
+
+(deftest parse-drop-model-test
+  (testing "DROP MODEL"
+    (let [reg (make-test-registry)
+          result (sql/parse-sql "DROP MODEL my_model" reg)]
+      (is (= :drop-model (get-in result [:ddl :op])))
+      (is (= "my_model" (get-in result [:ddl :model-name])))
+      (is (not (get-in result [:ddl :if-exists?])))))
+
+  (testing "DROP MODEL IF EXISTS"
+    (let [reg (make-test-registry)
+          result (sql/parse-sql "DROP MODEL IF EXISTS my_model" reg)]
+      (is (= :drop-model (get-in result [:ddl :op])))
+      (is (= "my_model" (get-in result [:ddl :model-name])))
+      (is (true? (get-in result [:ddl :if-exists?]))))))
+
+(deftest parse-show-models-test
+  (testing "SHOW MODELS with no models"
+    (let [reg (make-test-registry)
+          result (sql/parse-sql "SHOW MODELS" reg)]
+      (is (:system result))
+      (is (= "SHOW MODELS" (:tag result)))
+      (is (= [] (get-in result [:result :rows])))))
+
+  (testing "SHOW MODELS with models registered"
+    (let [reg (assoc (make-test-registry)
+                     "__models__" {"m1" {:model-type "ISOLATION_FOREST"
+                                         :n-features 3 :n-trees 100 :sample-size 256}})]
+      (let [result (sql/parse-sql "SHOW MODELS" reg)]
+        (is (:system result))
+        (is (= 1 (count (get-in result [:result :rows]))))
+        (is (= "m1" (ffirst (get-in result [:result :rows]))))))))
+
+(deftest parse-describe-model-test
+  (testing "DESCRIBE MODEL"
+    (let [reg (assoc (make-test-registry)
+                     "__models__" {"m1" {:model-type "ISOLATION_FOREST"
+                                         :n-features 2 :n-trees 100 :sample-size 256
+                                         :feature-names [:price :quantity]
+                                         :contamination 0.05 :threshold 0.6}})
+          result (sql/parse-sql "DESCRIBE MODEL m1" reg)]
+      (is (:system result))
+      (is (= "DESCRIBE MODEL" (:tag result)))
+      (is (= "m1" (second (first (get-in result [:result :rows])))))
+      (is (= "price, quantity" (second (nth (get-in result [:result :rows]) 5))))))
+
+  (testing "DESCRIBE MODEL not found"
+    (let [reg (make-test-registry)
+          result (sql/parse-sql "DESCRIBE MODEL nonexistent" reg)]
+      (is (:error result)))))
+
+(deftest sql-create-model-end-to-end-test
+  (testing "Full CREATE MODEL → SHOW → DESCRIBE → ANOMALY_SCORE → DROP flow"
+    (let [srv (server/start {:port 0})
+          _ (server/register-table! srv "sensor_data"
+                                    {:temperature (double-array [20.0 21.0 19.5 22.0 20.5
+                                                                 100.0 21.5 19.0 20.8 21.2])
+                                     :humidity    (double-array [50.0 52.0 48.0 55.0 51.0
+                                                                 5.0 53.0 47.0 50.5 52.5])})
+          make-handler @(resolve 'stratum.server/make-query-handler)
+          handler (make-handler (:registry srv) (atom nil))]
+      (try
+        ;; CREATE MODEL via handler
+        (let [^PgWireServer$QueryResult qr
+              (.execute handler
+                        "CREATE MODEL anomaly_detector TYPE ISOLATION_FOREST OPTIONS (n_trees = 50, sample_size = 8, seed = 42, contamination = 0.1) AS SELECT temperature, humidity FROM sensor_data")]
+          (is (= "CREATE MODEL" (.commandTag qr))))
+
+        ;; Verify model in registry
+        (let [model (get-in @(:registry srv) ["__models__" "anomaly_detector"])]
+          (is (some? model))
+          (is (= 2 (:n-features model)))
+          (is (= 50 (:n-trees model)))
+          (is (= [:temperature :humidity] (:feature-names model)))
+          (is (some? (:threshold model)))
+          (is (= "ISOLATION_FOREST" (:model-type model))))
+
+        ;; SHOW MODELS
+        (let [result (sql/parse-sql "SHOW MODELS" @(:registry srv))]
+          (is (:system result))
+          (is (= 1 (count (get-in result [:result :rows]))))
+          (is (= "anomaly_detector" (ffirst (get-in result [:result :rows])))))
+
+        ;; DESCRIBE MODEL
+        (let [result (sql/parse-sql "DESCRIBE MODEL anomaly_detector" @(:registry srv))]
+          (is (:system result))
+          (is (= "anomaly_detector" (second (first (get-in result [:result :rows])))))
+          (is (= "temperature, humidity" (second (nth (get-in result [:result :rows]) 5)))))
+
+        ;; ANOMALY_SCORE query using the SQL-created model (via handler, end-to-end)
+        (let [^PgWireServer$QueryResult qr
+              (.execute handler
+                        "SELECT temperature, ANOMALY_SCORE('anomaly_detector', temperature, humidity) AS score FROM sensor_data ORDER BY score DESC")]
+          (is (nil? (.error qr)) (str "Query should succeed: " (.error qr)))
+          (is (= 10 (alength (.rows qr))))
+          ;; The anomaly (100.0, 5.0) should have the highest score
+          (is (= "100.0" (aget ^"[Ljava.lang.String;" (aget (.rows qr) 0) 0))))
+
+        ;; DROP MODEL
+        (let [^PgWireServer$QueryResult qr (.execute handler "DROP MODEL anomaly_detector")]
+          (is (= "DROP MODEL" (.commandTag qr))))
+
+        ;; Verify model removed
+        (is (nil? (get-in @(:registry srv) ["__models__" "anomaly_detector"])))
+
+        ;; DROP MODEL IF EXISTS on nonexistent model should not throw
+        (let [^PgWireServer$QueryResult qr (.execute handler "DROP MODEL IF EXISTS nonexistent")]
+          (is (= "DROP MODEL" (.commandTag qr))))
+
+        ;; DROP MODEL on nonexistent should return error
+        (let [^PgWireServer$QueryResult qr (.execute handler "DROP MODEL nonexistent")]
+          (is (some? (.error qr)))
+          (is (re-find #"Model not found" (.error qr))))
+
+        (finally
+          (server/stop srv))))))
+
+(deftest sql-anomaly-expression-form-test
+  (testing "Long form with expression args evaluates expressions before scoring"
+    (let [n 100
+          amounts (double-array n)
+          freqs (double-array n)
+          rng (java.util.Random. 42)]
+      (dotimes [i n]
+        (aset amounts i (+ 5.0 (* (.nextDouble rng) 45.0)))
+        (aset freqs i (+ 1.0 (* (.nextDouble rng) 9.0))))
+      ;; Inject anomalies
+      (dotimes [i 5]
+        (aset amounts (- n 1 i) 500.0)
+        (aset freqs (- n 1 i) 0.1))
+      (let [data {:amount amounts :freq freqs}
+            model ((requiring-resolve 'stratum.iforest/train)
+                   {:from data :n-trees 50 :sample-size 64 :seed 42 :contamination 0.05})
+            models {"test_model" model}]
+        ;; Expression form: ANOMALY_SCORE('model', amount * 1.0, freq)
+        ;; The * 1.0 is a no-op expression but exercises the expression eval path
+        (let [result (q/q {:from data
+                           :_anomaly-models models
+                           :select [[:as [:anomaly-score "test_model" [:* :amount 1.0] :freq] :score] :amount]
+                           :order [[:score :desc]]
+                           :limit 5})]
+          (is (= 5 (count result)))
+          (is (every? #(= 500.0 (:amount %)) result)
+              "Expression form: top 5 should be injected anomalies")))))
+
+  (testing "Arity mismatch throws clear error"
+    (let [data {:a (double-array [1 2 3]) :b (double-array [4 5 6])}
+          model ((requiring-resolve 'stratum.iforest/train)
+                 {:from data :n-trees 10 :sample-size 2 :seed 42})
+          models {"m" model}]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"arity mismatch"
+                            (q/q {:from data
+                                  :_anomaly-models models
+                                  :select [[:as [:anomaly-score "m" :a] :score]]}))
+          "Passing 1 arg to 2-feature model should throw arity mismatch"))))
+
+(deftest sql-anomaly-join-scoring-test
+  (testing "ANOMALY_SCORE works across join results"
+    (let [;; Fact table: transactions with sensor_id
+          tx-data {:sensor_id (long-array [1 1 2 2 3 3])
+                   :reading   (double-array [10.0 12.0 11.0 200.0 9.0 300.0])}
+          ;; Dimension table: sensor metadata with calibration offset
+          sensor-data {:id     (long-array [1 2 3])
+                       :offset (double-array [0.5 0.5 0.5])}
+          ;; Train on reading + offset features
+          model ((requiring-resolve 'stratum.iforest/train)
+                 {:from {:reading (double-array [10.0 12.0 11.0 200.0 9.0 300.0])
+                         :offset  (double-array [0.5 0.5 0.5 0.5 0.5 0.5])}
+                  :n-trees 50 :sample-size 4 :seed 42 :contamination 0.1})
+          models {"sensor_model" model}
+          ;; Query: join + anomaly score using post-join columns
+          result (q/q {:from tx-data
+                       :join [{:with sensor-data
+                               :on [:= :sensor_id :id]
+                               :type :inner}]
+                       :_anomaly-models models
+                       :select [[:as [:anomaly-score "sensor_model" :reading :offset] :score]
+                                :reading :sensor_id]
+                       :order [[:score :desc]]})]
+      (is (= 6 (count result)) "Should have all 6 joined rows")
+      ;; The 200.0 and 300.0 readings should have highest scores
+      (is (contains? #{200.0 300.0} (:reading (first result)))
+          "Highest anomaly score should be for extreme readings"))))

@@ -202,7 +202,8 @@ Translates to:
 | FILTER clause | `SUM(x) FILTER (WHERE status = 1)` |
 | Statistical aggregates | `MEDIAN, PERCENTILE_CONT, APPROX_QUANTILE` |
 | COUNT(DISTINCT col) | `SELECT COUNT(DISTINCT region)` |
-| Anomaly detection | `ANOMALY_SCORE, ANOMALY_PREDICT, ANOMALY_PROBA, ANOMALY_CONFIDENCE` |
+| Anomaly detection | `ANOMALY_SCORE('model')` (short) or `ANOMALY_SCORE('model', col1, expr)` (long) |
+| Model management | `CREATE MODEL, DROP MODEL, SHOW MODELS, DESCRIBE MODEL` |
 | GROUP BY | `GROUP BY col1, col2` |
 | HAVING | `HAVING COUNT(*) > 10` |
 | ORDER BY | `ORDER BY col ASC, col2 DESC`, `ORDER BY a * b DESC` |
@@ -246,33 +247,52 @@ FROM orders GROUP BY region;
 
 ### Anomaly Detection
 
-Isolation forest scoring is available as SQL functions. Models must be registered via the Clojure API:
-
-```clojure
-;; Register model with server
-(def model (st/train-iforest {:from data :contamination 0.05}))
-(st/register-model! srv "fraud_model" model)
-```
-
-Then query via SQL:
+Train and manage isolation forest models entirely from SQL:
 
 ```sql
--- Raw anomaly score [0, 1]
+-- Train a model on your data
+CREATE MODEL fraud_model
+  TYPE ISOLATION_FOREST
+  OPTIONS (n_trees = 200, sample_size = 256, contamination = 0.05)
+  AS SELECT amount, freq FROM transactions;
+
+-- Manage models
+SHOW MODELS;
+DESCRIBE MODEL fraud_model;
+DROP MODEL fraud_model;
+DROP MODEL IF EXISTS fraud_model;
+```
+
+Query with trained models (short form — model remembers its features):
+
+```sql
+-- Short form: uses model's feature names automatically
+SELECT *, ANOMALY_SCORE('fraud_model') AS score
+FROM transactions WHERE ANOMALY_SCORE('fraud_model') > 0.7;
+
+-- All functions support short form
+SELECT *, ANOMALY_PREDICT('fraud_model') AS is_anomaly FROM transactions;
+SELECT *, ANOMALY_PROBA('fraud_model') AS prob FROM transactions;
+SELECT *, ANOMALY_CONFIDENCE('fraud_model') AS conf FROM transactions;
+```
+
+Long form — explicit columns or expressions (mapped positionally to features):
+
+```sql
+-- Explicit columns
 SELECT *, ANOMALY_SCORE('fraud_model', amount, freq) AS score
 FROM transactions WHERE ANOMALY_SCORE('fraud_model', amount, freq) > 0.7;
 
--- Binary prediction (1 = anomaly, 0 = normal)
-SELECT *, ANOMALY_PREDICT('fraud_model', amount, freq) AS is_anomaly
+-- With expressions
+SELECT *, ANOMALY_SCORE('fraud_model', amount * 100, LOG(freq)) AS score
 FROM transactions;
 
--- Calibrated probability [0, 1]
-SELECT *, ANOMALY_PROBA('fraud_model', amount, freq) AS prob
-FROM transactions;
-
--- Prediction confidence (tree agreement) [0, 1]
-SELECT *, ANOMALY_CONFIDENCE('fraud_model', amount, freq) AS conf
-FROM transactions;
+-- Works across JOINs
+SELECT t.*, ANOMALY_SCORE('fraud_model', t.amount, r.rate) AS score
+FROM transactions t JOIN rates r ON t.currency = r.code;
 ```
+
+See [Anomaly Detection](anomaly-detection.md) for full details on model options and the Clojure API.
 
 ### Window Functions
 

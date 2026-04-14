@@ -146,35 +146,104 @@ Anomaly scores can be used as regular columns in queries:
 
 ## SQL Interface
 
-Register a model with the pgwire server, then use SQL functions:
+Models can be created, managed, and queried entirely from SQL — no Clojure needed.
 
-```clojure
-;; Server setup
-(def srv (st/start-server {:port 5432}))
-(st/register-table! srv "transactions" tx-data)
-(st/register-model! srv "fraud_model" model)
-```
+### Creating Models
 
 ```sql
--- Raw anomaly score [0, 1]
+-- Train an isolation forest on the training query results
+CREATE MODEL fraud_model
+  TYPE ISOLATION_FOREST
+  OPTIONS (n_trees = 200, sample_size = 256, contamination = 0.05)
+  AS SELECT amount, freq FROM transactions;
+```
+
+The `AS SELECT ...` query defines the training data. Any valid SELECT is supported (including WHERE filters, JOINs, expressions). Column names from the SELECT become the model's feature names.
+
+**OPTIONS** (all optional):
+| Option | Default | Description |
+|--------|---------|-------------|
+| `n_trees` | 100 | Number of isolation trees |
+| `sample_size` | 256 | Rows subsampled per tree |
+| `seed` | 42 | Random seed for reproducibility |
+| `contamination` | not set | Expected anomaly fraction (0, 0.5]. Sets threshold automatically |
+
+### Managing Models
+
+```sql
+-- List all registered models
+SHOW MODELS;
+
+-- Show model details (features, hyperparameters, threshold)
+DESCRIBE MODEL fraud_model;
+
+-- Remove a model
+DROP MODEL fraud_model;
+
+-- Remove only if it exists (no error if missing)
+DROP MODEL IF EXISTS fraud_model;
+```
+
+### Querying with Models
+
+Two calling conventions are supported:
+
+**Short form** — uses the model's feature names automatically:
+
+```sql
+-- Simplest: model remembers its features from training
+SELECT *, ANOMALY_SCORE('fraud_model') AS score
+FROM transactions
+WHERE ANOMALY_SCORE('fraud_model') > 0.7;
+```
+
+**Long form** — explicit column/expression arguments (mapped positionally to features):
+
+```sql
+-- Explicit columns (useful for remapping or expressions)
 SELECT *, ANOMALY_SCORE('fraud_model', amount, freq) AS score
 FROM transactions
 WHERE ANOMALY_SCORE('fraud_model', amount, freq) > 0.7;
 
+-- With expressions: score on transformed data
+SELECT *, ANOMALY_SCORE('fraud_model', amount * 100, LOG(freq)) AS score
+FROM transactions;
+
+-- Works across JOINs
+SELECT t.*, ANOMALY_SCORE('fraud_model', t.amount, r.rate) AS score
+FROM transactions t JOIN rates r ON t.currency = r.code;
+```
+
+All anomaly functions support both forms:
+
+```sql
 -- Binary prediction (1 = anomaly, 0 = normal)
-SELECT *, ANOMALY_PREDICT('fraud_model', amount, freq) AS is_anomaly
+SELECT *, ANOMALY_PREDICT('fraud_model') AS is_anomaly
 FROM transactions;
 
 -- Calibrated probability [0, 1]
-SELECT *, ANOMALY_PROBA('fraud_model', amount, freq) AS prob
+SELECT *, ANOMALY_PROBA('fraud_model') AS prob
 FROM transactions;
 
 -- Prediction confidence (tree agreement) [0, 1]
-SELECT *, ANOMALY_CONFIDENCE('fraud_model', amount, freq) AS conf
+SELECT *, ANOMALY_CONFIDENCE('fraud_model') AS conf
 FROM transactions;
 ```
 
-The column arguments must match the feature names used during training (in order).
+In the long form, column arguments must match the feature count from training (in order).
+
+### Alternative: Clojure API Registration
+
+Models can also be trained via the Clojure API and registered with the server:
+
+```clojure
+(def srv (st/start-server {:port 5432}))
+(st/register-table! srv "transactions" tx-data)
+(def model (st/train-iforest {:from tx-data :contamination 0.05}))
+(st/register-model! srv "fraud_model" model)
+```
+
+This is useful for programmatic workflows, custom training pipelines, or model rotation.
 
 ## Implementation Details
 
