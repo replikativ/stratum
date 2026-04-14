@@ -48,7 +48,8 @@
             [stratum.chunk :as chunk]
             [stratum.specification :as spec]
             [stratum.column :as column]
-            [stratum.dataset :as dataset])
+            [stratum.dataset :as dataset]
+            [stratum.iforest :as iforest])
   (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsChunked ColumnOpsChunkedSimd ColumnOpsChunkedLong ColumnOpsAnalytics]
            [stratum.index ChunkEntry]))
 
@@ -139,6 +140,143 @@
           (throw (ex-info (str "Unknown column " (second s) " in :select. Available: " (sort col-names))
                           {:column (second s) :available col-names})))))))
 
+;; ============================================================================
+;; Anomaly detection resolution (post-join)
+;; ============================================================================
+
+(def ^:private anomaly-ops
+  #{:anomaly-score :anomaly-predict :anomaly-proba :anomaly-confidence})
+
+(def ^:private anomaly-op->fn
+  {:anomaly-score      iforest/score
+   :anomaly-predict    iforest/predict
+   :anomaly-proba      iforest/predict-proba
+   :anomaly-confidence iforest/predict-confidence})
+
+(defn- anomaly-expr?
+  [form]
+  (and (vector? form) (seq form) (contains? anomaly-ops (first form))))
+
+(defn- collect-anomaly-exprs
+  "Walk a nested structure and collect all unique anomaly expressions."
+  [form]
+  (cond
+    (anomaly-expr? form) #{form}
+    (sequential? form) (reduce into #{} (map collect-anomaly-exprs form))
+    :else #{}))
+
+(defn- rewrite-anomaly-exprs
+  "Replace anomaly expressions with their synthetic column keywords."
+  [form expr->col]
+  (cond
+    (contains? expr->col form) (get expr->col form)
+    (vector? form) (mapv #(rewrite-anomaly-exprs % expr->col) form)
+    :else form))
+
+(defn- select-alias-map
+  "Build a map from anomaly expression → alias keyword for aliased SELECT items."
+  [select-items]
+  (into {}
+        (keep (fn [item]
+                (when (and (sequential? item) (= :as (first item))
+                           (sequential? (second item))
+                           (contains? anomaly-ops (first (second item))))
+                  [(second item) (nth item 2)])))
+        select-items))
+
+(defn- resolve-anomaly-columns
+  "Resolve anomaly expressions post-join. Materializes columns, evaluates expression
+   arguments, scores with iforest, and injects results as synthetic columns.
+   Rewrites query clauses to reference the synthetic column keywords.
+
+   Short form:  [:anomaly-score \"model\"]       — uses model's feature-names from columns
+   Long form:   [:anomaly-score \"model\" e1 e2]  — evaluates expressions, maps to features"
+  [query columns length models]
+  (let [all-exprs (reduce into #{}
+                          (map #(collect-anomaly-exprs (get query %))
+                               [:select :where :having :order]))]
+    (if (empty? all-exprs)
+      [query columns]
+      (let [aliases (select-alias-map (:select query))
+            ;; Materialize columns once (needed for both short and long form)
+            mat-cols (x/materialize-columns columns)
+            col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)
+            cache (java.util.HashMap.)
+            {:keys [q expr->col new-columns]}
+            (reduce
+             (fn [{:keys [q expr->col new-columns]} anom-expr]
+               (let [op (first anom-expr)
+                     model-name (second anom-expr)
+                     model-name (if (string? model-name) model-name (name model-name))
+                     model (get models model-name)]
+                 (when-not model
+                   (throw (ex-info (str "Unknown model: " model-name)
+                                   {:model model-name
+                                    :available (keys models)})))
+                 (let [feature-names (:feature-names model)
+                       explicit-args (vec (drop 2 anom-expr))
+                       short-form? (empty? explicit-args)
+                       ;; Build the data map for iforest scoring
+                       data (if short-form?
+                              ;; Short form: pick columns by model's feature names
+                              (into {}
+                                    (map (fn [k]
+                                           (let [v (get col-arrays k)]
+                                             (when-not v
+                                               (throw (ex-info (str "Model feature " k " not found in columns. "
+                                                                    "Use long form ANOMALY_SCORE('model', expr, ...) "
+                                                                    "or ensure column is available.")
+                                                               {:feature k
+                                                                :available (vec (keys col-arrays))})))
+                                             [k v])))
+                                    feature-names)
+                              ;; Long form: evaluate each arg as expression, map to features
+                              (do
+                                (when (not= (count explicit-args) (count feature-names))
+                                  (throw (ex-info (str "ANOMALY_SCORE arity mismatch: model '"
+                                                       model-name "' has " (count feature-names)
+                                                       " features but " (count explicit-args)
+                                                       " arguments were provided")
+                                                  {:model model-name
+                                                   :expected (count feature-names)
+                                                   :actual (count explicit-args)
+                                                   :features feature-names})))
+                                (into {}
+                                      (map-indexed
+                                       (fn [i arg]
+                                         (let [feat-name (nth feature-names i)
+                                               ;; Normalize vector expressions to map form
+                                               ;; e.g. [:* :amount 2.0] → {:op :mul :args [:amount 2.0]}
+                                               norm-arg (if (and (vector? arg) (not (keyword? arg)))
+                                                          (norm/normalize-expr arg)
+                                                          arg)
+                                               arr (if (keyword? norm-arg)
+                                                     (get col-arrays norm-arg)
+                                                     (expr/eval-expr-vectorized norm-arg col-arrays length cache))]
+                                           [feat-name arr])))
+                                      explicit-args)))
+                       compute-fn (get anomaly-op->fn op)
+                       result-arr (compute-fn model data)
+                       col-name (keyword (str "__" (name op) "_" model-name))]
+                   {:q q
+                    :expr->col (assoc expr->col anom-expr col-name)
+                    :new-columns (assoc new-columns col-name {:type :float64 :data result-arr})})))
+             {:q query :expr->col {} :new-columns columns}
+             all-exprs)
+            expr->alias (into {}
+                              (keep (fn [[expr _]]
+                                      (when-let [a (get aliases expr)]
+                                        [expr a])))
+                              expr->col)
+            expr->col-other (merge expr->col expr->alias)
+            rewritten (-> q
+                          (assoc :select (rewrite-anomaly-exprs (:select q) expr->col))
+                          (cond->
+                           (:where q) (assoc :where (rewrite-anomaly-exprs (:where q) expr->col))
+                           (:having q) (assoc :having (rewrite-anomaly-exprs (:having q) expr->col))
+                           (:order q) (assoc :order (rewrite-anomaly-exprs (:order q) expr->col-other))))]
+        [rewritten new-columns]))))
+
 (defn q
   "Query columnar data using Stratum's analytical engine.
 
@@ -223,7 +361,7 @@
        :agg [[:sum :revenue]]
        :group [:region]
        :result :columns})"
-  [{:keys [from join where select agg group having order limit offset result distinct window _union _set-op _having-only-keys _order-only-keys]
+  [{:keys [from join where select agg group having order limit offset result distinct window _union _set-op _having-only-keys _order-only-keys _anomaly-models]
     :as query}]
   ;; Handle set operations (UNION/INTERSECT/EXCEPT)
   (if-let [set-op (or _set-op (when _union {:op :union :queries (:queries _union) :all? (:all? _union)}))]
@@ -343,7 +481,21 @@
                     (let [initial-length (x/get-column-length (val (first columns)))
                           result (jn/execute-joins columns initial-length join)]
                       [(:columns result) (long (:length result))])
-                    [columns nil])]
+                    [columns nil])
+                  ;; ANOMALY RESOLUTION: score post-join so all columns (including
+                  ;; join results and index-backed data) are available
+                  [query columns] (if (seq _anomaly-models)
+                                    (let [len (long (or length
+                                                        (x/get-column-length (val (first columns)))))]
+                                      (resolve-anomaly-columns query columns len _anomaly-models))
+                                    [query columns])
+                  ;; Re-destructure clauses that may have been rewritten by anomaly resolution.
+                  ;; ONLY when models were present — otherwise preserve local var modifications
+                  ;; (e.g. bitmap semi-join injects mask predicates into `where`)
+                  where  (if (seq _anomaly-models) (:where query) where)
+                  select (if (seq _anomaly-models) (:select query) select)
+                  having (if (seq _anomaly-models) (:having query) having)
+                  order  (if (seq _anomaly-models) (:order query) order)]
   ;; Bind expr/*columns-meta* and gb/*dense-group-limit*
               (binding [expr/*columns-meta* (into {} (keep (fn [[k v]] (when (:dict v) [k v]))) columns)
                         gb/*dense-group-limit* *dense-group-limit*]

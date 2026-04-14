@@ -304,26 +304,27 @@
       "EPOCH_DAYS" [:epoch-days (first params)]
       "EPOCH_SECONDS" [:epoch-seconds (first params)]
 
-      ;; Anomaly detection
+      ;; Anomaly detection — 1-arg short form uses model's feature names,
+      ;; N-arg long form maps positional args to features
       "ANOMALY_SCORE"
-      (if (>= n-params 2)
+      (if (>= n-params 1)
         (into [:anomaly-score (first params)] (rest params))
-        (throw (ex-info "ANOMALY_SCORE requires (model_name, col1, ...)" {:params params})))
+        (throw (ex-info "ANOMALY_SCORE requires at least (model_name)" {:params params})))
 
       "ANOMALY_PREDICT"
-      (if (>= n-params 2)
+      (if (>= n-params 1)
         (into [:anomaly-predict (first params)] (rest params))
-        (throw (ex-info "ANOMALY_PREDICT requires (model_name, col1, ...)" {:params params})))
+        (throw (ex-info "ANOMALY_PREDICT requires at least (model_name)" {:params params})))
 
       "ANOMALY_PROBA"
-      (if (>= n-params 2)
+      (if (>= n-params 1)
         (into [:anomaly-proba (first params)] (rest params))
-        (throw (ex-info "ANOMALY_PROBA requires (model_name, col1, ...)" {:params params})))
+        (throw (ex-info "ANOMALY_PROBA requires at least (model_name)" {:params params})))
 
       "ANOMALY_CONFIDENCE"
-      (if (>= n-params 2)
+      (if (>= n-params 1)
         (into [:anomaly-confidence (first params)] (rest params))
-        (throw (ex-info "ANOMALY_CONFIDENCE requires (model_name, col1, ...)" {:params params})))
+        (throw (ex-info "ANOMALY_CONFIDENCE requires at least (model_name)" {:params params})))
 
       ;; Default: unknown function
       (throw (ex-info (str "Unsupported SQL function: " name)

@@ -177,7 +177,7 @@ Every Stratum dataset is a copy-on-write value. Fork one in O(1) to create an is
 
 **Ad-hoc file queries**: `read_csv()`, `read_parquet()`
 
-**Analytics**: CREATE MODEL, ANOMALY_SCORE, ANOMALY_PREDICT (isolation forest via SQL)
+**Analytics**: CREATE MODEL, ANOMALY_SCORE('model') / ANOMALY_SCORE('model', expr, ...), ANOMALY_PREDICT, ANOMALY_PROBA, ANOMALY_CONFIDENCE (isolation forest via SQL)
 
 **Other**: EXPLAIN, SELECT DISTINCT, LIMIT/OFFSET, IS NULL/IS NOT NULL
 

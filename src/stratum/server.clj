@@ -93,112 +93,20 @@
      (into-array (Class/forName "[Ljava.lang.String;") rows)
      (str "EXPLAIN"))))
 
-(def ^:private anomaly-ops
-  "Set of anomaly detection operations resolved from SQL."
-  #{:anomaly-score :anomaly-predict :anomaly-proba :anomaly-confidence})
-
-(def ^:private anomaly-op->fn
-  "Map anomaly operation to iforest function."
-  {:anomaly-score      iforest/score
-   :anomaly-predict    iforest/predict
-   :anomaly-proba      iforest/predict-proba
-   :anomaly-confidence iforest/predict-confidence})
-
 (def ^:private model-type-map
   "Extensible registry of model types for CREATE MODEL.
    Each entry maps an uppercase type name to {:train-fn, :default-opts}."
   {"ISOLATION_FOREST" {:train-fn    iforest/train
                        :default-opts {:n-trees 100 :sample-size 256 :seed 42}}})
 
-(defn- anomaly-expr?
-  "True if form is an anomaly function call like [:anomaly-score \"model\" :col1 ...]."
-  [form]
-  (and (vector? form) (seq form) (contains? anomaly-ops (first form))))
-
-(defn- collect-anomaly-exprs
-  "Walk a nested structure and collect all unique anomaly expressions as a set."
-  [form]
-  (cond
-    (anomaly-expr? form) #{form}
-    (sequential? form) (reduce into #{} (map collect-anomaly-exprs form))
-    :else #{}))
-
-(defn- rewrite-anomaly-exprs
-  "Replace anomaly expressions in a nested form with their synthetic column keywords."
-  [form expr->col]
-  (cond
-    (contains? expr->col form) (get expr->col form)
-    (vector? form) (mapv #(rewrite-anomaly-exprs % expr->col) form)
-    :else form))
-
-(defn- select-alias-map
-  "Build a map from anomaly expression → alias keyword for aliased SELECT items.
-   E.g. [:as [:anomaly-score \"m\" :c1] :score] → {[:anomaly-score \"m\" :c1] :score}"
-  [select-items]
-  (into {}
-        (keep (fn [item]
-                (when (and (sequential? item) (= :as (first item))
-                           (sequential? (second item))
-                           (contains? anomaly-ops (first (second item))))
-                  [(second item) (nth item 2)])))
-        select-items))
-
-(defn- resolve-anomaly-expressions
-  "Resolve anomaly detection expressions throughout the query.
-   Finds ANOMALY_SCORE/PREDICT/PROBA/CONFIDENCE calls in SELECT, WHERE, HAVING,
-   and ORDER BY. Computes each unique call once, injects as a column in :from,
-   and rewrites all references to point to the synthetic column.
-   When an anomaly expression has a SELECT alias, WHERE/ORDER BY/HAVING
-   use the alias (the query engine sorts by result-row key names)."
+(defn- attach-anomaly-models
+  "Look up anomaly models referenced in the query and attach them as :_anomaly-models.
+   Does NOT compute scores — that happens post-join inside query.clj."
   [query registry]
-  (let [all-exprs (reduce into #{}
-                          (map #(collect-anomaly-exprs (get query %))
-                               [:select :where :having :order]))]
-    (if (empty? all-exprs)
-      query
-      (let [aliases (select-alias-map (:select query))
-            {:keys [q expr->col]}
-            (reduce
-             (fn [{:keys [q expr->col]} expr]
-               (let [op (first expr)
-                     model-name (second expr)
-                     model-name (if (string? model-name) model-name (name model-name))
-                     model (get-in registry ["__models__" model-name])]
-                 (if model
-                   (let [feature-names (:feature-names model)
-                         from (:from q)
-                         ;; Unwrap encoded columns {:type T :data arr} → raw arr
-                         data (into {}
-                                    (map (fn [k]
-                                           (let [v (get from k)]
-                                             [k (if (and (map? v) (:data v)) (:data v) v)])))
-                                    feature-names)
-                         compute-fn (get anomaly-op->fn op)
-                         result (compute-fn model data)
-                         col-name (keyword (str "__" (name op) "_" model-name))]
-                     {:q (assoc-in q [:from col-name] result)
-                      :expr->col (assoc expr->col expr col-name)})
-                   (throw (ex-info (str "Unknown model: " model-name)
-                                   {:model model-name
-                                    :available (keys (get registry "__models__"))})))))
-             {:q query :expr->col {}}
-             all-exprs)
-            ;; For non-SELECT clauses, prefer the alias if one exists in SELECT
-            ;; (the query engine sorts/filters by result-row key names)
-            expr->alias (into {}
-                              (keep (fn [[expr col-name]]
-                                      (when-let [a (get aliases expr)]
-                                        [expr a])))
-                              expr->col)
-            expr->col-other (merge expr->col expr->alias)]
-        (-> q
-            (assoc :select (rewrite-anomaly-exprs (:select q) expr->col))
-            (cond->
-              ;; WHERE/HAVING filter on :from columns (pre-projection) → use synthetic name
-             (:where q)  (assoc :where (rewrite-anomaly-exprs (:where q) expr->col))
-             (:having q) (assoc :having (rewrite-anomaly-exprs (:having q) expr->col))
-              ;; ORDER BY sorts result rows (post-projection) → use alias when available
-             (:order q)  (assoc :order (rewrite-anomaly-exprs (:order q) expr->col-other))))))))
+  (let [models (get registry "__models__")]
+    (if (seq models)
+      (assoc query :_anomaly-models models)
+      query)))
 
 (defn- resolve-live-tables
   "Resolve any live table entries in the registry by loading fresh from storage."
@@ -810,8 +718,8 @@
             ;; Normal query — execute via Stratum engine
             (:query parsed)
             (let [query (:query parsed)
-                  ;; Resolve ANOMALY_SCORE expressions: inject model scores as computed columns
-                  query (resolve-anomaly-expressions query registry)
+                  ;; Attach anomaly models to query map — scoring happens post-join in query.clj
+                  query (attach-anomaly-models query registry)
                   result (q/q query)
                   result (if-let [post-aggs (:_post-aggs query)]
                            (sql/apply-post-aggs result post-aggs)
