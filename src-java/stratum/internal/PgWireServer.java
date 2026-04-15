@@ -162,8 +162,9 @@ public final class PgWireServer {
                 return;
             }
 
-            // Per-connection state for the extended query protocol (unnamed prepared statement)
+            // Per-connection state for the extended query protocol
             String[] lastParsedSql = new String[]{""};
+            String[][] lastBoundParams = new String[][]{null};
 
             // Phase 2: Query loop
             while (running.get() && !client.isClosed()) {
@@ -183,9 +184,9 @@ public final class PgWireServer {
                     case 'Q' -> handleQuery(body, out);
                     case 'X' -> { return; } // Terminate
                     case 'P' -> handleParse(body, out, lastParsedSql);   // Extended protocol: Parse
-                    case 'B' -> handleBind(body, out);     // Extended protocol: Bind
+                    case 'B' -> handleBind(body, out, lastBoundParams);  // Extended protocol: Bind
                     case 'D' -> handleDescribe(body, out); // Extended protocol: Describe
-                    case 'E' -> handleExecuteMsg(body, out, lastParsedSql); // Extended protocol: Execute
+                    case 'E' -> handleExecuteMsg(body, out, lastParsedSql, lastBoundParams); // Extended protocol: Execute
                     case 'S' -> handleSync(out);           // Extended protocol: Sync
                     case 'C' -> handleClose(body, out);    // Extended protocol: Close
                     default -> {
@@ -373,25 +374,53 @@ public final class PgWireServer {
         out.flush();
     }
 
-    private void handleBind(byte[] body, DataOutputStream out) throws IOException {
-        // Bind message — we ignore params for now (unnamed portal)
-        // BindComplete
+    private void handleBind(byte[] body, DataOutputStream out, String[][] lastBoundParams) throws IOException {
+        ByteBuffer buf = ByteBuffer.wrap(body);
+        String portalName = readCString(buf);
+        String stmtName = readCString(buf);
+
+        short numFormatCodes = buf.getShort();
+        for (int i = 0; i < numFormatCodes; i++) buf.getShort();
+
+        short numParams = buf.getShort();
+        String[] params = new String[numParams];
+        for (int i = 0; i < numParams; i++) {
+            int paramLen = buf.getInt();
+            if (paramLen == -1) {
+                params[i] = null;
+            } else {
+                byte[] paramBytes = new byte[paramLen];
+                buf.get(paramBytes);
+                params[i] = new String(paramBytes, StandardCharsets.UTF_8);
+            }
+        }
+        lastBoundParams[0] = params;
+
+        if (buf.hasRemaining()) {
+            short numResultFormats = buf.getShort();
+            for (int i = 0; i < numResultFormats; i++) buf.getShort();
+        }
+
         out.writeByte('2');
         out.writeInt(4);
         out.flush();
     }
 
     private void handleDescribe(byte[] body, DataOutputStream out) throws IOException {
-        // Describe message — send NoData for now
-        // We'll send real RowDescription during Execute
-        out.writeByte('n'); // NoData
+        out.writeByte('n');
         out.writeInt(4);
         out.flush();
     }
 
-    private void handleExecuteMsg(byte[] body, DataOutputStream out, String[] lastParsedSql) throws IOException {
-        // Execute the last parsed query via the handler
+    private void handleExecuteMsg(byte[] body, DataOutputStream out,
+                                  String[] lastParsedSql, String[][] lastBoundParams) throws IOException {
         String sql = lastParsedSql[0];
+        String[] params = lastBoundParams[0];
+
+        if (sql != null && !sql.isEmpty() && params != null && params.length > 0) {
+            sql = substituteParams(sql, params);
+        }
+
         if (sql != null && !sql.isEmpty()) {
             try {
                 QueryResult result = handler.execute(sql);
@@ -413,6 +442,7 @@ public final class PgWireServer {
         } else {
             sendCommandComplete(out, "SELECT 0");
         }
+        lastBoundParams[0] = null;
         out.flush();
     }
 
@@ -573,6 +603,58 @@ public final class PgWireServer {
             case OID_TIMESTAMP -> 8;
             default -> -1;
         };
+    }
+
+    private static String substituteParams(String sql, String[] params) {
+        StringBuilder sb = new StringBuilder(sql.length() + params.length * 10);
+        int i = 0;
+        while (i < sql.length()) {
+            char c = sql.charAt(i);
+            if (c == '\'') {
+                sb.append(c); i++;
+                while (i < sql.length()) {
+                    char q = sql.charAt(i); sb.append(q); i++;
+                    if (q == '\'') {
+                        if (i < sql.length() && sql.charAt(i) == '\'') { sb.append('\''); i++; }
+                        else break;
+                    }
+                }
+            } else if (c == '$' && i + 1 < sql.length() && Character.isDigit(sql.charAt(i + 1))) {
+                int start = i + 1, end = start;
+                while (end < sql.length() && Character.isDigit(sql.charAt(end))) end++;
+                int paramIdx = Integer.parseInt(sql.substring(start, end)) - 1;
+                if (paramIdx >= 0 && paramIdx < params.length) {
+                    String val = params[paramIdx];
+                    if (val == null) { sb.append("NULL"); }
+                    else if (isNumeric(val)) { sb.append(val); }
+                    else {
+                        sb.append('\'');
+                        for (int j = 0; j < val.length(); j++) {
+                            char vc = val.charAt(j);
+                            if (vc == '\'') sb.append('\'');
+                            sb.append(vc);
+                        }
+                        sb.append('\'');
+                    }
+                } else { sb.append(sql, i, end); }
+                i = end;
+            } else { sb.append(c); i++; }
+        }
+        return sb.toString();
+    }
+
+    private static boolean isNumeric(String s) {
+        if (s.isEmpty()) return false;
+        int start = 0;
+        if (s.charAt(0) == '-' || s.charAt(0) == '+') start = 1;
+        if (start >= s.length()) return false;
+        boolean hasDot = false;
+        for (int i = start; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '.') { if (hasDot) return false; hasDot = true; }
+            else if (!Character.isDigit(c)) return false;
+        }
+        return true;
     }
 
     private static String readCString(ByteBuffer buf) {
