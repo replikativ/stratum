@@ -226,74 +226,74 @@
             (do (swap! table-registry-atom dissoc table)
                 (PgWireServer$QueryResult/empty "DROP TABLE"))
 
-                :create-model
-                (let [{:keys [model-name model-type options training-sql]} ddl
-                      type-config (get model-type-map model-type)]
-                  (when-not type-config
-                    (throw (ex-info (str "Unknown model type: " model-type
-                                         ". Available: " (str/join ", " (keys model-type-map)))
-                                    {:model-type model-type})))
-                  (let [;; Execute the training SELECT to get data
-                        parsed-training (sql/parse-sql training-sql registry)
-                        _ (when (:error parsed-training)
-                            (throw (ex-info (str "Error in training query: " (:error parsed-training))
-                                            {:sql training-sql})))
-                        training-result (q/q (:query parsed-training))
-                        training-cols (q/results->columns training-result)
+            :create-model
+            (let [{:keys [model-name model-type options training-sql]} ddl
+                  type-config (get model-type-map model-type)]
+              (when-not type-config
+                (throw (ex-info (str "Unknown model type: " model-type
+                                     ". Available: " (str/join ", " (keys model-type-map)))
+                                {:model-type model-type})))
+              (let [;; Execute the training SELECT to get data
+                    parsed-training (sql/parse-sql training-sql registry)
+                    _ (when (:error parsed-training)
+                        (throw (ex-info (str "Error in training query: " (:error parsed-training))
+                                        {:sql training-sql})))
+                    training-result (q/q (:query parsed-training))
+                    training-cols (q/results->columns training-result)
                         ;; Merge defaults with user options
-                        train-opts (merge (:default-opts type-config)
-                                          options
-                                          {:from training-cols})
+                    train-opts (merge (:default-opts type-config)
+                                      options
+                                      {:from training-cols})
                         ;; Train the model
-                        train-fn (:train-fn type-config)
-                        model (assoc (train-fn train-opts) :model-type model-type)]
-                    (swap! table-registry-atom assoc-in ["__models__" model-name] model)
-                    (println (str "Created model '" model-name "' (" model-type ") with "
-                                  (:n-features model) " features"))
-                    (PgWireServer$QueryResult/empty "CREATE MODEL")))
+                    train-fn (:train-fn type-config)
+                    model (assoc (train-fn train-opts) :model-type model-type)]
+                (swap! table-registry-atom assoc-in ["__models__" model-name] model)
+                (println (str "Created model '" model-name "' (" model-type ") with "
+                              (:n-features model) " features"))
+                (PgWireServer$QueryResult/empty "CREATE MODEL")))
 
-                :drop-model
-                (let [{:keys [model-name if-exists?]} ddl
-                      models (get @table-registry-atom "__models__")]
-                  (when (and (not if-exists?) (not (get models model-name)))
-                    (throw (ex-info (str "Model not found: " model-name)
-                                    {:model model-name
-                                     :available (keys models)})))
-                  (swap! table-registry-atom update "__models__" dissoc model-name)
-                  (PgWireServer$QueryResult/empty "DROP MODEL"))
+            :drop-model
+            (let [{:keys [model-name if-exists?]} ddl
+                  models (get @table-registry-atom "__models__")]
+              (when (and (not if-exists?) (not (get models model-name)))
+                (throw (ex-info (str "Model not found: " model-name)
+                                {:model model-name
+                                 :available (keys models)})))
+              (swap! table-registry-atom update "__models__" dissoc model-name)
+              (PgWireServer$QueryResult/empty "DROP MODEL"))
 
-                :insert
-                (let [existing (get @table-registry-atom table)]
-                  (when-not existing
-                    (throw (ex-info (str "Table not found: " table) {:table table})))
-                  (let [col-keys (vec (keys existing))
-                        n-existing (if-let [first-col (get existing (first col-keys))]
-                                     (cond
-                                       (instance? (Class/forName "[J") first-col)
-                                       (alength ^longs first-col)
-                                       (instance? (Class/forName "[D") first-col)
-                                       (alength ^doubles first-col)
-                                       (instance? (Class/forName "[Ljava.lang.String;") first-col)
-                                       (alength ^"[Ljava.lang.String;" first-col)
-                                       :else 0)
-                                     0)
-                        n-new (count rows)
-                        n-total (+ n-existing n-new)
-                        new-cols
-                        (into {}
-                              (map-indexed
-                               (fn [ci col-key]
-                                 (let [old-arr (get existing col-key)]
-                                   [col-key
-                                    (cond
-                                      (instance? (Class/forName "[J") old-arr)
-                                      (let [arr (long-array n-total)]
-                                        (System/arraycopy ^longs old-arr 0 arr 0 n-existing)
-                                        (dotimes [r n-new]
-                                          (let [v (nth (nth rows r) ci)]
-                                            (aset arr (+ n-existing r)
-                                                  (long (if (nil? v) Long/MIN_VALUE v)))))
-                                        arr)
+            :insert
+            (let [existing (get @table-registry-atom table)]
+              (when-not existing
+                (throw (ex-info (str "Table not found: " table) {:table table})))
+              (let [col-keys (vec (keys existing))
+                    n-existing (if-let [first-col (get existing (first col-keys))]
+                                 (cond
+                                   (instance? (Class/forName "[J") first-col)
+                                   (alength ^longs first-col)
+                                   (instance? (Class/forName "[D") first-col)
+                                   (alength ^doubles first-col)
+                                   (instance? (Class/forName "[Ljava.lang.String;") first-col)
+                                   (alength ^"[Ljava.lang.String;" first-col)
+                                   :else 0)
+                                 0)
+                    n-new (count rows)
+                    n-total (+ n-existing n-new)
+                    new-cols
+                    (into {}
+                          (map-indexed
+                           (fn [ci col-key]
+                             (let [old-arr (get existing col-key)]
+                               [col-key
+                                (cond
+                                  (instance? (Class/forName "[J") old-arr)
+                                  (let [arr (long-array n-total)]
+                                    (System/arraycopy ^longs old-arr 0 arr 0 n-existing)
+                                    (dotimes [r n-new]
+                                      (let [v (nth (nth rows r) ci)]
+                                        (aset arr (+ n-existing r)
+                                              (long (if (nil? v) Long/MIN_VALUE v)))))
+                                    arr)
 
                                   (instance? (Class/forName "[D") old-arr)
                                   (let [arr (double-array n-total)]
@@ -714,18 +714,18 @@
         (PgWireServer$QueryResult. ^String (:error parsed))
 
             ;; Normal query — execute via Stratum engine
-            (:query parsed)
-            (let [query (:query parsed)
+        (:query parsed)
+        (let [query (:query parsed)
                   ;; Attach anomaly models to query map — scoring happens post-join in query.clj
-                  query (attach-anomaly-models query registry)
-                  result (q/q query)
-                  result (if-let [post-aggs (:_post-aggs query)]
-                           (sql/apply-post-aggs result post-aggs)
-                           result)
-                  result (if-let [sel-cols (:_select-columns query)]
-                           (sql/apply-select-columns result sel-cols)
-                           result)]
-              (sql/format-results result))
+              query (attach-anomaly-models query registry)
+              result (q/q query)
+              result (if-let [post-aggs (:_post-aggs query)]
+                       (sql/apply-post-aggs result post-aggs)
+                       result)
+              result (if-let [sel-cols (:_select-columns query)]
+                       (sql/apply-select-columns result sel-cols)
+                       result)]
+          (sql/format-results result))
 
         :else
         (PgWireServer$QueryResult. "Internal error: unexpected parse result")))
