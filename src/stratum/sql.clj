@@ -2463,7 +2463,8 @@
        (into-array (Class/forName "[Ljava.lang.String;") [])
        "SELECT 0")
       (let [first-row (first results)
-            col-keys (vec (keys first-row))
+            ;; Filter out internal engine keys (starting with _) before serializing
+            col-keys (vec (filter #(not (str/starts-with? (name %) "_")) (keys first-row)))
             col-names (mapv name col-keys)
             oids (int-array (map #(infer-oid (get first-row %)) col-keys))
             rows (into-array (Class/forName "[Ljava.lang.String;")

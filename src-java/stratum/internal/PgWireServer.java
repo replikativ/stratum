@@ -316,9 +316,7 @@ public final class PgWireServer {
             try {
                 QueryResult result = handler.execute(stmt);
 
-                if (result.txStatus != 'I') {
-                    txStatus[0] = result.txStatus;
-                }
+                txStatus[0] = result.txStatus;
 
                 if (result.error != null) {
                     sendError(out, "ERROR", "42000", result.error);
@@ -573,7 +571,7 @@ public final class PgWireServer {
         }
 
         if (result != null) {
-            if (result.txStatus != 'I') txStatus[0] = result.txStatus;
+            txStatus[0] = result.txStatus;
 
             if (result.error != null) {
                 sendError(out, "ERROR", "42000", result.error);
