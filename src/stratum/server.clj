@@ -750,21 +750,21 @@
                 ;; BEGIN — start transaction
                 (re-find #"(?i)^\s*BEGIN" sql)
                 (do (swap! tx-state assoc :in-tx true :aborted false)
-                    (-> (execute-sql sql table-registry-atom data-dir-atom)
+                    (-> ^PgWireServer$QueryResult (execute-sql sql table-registry-atom data-dir-atom)
                         (.withTxStatus \T)))
                 ;; COMMIT / END — commit transaction
                 (re-find #"(?i)^\s*(COMMIT|END)\s*$" sql)
                 (do (reset! tx-state {:in-tx false :aborted false})
-                    (-> (execute-sql sql table-registry-atom data-dir-atom)
+                    (-> ^PgWireServer$QueryResult (execute-sql sql table-registry-atom data-dir-atom)
                         (.withTxStatus \I)))
                 ;; ROLLBACK — roll back transaction
                 (re-find #"(?i)^\s*ROLLBACK" sql)
                 (do (reset! tx-state {:in-tx false :aborted false})
-                    (-> (execute-sql sql table-registry-atom data-dir-atom)
+                    (-> ^PgWireServer$QueryResult (execute-sql sql table-registry-atom data-dir-atom)
                         (.withTxStatus \I)))
                 ;; Normal command — execute and propagate tx status
                 :else
-                (let [qr (execute-sql sql table-registry-atom data-dir-atom)]
+                (let [^PgWireServer$QueryResult qr (execute-sql sql table-registry-atom data-dir-atom)]
                   (cond
                     (and in-tx (.error qr))
                     (do (swap! tx-state assoc :aborted true)

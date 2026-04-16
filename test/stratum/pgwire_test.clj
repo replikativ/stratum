@@ -8,8 +8,8 @@
             [stratum.server])
   (:import [stratum.internal PgWireServer]
            [java.io DataInputStream DataOutputStream
-                    BufferedInputStream BufferedOutputStream
-                    ByteArrayOutputStream]
+            BufferedInputStream BufferedOutputStream
+            ByteArrayOutputStream]
            [java.net Socket]
            [java.nio ByteBuffer]
            [java.nio.charset StandardCharsets]))
@@ -27,7 +27,7 @@
     (stratum.server/register-table!
      srv "orders"
      {:price    (double-array [10.0 50.0 100.0 200.0 500.0])
-      :quantity (long-array   [1    2    5     10    20   ])
+      :quantity (long-array   [1    2    5     10    20])
       :region   (into-array String ["N" "N" "S" "S" "E"])})
     (binding [*srv* srv]
       (try (f) (finally (stratum.server/stop srv))))))
