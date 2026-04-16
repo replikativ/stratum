@@ -25,7 +25,7 @@
             [stratum.files :as files]
             [stratum.iforest :as iforest]
             [clojure.string :as str])
-  (:import [stratum.internal PgWireServer PgWireServer$QueryHandler PgWireServer$QueryResult]
+  (:import [stratum.internal PgWireServer PgWireServer$QueryHandler PgWireServer$QueryHandlerFactory PgWireServer$QueryResult]
            [java.util Random]
            [java.io File])
   (:gen-class))
@@ -175,12 +175,10 @@
                                          (str "FROM " synthetic))))))
       [@result @extra-reg])))
 
-(defn- make-query-handler
-  "Create a PgWireServer.QueryHandler that routes SQL to Stratum."
-  [table-registry-atom data-dir-atom]
-  (reify PgWireServer$QueryHandler
-    (execute [_ sql]
-      (try
+(defn- execute-sql
+  "Execute a SQL statement against the registry and return a QueryResult."
+  [sql table-registry-atom data-dir-atom]
+  (try
         (let [raw-registry @table-registry-atom
               registry     (resolve-live-tables raw-registry)
               [sql extra]  (resolve-file-refs sql @data-dir-atom)
@@ -731,8 +729,50 @@
 
             :else
             (PgWireServer$QueryResult. "Internal error: unexpected parse result")))
-        (catch Exception e
-          (PgWireServer$QueryResult. (str (.getMessage e))))))))
+    (catch Exception e
+      (PgWireServer$QueryResult. (str (.getMessage e))))))
+
+(defn- make-handler-factory
+  "Create a PgWireServer.QueryHandlerFactory. Each call to .create() returns
+   an independent QueryHandler with its own per-connection transaction state."
+  [table-registry-atom data-dir-atom]
+  (reify PgWireServer$QueryHandlerFactory
+    (create [_]
+      (let [tx-state (atom {:in-tx false :aborted false})]
+        (reify PgWireServer$QueryHandler
+          (execute [_ sql]
+            (let [{:keys [in-tx aborted]} @tx-state]
+              (cond
+                ;; Reject non-tx commands when transaction is in error state
+                (and aborted (not (re-find #"(?i)^\s*(ROLLBACK|COMMIT|END)" sql)))
+                (-> (PgWireServer$QueryResult. "current transaction is aborted, commands ignored until end of transaction block")
+                    (.withTxStatus \E))
+                ;; BEGIN — start transaction
+                (re-find #"(?i)^\s*BEGIN" sql)
+                (do (swap! tx-state assoc :in-tx true :aborted false)
+                    (-> (execute-sql sql table-registry-atom data-dir-atom)
+                        (.withTxStatus \T)))
+                ;; COMMIT / END — commit transaction
+                (re-find #"(?i)^\s*(COMMIT|END)\s*$" sql)
+                (do (reset! tx-state {:in-tx false :aborted false})
+                    (-> (execute-sql sql table-registry-atom data-dir-atom)
+                        (.withTxStatus \I)))
+                ;; ROLLBACK — roll back transaction
+                (re-find #"(?i)^\s*ROLLBACK" sql)
+                (do (reset! tx-state {:in-tx false :aborted false})
+                    (-> (execute-sql sql table-registry-atom data-dir-atom)
+                        (.withTxStatus \I)))
+                ;; Normal command — execute and propagate tx status
+                :else
+                (let [qr (execute-sql sql table-registry-atom data-dir-atom)]
+                  (cond
+                    (and in-tx (.error qr))
+                    (do (swap! tx-state assoc :aborted true)
+                        (.withTxStatus qr \E))
+                    in-tx
+                    (.withTxStatus qr \T)
+                    :else
+                    qr))))))))))
 
 ;; ============================================================================
 ;; Public API
@@ -754,8 +794,8 @@
   ([{:keys [port host data-dir] :or {port 5432 host "127.0.0.1"}}]
    (let [registry (atom {})
          data-dir-atom (atom data-dir)
-         handler  (make-query-handler registry data-dir-atom)
-         server   (PgWireServer. (int port) ^String host handler)]
+         factory  (make-handler-factory registry data-dir-atom)
+         server   (PgWireServer. (int port) ^String host ^PgWireServer$QueryHandlerFactory factory)]
      (.start server)
      {:server   server
       :registry registry
