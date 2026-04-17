@@ -1858,8 +1858,8 @@
                                                                  100.0 21.5 19.0 20.8 21.2])
                                      :humidity    (double-array [50.0 52.0 48.0 55.0 51.0
                                                                  5.0 53.0 47.0 50.5 52.5])})
-          make-handler @(resolve 'stratum.server/make-query-handler)
-          handler (make-handler (:registry srv) (atom nil))]
+          make-factory @(resolve 'stratum.server/make-handler-factory)
+          handler (.create (make-factory (:registry srv) (atom nil)))]
       (try
         ;; CREATE MODEL via handler
         (let [^PgWireServer$QueryResult qr

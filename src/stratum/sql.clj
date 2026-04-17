@@ -2002,13 +2002,29 @@
      :tag (str "SELECT " (count rows))}))
 
 (defn- handle-pg-attribute
-  "Return mock pg_attribute rows. Minimal implementation for client compatibility."
-  []
-  {:system true
-   :result {:columns ["attname" "atttypid" "attnum"]
-            :oids [(:name pg-type-oids) (:oid pg-type-oids) (:int4 pg-type-oids)]
-            :rows []}
-   :tag "SELECT 0"})
+  "Return pg_attribute rows for all registered tables."
+  [table-registry]
+  (let [col-type-oid (fn [col-val]
+                       (cond
+                         (instance? (Class/forName "[J") col-val) (:int8 pg-type-oids)
+                         (instance? (Class/forName "[D") col-val) (:float8 pg-type-oids)
+                         :else (:text pg-type-oids)))
+        rows (vec (for [[table-name columns] table-registry
+                        :when (not (.startsWith ^String table-name "__"))
+                        [idx [col-name col-val]] (map-indexed vector columns)]
+                    [col-name
+                     (str (col-type-oid col-val))
+                     (str (+ 2 idx))
+                     table-name
+                     "f"
+                     "-1"
+                     "t"]))]
+    {:system true
+     :result {:columns ["attname" "atttypid" "attnum" "attrelid" "attisdropped" "atttypmod" "attnotnull"]
+              :oids [(:name pg-type-oids) (:oid pg-type-oids) (:int4 pg-type-oids)
+                     (:name pg-type-oids) (:bool pg-type-oids) (:int4 pg-type-oids) (:bool pg-type-oids)]
+              :rows rows}
+     :tag (str "SELECT " (count rows))}))
 
 (defn- handle-pg-tables
   "Return pg_tables view rows for registered tables."
@@ -2033,7 +2049,7 @@
     :pg_class (handle-pg-class table-registry)
     :pg_namespace (handle-pg-namespace)
     :pg_type (handle-pg-type)
-    :pg_attribute (handle-pg-attribute)
+    :pg_attribute (handle-pg-attribute table-registry)
     :pg_tables (handle-pg-tables table-registry)
     :information_schema {:system true
                          :result {:columns [] :oids [] :rows []}
@@ -2447,7 +2463,8 @@
        (into-array (Class/forName "[Ljava.lang.String;") [])
        "SELECT 0")
       (let [first-row (first results)
-            col-keys (vec (keys first-row))
+            ;; Filter out internal engine keys (starting with _) before serializing
+            col-keys (vec (filter #(not (str/starts-with? (name %) "_")) (keys first-row)))
             col-names (mapv name col-keys)
             oids (int-array (map #(infer-oid (get first-row %)) col-keys))
             rows (into-array (Class/forName "[Ljava.lang.String;")
