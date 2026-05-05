@@ -418,9 +418,16 @@
          len (chunk-length chunk)
          ;; Detect constant from stats (min==max) or from chunk's own constant-val
          cv (chunk-constant-val chunk)
+         ;; All-NULL chunks have min-val/max-val left at compute-stats's initial
+         ;; sentinels (Double/MAX_VALUE / -Double/MAX_VALUE for both int64 and
+         ;; float64 — see stats/compute-stats). Casting Double/MAX_VALUE to long
+         ;; throws "Value out of range", so guard the constant check by null count.
+         null-cnt (when stats (long (:null-count stats)))
+         all-non-null? (and stats (> len 0) (zero? null-cnt))
+         all-null? (and stats (> len 0) (= null-cnt len))
          constant? (or (some? cv)
-                       (and stats
-                            (> len 0)
+                       all-null?
+                       (and all-non-null?
                             (case dt
                               ;; For int64, compare as longs to avoid precision loss near 2^53
                               :int64 (= (long (:min-val stats)) (long (:max-val stats)))
@@ -428,11 +435,16 @@
                               :float64 (and (not (Double/isNaN (:min-val stats)))
                                             (== (double (:min-val stats)) (double (:max-val stats)))))))]
      (if constant?
-       ;; Constant encoding: just 8 bytes for the single value
-       (let [val (or cv
-                     (case dt
-                       :float64 (:min-val stats)
-                       :int64 (long (:min-val stats))))
+       ;; Constant encoding: just 8 bytes for the single value.
+       ;; All-NULL chunks encode their NULL sentinel (NaN / Long.MIN_VALUE).
+       (let [val (cond
+                   (some? cv) cv
+                   all-null? (case dt
+                               :float64 Double/NaN
+                               :int64 Long/MIN_VALUE)
+                   :else (case dt
+                           :float64 (:min-val stats)
+                           :int64 (long (:min-val stats))))
              bb (ByteBuffer/allocate 8)]
          (.order bb ByteOrder/LITTLE_ENDIAN)
          (case dt
