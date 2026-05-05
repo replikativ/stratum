@@ -820,24 +820,24 @@
       (is (= 1 (count lt)))  (is (= 3.0 (:v (first lt)))))))
 
 (deftest sql-asof-rejects-multiple-inequalities-test
-  (testing "ASOF JOIN with two inequality predicates returns error sqlstate 0A000"
+  (testing "ASOF JOIN with two inequality predicates throws at execute time"
     (let [reg {"l" {:t (long-array [1])}
                "r" {:t (long-array [1])}}
-          {:keys [error sqlstate]}
-          (sql/parse-sql
-           "SELECT * FROM l ASOF JOIN r ON l.t >= r.t AND l.t <= r.t"
-           reg)]
-      (is (re-find #"exactly one inequality" error))
-      (is (= "0A000" sqlstate)))))
+          {:keys [query]} (sql/parse-sql
+                           "SELECT * FROM l ASOF JOIN r ON l.t >= r.t AND l.t <= r.t"
+                           reg)]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"exactly one inequality"
+                            (q/q query))))))
 
 (deftest sql-asof-rejects-no-inequality-test
-  (testing "ASOF JOIN with only equality predicates returns error"
+  (testing "ASOF JOIN with only equality predicates throws at execute time"
     (let [reg {"l" {:t (long-array [1])}
                "r" {:t (long-array [1])}}
-          {:keys [error sqlstate]}
-          (sql/parse-sql "SELECT * FROM l ASOF JOIN r ON l.t = r.t" reg)]
-      (is (re-find #"exactly one inequality" error))
-      (is (= "0A000" sqlstate)))))
+          {:keys [query]} (sql/parse-sql "SELECT * FROM l ASOF JOIN r ON l.t = r.t" reg)]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"exactly one inequality"
+                            (q/q query))))))
 
 (deftest sql-asof-preserves-string-literals-test
   (testing "Rewriter does not touch 'ASOF' inside string literals"

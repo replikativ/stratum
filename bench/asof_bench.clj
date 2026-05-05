@@ -316,8 +316,8 @@
   (q/q {:from {:k (:probe-k data) :pt (:probe-t data)}
         :join [{:with {:k (:build-k data) :bt (:build-t data) :v (:build-v data)}
                 :type :asof
-                :on [:= :k :k]
-                :match-condition [:>= :pt :bt]}]
+                :on [[:= :k :k]
+                     [:>= :pt :bt]]}]
         :agg [[:sum :v]]}))
 
 (def ^:private q1-sql
@@ -327,7 +327,7 @@
   (q/q {:from {:pt (:probe-t data)}
         :join [{:with {:bt (:build-t data) :v (:build-v data)}
                 :type :asof
-                :match-condition [:>= :pt :bt]}]
+                :on [:>= :pt :bt]}]
         :agg [[:sum :v]]}))
 
 (def ^:private q2-sql
@@ -337,8 +337,8 @@
   (q/q {:from {:k (:probe-k data) :pt (:probe-t data)}
         :join [{:with {:k (:build-k data) :bt (:build-t data) :v (:build-v data)}
                 :type :asof
-                :on [:= :k :k]
-                :match-condition [:>= :pt :bt]}]
+                :on [[:= :k :k]
+                     [:>= :pt :bt]]}]
         :agg [[:sum :v]]}))
 
 (def ^:private q3-sql
