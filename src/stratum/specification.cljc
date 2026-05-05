@@ -163,7 +163,7 @@
 
 (def SJoinType
   "Join type."
-  [:enum :inner :left :right :full])
+  [:enum :inner :left :right :full :asof :asof-left])
 
 (def SJoinOn
   "Join condition: [:= :left-col :right-col] or vector of such."
@@ -171,12 +171,19 @@
    [:tuple [:= :=] :keyword :keyword]
    [:vector {:min 1} [:tuple [:= :=] :keyword :keyword]]])
 
+(def SAsofMatchCondition
+  "ASOF match-condition: [op left-col right-col] with op ∈ #{:>= :> :<= :<}."
+  [:tuple [:enum :>= :> :<= :<] :keyword :keyword])
+
 (def SJoinSpec
-  "Single join specification."
+  "Single join specification.
+   :on is required for equi-joins; ASOF joins (:asof / :asof-left) require
+   :match-condition and may have an empty/missing :on (pure time-series)."
   [:map {:closed false}
    [:with SColumnMap]
-   [:on SJoinOn]
-   [:type {:optional true :default :inner} SJoinType]])
+   [:on {:optional true} SJoinOn]
+   [:type {:optional true :default :inner} SJoinType]
+   [:match-condition {:optional true} SAsofMatchCondition]])
 
 (def SWindowOp
   "Window function operator."
