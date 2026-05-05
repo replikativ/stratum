@@ -43,26 +43,35 @@
 
 (defn- index-file-into-store!
   "Read file at abs-path, index all columns, persist to store under branch.
-   Returns the synced StratumDataset."
+   Returns the synced StratumDataset.
+
+   For .parquet files, uses parquet/index-parquet! — a streaming path that
+   builds chunks directly without materializing the whole file in heap.
+   For .csv files, falls back to materialize-then-index (same as before)."
   [^String abs-path store ^String branch ^long mtime]
   (let [ext (let [n abs-path i (.lastIndexOf n ".")]
-              (when (>= i 0) (str/lower-case (.substring n i))))
-        ds  (cond
-              (= ext ".csv")
-              (csv/from-csv abs-path)
+              (when (>= i 0) (str/lower-case (.substring n i))))]
+    (cond
+      (= ext ".csv")
+      (-> (csv/from-csv abs-path)
+          dataset/ensure-indexed
+          (dataset/with-metadata {:source-path  abs-path
+                                  :source-mtime mtime})
+          (dataset/sync! store branch))
 
-              (= ext ".parquet")
-              (parquet/from-parquet abs-path)
+      (= ext ".parquet")
+      (let [ds (parquet/index-parquet! abs-path store branch)]
+        ;; index-parquet! already syncs once with its own metadata; we re-sync
+        ;; with the source-mtime added so cache invalidation works.
+        (-> ds
+            (dataset/with-metadata {:source-path  abs-path
+                                    :source-mtime mtime})
+            (dataset/sync! store branch)))
 
-              :else
-              (throw (ex-info (str "Unsupported file type '" ext
-                                   "' — supported: .csv .parquet")
-                              {:path abs-path})))]
-    (-> ds
-        dataset/ensure-indexed
-        (dataset/with-metadata {:source-path  abs-path
-                                :source-mtime mtime})
-        (dataset/sync! store branch))))
+      :else
+      (throw (ex-info (str "Unsupported file type '" ext
+                           "' — supported: .csv .parquet")
+                      {:path abs-path})))))
 
 (defn load-or-index-file!
   "Load a CSV or Parquet file as a fully-indexed StratumDataset.

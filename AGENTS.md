@@ -108,7 +108,9 @@ These are already configured in `deps.edn` aliases.
 
 **Data Import** (`stratum.csv`, `stratum.parquet`):
 - CSV import with auto type detection (long/double/string)
-- Parquet import via parquet-java (no Hadoop runtime)
+- Parquet import via parquet-java (no Hadoop runtime). Two paths:
+  - `from-parquet` — heap path. Pre-allocates primitive arrays from `getRecordCount()`, dict-encodes strings at ingest. Memory scales with file size; suitable for programmatic in-memory use.
+  - `index-parquet!` — streaming path. Reads row-group-by-row-group into 64K-row chunk buffers, flushes via `idx-append-chunk!`, syncs to konserve every 16 chunks per column to free chunk heap. Memory bounded by chunk-size × num-cols × 8 B; used by `stratum.files/index-file-into-store!` for the `--index` and `read_parquet` server paths.
 
 **Storage Layer** (`stratum.storage`, `stratum.cached_storage`):
 - PSS-backed lazy loading via IStorage protocol with LRU-cached konserve backend
