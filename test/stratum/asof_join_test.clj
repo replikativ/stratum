@@ -25,23 +25,16 @@
                 {:from trades
                  :join [{:with prices
                          :type :asof
-                         :on [:= :sym :sym]
-                         :match-condition [:>= :ts :ts]}]})
-          ;; The top-level is LAsofJoin since no select/agg/filter wrap it
-          asof (cond-> plan
-                 (not (instance? LAsofJoin plan))
-                 (some-> :input))]
-      (is (instance? LAsofJoin (or asof plan)))
-      (let [n (or (when (instance? LAsofJoin plan) plan)
-                  (when-let [c (:input plan)]
-                    (when (instance? LAsofJoin c) c)))]
-        (is (some? n))
-        (is (= :inner (:join-type n)))
-        (is (= [[:sym :sym]] (:on-pairs n)))
-        (is (= [:>= :ts :ts] (:match-condition n)))))))
+                         :on [[:= :sym :sym]
+                              [:>= :ts :ts]]}]})
+          n (or (when (instance? LAsofJoin plan) plan) (:input plan))]
+      (is (instance? LAsofJoin n))
+      (is (= :inner (:join-type n)))
+      (is (= [[:sym :sym]] (:on-pairs n)))
+      (is (= [:>= :ts :ts] (:match-condition n))))))
 
 (deftest asof-left-builds-LAsofJoin-with-left-type-test
-  (testing ":type :asof-left maps to LAsofJoin :join-type :left"
+  (testing ":type :asof-left maps to LAsofJoin :join-type :left, no equality keys"
     (let [trades {:ts (long-array [10 20])}
           prices {:ts (long-array [5 15])
                   :px (double-array [1.0 2.0])}
@@ -49,7 +42,7 @@
                 {:from trades
                  :join [{:with prices
                          :type :asof-left
-                         :match-condition [:>= :ts :ts]}]})
+                         :on [:>= :ts :ts]}]})
           n (or (when (instance? LAsofJoin plan) plan) (:input plan))]
       (is (instance? LAsofJoin n))
       (is (= :left (:join-type n)))
@@ -68,27 +61,30 @@
                  {:from trades
                   :join [{:with prices
                           :type :asof
-                          :on [:= :sym :sym]
-                          :match-condition [:>= :ts :ts]}]}))
+                          :on [[:= :sym :sym]
+                               [:>= :ts :ts]]}]}))
           n (or (when (instance? PAsofJoin phys) phys) (:input phys))]
       (is (instance? PAsofJoin n))
       (is (= [[:sym :sym]] (:on-pairs n)))
       (is (= [:>= :ts :ts] (:match-condition n))))))
 
-(deftest asof-rejects-bad-match-condition-test
-  (testing "Missing :match-condition throws"
+(deftest asof-rejects-no-inequality-test
+  (testing "ASOF :on with only equalities throws"
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"requires :match-condition"
-         (plan/build-logical-plan
-          {:from {:ts (long-array [1])}
-           :join [{:with {:ts (long-array [1])} :type :asof :on [:= :ts :ts]}]}))))
-  (testing "Non-asof operator in :match-condition throws"
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"match-condition must be"
+         clojure.lang.ExceptionInfo #"exactly one inequality"
          (plan/build-logical-plan
           {:from {:ts (long-array [1])}
            :join [{:with {:ts (long-array [1])} :type :asof
-                   :match-condition [:= :ts :ts]}]})))))
+                   :on [:= :ts :ts]}]})))))
+
+(deftest asof-rejects-multiple-inequalities-test
+  (testing "ASOF :on with two inequalities throws"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"exactly one inequality"
+         (plan/build-logical-plan
+          {:from {:ts (long-array [1])}
+           :join [{:with {:ts (long-array [1])} :type :asof
+                   :on [[:>= :ts :ts] [:<= :ts :ts]]}]})))))
 
 (deftest asof-explain-mentions-match-test
   (testing "explain output includes match condition"
@@ -97,7 +93,7 @@
                  {:from {:ts (long-array [1])}
                   :join [{:with {:ts (long-array [1]) :px (double-array [1.0])}
                           :type :asof
-                          :match-condition [:>= :ts :ts]}]}))
+                          :on [:>= :ts :ts]}]}))
           s (plan/explain phys)]
       (is (re-find #"PAsofJoin" s))
       (is (re-find #"match=" s)))))
@@ -117,7 +113,7 @@
           result (q/q {:from probe
                        :join [{:with build
                                :type :asof
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [:>= :probe_ts :build_ts]}]
                        :select [:probe_ts :qty :px]})]
       (is (= 3 (count result)))
       ;; ts=5  → newest build at-or-before 5 is ts=0  → px=1.0
@@ -137,7 +133,7 @@
           result (q/q {:from probe
                        :join [{:with build
                                :type :asof
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [:>= :probe_ts :build_ts]}]
                        :select [:probe_ts :px]})]
       ;; ts=1 has no match (1 < 10), dropped. ts=50 → newest at-or-before is ts=30.
       (is (= 1 (count result)))
@@ -154,7 +150,7 @@
           result (q/q {:from probe
                        :join [{:with build
                                :type :asof
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [:>= :probe_ts :build_ts]}]
                        :select [:tag :probe_ts :px]})]
       (is (= 4 (count result)))
       ;; Probe ts=50 → newest build at-or-before 50 is ts=45 → px=50
@@ -173,7 +169,7 @@
           result (q/q {:from probe
                        :join [{:with build
                                :type :asof
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [:>= :probe_ts :build_ts]}]
                        :select [:probe_ts :px]})]
       ;; Tie-breaker is non-deterministic per DuckDB/Snowflake; just check we got one match
       (is (= 1 (count result)))
@@ -187,7 +183,7 @@
           result (q/q {:from probe
                        :join [{:with build
                                :type :asof
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [:>= :probe_ts :build_ts]}]
                        :select [:probe_ts :px]})]
       (is (= 0 (count result))))))
 
@@ -199,7 +195,7 @@
           result (q/q {:from probe
                        :join [{:with build
                                :type :asof
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [:>= :probe_ts :build_ts]}]
                        :select [:probe_ts :px]})]
       (is (= 0 (count result))))))
 
@@ -213,7 +209,7 @@
   (q/q {:from probe
         :join [{:with build
                 :type join-type
-                :match-condition [op :probe_ts :build_ts]}]
+                :on [op :probe_ts :build_ts]}]
         :select [:probe_ts :px]}))
 
 (defn- by-probe-ts
@@ -372,8 +368,8 @@
           result (q/q {:from probe
                        :join [{:with build
                                :type :asof
-                               :on [:= :sym :sym]
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [[:= :sym :sym]
+                                    [:>= :probe_ts :build_ts]]}]
                        :select [:sym :probe_ts :px]})]
       ;; sym=1 ts=15 → newest sym=1 build at-or-before 15 is ts=10 → 101.0
       ;; sym=2 ts=25 → newest sym=2 build at-or-before 25 is ts=20 → 202.0
@@ -398,8 +394,8 @@
           result (q/q {:from probe
                        :join [{:with build
                                :type :asof
-                               :on [:= :sym :sym]
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [[:= :sym :sym]
+                                    [:>= :probe_ts :build_ts]]}]
                        :select [:sym :probe_ts :px]})]
       ;; Must match sym=1 only: 100.0 (NOT 200.0 even though closer)
       (is (= 1 (count result)))
@@ -417,8 +413,9 @@
           result (q/q {:from probe
                        :join [{:with build
                                :type :asof
-                               :on [[:= :sym :sym] [:= :exch :exch]]
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [[:= :sym :sym]
+                                    [:= :exch :exch]
+                                    [:>= :probe_ts :build_ts]]}]
                        :select [:sym :exch :probe_ts :px]})]
       ;; (1,1) ts=10 → build (1,1,5)  → 11.0
       ;; (1,2) ts=10 → build (1,2,6)  → 12.0
@@ -438,13 +435,13 @@
                  :px       (double-array [10.0 20.0])}
           inner (q/q {:from probe
                       :join [{:with build :type :asof
-                              :on [:= :sym :sym]
-                              :match-condition [:>= :probe_ts :build_ts]}]
+                              :on [[:= :sym :sym]
+                                   [:>= :probe_ts :build_ts]]}]
                       :select [:sym :px]})
           left  (q/q {:from probe
                       :join [{:with build :type :asof-left
-                              :on [:= :sym :sym]
-                              :match-condition [:>= :probe_ts :build_ts]}]
+                              :on [[:= :sym :sym]
+                                   [:>= :probe_ts :build_ts]]}]
                       :select [:sym :px]})]
       (is (= 2 (count inner)))
       (is (= 3 (count left)))
@@ -463,8 +460,8 @@
                  :px       (double-array (map double (range n)))}
           result (q/q {:from probe
                        :join [{:with build :type :asof
-                               :on [:= :sym :sym]
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [[:= :sym :sym]
+                                    [:>= :probe_ts :build_ts]]}]
                        :select [:sym :probe_ts :px]})]
       (is (= n (count result)))
       ;; Every row should match its own sym (px == probe_ts)
@@ -480,8 +477,8 @@
                  :px       (double-array [11.0 12.0 13.0 14.0])}
           result (q/q {:from probe
                        :join [{:with build :type :asof
-                               :on [:= :sym :sym]
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [[:= :sym :sym]
+                                    [:>= :probe_ts :build_ts]]}]
                        :select [:probe_ts :px]})]
       ;; Output preserves probe input order: [4,3,2,1] → [14,13,12,11]
       (is (= [4 3 2 1] (mapv #(long (:probe_ts %)) result)))
@@ -501,7 +498,7 @@
                  :px       (double-array [99.0 50.0 150.0])}
           result (q/q {:from probe
                        :join [{:with build :type :asof
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [:>= :probe_ts :build_ts]}]
                        :select [:probe_ts :px]})
           m (into {} (map (fn [r] [(long (:probe_ts r)) (:px r)])) result)]
       ;; ts=10 → newest non-NULL build at-or-before 10 is 5 → 50.0 (NOT 99.0)
@@ -516,7 +513,7 @@
                  :px       (double-array [1.0])}
           result (q/q {:from probe
                        :join [{:with build :type :asof
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [:>= :probe_ts :build_ts]}]
                        :select [:probe_ts :px]})]
       ;; Only the ts=15 row survives
       (is (= 1 (count result)))
@@ -530,7 +527,7 @@
                  :px       (double-array [1.0])}
           result (q/q {:from probe
                        :join [{:with build :type :asof-left
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [:>= :probe_ts :build_ts]}]
                        :select [:tag :probe_ts :px]})]
       ;; Per DuckDB: NULL inequality value on probe → row is filtered, not emitted with NULL.
       (is (= 1 (count result)))
@@ -546,8 +543,8 @@
                  :px       (double-array [11.0 22.0])}
           result (q/q {:from probe
                        :join [{:with build :type :asof-left
-                               :on [:= :sym :sym]
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [[:= :sym :sym]
+                                    [:>= :probe_ts :build_ts]]}]
                        :select [:tag :px]})
           m (into {} (map (fn [r] [(long (:tag r)) (:px r)])) result)]
       (is (= 3 (count result)))
@@ -564,8 +561,8 @@
                  :px       (double-array [11.0])}
           result (q/q {:from probe
                        :join [{:with build :type :asof
-                               :on [:= :sym :sym]
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [[:= :sym :sym]
+                                    [:>= :probe_ts :build_ts]]}]
                        :select [:sym :px]})]
       (is (= 1 (count result)))
       (is (= 11.0 (:px (first result)))))))
@@ -577,11 +574,11 @@
                  :px       (double-array [1.0 2.0])}
           inner (q/q {:from probe
                       :join [{:with build :type :asof
-                              :match-condition [:>= :probe_ts :build_ts]}]
+                              :on [:>= :probe_ts :build_ts]}]
                       :select [:probe_ts :px]})
           left  (q/q {:from probe
                       :join [{:with build :type :asof-left
-                              :match-condition [:>= :probe_ts :build_ts]}]
+                              :on [:>= :probe_ts :build_ts]}]
                       :select [:probe_ts :px]})]
       (is (= 0 (count inner)))
       (is (= 2 (count left)))
@@ -594,7 +591,7 @@
                  :px       (double-array [42.0])}
           inner (q/q {:from probe
                       :join [{:with build :type :asof
-                              :match-condition [:>= :probe_ts :build_ts]}]
+                              :on [:>= :probe_ts :build_ts]}]
                       :select [:px]})]
       (is (= 1 (count inner)))
       (is (= 42.0 (:px (first inner)))))))
@@ -606,7 +603,7 @@
                  :px       (double-array [10.0 20.0 30.0])}
           result (q/q {:from probe
                        :join [{:with build :type :asof
-                               :match-condition [:>= :probe_ts :build_ts]}]
+                               :on [:>= :probe_ts :build_ts]}]
                        :select [:probe_ts :px]})]
       ;; double 1.5 → long 1; latest build long ≤ 1 is 1 → 10.0
       ;; double 2.5 → long 2; latest build long ≤ 2 is 2 → 20.0

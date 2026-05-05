@@ -62,60 +62,75 @@
 
 (def ^:private asof-ops #{:>= :> :<= :<})
 
-(defn- normalize-on-pairs
-  "Normalize :on spec to vector of [left-col right-col] pairs.
-   Accepts nil/empty, single [:= a b], or vec of equality clauses."
+(defn- parse-on-preds
+  "Normalize a :on spec into a flat seq of [op left-col right-col] tuples.
+   Accepts nil/empty, single [op a b], or vec of [op a b].
+   Strips column-name namespaces."
   [on]
   (cond
     (nil? on) []
-    (and (vector? on) (= := (first on)))
-    [[(second on) (nth on 2)]]
+    (and (vector? on) (keyword? (first on)) (= 3 (count on)))
+    [[(first on) (norm/strip-ns (second on)) (norm/strip-ns (nth on 2))]]
     (and (vector? on) (every? vector? on))
-    (mapv (fn [pair]
-            (when-not (= := (first pair))
-              (throw (ex-info "Join :on clauses must use := operator (use :match-condition for inequality)"
-                              {:clause pair})))
-            [(second pair) (nth pair 2)])
+    (mapv (fn [pred]
+            (when-not (and (= 3 (count pred)) (keyword? (first pred)))
+              (throw (ex-info "Join :on predicate must be [op left-col right-col]"
+                              {:predicate pred})))
+            [(first pred) (norm/strip-ns (second pred)) (norm/strip-ns (nth pred 2))])
           on)
     (and (sequential? on) (empty? on)) []
     :else (throw (ex-info "Unsupported join :on format" {:on on}))))
 
-(defn- normalize-match-condition
-  "Validate :match-condition shape [op left-col right-col] for ASOF joins."
-  [mc]
-  (when-not (and (vector? mc) (= 3 (count mc))
-                 (contains? asof-ops (first mc))
-                 (keyword? (second mc))
-                 (keyword? (nth mc 2)))
-    (throw (ex-info "ASOF :match-condition must be [op left-col right-col] with op ∈ #{:>= :> :<= :<}"
-                    {:match-condition mc})))
-  [(first mc) (norm/strip-ns (second mc)) (norm/strip-ns (nth mc 2))])
+(defn- split-asof-on
+  "Split parsed ON predicates into equality keys and the single inequality.
+   Returns {:on-pairs [[l r] ...] :match-condition [op l r]}.
+   Throws if the inequality count is not exactly 1."
+  [preds join-spec]
+  (let [eq (filterv #(= := (first %)) preds)
+        ineq (filterv #(contains? asof-ops (first %)) preds)
+        other (filterv #(and (not= := (first %))
+                             (not (contains? asof-ops (first %)))) preds)]
+    (when (seq other)
+      (throw (ex-info (str "ASOF join :on supports only := and inequality operators "
+                           "(#{:>= :> :<= :<}); got " (mapv first other))
+                      {:join-spec join-spec :unsupported-ops (mapv first other)})))
+    (when-not (= 1 (count ineq))
+      (throw (ex-info (str "ASOF join :on must contain exactly one inequality predicate "
+                           "(#{:>= :> :<= :<}), got " (count ineq))
+                      {:join-spec join-spec :inequality-count (count ineq)})))
+    {:on-pairs (mapv (fn [[_ l r]] [l r]) eq)
+     :match-condition (first ineq)}))
 
 (defn- build-join-tree
   "Wrap scan with join nodes for each join spec.
-   Supports equi-joins (:inner/:left/:right/:full) and ASOF (:asof/:asof-left)."
+   Supports equi-joins (:inner/:left/:right/:full) and ASOF (:asof/:asof-left).
+
+   For ASOF joins, the inequality (one of #{:>= :> :<= :<}) lives inside :on
+   alongside the equality predicates — same shape as DuckDB's SQL form. The
+   planner splits them into :on-pairs and :match-condition on the IR node."
   [scan join-specs]
   (reduce
    (fn [left join-spec]
-     (let [{:keys [with on type match-condition]} join-spec
+     (let [{:keys [with on type]} join-spec
            jt (or type :inner)
-           right-scan (build-scan with)]
+           right-scan (build-scan with)
+           preds (parse-on-preds on)]
        (cond
          (#{:asof :asof-left} jt)
-         (do
-           (when-not match-condition
-             (throw (ex-info "ASOF join requires :match-condition [op left-col right-col]"
-                             {:join-spec join-spec})))
-           (let [on-pairs (normalize-on-pairs on)
-                 mc       (normalize-match-condition match-condition)
-                 jt'      (if (= jt :asof-left) :left :inner)]
-             (ir/->LAsofJoin jt' on-pairs mc left right-scan)))
+         (let [{:keys [on-pairs match-condition]} (split-asof-on preds join-spec)
+               jt' (if (= jt :asof-left) :left :inner)]
+           (ir/->LAsofJoin jt' on-pairs match-condition left right-scan))
 
          :else
-         (let [on-pairs (normalize-on-pairs on)]
-           (when (empty? on-pairs)
+         (do
+           (when (empty? preds)
              (throw (ex-info "Join :on is required for non-ASOF joins" {:join-spec join-spec})))
-           (ir/->LJoin jt on-pairs left right-scan)))))
+           (when-let [bad (seq (filter #(not= := (first %)) preds))]
+             (throw (ex-info (str "Non-equality predicate in :on clause is not supported for "
+                                  jt " join. Use :type :asof for inequality matches. Got: "
+                                  (mapv first bad))
+                             {:join-spec join-spec :bad-ops (mapv first bad)})))
+           (ir/->LJoin jt (mapv (fn [[_ l r]] [l r]) preds) left right-scan)))))
    scan
    join-specs))
 

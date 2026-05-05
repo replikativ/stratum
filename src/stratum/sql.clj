@@ -1158,10 +1158,10 @@
 (defn- translate-join
   "Translate a Join to a Stratum join spec.
 
-   asof-marker is :asof, :asof-left, or nil. When non-nil, the ON clause is
-   split into equality predicates (→ :on-pairs) and exactly one inequality
-   predicate (→ :match-condition). When nil, only equi-joins are accepted —
-   any non-equality predicate throws with sqlstate 0A000."
+   asof-marker is :asof, :asof-left, or nil. When non-nil, all ON predicates
+   (the equalities and the one inequality) are emitted unified into :on; the
+   planner splits them. When nil, only equi-joins are accepted — any
+   non-equality predicate throws with sqlstate 0A000."
   [^Join join table-registry from-table-name asof-marker]
   (let [join-table (when (instance? Table (.getFromItem join))
                      ^Table (.getFromItem join))
@@ -1174,26 +1174,18 @@
       (throw (ex-info (str "Unknown table in JOIN: " join-table-name)
                       {:table join-table-name})))
     (if asof-marker
-      ;; ASOF JOIN: equality preds → :on, exactly one inequality → :match-condition.
-      (let [classified (mapv on-clause-kind flat-exprs)
-            eq-preds (vec (filter #(= := (first %)) classified))
-            ineq-preds (vec (remove #(= := (first %)) classified))]
-        (when-not (= 1 (count ineq-preds))
-          (throw (ex-info
-                  (str "ASOF JOIN requires exactly one inequality predicate in ON clause, got "
-                       (count ineq-preds))
-                  {:sqlstate "0A000"
-                   :join-table join-real-name
-                   :inequality-count (count ineq-preds)})))
-        (let [on-pairs (mapv (fn [[_ l r]] [:= (translate-expr l) (translate-expr r)])
-                             eq-preds)
-              [ineq-op ineq-l ineq-r] (first ineq-preds)
-              match-condition [ineq-op (translate-expr ineq-l) (translate-expr ineq-r)]]
-          (cond-> {:with join-data
-                   :type asof-marker
-                   :match-condition match-condition}
-            (= 1 (count on-pairs)) (assoc :on (first on-pairs))
-            (> (count on-pairs) 1) (assoc :on on-pairs))))
+      ;; ASOF JOIN: emit unified :on with all preds (one inequality + zero or
+      ;; more equalities). The planner's build-join-tree splits them and
+      ;; validates the inequality count.
+      (let [translated (mapv (fn [expr]
+                               (let [[op l r] (on-clause-kind expr)]
+                                 [op (translate-expr l) (translate-expr r)]))
+                             flat-exprs)
+            on-spec (if (= 1 (count translated))
+                      (first translated)
+                      (vec translated))]
+        (cond-> {:with join-data :type asof-marker}
+          (seq translated) (assoc :on on-spec)))
       ;; Regular equi-join: every predicate must be equality.
       (let [join-type (cond
                         (.isLeft join) :left
@@ -1678,9 +1670,7 @@
         join-specs (if has-joins?
                      (mapv (fn [spec]
                              (cond-> spec
-                               (:on spec) (update :on (partial rewrite-refs ref-map))
-                               (:match-condition spec)
-                               (update :match-condition (partial rewrite-refs ref-map))))
+                               (:on spec) (update :on (partial rewrite-refs ref-map))))
                            join-specs)
                      join-specs)
         select-column-specs (if has-joins?
