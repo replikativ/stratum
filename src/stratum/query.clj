@@ -379,7 +379,10 @@
         (let [first-result (first sub-results)
               to-remove (reduce (fn [acc r] (into acc r)) #{} (rest sub-results))]
           (vec (remove to-remove first-result)))))
-    (if *use-planner*
+    (if (or *use-planner*
+            ;; ASOF joins must go through the planner — the legacy hardcoded
+            ;; path doesn't know about LAsofJoin/PAsofJoin.
+            (some #(#{:asof :asof-left} (:type %)) join))
       ;; === IR Planner path ===
       (do
         (spec/validate! spec/SQuery query {:op :execute})

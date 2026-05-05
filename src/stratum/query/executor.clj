@@ -17,6 +17,7 @@
             [stratum.query.columns :as cols]
             [stratum.query.group-by :as gb]
             [stratum.query.join :as jn]
+            [stratum.query.asof-join :as asof]
             [stratum.query.postprocess :as post]
             [stratum.query.window :as win]
             [stratum.index :as index]
@@ -28,7 +29,7 @@
             PFusedMultiSum PPercentileAgg PScalarAgg
             PChunkedDenseGroupBy PDenseGroupBy PHashGroupBy
             PFusedExtractCount PBitmapSemiJoin PHashJoin
-            PPerfectHashJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
+            PPerfectHashJoin PAsofJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
             PProject PWindow PHaving PSort PDistinct PLimit
             PMaterializeExpr]
            [stratum.internal ColumnOps ColumnOpsExt ColumnOpsAnalytics]))
@@ -511,6 +512,25 @@
      fact-cols fact-length jn-spec group-keys aggs columnar?
      :probe-mask probe-mask :build-mask build-mask)))
 
+(defn- execute-asof-join [node]
+  (let [left-ctx  (execute-node (:left node))
+        right-ctx (execute-node (:right node))
+        probe-mask (realize-mask left-ctx)
+        build-mask (realize-mask right-ctx)
+        probe-cols (cols/materialize-columns (ctx-columns left-ctx))
+        probe-length (ctx-length left-ctx)
+        build-cols (cols/materialize-columns (ctx-columns right-ctx))
+        build-length (ctx-length right-ctx)
+        spec {:join-type (:join-type node)
+              :on-pairs (:on-pairs node)
+              :match-condition (:match-condition node)}
+        result (asof/execute-asof-join probe-cols probe-length
+                                       build-cols build-length
+                                       spec
+                                       :probe-mask probe-mask
+                                       :build-mask build-mask)]
+    {:columns (:columns result) :length (long (:length result))}))
+
 (defn- execute-fused-join-global-agg [node columnar?]
   (let [left-ctx  (execute-node (:left node))
         right-ctx (execute-node (:right node))
@@ -638,6 +658,7 @@
      (instance? PHashJoin node)             (execute-hash-join node)
      (instance? PPerfectHashJoin node)      (execute-hash-join node) ;; same API, perfect hash is internal
      (instance? PBitmapSemiJoin node)       (execute-bitmap-semi-join-node node)
+     (instance? PAsofJoin node)             (execute-asof-join node)
      (instance? PFusedJoinGroupAgg node)    (execute-fused-join-group-agg node columnar?)
      (instance? PFusedJoinGlobalAgg node)   (execute-fused-join-global-agg node columnar?)
 

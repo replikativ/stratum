@@ -23,7 +23,7 @@
             [stratum.query.estimate :as est]
             [stratum.dataset :as dataset])
   (:import [stratum.query.ir
-            LScan LFilter LJoin LGroupBy LGlobalAgg LProject
+            LScan LFilter LJoin LAsofJoin LGroupBy LGlobalAgg LProject
             LWindow LHaving LDistinct LSort LLimit LSetOp
             PScan PChunkedScan PSIMDFilter PMaskFilter
             PStatsOnlyAgg PFusedSIMDAgg PFusedSIMDCount
@@ -31,7 +31,7 @@
             PFusedMultiSum PPercentileAgg PScalarAgg
             PChunkedDenseGroupBy PDenseGroupBy PHashGroupBy
             PFusedExtractCount PBitmapSemiJoin PHashJoin
-            PPerfectHashJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
+            PPerfectHashJoin PAsofJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
             PProject PWindow PHaving PSort PDistinct PLimit
             PMaterializeExpr]))
 
@@ -60,22 +60,62 @@
         length  (cols/get-column-length (val (first columns)))]
     (ir/->LScan columns length)))
 
+(def ^:private asof-ops #{:>= :> :<= :<})
+
+(defn- normalize-on-pairs
+  "Normalize :on spec to vector of [left-col right-col] pairs.
+   Accepts nil/empty, single [:= a b], or vec of equality clauses."
+  [on]
+  (cond
+    (nil? on) []
+    (and (vector? on) (= := (first on)))
+    [[(second on) (nth on 2)]]
+    (and (vector? on) (every? vector? on))
+    (mapv (fn [pair]
+            (when-not (= := (first pair))
+              (throw (ex-info "Join :on clauses must use := operator (use :match-condition for inequality)"
+                              {:clause pair})))
+            [(second pair) (nth pair 2)])
+          on)
+    (and (sequential? on) (empty? on)) []
+    :else (throw (ex-info "Unsupported join :on format" {:on on}))))
+
+(defn- normalize-match-condition
+  "Validate :match-condition shape [op left-col right-col] for ASOF joins."
+  [mc]
+  (when-not (and (vector? mc) (= 3 (count mc))
+                 (contains? asof-ops (first mc))
+                 (keyword? (second mc))
+                 (keyword? (nth mc 2)))
+    (throw (ex-info "ASOF :match-condition must be [op left-col right-col] with op ∈ #{:>= :> :<= :<}"
+                    {:match-condition mc})))
+  [(first mc) (norm/strip-ns (second mc)) (norm/strip-ns (nth mc 2))])
+
 (defn- build-join-tree
-  "Wrap scan with join nodes for each join spec."
+  "Wrap scan with join nodes for each join spec.
+   Supports equi-joins (:inner/:left/:right/:full) and ASOF (:asof/:asof-left)."
   [scan join-specs]
   (reduce
    (fn [left join-spec]
-     (let [{:keys [with on type]} join-spec
-           on-pairs (cond
-                      ;; [:= :a :b]
-                      (and (vector? on) (= := (first on)))
-                      [[(second on) (nth on 2)]]
-                      ;; [[:= :a :b] [:= :c :d]]
-                      (and (vector? on) (every? vector? on))
-                      (mapv (fn [pair] [(second pair) (nth pair 2)]) on)
-                      :else (throw (ex-info "Unsupported join :on format" {:on on})))
+     (let [{:keys [with on type match-condition]} join-spec
+           jt (or type :inner)
            right-scan (build-scan with)]
-       (ir/->LJoin (or type :inner) on-pairs left right-scan)))
+       (cond
+         (#{:asof :asof-left} jt)
+         (do
+           (when-not match-condition
+             (throw (ex-info "ASOF join requires :match-condition [op left-col right-col]"
+                             {:join-spec join-spec})))
+           (let [on-pairs (normalize-on-pairs on)
+                 mc       (normalize-match-condition match-condition)
+                 jt'      (if (= jt :asof-left) :left :inner)]
+             (ir/->LAsofJoin jt' on-pairs mc left right-scan)))
+
+         :else
+         (let [on-pairs (normalize-on-pairs on)]
+           (when (empty? on-pairs)
+             (throw (ex-info "Join :on is required for non-ASOF joins" {:join-spec join-spec})))
+           (ir/->LJoin jt on-pairs left right-scan)))))
    scan
    join-specs))
 
@@ -250,25 +290,30 @@
 
 (defn- scan-columns
   "Get the set of column keywords reachable from a subtree.
-   Recurses through LFilter and LJoin so that predicate pushdown works
+   Recurses through LFilter and join nodes so that predicate pushdown works
    through chained joins (e.g. fact → join1 → join2)."
   [node]
   (cond
-    (instance? LScan node)   (set (keys (:columns node)))
-    (instance? LFilter node) (recur (:input node))
-    (instance? LJoin node)   (let [l (scan-columns (:left node))
-                                   r (scan-columns (:right node))]
-                               (when (and l r)
-                                 (into l r)))
+    (instance? LScan node)     (set (keys (:columns node)))
+    (instance? LFilter node)   (recur (:input node))
+    (instance? LJoin node)     (let [l (scan-columns (:left node))
+                                     r (scan-columns (:right node))]
+                                 (when (and l r)
+                                   (into l r)))
+    (instance? LAsofJoin node) (let [l (scan-columns (:left node))
+                                     r (scan-columns (:right node))]
+                                 (when (and l r)
+                                   (into l r)))
     :else nil))
 
 (defn- pushdown-once
-  "Single pass: push LFilter predicates below LJoin when they reference only one side."
+  "Single pass: push LFilter predicates below a join when they reference only one side."
   [plan]
   (ir/walk-plan plan
                 (fn [node]
                   (if (and (instance? LFilter node)
-                           (instance? LJoin (:input node)))
+                           (or (instance? LJoin (:input node))
+                               (instance? LAsofJoin (:input node))))
                     (let [join (:input node)
                           left-cols  (scan-columns (:left join))
                           right-cols (scan-columns (:right join))]
@@ -748,6 +793,12 @@
                     (instance? LJoin node)
                     (select-join-strategy node nil)
 
+        ;; LAsofJoin → PAsofJoin (single strategy for now; revisit if we add NLJ alt)
+                    (instance? LAsofJoin node)
+                    (ir/->PAsofJoin (:join-type node) (:on-pairs node)
+                                    (:match-condition node)
+                                    (:left node) (:right node))
+
         ;; LFilter without a parent agg (standalone filter, e.g. filter-only query)
         ;; Strategy selection for filter-under-agg is handled above.
                     (instance? LFilter node)
@@ -1017,6 +1068,13 @@
           sel (min 1.0 (/ (double build-rows) (max 1.0 (double build-total))))]
       (max 1 (long (* probe-rows sel))))
 
+    ;; ASOF: each probe row matches ≤1 build row. LEFT preserves all probes;
+    ;; INNER drops unmatched. Without selectivity stats we keep probe count.
+    (instance? PAsofJoin node)
+    (long (or (::estimated-rows (meta (:left node)))
+              (:length (:left node))
+              1000000))
+
     ;; Global agg always produces 1 row
     (or (instance? PStatsOnlyAgg node)
         (instance? PFusedSIMDAgg node) (instance? PFusedSIMDCount node)
@@ -1080,6 +1138,10 @@
                       (doseq [[l r] on] (vswap! refs conj! l) (vswap! refs conj! r)))
                     (when-let [js (:join-spec node)]
                       (doseq [[l r] (:on-pairs js)] (vswap! refs conj! l) (vswap! refs conj! r)))
+        ;; ASOF match-condition columns
+                    (when-let [mc (:match-condition node)]
+                      (vswap! refs conj! (nth mc 1))
+                      (vswap! refs conj! (nth mc 2)))
         ;; Window specs
                     (when-let [specs (:specs node)]
                       (doseq [s specs]
@@ -1182,6 +1244,11 @@
                 (instance? PFusedJoinGlobalAgg node)
                 (str "aggs=" (mapv :op (:aggs node)) " join=" (:join-spec node))
 
+                (instance? PAsofJoin node)
+                (str "type=" (:join-type node)
+                     " on=" (:on-pairs node)
+                     " match=" (:match-condition node))
+
                 (instance? PMaterializeExpr node)
                 (str "col=" (:col-name node) " expr=" (:expr node))
 
@@ -1201,6 +1268,14 @@
                     (instance? LJoin plan)
                     [(str indent "  left:\n" (explain (:left plan) (+ depth 2)))
                      (str indent "  right:\n" (explain (:right plan) (+ depth 2)))]
+
+                    (instance? LAsofJoin plan)
+                    [(str indent "  left:\n" (explain (:left plan) (+ depth 2)))
+                     (str indent "  right:\n" (explain (:right plan) (+ depth 2)))]
+
+                    (instance? PAsofJoin plan)
+                    [(str indent "  probe:\n" (explain (:left plan) (+ depth 2)))
+                     (str indent "  build:\n" (explain (:right plan) (+ depth 2)))]
 
                     (instance? PHashJoin plan)
                     [(str indent "  build:\n" (explain (:build-side plan) (+ depth 2)))
