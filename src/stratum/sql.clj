@@ -1106,8 +1106,59 @@
       (.getName alias)
       (.getName t))))
 
+(defn- unwrap-paren
+  "Strip leading Parenthesis / single-element ParenthesedExpressionList wrappers.
+   JSqlParser produces these around ON-clause subexpressions and predicates;
+   instance-checking the inner type fails without unwrapping first."
+  [expr]
+  (cond
+    (instance? Parenthesis expr)
+    (recur (.getExpression ^Parenthesis expr))
+
+    (and (instance? ParenthesedExpressionList expr)
+         (= 1 (.size ^ParenthesedExpressionList expr)))
+    (recur (.get ^ParenthesedExpressionList expr 0))
+
+    :else expr))
+
+(defn- on-clause-kind
+  "Classify an ON-clause predicate. Returns [op left-expr right-expr] where op
+   is one of #{:= :>= :> :<= :<}. Throws on any other shape (sqlstate 0A000)."
+  [expr]
+  (let [e (unwrap-paren expr)]
+    (cond
+      (instance? EqualsTo e)
+      [:= (.getLeftExpression ^EqualsTo e) (.getRightExpression ^EqualsTo e)]
+      (instance? GreaterThanEquals e)
+      [:>= (.getLeftExpression ^GreaterThanEquals e) (.getRightExpression ^GreaterThanEquals e)]
+      (instance? GreaterThan e)
+      [:> (.getLeftExpression ^GreaterThan e) (.getRightExpression ^GreaterThan e)]
+      (instance? MinorThanEquals e)
+      [:<= (.getLeftExpression ^MinorThanEquals e) (.getRightExpression ^MinorThanEquals e)]
+      (instance? MinorThan e)
+      [:< (.getLeftExpression ^MinorThan e) (.getRightExpression ^MinorThan e)]
+      :else
+      (throw (ex-info (str "Unsupported predicate in JOIN ON clause: " e)
+                      {:sqlstate "0A000" :predicate (str e)})))))
+
+(defn- flatten-and-exprs
+  "Recursively flatten AND chains in ON-clause expressions, unwrapping
+   parentheses at each level. Returns a flat seq of leaf predicate exprs."
+  [exprs]
+  (mapcat (fn flat [expr]
+            (let [e (unwrap-paren expr)]
+              (if (instance? AndExpression e)
+                (let [^AndExpression ae e]
+                  (concat (flat (.getLeftExpression ae))
+                          (flat (.getRightExpression ae))))
+                [e])))
+          exprs))
+
 (defn- translate-join
-  "Translate a Join to a Stratum join spec."
+  "Translate a Join to a Stratum join spec.
+
+   Only equi-joins are supported in the ON clause: any non-equality predicate
+   throws with sqlstate 0A000 (feature_not_supported)."
   [^Join join table-registry from-table-name]
   (let [join-table (when (instance? Table (.getFromItem join))
                      ^Table (.getFromItem join))
@@ -1119,24 +1170,22 @@
                     (.isRight join) :right
                     (.isFull join) :full
                     :else :inner)
-        on-exprs (.getOnExpressions join)]
+        on-exprs (.getOnExpressions join)
+        flat-exprs (flatten-and-exprs on-exprs)]
     (when (and (nil? join-data) join-table-name)
       (throw (ex-info (str "Unknown table in JOIN: " join-table-name)
                       {:table join-table-name})))
-    (let [;; Flatten AND expressions in ON clause (e.g., ON a = b AND c = d)
-          flat-exprs (mapcat (fn flatten-on [expr]
-                               (if (instance? AndExpression expr)
-                                 (let [^AndExpression ae expr]
-                                   (concat (flatten-on (.getLeftExpression ae))
-                                           (flatten-on (.getRightExpression ae))))
-                                 [expr]))
-                             on-exprs)
-          on-clauses (mapv (fn [on-expr]
-                             (when (instance? EqualsTo on-expr)
-                               (let [^EqualsTo eq on-expr
-                                     left (.getLeftExpression eq)
-                                     right (.getRightExpression eq)]
-                                 [:= (translate-expr left) (translate-expr right)])))
+    (let [on-clauses (mapv (fn [expr]
+                             (let [[op l r] (on-clause-kind expr)]
+                               (when (not= := op)
+                                 (throw (ex-info
+                                         (str "Non-equality predicate in JOIN ON clause is not supported. "
+                                              "Use WHERE for filters; use ASOF JOIN for inequality matches. "
+                                              "Got: " (str expr))
+                                         {:sqlstate "0A000"
+                                          :predicate (str expr)
+                                          :join-table join-real-name})))
+                               [:= (translate-expr l) (translate-expr r)]))
                            flat-exprs)
           on-spec (if (= 1 (count on-clauses))
                     (first on-clauses)
@@ -2363,6 +2412,12 @@
            :else
            {:error (str "Unsupported SQL statement type: " (type stmt))}))))
 
+    (catch clojure.lang.ExceptionInfo e
+      ;; Preserve sqlstate and other ex-data set by translation helpers
+      ;; (e.g., :sqlstate "0A000" for feature_not_supported errors).
+      (let [data (ex-data e)]
+        (cond-> {:error (.getMessage e)}
+          (:sqlstate data) (assoc :sqlstate (:sqlstate data)))))
     (catch Exception e
       {:error (.getMessage e)})))
 
