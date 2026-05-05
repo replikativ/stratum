@@ -718,6 +718,31 @@
       (is (= 10 (count results)))
       (is (every? #(pos? (double (:sum %))) results)))))
 
+(deftest sql-join-rejects-non-equi-predicate-test
+  (testing "Non-equality predicate in JOIN ON returns :error with sqlstate 0A000"
+    (let [reg {"a" {:x (long-array [1 2 3])}
+               "b" {:y (long-array [1 2 3])}}
+          r1 (sql/parse-sql "SELECT * FROM a JOIN b ON a.x >= b.y" reg)
+          r2 (sql/parse-sql "SELECT * FROM a JOIN b ON a.x = b.y AND a.x > b.y" reg)]
+      (is (re-find #"Non-equality predicate" (:error r1)))
+      (is (= "0A000" (:sqlstate r1)))
+      (is (re-find #"Non-equality predicate" (:error r2)))
+      (is (= "0A000" (:sqlstate r2))))))
+
+(deftest sql-join-on-with-parentheses-test
+  (testing "JOIN ON (a = b) AND (c = d) — parentheses around equality terms unwrap correctly"
+    (let [reg {"a" {:id   (long-array [1 2 3])
+                    :cat  (long-array [10 20 30])}
+               "b" {:id   (long-array [1 2 3])
+                    :cat  (long-array [10 20 30])
+                    :v    (double-array [1.0 2.0 3.0])}}
+          {:keys [query]} (sql/parse-sql
+                           "SELECT a.id, b.v FROM a JOIN b ON (a.id = b.id) AND (a.cat = b.cat)"
+                           reg)
+          result (q/q query)]
+      (is (= 3 (count result))))))
+
+
 ;; ============================================================================
 ;; Bug Fix Regression Tests
 ;; ============================================================================
