@@ -13,7 +13,8 @@
   (:require [clojure.string :as str]
             [stratum.query :as q]
             [stratum.csv :as csv]
-            [stratum.parquet :as parquet])
+            [stratum.parquet :as parquet]
+            [stratum.sql.rewrite :as rewrite])
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.statement Statement]
            [net.sf.jsqlparser.statement.select
@@ -1157,42 +1158,66 @@
 (defn- translate-join
   "Translate a Join to a Stratum join spec.
 
-   Only equi-joins are supported in the ON clause: any non-equality predicate
-   throws with sqlstate 0A000 (feature_not_supported)."
-  [^Join join table-registry from-table-name]
+   asof-marker is :asof, :asof-left, or nil. When non-nil, the ON clause is
+   split into equality predicates (→ :on-pairs) and exactly one inequality
+   predicate (→ :match-condition). When nil, only equi-joins are accepted —
+   any non-equality predicate throws with sqlstate 0A000."
+  [^Join join table-registry from-table-name asof-marker]
   (let [join-table (when (instance? Table (.getFromItem join))
                      ^Table (.getFromItem join))
         join-table-name (when join-table (table-name join-table))
         join-real-name (when join-table (.getName join-table))
         join-data (when join-real-name (get table-registry join-real-name))
-        join-type (cond
-                    (.isLeft join) :left
-                    (.isRight join) :right
-                    (.isFull join) :full
-                    :else :inner)
         on-exprs (.getOnExpressions join)
         flat-exprs (flatten-and-exprs on-exprs)]
     (when (and (nil? join-data) join-table-name)
       (throw (ex-info (str "Unknown table in JOIN: " join-table-name)
                       {:table join-table-name})))
-    (let [on-clauses (mapv (fn [expr]
-                             (let [[op l r] (on-clause-kind expr)]
-                               (when (not= := op)
-                                 (throw (ex-info
-                                         (str "Non-equality predicate in JOIN ON clause is not supported. "
-                                              "Use WHERE for filters; use ASOF JOIN for inequality matches. "
-                                              "Got: " (str expr))
-                                         {:sqlstate "0A000"
-                                          :predicate (str expr)
-                                          :join-table join-real-name})))
-                               [:= (translate-expr l) (translate-expr r)]))
-                           flat-exprs)
-          on-spec (if (= 1 (count on-clauses))
-                    (first on-clauses)
-                    (vec on-clauses))]
-      {:with join-data
-       :on on-spec
-       :type join-type})))
+    (if asof-marker
+      ;; ASOF JOIN: equality preds → :on, exactly one inequality → :match-condition.
+      (let [classified (mapv on-clause-kind flat-exprs)
+            eq-preds (vec (filter #(= := (first %)) classified))
+            ineq-preds (vec (remove #(= := (first %)) classified))]
+        (when-not (= 1 (count ineq-preds))
+          (throw (ex-info
+                  (str "ASOF JOIN requires exactly one inequality predicate in ON clause, got "
+                       (count ineq-preds))
+                  {:sqlstate "0A000"
+                   :join-table join-real-name
+                   :inequality-count (count ineq-preds)})))
+        (let [on-pairs (mapv (fn [[_ l r]] [:= (translate-expr l) (translate-expr r)])
+                             eq-preds)
+              [ineq-op ineq-l ineq-r] (first ineq-preds)
+              match-condition [ineq-op (translate-expr ineq-l) (translate-expr ineq-r)]]
+          (cond-> {:with join-data
+                   :type asof-marker
+                   :match-condition match-condition}
+            (= 1 (count on-pairs)) (assoc :on (first on-pairs))
+            (> (count on-pairs) 1) (assoc :on on-pairs))))
+      ;; Regular equi-join: every predicate must be equality.
+      (let [join-type (cond
+                        (.isLeft join) :left
+                        (.isRight join) :right
+                        (.isFull join) :full
+                        :else :inner)
+            on-clauses (mapv (fn [expr]
+                               (let [[op l r] (on-clause-kind expr)]
+                                 (when (not= := op)
+                                   (throw (ex-info
+                                           (str "Non-equality predicate in JOIN ON clause is not supported. "
+                                                "Use WHERE for filters; use ASOF JOIN for inequality matches. "
+                                                "Got: " (str expr))
+                                           {:sqlstate "0A000"
+                                            :predicate (str expr)
+                                            :join-table join-real-name})))
+                                 [:= (translate-expr l) (translate-expr r)]))
+                             flat-exprs)
+            on-spec (if (= 1 (count on-clauses))
+                      (first on-clauses)
+                      (vec on-clauses))]
+        {:with join-data
+         :on on-spec
+         :type join-type}))))
 
 ;; ============================================================================
 ;; Qualified column resolution for JOINs
@@ -1278,8 +1303,15 @@
              with-data renamed-keys))
 
 (defn- translate-select
-  "Translate a PlainSelect AST to a Stratum query map."
-  [^PlainSelect select table-registry]
+  "Translate a PlainSelect AST to a Stratum query map.
+
+   asof-markers (optional, 3-arity): vector of marker keywords (:asof / :asof-left
+   / nil) indexed by top-level join ordinal. Set by the rewriter when ASOF JOIN
+   syntax appears in the original SQL. Recursive translate-select calls (CTE,
+   subquery, set-op side) pass nil so outer markers don't bleed into inner joins."
+  ([^PlainSelect select table-registry]
+   (translate-select select table-registry nil))
+  ([^PlainSelect select table-registry asof-markers]
   (let [select-items (.getSelectItems select)
         from-item (.getFromItem select)
         where-expr (.getWhere select)
@@ -1591,7 +1623,11 @@
 
         ;; Build JOINs
         join-specs-raw (when (seq joins)
-                         (mapv #(translate-join % table-registry from-table-name) joins))
+                         (vec (map-indexed
+                               (fn [idx j]
+                                 (translate-join j table-registry from-table-name
+                                                 (get asof-markers idx)))
+                               joins)))
 
         ;; Qualified column resolution: detect collisions and rewrite refs
         ;; Build join table info for ref-map
@@ -1614,8 +1650,11 @@
                               (filterv some? join-table-infos))
           [nil nil nil])
 
-        ;; Apply rewriting when ref-map is non-empty and has actual renames
+        ;; has-renames? — whether any column collides across tables (drives :with rename).
+        ;; has-joins? — whether the query has any JOIN at all (drives qualified-ref rewriting,
+        ;; since `t.col` ends up as `:t/col` and must be stripped/resolved before execution).
         has-renames? (and ref-map (seq renamed-keys-by-table))
+        has-joins? (boolean (seq join-table-infos))
 
         ;; Rename join :with data keys for colliding columns
         join-specs (if has-renames?
@@ -1628,20 +1667,23 @@
                            (concat join-table-infos (repeat nil)))
                      join-specs-raw)
 
-        ;; Rewrite all refs through ref-map
-        preds (if has-renames? (rewrite-refs ref-map preds) preds)
-        projection (if (and has-renames? projection) (rewrite-refs ref-map projection) projection)
-        groups (if has-renames? (rewrite-refs ref-map groups) groups)
-        having-preds (if has-renames? (rewrite-refs ref-map having-preds) having-preds)
-        orders (if has-renames? (rewrite-refs ref-map orders) orders)
-        aggs (if has-renames? (rewrite-refs ref-map aggs) aggs)
-        window-specs (if has-renames? (rewrite-refs ref-map window-specs) window-specs)
-        join-specs (if has-renames?
+        ;; Rewrite all refs through ref-map (resolves qualified keywords + applies renames)
+        preds (if has-joins? (rewrite-refs ref-map preds) preds)
+        projection (if (and has-joins? projection) (rewrite-refs ref-map projection) projection)
+        groups (if has-joins? (rewrite-refs ref-map groups) groups)
+        having-preds (if has-joins? (rewrite-refs ref-map having-preds) having-preds)
+        orders (if has-joins? (rewrite-refs ref-map orders) orders)
+        aggs (if has-joins? (rewrite-refs ref-map aggs) aggs)
+        window-specs (if has-joins? (rewrite-refs ref-map window-specs) window-specs)
+        join-specs (if has-joins?
                      (mapv (fn [spec]
-                             (update spec :on (partial rewrite-refs ref-map)))
+                             (cond-> spec
+                               (:on spec) (update :on (partial rewrite-refs ref-map))
+                               (:match-condition spec)
+                               (update :match-condition (partial rewrite-refs ref-map))))
                            join-specs)
                      join-specs)
-        select-column-specs (if has-renames?
+        select-column-specs (if has-joins?
                               (mapv (fn [spec]
                                       (cond-> spec
                                         (:source spec) (update :source #(rewrite-ref ref-map %))
@@ -1689,7 +1731,7 @@
                 (and (or has-agg? has-group?)
                      (some #(= :literal (:type %)) select-column-specs))
                 (assoc :_select-columns select-column-specs))]
-    query))
+    query)))
 
 ;; ============================================================================
 ;; Post-aggregate expression evaluation
@@ -2312,8 +2354,12 @@
        (when (pg-catalog-table sql)
          (handle-pg-catalog sql table-registry))
 
-        ;; Parse with JSqlParser
-       (let [stmt (CCJSqlParserUtil/parse ^String sql)]
+        ;; Pre-parse rewrite for non-standard syntax (ASOF JOIN, ...) and
+        ;; parse with JSqlParser.
+       (let [{rewritten-sql :sql asof-markers :asof-markers}
+             (rewrite/preprocess-sql sql)
+             sql rewritten-sql  ;; shadow: downstream uses rewritten form
+             stmt (CCJSqlParserUtil/parse ^String sql)]
          (cond
            (instance? PlainSelect stmt)
            (let [^PlainSelect select stmt
@@ -2359,10 +2405,11 @@
                            fixed-registry (assoc enriched-registry "__file_table__" table-data)]
                        {:query (translate-select
                                 ^PlainSelect (CCJSqlParserUtil/parse ^String fixed-sql)
-                                fixed-registry)})))
+                                fixed-registry
+                                asof-markers)})))
 
                   ;; Normal SELECT translation
-                 {:query (translate-select select enriched-registry)}))
+                 {:query (translate-select select enriched-registry asof-markers)}))
 
             ;; UNION / UNION ALL / INTERSECT / EXCEPT
            (instance? SetOperationList stmt)
