@@ -1,36 +1,53 @@
 (ns stratum.parquet
-  "Parquet import for Stratum.
+  "Parquet support for Stratum.
 
-   Two ingest paths:
+   Three paths, picked by the lifecycle of the data:
 
      (from-parquet \"data/orders.parquet\")
        In-memory: builds heap arrays and returns a non-persistent
        StratumDataset. Suitable for small-to-medium files used
        programmatically. Memory footprint scales with file size.
 
+     (parquet-dataset \"data/orders.parquet\")
+       Zero-copy: opens the file, reads only metadata, and returns a
+       read-only StratumDataset whose columns lazy-decode their row
+       groups on first SIMD-path or materialization. Open is
+       constant-time. Stats from parquet's own row-group metadata feed
+       directly into stratum's zone-map pruning. No konserve, no
+       persistence — the parquet file is the storage. Best for ad-hoc
+       analytics on parquet files.
+
      (index-parquet! \"data/orders.parquet\" store branch)
        Streaming: reads the file row-group-by-row-group, fills
        chunk-sized buffers per column, flushes chunks to konserve
        via idx-append-chunk!, and periodically syncs to free heap.
        Returns a synced, index-backed StratumDataset. Memory is
-       bounded — independent of file size.
+       bounded — independent of file size. Best when the data needs
+       stratum's mutate/branch/sync lifecycle.
 
    No Hadoop runtime required — uses LocalInputFile for direct file access."
   (:require [clojure.core.async :as async]
+            [clojure.string :as str]
             [stratum.dataset :as dataset]
             [stratum.index :as idx]
             [stratum.chunk :as chunk]
+            [stratum.stats :as stats]
             [stratum.cached-storage :as cstorage]
-            [stratum.storage :as storage])
+            [stratum.storage :as storage]
+            [org.replikativ.persistent-sorted-set :as pss])
   (:import [org.apache.parquet.hadoop ParquetFileReader]
            [org.apache.parquet.io LocalInputFile]
-           [org.apache.parquet.column.page PageReadStore]
+           [org.apache.parquet.column ColumnDescriptor Dictionary]
+           [org.apache.parquet.column.page PageReadStore DictionaryPageReadStore]
+           [org.apache.parquet.column.statistics Statistics]
+           [org.apache.parquet.hadoop.metadata BlockMetaData ColumnChunkMetaData]
            [org.apache.parquet.io ColumnIOFactory MessageColumnIO]
            [org.apache.parquet.io.api RecordMaterializer GroupConverter PrimitiveConverter Binary]
            [org.apache.parquet.schema MessageType Type GroupType]
            [org.apache.parquet.schema PrimitiveType PrimitiveType$PrimitiveTypeName]
            [org.apache.parquet.schema LogicalTypeAnnotation LogicalTypeAnnotation$StringLogicalTypeAnnotation
             LogicalTypeAnnotation$TimestampLogicalTypeAnnotation]
+           [java.lang.ref Cleaner]
            [java.nio ByteBuffer ByteOrder]
            [java.nio.file Path Paths]
            [java.util HashMap]
@@ -558,3 +575,508 @@
                                             :source-type :parquet}})))
       (finally
         (.close reader)))))
+
+;; ============================================================================
+;; parquet-dataset — zero-copy / lazy-decode parquet reader
+;; ============================================================================
+;;
+;; Open a parquet file in constant time, return a read-only StratumDataset
+;; whose columns are parquet-backed PSS trees. Each row group becomes one
+;; chunk; chunks decode their data lazily on first SIMD-path / materialize
+;; access. Stats from parquet metadata feed our zone-map pruning directly.
+;;
+;; No konserve, no ingest. The parquet file is the storage.
+
+(def ^:private cleaner
+  "Shared Cleaner that closes ParquetFileReaders when their owning dataset
+   is no longer reachable."
+  (delay (Cleaner/create)))
+
+(defn- parquet-type->stratum-type
+  "Map a parquet column to stratum :int64 / :float64 / :string. Mirrors
+   classify-column above, returning stratum's idx-datatype keywords."
+  [^ColumnDescriptor cd]
+  (let [pt (.getPrimitiveType cd)]
+    (case (str (.getPrimitiveTypeName pt))
+      "INT64"  :int64
+      "INT32"  :int64
+      "INT96"  :int64
+      "BOOLEAN" :int64
+      "DOUBLE" :float64
+      "FLOAT"  :float64
+      "BINARY" :string
+      "FIXED_LEN_BYTE_ARRAY" :string)))
+
+(defn- find-column-meta
+  "Find the ColumnChunkMetaData for `cd` in `block`."
+  ^ColumnChunkMetaData [^BlockMetaData block ^ColumnDescriptor cd]
+  (let [path (str/join "." (.getPath cd))]
+    (or (some (fn [^ColumnChunkMetaData c]
+                (when (= path (.toDotString (.getPath c)))
+                  c))
+              (.getColumns block))
+        (throw (ex-info "Column metadata not found in row group"
+                        {:path path
+                         :rg-cols (mapv #(.toDotString (.getPath ^ColumnChunkMetaData %))
+                                        (.getColumns block))})))))
+
+(defn- statistics->chunk-stats
+  "Map a parquet `Statistics` (per-row-group/per-column) to stratum
+   ChunkStats. parquet doesn't store sum/sum-sq, so those are 0.0 — the
+   stats-only SUM/AVG fast path won't fire on parquet-backed columns,
+   but min/max/count/null-count drive zone-map pruning fully.
+
+   For string columns, we don't yet know the per-row-group dict-id range
+   (the global dict is built later). Caller updates the stats with
+   string-stats-from-dict-translate once the translation table exists."
+  ^stratum.stats.ChunkStats [^Statistics s ^long n-values datatype]
+  (let [null-count (.getNumNulls s)
+        nominal-count (- n-values null-count)
+        [mn mx] (cond
+                  (not (.hasNonNullValue s))
+                  [Double/NaN Double/NaN]
+
+                  (= :int64 datatype)
+                  [(double (.longValue ^Number (.genericGetMin s)))
+                   (double (.longValue ^Number (.genericGetMax s)))]
+
+                  (= :float64 datatype)
+                  [(double (.doubleValue ^Number (.genericGetMin s)))
+                   (double (.doubleValue ^Number (.genericGetMax s)))]
+
+                  :else
+                  [Double/NaN Double/NaN])]
+    (stats/->ChunkStats nominal-count 0.0 0.0 mn mx null-count)))
+
+(defn- string-rg-min-max
+  "Compute min/max global-dict-id appearing in the row-group `rg-idx`
+   from the per-row-group translation table — the smallest and largest
+   global ids the row group can produce. Returns [min max] as doubles,
+   or [NaN NaN] if the row group has no dict (plain encoding)."
+  [translates rg-idx]
+  (if-let [^longs t (when translates (nth translates rg-idx))]
+    (let [n (alength t)]
+      (if (zero? n)
+        [Double/NaN Double/NaN]
+        (loop [i 1
+               mn (aget t 0)
+               mx (aget t 0)]
+          (if (>= i n)
+            [(double mn) (double mx)]
+            (let [v (aget t i)]
+              (recur (inc i)
+                     (if (< v mn) v mn)
+                     (if (> v mx) v mx)))))))
+    [Double/NaN Double/NaN]))
+
+;; ----------------------------------------------------------------------------
+;; String column support — global dict + per-row-group translation
+;; ----------------------------------------------------------------------------
+;;
+;; Stratum's query engine expects string columns as long-encoded dict IDs
+;; against a single global String[] per column. Parquet, by contrast,
+;; stores a separate dictionary per row group. To bridge the two cleanly:
+;;
+;;   1. At parquet-dataset open time, walk every row group's dict page for
+;;      this column (small; no row data read), merge entries into a global
+;;      HashMap<String,Long>. Cost = sum of distinct values across row
+;;      groups, typically tiny for low-cardinality columns.
+;;
+;;   2. Build a per-row-group `int[] localId → long globalId` translation
+;;      table while merging.
+;;
+;;   3. At chunk decode time, the column reader emits local-dict IDs
+;;      (parquet's `getCurrentValueDictionaryID()`) — we look them up in
+;;      the row group's translation table to produce a long[] of global
+;;      IDs. For pages encoded plainly (no dict), fall back to looking up
+;;      the binary in the global dict.
+
+(defn- read-rg-dict
+  "Read the dictionary page for `cd` in row group `rg-idx` of `reader`,
+   returning a vector of `String`s in local-dict ID order. Returns nil
+   when the row group has no dict page (e.g. all-PLAIN encoding)."
+  [^ParquetFileReader reader rg-idx ^ColumnDescriptor cd]
+  (let [^DictionaryPageReadStore drs (.getDictionaryReader reader (int rg-idx))
+        dp (when drs (.readDictionaryPage drs cd))]
+    (when dp
+      (let [^Dictionary dict (.initDictionary (.getEncoding dp) cd dp)
+            n (inc (.getMaxId dict))
+            out (object-array n)]
+        (dotimes [i n]
+          (aset out i (.toStringUsingUTF8 ^Binary (.decodeToBinary dict (int i)))))
+        (vec out)))))
+
+(defn- build-string-global-dict
+  "Walk every row group's dict page for `cd`, merging into a single global
+   `String → long` map. Returns:
+     {:dict     ^objects globalIdx → String
+      :translates [translate-table-per-row-group]
+                 each translate-table is a long[] (local-dict-id → global-id)
+                 or nil if the row group has no dict page (caller falls back).}
+
+   `dict-cap` is the maximum allowed global dict size; throws when crossed
+   (per the Ryan-style high-cardinality OOM guard)."
+  [^ParquetFileReader reader ^ColumnDescriptor cd ^long n-row-groups dict-cap]
+  (let [global ^HashMap (HashMap.)
+        translates (object-array n-row-groups)]
+    (dotimes [rg-idx n-row-groups]
+      (when-let [rg-dict (read-rg-dict reader rg-idx cd)]
+        (let [n (count rg-dict)
+              tab (long-array n)]
+          (dotimes [i n]
+            (let [s ^String (nth rg-dict i)
+                  existing (.get global s)
+                  gid (if existing
+                        (long existing)
+                        (let [new-id (.size global)]
+                          (when (and dict-cap (>= new-id (long dict-cap)))
+                            (throw (ex-info
+                                    "parquet-dataset string dict cap exceeded — column has too many distinct values"
+                                    {:column (last (.getPath cd))
+                                     :dict-cap dict-cap})))
+                          (.put global s (long new-id))
+                          new-id))]
+              (aset ^longs tab i (long gid))))
+          (aset translates rg-idx tab))))
+    (let [n (.size global)
+          arr (make-array String n)]
+      (doseq [^java.util.Map$Entry e (.entrySet global)]
+        (aset ^"[Ljava.lang.String;" arr
+              (int (long (.getValue e))) ^String (.getKey e)))
+      {:dict arr
+       :global-map global             ; for plain-encoded fallbacks
+       :translates (vec translates)})))
+
+(defn- decode-row-group-string
+  "Decode a single string column from a single row group into a long[]
+   of global-dict IDs. When the row group is dict-encoded we use the
+   translation table for zero-string-allocation; for plain pages we look
+   up the binary in the global map. Long.MIN_VALUE marks NULL."
+  [^ParquetFileReader reader rg-index ^ColumnDescriptor cd
+   translate ^HashMap global-map length]
+  (let [rg-index (int rg-index)
+        length (int length)
+        full-schema (.getSchema (.getFileMetaData (.getFooter reader)))
+        col-name (last (.getPath cd))
+        proj-field (some (fn [^Type f] (when (= col-name (.getName f)) f))
+                         (.getFields ^MessageType full-schema))
+        proj-schema (MessageType. (.getName ^MessageType full-schema)
+                                  ^"[Lorg.apache.parquet.schema.Type;"
+                                  (into-array Type [proj-field]))
+        ^longs out (long-array length)
+        _ (java.util.Arrays/fill out Long/MIN_VALUE)
+        cursor (int-array 1)
+        pages (.readRowGroup reader rg-index)
+        column-io (.getColumnIO (ColumnIOFactory.) proj-schema)
+        ^longs translate-arr translate
+        conv (proxy [PrimitiveConverter] []
+               ;; Opt into dict-aware decoding. Parquet calls setDictionary
+               ;; once per dict-encoded page; we ignore the per-page
+               ;; Dictionary because our translation table maps local ids
+               ;; to global ids precomputed at open time.
+               (hasDictionarySupport [] (some? translate-arr))
+               (setDictionary [_dict] nil)
+               (addValueFromDictionary [local-id]
+                 (aset out (aget cursor 0) (aget translate-arr (int local-id))))
+               (addBinary [^Binary v]
+                 (let [s (.toStringUsingUTF8 v)
+                       gid (.get global-map s)]
+                   (aset out (aget cursor 0)
+                         (if gid (long gid) Long/MIN_VALUE)))))
+        gc (proxy [GroupConverter] []
+             (getConverter [_] conv)
+             (start [])
+             (end [] (aset cursor 0 (inc (aget cursor 0)))))
+        rm (proxy [RecordMaterializer] []
+             (getRootConverter [] gc)
+             (getCurrentRecord [] nil))
+        rr (.getRecordReader ^MessageColumnIO column-io pages rm)]
+    (dotimes [_ length] (.read rr))
+    out))
+
+(defn- decode-row-group-numeric
+  "Decode a single column from a single row group into a long[] or
+   double[] sized to the row group. One allocation, one decode pass.
+
+   Uses parquet's RecordReader path (same as index-parquet!), restricted
+   to a single column and a single row group."
+  [^ParquetFileReader reader rg-index ^ColumnDescriptor cd datatype length]
+  (let [rg-index (int rg-index)
+        length (int length)
+        ;; Build a single-column projected schema so the RecordReader only
+        ;; decodes our column.
+        full-schema (.getSchema (.getFileMetaData (.getFooter reader)))
+        col-name (last (.getPath cd))
+        proj-field (some (fn [^Type f] (when (= col-name (.getName f)) f))
+                         (.getFields ^MessageType full-schema))
+        _ (when (nil? proj-field)
+            (throw (ex-info "Projected field not found"
+                            {:col col-name
+                             :have (mapv #(.getName ^Type %) (.getFields ^MessageType full-schema))})))
+        proj-schema (MessageType. (.getName ^MessageType full-schema)
+                                  ^"[Lorg.apache.parquet.schema.Type;"
+                                  (into-array Type [proj-field]))
+        is-int96 (= "INT96" (str (.getPrimitiveTypeName (.getPrimitiveType cd))))
+        out (case datatype
+              :int64   (long-array length)
+              :float64 (double-array length))
+        cursor (int-array 1)
+        pages (.readRowGroup reader rg-index)
+        column-io (.getColumnIO (ColumnIOFactory.) proj-schema)
+        conv (case datatype
+               :int64
+               (let [^longs arr out]
+                 (if is-int96
+                   (proxy [PrimitiveConverter] []
+                     (addBinary [^Binary v]
+                       (aset arr (aget cursor 0) (long (int96->epoch-millis v)))))
+                   (proxy [PrimitiveConverter] []
+                     (addLong    [v] (aset arr (aget cursor 0) (long v)))
+                     (addInt     [v] (aset arr (aget cursor 0) (long (int v))))
+                     (addBoolean [v] (aset arr (aget cursor 0) (if v 1 0)))
+                     (addBinary  [^Binary v] (aset arr (aget cursor 0) (long (int96->epoch-millis v))))
+                     (addFloat   [v] (aset arr (aget cursor 0) (long (float v))))
+                     (addDouble  [v] (aset arr (aget cursor 0) (long (double v)))))))
+               :float64
+               (let [^doubles arr out]
+                 (proxy [PrimitiveConverter] []
+                   (addDouble [v] (aset arr (aget cursor 0) (double v)))
+                   (addFloat  [v] (aset arr (aget cursor 0) (double (float v))))
+                   (addLong   [v] (aset arr (aget cursor 0) (double (long v))))
+                   (addInt    [v] (aset arr (aget cursor 0) (double (int v)))))))
+        gc (proxy [GroupConverter] []
+             (getConverter [_] conv)
+             (start [])
+             (end [] (aset cursor 0 (inc (aget cursor 0)))))
+        rm (proxy [RecordMaterializer] []
+             (getRootConverter [] gc)
+             (getCurrentRecord [] nil))
+        rr (.getRecordReader ^MessageColumnIO column-io pages rm)]
+    (dotimes [_ length] (.read rr))
+    out))
+
+(deftype ParquetRowGroupChunk
+         [;; lifeline keeps the underlying ParquetFileReader strongly
+          ;; reachable. The Cleaner action that closes the reader is
+          ;; registered on this same lifeline object — as long as any
+          ;; chunk references it, the reader stays open. ds also
+          ;; references it, so closing happens only when ds AND all
+          ;; chunks are unreachable.
+          lifeline
+          ^ParquetFileReader reader
+          ^long rg-index
+          ^ColumnDescriptor col-desc
+          datatype                      ; :int64 | :float64 | :string
+          ^long length
+          translate                     ; long[] (string cols) or nil
+          global-map                    ; HashMap (string fallback) or nil
+          ^:volatile-mutable data       ; nil until first decode; long[] | double[]
+          ^:volatile-mutable lock]
+
+  chunk/IColChunk
+  (chunk-length [_] length)
+  ;; Stratum's :string source-type is presented through the column map's
+  ;; :dict; the underlying chunk is long-encoded, so we report :int64 to
+  ;; satisfy long-vs-double dispatch in the SIMD path. Numeric types map
+  ;; through unchanged.
+  (chunk-datatype [_]
+    (if (= :string datatype) :int64 datatype))
+
+  (read-value [this idx]
+    (if (= :float64 datatype)
+      (aget ^doubles (chunk/chunk-as-doubles this) (int idx))
+      (aget ^longs (chunk/chunk-as-longs this) (int idx))))
+  (read-long [this idx]
+    (aget ^longs (chunk/chunk-as-longs this) (int idx)))
+  (read-double [this idx]
+    (if (= :float64 datatype)
+      (aget ^doubles (chunk/chunk-as-doubles this) (int idx))
+      (double (aget ^longs (chunk/chunk-as-longs this) (int idx)))))
+
+  (chunk-data [this]
+    (if (= :float64 datatype)
+      (chunk/chunk-as-doubles this)
+      (chunk/chunk-as-longs this)))
+
+  (chunk-as-longs [_]
+    (or data
+        (locking lock
+          (or data
+              (let [arr (case datatype
+                          :string  (decode-row-group-string reader rg-index col-desc
+                                                            translate global-map length)
+                          (decode-row-group-numeric reader rg-index col-desc datatype length))]
+                (set! data arr)
+                arr)))))
+
+  (chunk-as-doubles [_]
+    (or data
+        (locking lock
+          (or data
+              (let [arr (decode-row-group-numeric reader rg-index col-desc datatype length)]
+                (set! data arr)
+                arr)))))
+
+  (chunk-constant? [_] false)
+  (chunk-constant-val [_] nil)
+
+  chunk/IColChunkMut
+  (write-value! [_ _ _]
+    (throw (UnsupportedOperationException. "ParquetRowGroupChunk is read-only")))
+  (write-double! [_ _ _]
+    (throw (UnsupportedOperationException. "ParquetRowGroupChunk is read-only")))
+  (write-long! [_ _ _]
+    (throw (UnsupportedOperationException. "ParquetRowGroupChunk is read-only")))
+
+  chunk/IColChunkPersistence
+  (col-fork [this] this)              ; immutable, sharing is safe
+  (col-transient [_]
+    (throw (UnsupportedOperationException. "ParquetRowGroupChunk is read-only")))
+  (col-persistent! [this] this)
+  (col-transient? [_] false))
+
+(defn- build-parquet-column-index
+  "Build a stratum PCI for a single parquet column. One ChunkEntry per
+   row group, lazy-decoded. PSS tree is in-memory (no storage).
+
+   `lifeline` is shared across all chunks of all columns from one file —
+   the Cleaner action that closes the reader is bound to its
+   reachability.
+
+   `dict-info` is nil for numeric columns; for strings it is the map
+   produced by `build-string-global-dict` (translates per row group +
+   global fallback map)."
+  [lifeline ^ParquetFileReader reader ^ColumnDescriptor cd dict-info]
+  (let [datatype (parquet-type->stratum-type cd)
+        ;; Stratum's downstream wiring expects string columns as
+        ;; long-encoded indices into a dict; the chunk reports :int64
+        ;; via `chunk-datatype`, but the PCI we build needs :int64 too
+        ;; so the query engine treats it as a long column.
+        idx-datatype (if (= :string datatype) :int64 datatype)
+        footer (.getFooter reader)
+        blocks (vec (.getBlocks footer))
+        translates (:translates dict-info)
+        global-map (:global-map dict-info)
+        cmp idx/chunk-entry-comparator
+        empty-tree (pss/sorted-set*
+                    {:cmp cmp
+                     :measure idx/chunk-entry-measure-ops})
+        entries (mapv (fn [^long rg-idx ^BlockMetaData block]
+                        (let [col-meta (find-column-meta block cd)
+                              n (.getValueCount col-meta)
+                              base-stats (statistics->chunk-stats
+                                          (.getStatistics col-meta) n datatype)
+                              translate (when translates (nth translates rg-idx))
+                              ;; For strings: parquet has Binary min/max; we
+                              ;; want dict-id min/max (so zone-map and dense
+                              ;; group-by sizing both work). Compute from the
+                              ;; per-row-group translation table.
+                              cstats (if (= :string datatype)
+                                       (let [[mn mx] (string-rg-min-max translates rg-idx)]
+                                         (assoc base-stats :min-val mn :max-val mx))
+                                       base-stats)
+                              chunk (->ParquetRowGroupChunk
+                                     lifeline reader rg-idx cd datatype n
+                                     translate global-map nil (Object.))]
+                          (idx/->ChunkEntry [rg-idx] chunk cstats)))
+                      (range (count blocks))
+                      blocks)
+        tree (reduce conj empty-tree entries)
+        total (long (reduce + (map #(.getRowCount ^BlockMetaData %) blocks)))]
+    (idx/->PersistentColumnIndex
+     tree total idx-datatype idx/DEFAULT_CHUNK_SIZE cmp
+     nil                             ; edit (persistent)
+     (atom #{})                      ; dirty-chunks
+     {:source :parquet}              ; metadata
+     (count blocks)                  ; next-chunk-id
+     nil)))                          ; storage (no konserve)
+
+(defn parquet-dataset
+  "Open a parquet file as a read-only, zero-copy StratumDataset.
+
+   Constant-time open: reads only file footer metadata (typically a few
+   ms for a multi-GB file). Each parquet row group becomes one chunk in
+   the stratum index; chunks lazy-decode on first SIMD-path or
+   materialize. Per-row-group min/max/count/null-count from parquet
+   metadata feed stratum's zone-map pruning, so chunks the planner can
+   prove irrelevant are never decoded.
+
+   No konserve, no persistence — the parquet file is the storage. The
+   returned dataset is read-only: idx-set!/idx-append!/idx-sync! all
+   throw.
+
+   Lifecycle: a Cleaner action is registered to close the underlying
+   ParquetFileReader when the dataset becomes unreachable. For long-lived
+   processes you can invoke `close-parquet-dataset!` explicitly.
+
+   Options:
+     :columns - vector of column names to expose (default: all)
+     :name    - dataset name (default: derived from filename)"
+  [^String path & {:keys [columns name dict-cap]
+                   :or {dict-cap (long 50000000)}}]
+  (let [reader (ParquetFileReader/open
+                (LocalInputFile. (Paths/get path (make-array String 0))))
+        ;; lifeline is the cleanup-anchor object. Both the dataset and
+        ;; every ParquetRowGroupChunk reference it strongly. The Cleaner
+        ;; action runs only when ALL of those references go away — so
+        ;; chunks that outlive the dataset (held via column refs) keep
+        ;; the reader open until they are themselves unreachable.
+        lifeline (Object.)
+        footer (.getFooter reader)
+        schema (.getSchema (.getFileMetaData footer))
+        n-row-groups (count (.getBlocks footer))
+        all-cols (vec (.getColumns schema))
+        proj-cols (if columns
+                    (let [col-set (set columns)]
+                      (vec (filter #(col-set (last (.getPath ^ColumnDescriptor %))) all-cols)))
+                    all-cols)
+        col-map (into {}
+                      (map (fn [^ColumnDescriptor cd]
+                             (let [col-name (last (.getPath cd))
+                                   datatype (parquet-type->stratum-type cd)
+                                   dict-info (when (= :string datatype)
+                                               (build-string-global-dict
+                                                reader cd n-row-groups dict-cap))
+                                   pci (build-parquet-column-index
+                                        lifeline reader cd dict-info)
+                                   col-info (if (= :string datatype)
+                                              ;; String column wired as
+                                              ;; long-encoded dict ID
+                                              ;; against global :dict.
+                                              {:type :int64 :source :index
+                                               :dict (:dict dict-info)
+                                               :dict-type :string
+                                               :dict-alpha-masks
+                                               (ColumnOpsString/buildDictAlphaMasks
+                                                ^"[Ljava.lang.String;" (:dict dict-info))
+                                               :dict-bigram-masks
+                                               (ColumnOpsString/buildDictBigramMasks
+                                                ^"[Ljava.lang.String;" (:dict dict-info))
+                                               :stats-sum-incomplete? true
+                                               :index pci}
+                                              {:type datatype :source :index
+                                               :stats-sum-incomplete? true
+                                               :index pci})]
+                               [(keyword col-name) col-info])))
+                      proj-cols)
+        ds-name (or name (str "parquet:" (.getName (java.io.File. path))))
+        ds (dataset/make-dataset col-map
+                                 {:name ds-name
+                                  :metadata {:source-path path
+                                             :source-type :parquet
+                                             ::reader reader
+                                             ::lifeline lifeline}})]
+    ;; Cleaner watches `lifeline`. As long as any chunk or `ds` holds it,
+    ;; the reader stays open. Closes only after the entire chain drops.
+    (.register ^Cleaner @cleaner lifeline
+               (reify Runnable
+                 (run [_]
+                   (try (.close reader) (catch Exception _ nil)))))
+    ds))
+
+(defn close-parquet-dataset!
+  "Explicitly close the parquet file backing a parquet-dataset.
+   After this call, accessing column data throws."
+  [ds]
+  (when-let [reader (some-> ds meta :metadata ::reader)]
+    (.close ^ParquetFileReader reader)))

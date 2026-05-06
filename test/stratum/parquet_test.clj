@@ -1,9 +1,10 @@
 (ns stratum.parquet-test
-  "Tests for Parquet import — both heap-array `from-parquet` and streaming
-   `index-parquet!` paths."
+  "Tests for Parquet import — heap-array `from-parquet`, streaming
+   `index-parquet!`, and zero-copy `parquet-dataset` paths."
   (:require [clojure.test :refer [deftest testing is use-fixtures]]
             [stratum.parquet :as parquet]
             [stratum.dataset :as dataset]
+            [stratum.index :as idx]
             [stratum.query :as q]
             [konserve.store :as kstore]
             [clojure.java.io :as io])
@@ -88,9 +89,9 @@
    }")
 
 (defn- gen-trades [^long n]
-  (mapv (fn [i]
-          (cond-> {"sym" (case (mod i 3) 0 "AAPL" 1 "MSFT" 2 "GOOG")
-                   "ts"  (long i)
+  (mapv (fn [^long i]
+          (cond-> {"sym" (case (long (mod i 3)) 0 "AAPL" 1 "MSFT" 2 "GOOG")
+                   "ts"  i
                    "px"  (* 100.0 (inc i))}
             (zero? (mod i 5)) (assoc "tag" (str "t" (mod i 7)))))
         (range n)))
@@ -261,3 +262,97 @@
           (doseq [col-name (dataset/column-names ds)]
             (is (keyword? col-name))
             (is (some? (dataset/column-type ds col-name)))))))))
+
+;; ============================================================================
+;; parquet-dataset (zero-copy / lazy-decode path)
+;; ============================================================================
+
+(deftest parquet-dataset-roundtrip-test
+  (testing "parquet-dataset opens a parquet file lazily and queries return the same answers as from-parquet"
+    (let [path (temp-parquet "ds-rt")]
+      (try
+        (write-parquet! path trades-schema (gen-trades 200))
+        (let [ds (parquet/parquet-dataset (.getAbsolutePath path))]
+          (is (= 200 (dataset/row-count ds)))
+          (is (= #{:sym :ts :px :tag} (set (dataset/column-names ds))))
+          ;; All cols index-backed via parquet-row-group chunks
+          (doseq [c [:sym :ts :px :tag]]
+            (is (= :index (:source (get (dataset/columns ds) c)))))
+          ;; String columns carry a global dict
+          (is (some? (:dict (get (dataset/columns ds) :sym))))
+          (is (= "string" (name (:dict-type (get (dataset/columns ds) :sym)))))
+          ;; count(*) — should not require full row decode
+          (is (= 200 (long (:count (first (q/q {:from ds :agg [[:count]]}))))))
+          ;; min/max from row-group metadata
+          (let [r (first (q/q {:from ds :agg [[:min :ts] [:max :ts]]}))]
+            (is (= 0   (long (:min r))))
+            (is (= 199 (long (:max r)))))
+          ;; group-by string column
+          (let [grouped (q/q {:from ds :agg [[:count]] :group [:sym]})
+                by-sym (into {} (map (fn [r] [(:sym r) (long (:count r))])) grouped)]
+            (is (= 67 (get by-sym "AAPL")))
+            (is (= 67 (get by-sym "MSFT")))
+            (is (= 66 (get by-sym "GOOG"))))
+          ;; equality predicate on string
+          (is (= 67 (long (:count (first (q/q {:from ds :where [[:= :sym "AAPL"]] :agg [[:count]]}))))))
+          ;; sum on numeric — falls through stats-only fast path (parquet
+          ;; doesn't store sum) and goes through the SIMD decode
+          (let [r (first (q/q {:from ds :agg [[:sum :px]]}))]
+            ;; sum_{i=0..199} 100*(i+1) = 100 * 200*201/2 = 2_010_000
+            (is (= 2010000.0 (double (:sum r))))))
+        (finally (.delete path))))))
+
+(deftest parquet-dataset-zone-pruning-test
+  (testing "Predicates outside parquet's per-row-group min/max prune all chunks (no row data read)"
+    (let [path (temp-parquet "ds-zone")]
+      (try
+        (write-parquet! path trades-schema (gen-trades 500))
+        (let [ds (parquet/parquet-dataset (.getAbsolutePath path))]
+          ;; ts ranges 0..499 — predicate ts>10000 should prune everything
+          (is (= 0 (long (:count (first (q/q {:from ds
+                                              :where [[:> :ts 10000]]
+                                              :agg [[:count]]}))))))
+          ;; And the symmetric: ts<0
+          (is (= 0 (long (:count (first (q/q {:from ds
+                                              :where [[:< :ts 0]]
+                                              :agg [[:count]]})))))))
+        (finally (.delete path))))))
+
+(deftest parquet-dataset-column-projection-test
+  (testing ":columns selects a subset; absent columns aren't decoded"
+    (let [path (temp-parquet "ds-proj")]
+      (try
+        (write-parquet! path trades-schema (gen-trades 50))
+        (let [ds (parquet/parquet-dataset (.getAbsolutePath path)
+                                          :columns ["ts" "px"])]
+          (is (= 50 (dataset/row-count ds)))
+          (is (= #{:ts :px} (set (dataset/column-names ds)))))
+        (finally (.delete path))))))
+
+(deftest parquet-dataset-readonly-test
+  (testing "parquet-dataset rejects mutations"
+    (let [path (temp-parquet "ds-ro")]
+      (try
+        (write-parquet! path trades-schema (gen-trades 10))
+        (let [ds (parquet/parquet-dataset (.getAbsolutePath path))
+              col-idx (:index (get (dataset/columns ds) :ts))]
+          ;; idx-set!/idx-append!/idx-append-chunk! on a transient PCI
+          ;; whose chunks come from parquet must fail. col-fork returns
+          ;; the same chunk (immutable, sharing is safe); col-transient
+          ;; on the chunk throws. We exercise that via idx-set!.
+          (let [tidx (idx/idx-transient col-idx)]
+            (is (thrown? UnsupportedOperationException
+                         (idx/idx-set! tidx 0 999)))))
+        (finally (.delete path))))))
+
+(deftest parquet-dataset-stats-sum-fallback-test
+  (testing "SUM/AVG fall through to SIMD decode (parquet stats lack sum)"
+    (let [path (temp-parquet "ds-sum")]
+      (try
+        (write-parquet! path trades-schema (gen-trades 100))
+        (let [ds (parquet/parquet-dataset (.getAbsolutePath path))]
+          ;; If the planner mistakenly took stats-only sum, we'd get 0.0.
+          ;; Real sum of 100*(i+1) for i=0..99 = 100 * 5050 = 505_000
+          (is (= 505000.0 (double (:sum (first (q/q {:from ds :agg [[:sum :px]]}))))))
+          (is (= 5050.0   (double (:avg (first (q/q {:from ds :agg [[:avg :px]]})))))))
+        (finally (.delete path))))))
