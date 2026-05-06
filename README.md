@@ -16,7 +16,7 @@ Stratum is a columnar analytics engine that combines the performance of fused SI
 Start a PostgreSQL-compatible server and query CSV/Parquet files directly:
 
 ```bash
-# Standalone JAR - no Clojure needed, just Java 21+
+# Standalone JAR - no Clojure needed, just Java 22+
 java --add-modules jdk.incubator.vector -jar stratum-standalone.jar --demo
 
 # Or with your own data
@@ -289,7 +289,7 @@ JVM flags required:
 
 ### Requirements
 
-- **JDK 21+** (for Vector API incubator module)
+- **JDK 22+** (for Vector API incubator module + foreign-memory API)
 - Clojure 1.12+
 
 ## Development

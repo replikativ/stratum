@@ -28,7 +28,7 @@
   (b/javac {:src-dirs [java-src-dir]
             :class-dir class-dir
             :basis @dev-basis
-            :javac-opts ["--release" "21"
+            :javac-opts ["--release" "22"
                          "--add-modules" "jdk.incubator.vector"
                          "-Xlint:-preview"]})
   (println "Done."))
