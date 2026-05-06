@@ -37,7 +37,8 @@
             [org.replikativ.persistent-sorted-set :as pss])
   (:import [org.apache.parquet.hadoop ParquetFileReader]
            [org.apache.parquet.io LocalInputFile]
-           [org.apache.parquet.column ColumnDescriptor Dictionary]
+           [org.apache.parquet.column ColumnDescriptor ColumnReader Dictionary]
+           [org.apache.parquet.column.impl ColumnReadStoreImpl]
            [org.apache.parquet.column.page PageReadStore DictionaryPageReadStore]
            [org.apache.parquet.column.statistics Statistics]
            [org.apache.parquet.hadoop.metadata BlockMetaData ColumnChunkMetaData]
@@ -794,17 +795,37 @@
     (dotimes [_ length] (.read rr))
     out))
 
+(defn- noop-primitive-converter
+  "PrimitiveConverter required by ColumnReadStoreImpl's path-walk; we
+   bypass it by reading values directly off the ColumnReader, so the
+   converter is never invoked."
+  ^PrimitiveConverter []
+  (proxy [PrimitiveConverter] []))
+
+(defn- noop-group-converter
+  "Single-column root GroupConverter that returns a no-op primitive
+   converter for any field index. Plumbing required by ColumnReadStoreImpl
+   even though the decoder loop never calls back through it."
+  ^GroupConverter []
+  (let [pc (noop-primitive-converter)]
+    (proxy [GroupConverter] []
+      (getConverter [_] pc)
+      (start [])
+      (end []))))
+
 (defn- decode-row-group-numeric
   "Decode a single column from a single row group into a long[] or
    double[] sized to the row group. One allocation, one decode pass.
 
-   Uses parquet's RecordReader path (same as index-parquet!), restricted
-   to a single column and a single row group."
+   Uses parquet's lower-level ColumnReader directly, bypassing the
+   RecordReader+proxy callback path (which dispatches a Clojure proxy
+   per value plus a GroupConverter.end() per row). For flat primitive
+   columns (no rep/def levels beyond NULL/non-NULL), the inner loop is
+   `consume + getLong/getInteger/getDouble + aset` — no virtual call
+   per value beyond the (already-required) ValuesReader."
   [^ParquetFileReader reader rg-index ^ColumnDescriptor cd datatype length]
   (let [rg-index (int rg-index)
         length (int length)
-        ;; Build a single-column projected schema so the RecordReader only
-        ;; decodes our column.
         full-schema (.getSchema (.getFileMetaData (.getFooter reader)))
         col-name (last (.getPath cd))
         proj-field (some (fn [^Type f] (when (= col-name (.getName f)) f))
@@ -816,44 +837,72 @@
         proj-schema (MessageType. (.getName ^MessageType full-schema)
                                   ^"[Lorg.apache.parquet.schema.Type;"
                                   (into-array Type [proj-field]))
-        is-int96 (= "INT96" (str (.getPrimitiveTypeName (.getPrimitiveType cd))))
-        out (case datatype
-              :int64   (long-array length)
-              :float64 (double-array length))
-        cursor (int-array 1)
-        pages (.readRowGroup reader rg-index)
-        column-io (.getColumnIO (ColumnIOFactory.) proj-schema)
-        conv (case datatype
-               :int64
-               (let [^longs arr out]
-                 (if is-int96
-                   (proxy [PrimitiveConverter] []
-                     (addBinary [^Binary v]
-                       (aset arr (aget cursor 0) (long (int96->epoch-millis v)))))
-                   (proxy [PrimitiveConverter] []
-                     (addLong    [v] (aset arr (aget cursor 0) (long v)))
-                     (addInt     [v] (aset arr (aget cursor 0) (long (int v))))
-                     (addBoolean [v] (aset arr (aget cursor 0) (if v 1 0)))
-                     (addBinary  [^Binary v] (aset arr (aget cursor 0) (long (int96->epoch-millis v))))
-                     (addFloat   [v] (aset arr (aget cursor 0) (long (float v))))
-                     (addDouble  [v] (aset arr (aget cursor 0) (long (double v)))))))
-               :float64
-               (let [^doubles arr out]
-                 (proxy [PrimitiveConverter] []
-                   (addDouble [v] (aset arr (aget cursor 0) (double v)))
-                   (addFloat  [v] (aset arr (aget cursor 0) (double (float v))))
-                   (addLong   [v] (aset arr (aget cursor 0) (double (long v))))
-                   (addInt    [v] (aset arr (aget cursor 0) (double (int v)))))))
-        gc (proxy [GroupConverter] []
-             (getConverter [_] conv)
-             (start [])
-             (end [] (aset cursor 0 (inc (aget cursor 0)))))
-        rm (proxy [RecordMaterializer] []
-             (getRootConverter [] gc)
-             (getCurrentRecord [] nil))
-        rr (.getRecordReader ^MessageColumnIO column-io pages rm)]
-    (dotimes [_ length] (.read rr))
-    out))
+        ptn (str (.getPrimitiveTypeName (.getPrimitiveType cd)))
+        max-def (.getMaxDefinitionLevel cd)
+        ^PageReadStore pages (.readRowGroup reader rg-index)
+        created-by (.getCreatedBy (.getFileMetaData (.getFooter reader)))
+        rs (ColumnReadStoreImpl. pages (noop-group-converter) proj-schema created-by)
+        ^ColumnReader cr (.getColumnReader rs cd)
+        n (long length)]
+    (case datatype
+      :int64
+      (let [^longs out (long-array length)
+            int96? (= "INT96" ptn)
+            int? (= "INT32" ptn)
+            bool? (= "BOOLEAN" ptn)]
+        (cond
+          int96?
+          (do (java.util.Arrays/fill out Long/MIN_VALUE)
+              (loop [i 0]
+                (when (< i n)
+                  (when (= max-def (.getCurrentDefinitionLevel cr))
+                    (aset out i (long (int96->epoch-millis (.getBinary cr)))))
+                  (.consume cr)
+                  (recur (unchecked-inc i)))))
+          int?
+          (do (java.util.Arrays/fill out Long/MIN_VALUE)
+              (loop [i 0]
+                (when (< i n)
+                  (when (= max-def (.getCurrentDefinitionLevel cr))
+                    (aset out i (long (.getInteger cr))))
+                  (.consume cr)
+                  (recur (unchecked-inc i)))))
+          bool?
+          (do (java.util.Arrays/fill out Long/MIN_VALUE)
+              (loop [i 0]
+                (when (< i n)
+                  (when (= max-def (.getCurrentDefinitionLevel cr))
+                    (aset out i (if (.getBoolean cr) 1 0)))
+                  (.consume cr)
+                  (recur (unchecked-inc i)))))
+          :else                              ; INT64
+          (do (java.util.Arrays/fill out Long/MIN_VALUE)
+              (loop [i 0]
+                (when (< i n)
+                  (when (= max-def (.getCurrentDefinitionLevel cr))
+                    (aset out i (.getLong cr)))
+                  (.consume cr)
+                  (recur (unchecked-inc i))))))
+        out)
+
+      :float64
+      (let [^doubles out (double-array length)
+            float? (= "FLOAT" ptn)]
+        (java.util.Arrays/fill out Double/NaN)
+        (if float?
+          (loop [i 0]
+            (when (< i n)
+              (when (= max-def (.getCurrentDefinitionLevel cr))
+                (aset out i (double (.getFloat cr))))
+              (.consume cr)
+              (recur (unchecked-inc i))))
+          (loop [i 0]
+            (when (< i n)
+              (when (= max-def (.getCurrentDefinitionLevel cr))
+                (aset out i (.getDouble cr)))
+              (.consume cr)
+              (recur (unchecked-inc i)))))
+        out))))
 
 (deftype ParquetRowGroupChunk
          [;; lifeline keeps the underlying ParquetFileReader strongly
