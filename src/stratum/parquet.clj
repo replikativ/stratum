@@ -25,7 +25,7 @@
        bounded — independent of file size. Best when the data needs
        stratum's mutate/branch/sync lifecycle.
 
-   No Hadoop runtime required — uses LocalInputFile for direct file access."
+   No Hadoop runtime required — uses MmapInputFile for direct file access."
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
             [stratum.dataset :as dataset]
@@ -36,10 +36,9 @@
             [stratum.storage :as storage]
             [org.replikativ.persistent-sorted-set :as pss])
   (:import [org.apache.parquet.hadoop ParquetFileReader]
-           [org.apache.parquet.io LocalInputFile]
            [org.apache.parquet.column ColumnDescriptor ColumnReader Dictionary]
            [org.apache.parquet.column.impl ColumnReadStoreImpl]
-           [org.apache.parquet.column.page PageReadStore PageReader DataPage DataPageV1 DataPageV2 DictionaryPageReadStore]
+           [org.apache.parquet.column.page PageReadStore PageReader DataPage DataPageV1 DataPageV2 DictionaryPage DictionaryPageReadStore]
            [org.apache.parquet.column.statistics Statistics]
            [org.apache.parquet.hadoop.metadata BlockMetaData ColumnChunkMetaData]
            [org.apache.parquet.io ColumnIOFactory MessageColumnIO]
@@ -61,7 +60,7 @@
            [java.nio ByteBuffer ByteOrder]
            [java.nio.file Path Paths]
            [java.util HashMap]
-           [stratum.internal ColumnOpsString]))
+           [stratum.internal ColumnOpsString MmapInputFile ParquetDictBulkDecoder]))
 
 (set! *warn-on-reflection* true)
 
@@ -303,7 +302,7 @@
    & {:keys [columns limit chunk-size sync-every name]
       :or {chunk-size DEFAULT_CHUNK_SIZE
            sync-every DEFAULT_SYNC_EVERY}}]
-  (let [input-file (LocalInputFile. (Paths/get path (make-array String 0)))
+  (let [input-file (MmapInputFile. (Paths/get path (make-array String 0)))
         reader (ParquetFileReader/open input-file)]
     (try
       (let [footer (.getFooter reader)
@@ -460,7 +459,8 @@
                                                    :source-type :parquet}})]
           (dataset/sync! ds store branch)))
       (finally
-        (.close reader)))))
+        (try (.close reader) (catch Exception _ nil))
+        (try (.close input-file) (catch Exception _ nil))))))
 
 (defn from-parquet
   "Read a Parquet file into a StratumDataset.
@@ -478,7 +478,7 @@
      :limit   — max rows to read
      :name    — dataset name (default: derived from filename)"
   [path & {:keys [columns limit name]}]
-  (let [input-file (LocalInputFile. (Paths/get ^String path (make-array String 0)))
+  (let [input-file (MmapInputFile. (Paths/get ^String path (make-array String 0)))
         reader (ParquetFileReader/open input-file)]
     (try
       (let [footer (.getFooter reader)
@@ -584,7 +584,8 @@
                                  :metadata {:source-path path
                                             :source-type :parquet}})))
       (finally
-        (.close reader)))))
+        (try (.close reader) (catch Exception _ nil))
+        (try (.close input-file) (catch Exception _ nil))))))
 
 ;; ============================================================================
 ;; parquet-dataset — zero-copy / lazy-decode parquet reader
@@ -1090,14 +1091,34 @@
     (.setRequestedSchema reader proj-schema)
     [(.readRowGroup reader (int rg-index)) proj-schema]))
 
+(defn- decode-typed-dict
+  "Decode a parquet DictionaryPage into a primitive typed array, matching
+   `kind` ∈ {:long :double :int}. Returns nil if `dp` is nil."
+  [^DictionaryPage dp ^ColumnDescriptor cd kind]
+  (when dp
+    (let [^org.apache.parquet.column.Dictionary d
+          (.initDictionary (.getEncoding dp) cd dp)
+          n (inc (.getMaxId d))]
+      (case kind
+        :double (let [out (double-array n)]
+                  (dotimes [i n] (aset out i (.decodeToDouble d i)))
+                  out)
+        :long   (let [out (long-array n)]
+                  (dotimes [i n] (aset out i (.decodeToLong d i)))
+                  out)
+        :int    (let [out (long-array n)]
+                  (dotimes [i n] (aset out i (long (.decodeToInt d i))))
+                  out)))))
+
 (defn- bulk-decode-pages!
   "Bulk-decode every PLAIN page in `pr` into `out[off..off+pr-rows)`.
    `kind` selects how to copy each page's bytes:
      :long   — `ByteBuffer.asLongBuffer().get(out, off, n)`
      :double — `asDoubleBuffer().get(out, off, n)`
      :int    — read as INT32 into a scratch int[], widen to long[]
-   Returns the next offset (long). Returns -1 if any page uses an
-   encoding we can't bulk-decode — caller falls back to ColumnReader."
+   Returns the next offset. Returns -1 if any page uses a non-PLAIN
+   encoding — caller falls back to the dict-aware variant or
+   ColumnReader."
   [^PageReader pr out kind off]
   (let [v-count (.getTotalValueCount pr)
         cursor (long-array 1)
@@ -1128,6 +1149,55 @@
                                 (aset ^longs out (int (+ o i))
                                       (long (aget ^ints buf i))))))
                   (aset cursor 0 (+ (aget cursor 0) (long n))))
+                (reset! bail? true))))
+          (recur))))
+    (if @bail? -1 (aget cursor 0))))
+
+(defn- bulk-decode-dict-pages!
+  "Bulk-decode every dict-encoded page in `pr` into `out[off..)` using
+   the pre-decoded `typed-dict`. Tolerates mixed PLAIN + dict-encoded
+   pages within a row group (rare but legal). Returns next offset, or
+   -1 on unsupported encoding."
+  [^PageReader pr out kind off typed-dict]
+  (let [v-count (.getTotalValueCount pr)
+        cursor (long-array 1)
+        _ (aset cursor 0 (long off))
+        end (+ (long off) v-count)
+        bail? (atom false)]
+    (loop []
+      (when (and (not @bail?) (< (aget cursor 0) end))
+        (let [page (.readPage pr)]
+          (when page
+            (let [n (.getValueCount page)
+                  enc (str (.getValueEncoding ^DataPageV1 page))
+                  o (int (aget cursor 0))]
+              (cond
+                (or (= "PLAIN_DICTIONARY" enc) (= "RLE_DICTIONARY" enc))
+                (let [page-bytes (.toByteArray (.getBytes ^DataPageV1 page))
+                      page-len (alength ^bytes page-bytes)]
+                  (case kind
+                    :double (ParquetDictBulkDecoder/decodeV1Double
+                             page-bytes 0 page-len (int n)
+                             ^doubles typed-dict ^doubles out o)
+                    (:long :int) (ParquetDictBulkDecoder/decodeV1Long
+                                  page-bytes 0 page-len (int n)
+                                  ^longs typed-dict ^longs out o))
+                  (aset cursor 0 (+ (aget cursor 0) (long n))))
+
+                (= "PLAIN" enc)
+                (let [bb (.toByteBuffer (.getBytes ^DataPageV1 page))]
+                  (.order bb ByteOrder/LITTLE_ENDIAN)
+                  (case kind
+                    :double (.get (.asDoubleBuffer bb) ^doubles out o (int n))
+                    :long   (.get (.asLongBuffer bb) ^longs out o (int n))
+                    :int    (let [buf (int-array n)]
+                              (.get (.asIntBuffer bb) ^ints buf 0 (int n))
+                              (dotimes [i n]
+                                (aset ^longs out (int (+ o i))
+                                      (long (aget ^ints buf i))))))
+                  (aset cursor 0 (+ (aget cursor 0) (long n))))
+
+                :else
                 (reset! bail? true))))
           (recur))))
     (if @bail? -1 (aget cursor 0))))
@@ -1166,25 +1236,31 @@
       ;; bulk-decode each page directly from its ByteBuffer.
       (locking lifeline
         (let [[^PageReadStore pages _] (read-rg-projected reader cd rg-index)
-              ^PageReader pr (.getPageReader pages cd)]
+              ^PageReader pr (.getPageReader pages cd)
+              dp (.readDictionaryPage pr)
+              do-bulk (fn [out kind]
+                        (if dp
+                          (bulk-decode-dict-pages! pr out kind 0
+                                                   (decode-typed-dict dp cd kind))
+                          (bulk-decode-pages! pr out kind 0)))]
           (case decoder-kind
             (:int64-raw :ts-millis)
             (let [out (long-array length)
-                  end (bulk-decode-pages! pr out :long 0)]
+                  end (do-bulk out :long)]
               (if (neg? (long end))
                 (decode-row-group-numeric-fallback
                  reader rg-index cd spec length lifeline)
                 out))
             :int32-raw
             (let [out (long-array length)
-                  end (bulk-decode-pages! pr out :int 0)]
+                  end (do-bulk out :int)]
               (if (neg? (long end))
                 (decode-row-group-numeric-fallback
                  reader rg-index cd spec length lifeline)
                 out))
             :double
             (let [out (double-array length)
-                  end (bulk-decode-pages! pr out :double 0)]
+                  end (do-bulk out :double)]
               (if (neg? (long end))
                 (decode-row-group-numeric-fallback
                  reader rg-index cd spec length lifeline)
@@ -1460,8 +1536,8 @@
      :name    - dataset name (default: derived from filename)"
   [^String path & {:keys [columns name dict-cap]
                    :or {dict-cap (long 50000000)}}]
-  (let [reader (ParquetFileReader/open
-                (LocalInputFile. (Paths/get path (make-array String 0))))
+  (let [input-file (MmapInputFile. (Paths/get path (make-array String 0)))
+        reader (ParquetFileReader/open input-file)
         success? (volatile! false)]
     (try
       (let [;; lifeline is the cleanup-anchor object. Both the dataset
@@ -1541,6 +1617,7 @@
                                       :metadata {:source-path path
                                                  :source-type :parquet
                                                  ::reader reader
+                                                 ::input-file input-file
                                                  ::lifeline lifeline}})]
         ;; Cleaner watches `lifeline`. As long as any chunk or `ds`
         ;; holds it, the reader stays open. Closes only after the
@@ -1548,14 +1625,18 @@
         (.register ^Cleaner @cleaner lifeline
                    (reify Runnable
                      (run [_]
-                       (try (.close reader) (catch Exception _ nil)))))
+                       (try (.close reader) (catch Exception _ nil))
+                       (try (.close ^MmapInputFile input-file)
+                            (catch Exception _ nil)))))
         (vreset! success? true)
         ds)
       (finally
         (when-not @success?
           ;; Open succeeded but classification or dict-build threw —
           ;; close the reader to avoid leaking an OS file handle.
-          (try (.close reader) (catch Exception _ nil)))))))
+          (try (.close reader) (catch Exception _ nil))
+          (try (.close ^MmapInputFile input-file)
+               (catch Exception _ nil)))))))
 
 (defn close-parquet-dataset!
   "Explicitly close the parquet file backing a parquet-dataset.
@@ -1567,5 +1648,8 @@
    chunks become unreachable. Use this only when you need deterministic
    release (e.g. tests, file rotation)."
   [ds]
-  (when-let [reader (some-> ds dataset/metadata ::reader)]
-    (.close ^ParquetFileReader reader)))
+  (let [m (dataset/metadata ds)]
+    (when-let [reader (::reader m)]
+      (try (.close ^ParquetFileReader reader) (catch Exception _ nil)))
+    (when-let [input-file (::input-file m)]
+      (try (.close ^MmapInputFile input-file) (catch Exception _ nil)))))
