@@ -412,14 +412,23 @@
      :doc "Read a CSV file into a Stratum column map."
      :impl stratum.csv/from-csv}
 
-    from-parquet
+    parquet-dataset
     {:args [:=> [:cat :string] :stratum/SColumnMap]
      :ret :stratum/SColumnMap
      :categories [:data :import]
      :stability :stable
-     :referentially-transparent? true
-     :doc "Read a Parquet file into a Stratum column map."
-     :impl stratum.parquet/from-parquet}
+     :referentially-transparent? false
+     :doc "Open a Parquet file as a read-only, lazy-decode StratumDataset."
+     :impl stratum.parquet/parquet-dataset}
+
+    close-parquet-dataset!
+    {:args [:=> [:cat :stratum/SColumnMap] :nil]
+     :ret :nil
+     :categories [:data :import]
+     :stability :stable
+     :referentially-transparent? false
+     :doc "Explicitly release the file handle backing a parquet-dataset."
+     :impl stratum.parquet/close-parquet-dataset!}
 
     from-maps
     {:args [:=> [:cat [:sequential :map]] :stratum/SColumnMap]

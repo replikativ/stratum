@@ -123,8 +123,8 @@ clj -M:olap cb            # ClickBench tier only
 (def taxi (st/from-csv "data/taxi.csv"))
 (st/q {:from taxi :group [:payment_type] :agg [[:avg :tip_amount] [:count]]})
 
-;; Import Parquet
-(def orders (st/from-parquet "data/orders.parquet"))
+;; Open a Parquet file (lazy decode, zone-map pruning)
+(def orders (st/parquet-dataset "data/orders.parquet"))
 (st/q "SELECT product, SUM(revenue) FROM t GROUP BY product" {"t" orders})
 
 ;; From Clojure maps

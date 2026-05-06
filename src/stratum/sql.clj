@@ -2304,7 +2304,7 @@
                      (let [[full-name func-name path] table-func
                            table-data (case func-name
                                         "read_csv"     (csv/from-csv path)
-                                        "read_parquet" (parquet/from-parquet path))
+                                        "read_parquet" (parquet/parquet-dataset path))
                             ;; Re-parse with the table data in registry
                            fixed-sql (.replace ^String sql ^String full-name "__file_table__")
                            fixed-registry (assoc enriched-registry "__file_table__" table-data)]

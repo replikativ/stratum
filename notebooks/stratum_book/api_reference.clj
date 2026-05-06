@@ -113,10 +113,12 @@
 ;; (st/from-csv "data/orders.csv")
 ;; (st/from-csv "data/orders.tsv" :separator \tab)
 
-(kind/doc #'st/from-parquet)
+(kind/doc #'st/parquet-dataset)
 
-;; (st/from-parquet "data/orders.parquet")
-;; (st/from-parquet "data/orders.parquet" :columns ["qty" "price"] :limit 1000)
+;; (st/parquet-dataset "data/orders.parquet")
+;; (st/parquet-dataset "data/orders.parquet" :columns ["qty" "price"])
+
+(kind/doc #'st/close-parquet-dataset!)
 
 ;; ---
 ;;

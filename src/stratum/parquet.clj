@@ -465,6 +465,12 @@
 (defn from-parquet
   "Read a Parquet file into a StratumDataset.
 
+   Deprecated: prefer `parquet-dataset` for queries (constant-time
+   open, lazy decode, zone-map pruning) or `index-parquet!` for
+   ingestion to konserve. `from-parquet` is retained for callers
+   that need eager heap-array semantics and a closed file handle
+   on return.
+
    Builds heap arrays in memory: pre-allocated long[]/double[] for numeric
    columns and dict-encoded long[] + HashMap<String,Long> for string columns.
    Memory scales with file size — for very large files prefer index-parquet!
@@ -477,6 +483,7 @@
      :columns — vector of column names to read (default: all)
      :limit   — max rows to read
      :name    — dataset name (default: derived from filename)"
+  {:deprecated "Use parquet-dataset (lazy/queries) or index-parquet! (ingestion)."}
   [path & {:keys [columns limit name]}]
   (let [input-file (MmapInputFile. (Paths/get ^String path (make-array String 0)))
         reader (ParquetFileReader/open input-file)]
