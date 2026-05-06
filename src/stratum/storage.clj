@@ -51,11 +51,23 @@
 ;; Index-Level Storage (No Branches)
 ;; ============================================================================
 
+(def ^:dynamic *skip-commit-write?*
+  "When true, `write-index-commit!` is a no-op. Used by streaming ingest
+   paths (`index-parquet!`) where intermediate index commits are wasted I/O
+   — only the final commit produced by the surrounding `dataset/sync!`
+   matters. Per-sync commits during a long ingest do not establish
+   meaningful crash-recovery state because the chunks themselves live in
+   konserve regardless."
+  false)
+
 (defn write-index-commit!
   "Write an index snapshot to [:indices :commits uuid].
-   Indices do not own branches — branch management is at the dataset level."
+   Indices do not own branches — branch management is at the dataset level.
+
+   When `*skip-commit-write?*` is true, the write is skipped entirely."
   [store commit-id snapshot]
-  (k/assoc store [:indices :commits commit-id] snapshot {:sync? true})
+  (when-not *skip-commit-write?*
+    (k/assoc store [:indices :commits commit-id] snapshot {:sync? true}))
   snapshot)
 
 (defn load-index-commit
