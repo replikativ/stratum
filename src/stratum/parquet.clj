@@ -16,9 +16,12 @@
        bounded — independent of file size.
 
    No Hadoop runtime required — uses LocalInputFile for direct file access."
-  (:require [stratum.dataset :as dataset]
+  (:require [clojure.core.async :as async]
+            [stratum.dataset :as dataset]
             [stratum.index :as idx]
-            [stratum.chunk :as chunk])
+            [stratum.chunk :as chunk]
+            [stratum.cached-storage :as cstorage]
+            [stratum.storage :as storage])
   (:import [org.apache.parquet.hadoop ParquetFileReader]
            [org.apache.parquet.io LocalInputFile]
            [org.apache.parquet.column.page PageReadStore]
@@ -106,8 +109,26 @@
 ;; Streaming index-parquet! — bounded memory, persists chunks to konserve
 ;; ============================================================================
 
-(def ^:private ^:const DEFAULT_CHUNK_SIZE 65536)
-(def ^:private ^:const DEFAULT_SYNC_EVERY 16)   ; chunks per column between syncs
+;; Match stratum's project-wide default (idx/DEFAULT_CHUNK_SIZE = 8192).
+;; A larger value here (we previously used 65536) made each chunk 8× bigger
+;; and, with PSS BRANCHING_FACTOR = 64, each PSS leaf 8× bigger. Leaf
+;; serialization through Fressian's ByteArrayOutputStream then needed
+;; hundreds of MB of contiguous heap during sync.
+(def ^:private ^:const DEFAULT_CHUNK_SIZE 8192)
+
+;; Chunks per column between syncs. Each sync re-walks the PSS, Fressian-
+;; encodes leaves, and round-trips through konserve — so syncing too
+;; aggressively dominates ingest time. Memory is already bounded by the
+;; storage LRU (cstorage/DEFAULT_CACHE_SIZE = 16 nodes), so sync_every
+;; controls only how often we flush, not steady-state heap.
+;;
+;; Measured 5M-row × 23-col ingest at -Xmx4g (Ryan-shape fixture):
+;;   sync=4    269s   19k rows/s   peak 1.4 GB
+;;   sync=16    45s  112k rows/s   peak 2.7 GB
+;;   sync=64    25s  200k rows/s   peak 2.3 GB    ← matches from-parquet
+;;   sync=256   14s  364k rows/s   peak 2.4 GB
+;; All fit in 4 GB Xmx with breathing room. 64 is the conservative pick.
+(def ^:private ^:const DEFAULT_SYNC_EVERY 64)
 
 (defn- alloc-buf
   "Pre-allocated chunk buffer filled with the type's NULL sentinel."
@@ -230,23 +251,26 @@
 
    Reads row-by-row, accumulating chunk-sized buffers per column. When a chunk
    buffer fills, it's appended to that column's transient PersistentColumnIndex
-   via idx-append-chunk!. Every :sync-every chunks (default 16, ~1M rows), the
-   index is persisted, synced to konserve, and re-transient'd — chunks become
-   weak-referenced and GC reclaims their heap. String columns are dict-encoded
-   on the fly: a HashMap interns each distinct value once and the chunk stores
-   only long indices.
+   via idx-append-chunk!. Every :sync-every chunks the index is persisted and
+   batch-flushed to konserve via a single bounded-parallel fan-out across all
+   columns, then re-transient'd — chunks become weak-referenced and GC
+   reclaims their heap. String columns are dict-encoded on the fly: a HashMap
+   interns each distinct value once and the chunk stores only long indices.
+
+   Intermediate index commits during the ingest loop are skipped — the final
+   `dataset/sync!` re-syncs each column and writes the durable commits.
 
    Memory is bounded by chunk-size × num-columns × 8 bytes during reading,
-   plus the LRU node cache in the konserve storage layer (~few MB to a few
-   hundred MB). Independent of total file size.
+   plus the LRU node cache in the konserve storage layer. Independent of
+   total file size.
 
    Returns a synced StratumDataset with index-backed columns.
 
    Options:
      :columns     - vector of column names to read (default: all)
      :limit       - max rows to read (default: full file)
-     :chunk-size  - rows per chunk (default 65536)
-     :sync-every  - flush to konserve every N chunks (default 16)
+     :chunk-size  - rows per chunk (default DEFAULT_CHUNK_SIZE)
+     :sync-every  - flush to konserve every N chunks (default DEFAULT_SYNC_EVERY)
      :name        - dataset name (default: derived from filename)"
   [^String path store ^String branch
    & {:keys [columns limit chunk-size sync-every name]
@@ -318,15 +342,28 @@
                 (aset cursor 0 0)
                 (aset chunks-since-sync 0 (inc (aget chunks-since-sync 0)))))
 
-            ;; Persist + sync each column's index, then re-transient. Frees
-            ;; chunk heap via weak refs in the storage-backed PSS tree.
+            ;; Sync all columns: per-column pss/store fills each storage's
+            ;; pending-writes (no I/O), then a single bounded-parallel flush
+            ;; drains them all together. Intermediate commits are skipped —
+            ;; the final dataset/sync! re-runs idx-sync! per col and writes
+            ;; the real commits there. PSS :ref-type :weak + small cache
+            ;; (cstorage/DEFAULT_CACHE_SIZE) lets GC reclaim chunk arrays.
             sync-all!
             (fn []
               (when (pos? (aget chunks-since-sync 0))
-                (dotimes [c ncols]
-                  (let [cs (nth col-states c)
-                        persistent-idx (idx/idx-persistent! @(:idx-ref cs))
-                        synced-idx (idx/idx-sync! persistent-idx store)]
+                (let [synced
+                      (binding [idx/*defer-flush?* true
+                                storage/*skip-commit-write?* true]
+                        (mapv (fn [cs]
+                                (let [pers (idx/idx-persistent! @(:idx-ref cs))
+                                      synced-idx (idx/idx-sync! pers store)]
+                                  [cs synced-idx]))
+                              col-states))
+                      storages (->> synced
+                                    (keep (fn [[_ s]] (idx/idx-storage s)))
+                                    distinct)]
+                  (async/<!! (cstorage/flush-storages-ch! storages))
+                  (doseq [[cs synced-idx] synced]
                     (reset! (:idx-ref cs) (idx/idx-transient synced-idx))))
                 (aset chunks-since-sync 0 0)))
 

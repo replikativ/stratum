@@ -19,7 +19,7 @@
             [konserve.core :as k])
   (:import [stratum.chunk PersistentColChunk]
            [stratum.stats ChunkStats]
-           [org.replikativ.persistent_sorted_set IMeasure PersistentSortedSet]
+           [org.replikativ.persistent_sorted_set ANode Branch Leaf IMeasure PersistentSortedSet IStorage]
            [java.util Arrays]))
 
 (set! *warn-on-reflection* true)
@@ -35,6 +35,16 @@
    - GPU transfer granularity
    - CoW overhead amortization"
   8192)
+
+(def ^:dynamic *defer-flush?*
+  "When true, `idx-sync!` does pss/store (queueing writes into the
+   CachedStorage's pending-writes atom) but does NOT call `flush-writes!`.
+   The caller is then responsible for draining pending writes — typically
+   via `cstorage/flush-storages-ch!` for batched parallel flush across
+   multiple columns. Used by `index-parquet!` to share a single bounded
+   fan-out across all 23 columns instead of 23 sequential per-column
+   flushes."
+  false)
 
 ;; ============================================================================
 ;; Chunk Entry - what we store in the PSS tree
@@ -138,6 +148,50 @@
 ;; ============================================================================
 ;; Helper Functions for Chunk Operations
 ;; ============================================================================
+
+(defn- seal-transient-chunks-in-dirty-subtrees!
+  "Walk only the dirty (not-yet-stored) subtrees of `tree` and seal any
+   transient ColChunks found in their leaves.
+
+   Mirrors PSS's own `Branch.store` traversal: descend a Branch's child
+   only when its slot's `_addresses[i]` is null (= the subtree has been
+   modified since the last sync and therefore lives strongly in memory).
+   Stored subtrees are skipped — chunks reachable through them have
+   already been Fressian-serialized to konserve, which fixes them in
+   persistent state, so reloading + re-walking them would do no useful
+   sealing work and would defeat the storage layer's weak/soft-ref design.
+
+   Without this discipline `(pss/slice tree nil nil)` forces every leaf
+   back into memory on every persistent! call — O(N) per sync, O(N²)
+   across an ingest."
+  [^PersistentSortedSet tree]
+  (let [^IStorage storage (.-_storage tree)
+        root-addr (.-_address tree)]
+    ;; Tree-level _address tracks the root's stored address. When non-nil,
+    ;; the entire root subtree is durable and contains no transient chunks.
+    (when (nil? root-addr)
+      (letfn [(walk [^ANode node]
+                (cond
+                  (instance? Leaf node)
+                  (let [^Leaf leaf node
+                        ks (.-_keys leaf)
+                        n (.-_len leaf)]
+                    (dotimes [i n]
+                      (let [^ChunkEntry entry (aget ^objects ks i)
+                            chunk (.chunk entry)]
+                        (when (chunk/col-transient? chunk)
+                          (chunk/col-persistent! chunk)))))
+
+                  (instance? Branch node)
+                  (let [^Branch branch node
+                        n (.-_len branch)]
+                    (dotimes [i n]
+                      (when (nil? (.address branch (int i)))
+                        ;; Dirty child: address null implies child is in
+                        ;; memory (strong ref by PSS invariant), no
+                        ;; storage.restore needed.
+                        (walk (.child branch storage (int i))))))))]
+        (walk (.root tree))))))
 
 (defn- copy-chunk-with-modification
   "Create a new chunk by copying an old chunk with a modification at idx."
@@ -406,11 +460,12 @@
           (vswap! offset + chunk-len)))))
 
   (idx-stats [this]
-    (if-let [fast-stats (pss/measure tree)]
-      fast-stats
-      (stats/merge-all-stats
-       (map (fn [^ChunkEntry e] (.stats e))
-            (pss/slice tree nil nil)))))
+    ;; PSS keeps the aggregate ChunkStats live at every Branch._measure via
+    ;; the IMeasure protocol (chunk-entry-measure-ops). pss/measure returns
+    ;; the root's measure — O(1) when warm, lazy descent via
+    ;; forceComputeMeasure when cold. We always register measure-ops, so
+    ;; this never falls through to nil.
+    (pss/measure tree))
 
   (idx-all-chunk-stats [this]
     (map (fn [^ChunkEntry e] (.stats e))
@@ -737,10 +792,7 @@
     (if-not edit
       (throw (IllegalStateException. "Already persistent"))
       (do
-        (doseq [^ChunkEntry entry (pss/slice tree nil nil)]
-          (let [chunk (.chunk entry)]
-            (when (chunk/col-transient? chunk)
-              (chunk/col-persistent! chunk))))
+        (seal-transient-chunks-in-dirty-subtrees! tree)
         (set! tree (persistent! tree))
         (set! edit nil)
         this)))
@@ -781,15 +833,12 @@
                              :branching-factor stratum.cached-storage/BRANCHING_FACTOR
                              :ref-type :weak})]
               (reduce conj new-tree (pss/slice tree nil nil))))
-
-          ;; Store tree — incremental, only dirty nodes written
+          ;; Store tree — incremental, only dirty nodes written.
           root-addr (pss/store storage-tree cached-storage)
-
-          ;; Flush pending writes to konserve
-          _ (cstorage/flush-writes! cached-storage)
-
-          ;; Generate commit ID
-          stats (idx-stats this)
+          ;; Flush pending writes to konserve unless caller defers (so a
+          ;; batched cross-column fan-out can flush all storages at once).
+          _ (when-not *defer-flush?*
+              (cstorage/flush-writes! cached-storage))
           commit-id (if crypto-hash?
                       (storage/generate-commit-id
                        {:pss-root root-addr
@@ -798,14 +847,17 @@
                         :chunk-size chunk-size})
                       (storage/generate-commit-id))
 
-          ;; Build snapshot with pss-root instead of chunk-addresses
+          ;; Build snapshot with pss-root instead of chunk-addresses.
+          ;; Per-chunk ChunkStats live in each ChunkEntry inside the PSS
+          ;; (used for zone-map pruning) and the global aggregate is kept
+          ;; live in PSS's measure cache — both are reconstructed on
+          ;; restore, so there is nothing extra to record here.
           parents (if parent-commit-id #{parent-commit-id} #{})
           snapshot {:commit-id commit-id
                     :parents parents
                     :total-length total-length
                     :datatype datatype
                     :chunk-size chunk-size
-                    :stats stats
                     :pss-root root-addr
                     :next-chunk-id next-chunk-id
                     :timestamp (System/currentTimeMillis)

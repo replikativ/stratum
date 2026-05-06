@@ -8,7 +8,8 @@
    - Fressian serialization for PSS nodes and stratum domain types
 
    Following the datahike/proximum CachedStorage pattern."
-  (:require [clojure.core.cache :as cache]
+  (:require [clojure.core.async :as async]
+            [clojure.core.cache :as cache]
             [konserve.core :as k]
             [konserve.serializers :refer [fressian-serializer]]
             [hasch.core :as hasch]
@@ -248,6 +249,21 @@
 ;; Factory Function
 ;; ============================================================================
 
+(def ^:const DEFAULT_CACHE_SIZE
+  "Default LRU node count for CachedStorage.
+
+   The cache holds heterogeneous PSS nodes — small branches (a few hundred
+   bytes) and fat leaves (up to BF=64 ChunkEntries × `chunk-size × 8` bytes
+   each, which at the project default 8K rows is ~4MB per leaf). The LRU is
+   count-bounded, so the practical byte ceiling = cache-size × max-leaf-size.
+
+   PSS traversal at BF=64 needs only ~log_64(N) spine nodes plus the leaf
+   under inspection — typically 4–5 nodes total even for billion-entry
+   indices. 16 leaves headroom for a small working set without letting a
+   single CachedStorage retain hundreds of MB of chunk data when nothing
+   is querying it."
+  16)
+
 (defn create-storage
   "Create CachedStorage backed by a konserve store.
 
@@ -255,12 +271,14 @@
      store - Konserve store (filestore, memory, etc.)
 
    Options:
-     :cache-size   - LRU cache size in nodes (default 1000)
+     :cache-size   - LRU node count (default DEFAULT_CACHE_SIZE = 16).
      :crypto-hash? - Enable merkle tree addressing (default false)
 
    Returns: CachedStorage implementing IStorage."
   ([store] (create-storage store {}))
-  ([store {:keys [cache-size crypto-hash?] :or {cache-size 1000 crypto-hash? false}}]
+  ([store {:keys [cache-size crypto-hash?]
+           :or {cache-size DEFAULT_CACHE_SIZE
+                crypto-hash? false}}]
    (let [storage-atom (atom nil)
          handlers (create-fressian-handlers storage-atom)
          ;; Add ChunkEntry/ChunkStats write handlers (keyed by class, resolved lazily)
@@ -270,7 +288,7 @@
                                    {"stratum.ChunkEntry" (chunk-entry-write-handler)}
                                    ChunkStats
                                    {"stratum.ChunkStats" (chunk-stats-write-handler)})
-         config {:crypto-hash? crypto-hash?}
+         config {:crypto-hash? crypto-hash? :cache-size cache-size}
          store (assoc store
                       :serializers {:FressianSerializer
                                     (fressian-serializer
@@ -289,18 +307,83 @@
 ;; Utilities
 ;; ============================================================================
 
+(def ^:const DEFAULT_FLUSH_PARALLELISM
+  "Bound on in-flight `k/assoc` calls during a flush. Each in-flight write
+   holds a Fressian byte-buffer of leaf data — an unbounded fan-out (e.g.
+   firing all 92 leaf writes from a sync cycle simultaneously) inflates
+   memory peak and overruns the OS page cache once dirty pages exceed
+   `vm.dirty_ratio`, after which fsync queues serialize anyway. Bounded
+   parallelism caps memory use and keeps konserve drainable at steady state."
+  8)
+
+(defn flush-writes-ch!
+  "Drain pending writes via `core.async/pipeline-async`. Returns a channel
+   that closes when all queued writes have completed. Uses bounded
+   parallelism (default DEFAULT_FLUSH_PARALLELISM) so memory and OS-page-
+   cache pressure stay bounded.
+
+   Caller composes: `<!!` to block, or compose with other flushes."
+  ([storage] (flush-writes-ch! storage DEFAULT_FLUSH_PARALLELISM))
+  ([^CachedStorage storage parallelism]
+   (let [store (.-store storage)
+         pending @(.-pending-writes storage)
+         done-ch (async/chan)]
+     (if (empty? pending)
+       (async/close! done-ch)
+       (let [in-ch (async/to-chan! pending)
+             out-ch (async/chan parallelism)
+             af (fn [[address node] result-ch]
+                  (let [w-ch (k/assoc store address node {:sync? false})]
+                    (async/take! w-ch (fn [_] (async/close! result-ch)))))]
+         (async/pipeline-async parallelism out-ch af in-ch)
+         (async/go
+           (loop [] (when (async/<! out-ch) (recur)))
+           (swap! (.-pending-writes storage)
+                  (fn [cur] (vec (drop (count pending) cur))))
+           (async/close! done-ch))))
+     done-ch)))
+
 (defn flush-writes!
-  "Flush all pending writes to the underlying konserve store.
-   Uses atomic removal pattern to avoid losing concurrent writes."
+  "Blocking flush. See `flush-writes-ch!` for the channel-returning variant."
   [^CachedStorage storage]
-  (let [store (.-store storage)
-        pending @(.-pending-writes storage)]
-    (when (seq pending)
-      (doseq [[address node] pending]
-        (k/assoc store address node {:sync? true}))
-      ;; Atomic removal: drop only items we processed
-      (swap! (.-pending-writes storage) #(vec (drop (count pending) %))))
-    nil))
+  (async/<!! (flush-writes-ch! storage)))
+
+(defn flush-storages-ch!
+  "Drain pending writes from a *collection* of CachedStorages in a single
+   bounded-parallel fan-out. All storages share one in-flight budget so
+   total memory pressure stays bounded regardless of column count.
+
+   Returns a channel that closes when all writes from all storages
+   complete. Pending-writes atoms are atomically drained in proportion."
+  ([storages] (flush-storages-ch! storages DEFAULT_FLUSH_PARALLELISM))
+  ([storages parallelism]
+   (let [;; Snapshot each storage's pending list — note: not yet drained.
+         per-storage (mapv (fn [^CachedStorage s]
+                             [s @(.-pending-writes s)])
+                           storages)
+         all-items (mapcat (fn [[s pending]]
+                             (map (fn [[a n]] [s a n]) pending))
+                           per-storage)
+         done-ch (async/chan)]
+     (if (empty? all-items)
+       (async/close! done-ch)
+       (let [in-ch (async/to-chan! all-items)
+             out-ch (async/chan parallelism)
+             af (fn [[^CachedStorage storage address node] result-ch]
+                  (let [w-ch (k/assoc (.-store storage) address node
+                                      {:sync? false})]
+                    (async/take! w-ch (fn [_] (async/close! result-ch)))))]
+         (async/pipeline-async parallelism out-ch af in-ch)
+         (async/go
+           (loop [] (when (async/<! out-ch) (recur)))
+           ;; Atomically drop processed items from each storage.
+           (doseq [[^CachedStorage s pending] per-storage
+                   :let [n (count pending)]
+                   :when (pos? n)]
+             (swap! (.-pending-writes s)
+                    (fn [cur] (vec (drop n cur)))))
+           (async/close! done-ch))))
+     done-ch)))
 
 (defn storage-stats
   "Get storage statistics: {:writes N :reads N :accessed N}."
@@ -313,9 +396,11 @@
   (count @(.-pending-writes storage)))
 
 (defn clear-cache!
-  "Clear the LRU cache. Nodes will be re-loaded from storage on next access."
+  "Clear the LRU cache. Nodes will be re-loaded from storage on next
+   access. Preserves the cache-size from the storage's original config."
   [^CachedStorage storage]
-  (reset! (.-cache storage) (cache/lru-cache-factory {} :threshold 1000))
+  (let [size (or (:cache-size (.-config storage)) DEFAULT_CACHE_SIZE)]
+    (reset! (.-cache storage) (cache/lru-cache-factory {} :threshold size)))
   nil)
 
 (defn cache-size
