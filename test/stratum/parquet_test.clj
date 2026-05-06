@@ -49,10 +49,17 @@
           (doseq [[k v] row]
             (when (some? v)
               (cond
-                (string? v)  (.append g ^String k ^String v)
-                (integer? v) (.append g ^String k (long v))
-                (float? v)   (.append g ^String k (double v))
-                (instance? Double v) (.append g ^String k (double v))
+                (string? v)            (.append g ^String k ^String v)
+                ;; INT32 columns require int, INT64 columns require long.
+                ;; Test callers use (Integer/valueOf x) for INT32 cells.
+                (instance? Integer v)  (.append g ^String k (int v))
+                (instance? Long v)     (.append g ^String k (long v))
+                (integer? v)           (.append g ^String k (long v))
+                (float? v)             (.append g ^String k (double v))
+                (instance? Double v)   (.append g ^String k (double v))
+                (instance? (Class/forName "[B") v)
+                (.append g ^String k
+                         (org.apache.parquet.io.api.Binary/fromConstantByteArray ^bytes v))
                 :else (throw (ex-info "Unsupported test value type"
                                       {:key k :value v :type (type v)})))))
           (.write writer g)))
@@ -355,4 +362,146 @@
           ;; Real sum of 100*(i+1) for i=0..99 = 100 * 5050 = 505_000
           (is (= 505000.0 (double (:sum (first (q/q {:from ds :agg [[:sum :px]]}))))))
           (is (= 5050.0   (double (:avg (first (q/q {:from ds :agg [[:avg :px]]})))))))
+        (finally (.delete path))))))
+
+;; ----------------------------------------------------------------------------
+;; parquet-dataset: NULL handling in numeric columns + type rejection +
+;; logical-type round-trips (Date, Timestamp[Millis|Micros|Nanos], UUID).
+;; ----------------------------------------------------------------------------
+
+(deftest parquet-dataset-null-numeric-test
+  (testing "NULL int64/double slots come back as Long/MIN_VALUE / NaN, not 0"
+    (let [path (temp-parquet "ds-null-num")
+          schema "message trades {
+                    required int64 row;
+                    optional int64 maybe_long;
+                    optional double maybe_dbl;
+                  }"
+          rows (mapv (fn [i]
+                       (cond-> {"row" (long i)}
+                         (even? i) (assoc "maybe_long" (long (* 10 i))
+                                          "maybe_dbl"  (double (* 1.5 i)))))
+                     (range 20))]
+      (try
+        (write-parquet! path schema rows)
+        (let [ds (parquet/parquet-dataset (.getAbsolutePath path))
+              not-null (q/q {:from ds :where [[:is-not-null :maybe_long]]
+                             :agg [[:count]]})
+              is-null (q/q {:from ds :where [[:is-null :maybe_long]]
+                            :agg [[:count]]})
+              dbl-null (q/q {:from ds :where [[:is-null :maybe_dbl]]
+                             :agg [[:count]]})]
+          (is (= 10 (long (:count (first not-null)))))
+          (is (= 10 (long (:count (first is-null)))))
+          (is (= 10 (long (:count (first dbl-null))))))
+        (finally (.delete path))))))
+
+(deftest parquet-dataset-rejects-decimal-test
+  (testing "Decimal columns are rejected with a clear error"
+    (let [path (temp-parquet "ds-decimal")
+          schema "message t {
+                    required int64 amount (DECIMAL(10,2));
+                  }"
+          rows (mapv (fn [i] {"amount" (long (* 100 i))}) (range 5))]
+      (try
+        (write-parquet! path schema rows)
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"Decimal column"
+             (parquet/parquet-dataset (.getAbsolutePath path))))
+        (finally (.delete path))))))
+
+(deftest parquet-dataset-rejects-list-test
+  (testing "Repeated/nested columns are rejected with a clear error"
+    (let [path (temp-parquet "ds-list")
+          schema "message t {
+                    required int64 id;
+                    repeated int64 tags;
+                  }"
+          rows (mapv (fn [i] {"id" (long i) "tags" (long i)}) (range 3))]
+      (try
+        (write-parquet! path schema rows)
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"Repeated/nested column"
+             (parquet/parquet-dataset (.getAbsolutePath path))))
+        (finally (.delete path))))))
+
+(deftest parquet-dataset-date-test
+  (testing "INT32 + Date logical-type → epoch-millis"
+    (let [path (temp-parquet "ds-date")
+          schema "message t {
+                    required int32 d (DATE);
+                  }"
+          ;; days-since-1970: 0=1970-01-01, 19000=2022-01-08, 20000=2024-10-04
+          rows (mapv (fn [d] {"d" (Integer/valueOf (int d))}) [0 100 19000 20000])]
+      (try
+        (write-parquet! path schema rows)
+        (let [ds (parquet/parquet-dataset (.getAbsolutePath path))
+              all (q/q {:from ds :select [:d] :order [[:d :asc]]})
+              expected [0
+                        (* 100 86400000)
+                        (* 19000 86400000)
+                        (* 20000 86400000)]]
+          (is (= expected (mapv (comp long :d) all))))
+        (finally (.delete path))))))
+
+(deftest parquet-dataset-timestamp-units-test
+  (testing "Timestamp{Millis|Micros|Nanos} all normalize to epoch-millis"
+    (let [path (temp-parquet "ds-ts")
+          schema "message t {
+                    required int64 t_millis (TIMESTAMP(MILLIS,true));
+                    required int64 t_micros (TIMESTAMP(MICROS,true));
+                    required int64 t_nanos  (TIMESTAMP(NANOS,true));
+                  }"
+          ;; Same logical instant in three units (1_700_000_000_000 ms).
+          rows [{"t_millis" 1700000000000
+                 "t_micros" 1700000000000000
+                 "t_nanos"  1700000000000000000}]]
+      (try
+        (write-parquet! path schema rows)
+        (let [ds (parquet/parquet-dataset (.getAbsolutePath path))
+              [r] (q/q {:from ds :select [:t_millis :t_micros :t_nanos]})]
+          (is (= 1700000000000 (long (:t_millis r))))
+          (is (= 1700000000000 (long (:t_micros r))))
+          (is (= 1700000000000 (long (:t_nanos r)))))
+        (finally (.delete path))))))
+
+(deftest parquet-dataset-uuid-test
+  (testing "FLBA[16] + UUID logical-type → 36-char hex string in dict"
+    (let [path (temp-parquet "ds-uuid")
+          schema "message t {
+                    required fixed_len_byte_array(16) id (UUID);
+                  }"
+          uuids [(java.util.UUID/fromString "00000000-0000-0000-0000-000000000001")
+                 (java.util.UUID/fromString "11111111-2222-3333-4444-555555555555")
+                 (java.util.UUID/fromString "ffffffff-ffff-ffff-ffff-ffffffffffff")]
+          uuid-bytes (fn [^java.util.UUID u]
+                       (let [bb (java.nio.ByteBuffer/allocate 16)]
+                         (.putLong bb (.getMostSignificantBits u))
+                         (.putLong bb (.getLeastSignificantBits u))
+                         (.array bb)))
+          rows (mapv (fn [u] {"id" (uuid-bytes u)}) uuids)]
+      (try
+        (write-parquet! path schema rows)
+        (let [ds (parquet/parquet-dataset (.getAbsolutePath path))
+              ;; The :dict carries our 36-char hex strings.
+              dict (set (vec (:dict (get (dataset/columns ds) :id))))]
+          (is (= 3 (count dict)))
+          (is (contains? dict "00000000-0000-0000-0000-000000000001"))
+          (is (contains? dict "11111111-2222-3333-4444-555555555555"))
+          (is (contains? dict "ffffffff-ffff-ffff-ffff-ffffffffffff")))
+        (finally (.delete path))))))
+
+(deftest parquet-dataset-close-test
+  (testing "close-parquet-dataset! actually closes the reader"
+    (let [path (temp-parquet "ds-close")]
+      (try
+        (write-parquet! path trades-schema (gen-trades 10))
+        (let [ds (parquet/parquet-dataset (.getAbsolutePath path))]
+          ;; First query works.
+          (is (= 10 (long (:count (first (q/q {:from ds :agg [[:count]]}))))))
+          (parquet/close-parquet-dataset! ds)
+          ;; After close, decoding throws (count is metadata-only so it
+          ;; would still work; force a decode via SUM).
+          (is (thrown? Exception
+                       (q/q {:from ds :agg [[:sum :ts]]}))))
         (finally (.delete path))))))

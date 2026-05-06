@@ -46,8 +46,17 @@
            [org.apache.parquet.io.api RecordMaterializer GroupConverter PrimitiveConverter Binary]
            [org.apache.parquet.schema MessageType Type GroupType]
            [org.apache.parquet.schema PrimitiveType PrimitiveType$PrimitiveTypeName]
-           [org.apache.parquet.schema LogicalTypeAnnotation LogicalTypeAnnotation$StringLogicalTypeAnnotation
-            LogicalTypeAnnotation$TimestampLogicalTypeAnnotation]
+           [org.apache.parquet.schema LogicalTypeAnnotation
+            LogicalTypeAnnotation$StringLogicalTypeAnnotation
+            LogicalTypeAnnotation$TimestampLogicalTypeAnnotation
+            LogicalTypeAnnotation$DateLogicalTypeAnnotation
+            LogicalTypeAnnotation$TimeLogicalTypeAnnotation
+            LogicalTypeAnnotation$IntLogicalTypeAnnotation
+            LogicalTypeAnnotation$EnumLogicalTypeAnnotation
+            LogicalTypeAnnotation$JsonLogicalTypeAnnotation
+            LogicalTypeAnnotation$UUIDLogicalTypeAnnotation
+            LogicalTypeAnnotation$DecimalLogicalTypeAnnotation
+            LogicalTypeAnnotation$TimeUnit]
            [java.lang.ref Cleaner]
            [java.nio ByteBuffer ByteOrder]
            [java.nio.file Path Paths]
@@ -593,20 +602,137 @@
    is no longer reachable."
   (delay (Cleaner/create)))
 
-(defn- parquet-type->stratum-type
-  "Map a parquet column to stratum :int64 / :float64 / :string. Mirrors
-   classify-column above, returning stratum's idx-datatype keywords."
+;; ----------------------------------------------------------------------------
+;; Column type classification — physical type + logical-type annotation
+;; ----------------------------------------------------------------------------
+;;
+;; Stratum's column type model has three kinds: :int64, :float64, :string.
+;; Parquet's primitive types times its logical-type annotations cover much
+;; more ground (Decimal, Date, Time, Timestamp[unit], UUID, …). We support
+;; the subset that maps cleanly onto our model — values are converted at
+;; decode time and at stats-mapping time so that downstream queries
+;; receive uniform values regardless of how the column was written.
+;;
+;; `classify-parquet-column` returns either:
+;;   {:datatype :int64|:float64|:string
+;;    :decoder-kind :int32-raw|:int64-raw|:int32-date|:ts-millis|:ts-micros|
+;;                  :ts-nanos|:int96-millis|:boolean|:double|:float|
+;;                  :binary-utf8|:flba-utf8|:flba-uuid
+;;    :stats-scale  long-multiplier-applied-to-int-min/max  (1 for default)
+;;    :stats-divide long-divisor-applied-to-int-min/max     (1 for default)
+;;    :uuid?        true for UUID columns (FLBA[16] → 36-char hex string)}
+;;
+;; Or, for unsupported columns:
+;;   {:reject "human-readable reason"}
+
+(defn- classify-parquet-column
   [^ColumnDescriptor cd]
-  (let [pt (.getPrimitiveType cd)]
-    (case (str (.getPrimitiveTypeName pt))
-      "INT64"  :int64
-      "INT32"  :int64
-      "INT96"  :int64
-      "BOOLEAN" :int64
-      "DOUBLE" :float64
-      "FLOAT"  :float64
-      "BINARY" :string
-      "FIXED_LEN_BYTE_ARRAY" :string)))
+  (let [pt (.getPrimitiveType cd)
+        ptn (str (.getPrimitiveTypeName pt))
+        annotation (.getLogicalTypeAnnotation pt)
+        col-name (last (.getPath cd))
+        max-rep (.getMaxRepetitionLevel cd)]
+    (cond
+      ;; Repeated columns (LIST elements / MAP entries / nested arrays).
+      ;; max-repetition-level > 0 means the column is inside a repeated
+      ;; group; flat scalar reads of these would yield wrong row counts.
+      (pos? max-rep)
+      {:reject (str "Repeated/nested column '" col-name
+                    "' (LIST/MAP/STRUCT) not supported by parquet-dataset. "
+                    "Use index-parquet! or project to a flat schema.")}
+
+      (instance? LogicalTypeAnnotation$DecimalLogicalTypeAnnotation annotation)
+      {:reject (str "Decimal column '" col-name
+                    "' not supported (stratum has no decimal type). "
+                    "Project to DOUBLE in your writer or use index-parquet!.")}
+
+      :else
+      (case ptn
+        "BOOLEAN" {:datatype :int64 :decoder-kind :boolean}
+        "DOUBLE"  {:datatype :float64 :decoder-kind :double}
+        "FLOAT"   {:datatype :float64 :decoder-kind :float}
+
+        "INT32"
+        (cond
+          (or (nil? annotation)
+              (instance? LogicalTypeAnnotation$IntLogicalTypeAnnotation annotation))
+          {:datatype :int64 :decoder-kind :int32-raw}
+
+          (instance? LogicalTypeAnnotation$DateLogicalTypeAnnotation annotation)
+          ;; days-since-1970-01-01 → epoch millis
+          {:datatype :int64 :decoder-kind :int32-date :stats-scale 86400000}
+
+          (instance? LogicalTypeAnnotation$TimeLogicalTypeAnnotation annotation)
+          ;; INT32 time is always TimeUnit.MILLIS — keep raw millis-of-day
+          {:datatype :int64 :decoder-kind :int32-raw}
+
+          :else
+          {:reject (str "INT32 column '" col-name "' has unsupported "
+                        "logical-type annotation: " annotation)})
+
+        "INT64"
+        (cond
+          (or (nil? annotation)
+              (instance? LogicalTypeAnnotation$IntLogicalTypeAnnotation annotation))
+          {:datatype :int64 :decoder-kind :int64-raw}
+
+          (instance? LogicalTypeAnnotation$TimestampLogicalTypeAnnotation annotation)
+          (let [unit (.getUnit ^LogicalTypeAnnotation$TimestampLogicalTypeAnnotation annotation)]
+            (condp = unit
+              LogicalTypeAnnotation$TimeUnit/MILLIS
+              {:datatype :int64 :decoder-kind :ts-millis}
+
+              LogicalTypeAnnotation$TimeUnit/MICROS
+              {:datatype :int64 :decoder-kind :ts-micros :stats-divide 1000}
+
+              LogicalTypeAnnotation$TimeUnit/NANOS
+              {:datatype :int64 :decoder-kind :ts-nanos :stats-divide 1000000}))
+
+          (instance? LogicalTypeAnnotation$TimeLogicalTypeAnnotation annotation)
+          ;; Time MICROS / NANOS — keep raw, user interprets
+          {:datatype :int64 :decoder-kind :int64-raw}
+
+          :else
+          {:reject (str "INT64 column '" col-name "' has unsupported "
+                        "logical-type annotation: " annotation)})
+
+        "INT96"
+        ;; Legacy timestamp. parquet stores it as 12-byte tuples; we
+        ;; convert each value to epoch-millis on decode. parquet stats
+        ;; for INT96 use BinaryStatistics with undefined sort order, so
+        ;; the stats-mapper skips min/max for INT96 columns.
+        {:datatype :int64 :decoder-kind :int96-millis :stats-skip-min-max? true}
+
+        "BINARY"
+        (cond
+          (or (nil? annotation)
+              (instance? LogicalTypeAnnotation$StringLogicalTypeAnnotation annotation)
+              (instance? LogicalTypeAnnotation$EnumLogicalTypeAnnotation annotation)
+              (instance? LogicalTypeAnnotation$JsonLogicalTypeAnnotation annotation))
+          {:datatype :string :decoder-kind :binary-utf8}
+
+          :else
+          {:reject (str "BINARY column '" col-name "' has unsupported "
+                        "logical-type annotation: " annotation)})
+
+        "FIXED_LEN_BYTE_ARRAY"
+        (cond
+          (instance? LogicalTypeAnnotation$StringLogicalTypeAnnotation annotation)
+          {:datatype :string :decoder-kind :flba-utf8}
+
+          (instance? LogicalTypeAnnotation$UUIDLogicalTypeAnnotation annotation)
+          {:datatype :string :decoder-kind :flba-uuid :uuid? true}
+
+          :else
+          {:reject (str "FIXED_LEN_BYTE_ARRAY column '" col-name
+                        "' has unsupported logical-type annotation: "
+                        annotation
+                        " — Float16, Interval, Decimal, Geometry, and bare"
+                        " FLBA are not yet supported.")})
+
+        ;; Unknown physical type
+        {:reject (str "Unknown parquet primitive type for column '"
+                      col-name "': " ptn)}))))
 
 (defn- find-column-meta
   "Find the ColumnChunkMetaData for `cd` in `block`."
@@ -627,26 +753,50 @@
    stats-only SUM/AVG fast path won't fire on parquet-backed columns,
    but min/max/count/null-count drive zone-map pruning fully.
 
-   For string columns, we don't yet know the per-row-group dict-id range
-   (the global dict is built later). Caller updates the stats with
-   string-stats-from-dict-translate once the translation table exists."
-  ^stratum.stats.ChunkStats [^Statistics s ^long n-values datatype]
-  (let [null-count (.getNumNulls s)
+   `spec` is the column spec from `classify-parquet-column`. We honor
+   `:stats-skip-min-max?` (e.g. INT96 has BinaryStatistics + undefined
+   sort order), `:stats-scale` (Date: ×86_400_000), and `:stats-divide`
+   (TimestampMicros: ÷1000, TimestampNanos: ÷1_000_000).
+
+   For string columns the per-row-group dict-id range isn't known yet
+   (global dict built later). Caller overrides min/max via
+   `string-rg-min-max` once the translation table exists."
+  ^stratum.stats.ChunkStats [^Statistics s ^long n-values spec]
+  (let [datatype (:datatype spec)
+        null-count (.getNumNulls s)
         nominal-count (- n-values null-count)
-        [mn mx] (cond
-                  (not (.hasNonNullValue s))
-                  [Double/NaN Double/NaN]
+        scale (long (or (:stats-scale spec) 1))
+        divide (long (or (:stats-divide spec) 1))
+        ;; INT96 stats: BinaryStatistics whose .genericGetMin returns
+        ;; Binary, not Number. Skip — INT96 sort order is undefined per
+        ;; the parquet spec, so writers shouldn't rely on these stats
+        ;; anyway. Values fall through to NaN, disabling zone-map
+        ;; pruning for the column (correctness > pruning).
+        [mn mx]
+        (cond
+          (not (.hasNonNullValue s))
+          [Double/NaN Double/NaN]
 
-                  (= :int64 datatype)
-                  [(double (.longValue ^Number (.genericGetMin s)))
-                   (double (.longValue ^Number (.genericGetMax s)))]
+          (:stats-skip-min-max? spec)
+          [Double/NaN Double/NaN]
 
-                  (= :float64 datatype)
-                  [(double (.doubleValue ^Number (.genericGetMin s)))
-                   (double (.doubleValue ^Number (.genericGetMax s)))]
+          (= :int64 datatype)
+          (try
+            (let [raw-mn (long (.longValue ^Number (.genericGetMin s)))
+                  raw-mx (long (.longValue ^Number (.genericGetMax s)))]
+              [(double (quot (* raw-mn scale) divide))
+               (double (quot (* raw-mx scale) divide))])
+            (catch ClassCastException _
+              ;; Defensive — some writers emit Binary stats for INT96
+              ;; despite the spec, and other surprises are possible.
+              [Double/NaN Double/NaN]))
 
-                  :else
-                  [Double/NaN Double/NaN])]
+          (= :float64 datatype)
+          [(double (.doubleValue ^Number (.genericGetMin s)))
+           (double (.doubleValue ^Number (.genericGetMax s)))]
+
+          :else
+          [Double/NaN Double/NaN])]
     (stats/->ChunkStats nominal-count 0.0 0.0 mn mx null-count)))
 
 (defn- string-rg-min-max
@@ -692,11 +842,35 @@
 ;;      IDs. For pages encoded plainly (no dict), fall back to looking up
 ;;      the binary in the global dict.
 
+(defn- binary->hex
+  "Render a 16-byte FLBA UUID into the canonical 36-char dashed form."
+  ^String [^Binary b]
+  (let [bytes (.getBytes b)
+        sb (StringBuilder. 36)
+        hex "0123456789abcdef"]
+    (dotimes [i 16]
+      (when (or (= i 4) (= i 6) (= i 8) (= i 10))
+        (.append sb \-))
+      (let [v (bit-and (aget ^bytes bytes (int i)) 0xff)]
+        (.append sb (.charAt ^String hex (bit-shift-right v 4)))
+        (.append sb (.charAt ^String hex (bit-and v 0x0f)))))
+    (.toString sb)))
+
+(defn- decode-binary-by-spec
+  "Convert a parquet Binary value to the canonical String for the column,
+   per its decoder-kind: UTF-8 for normal binary/FLBA; 36-char hex for
+   UUID FLBA[16]."
+  ^String [^Binary b decoder-kind]
+  (case decoder-kind
+    :flba-uuid (binary->hex b)
+    (.toStringUsingUTF8 b)))
+
 (defn- read-rg-dict
   "Read the dictionary page for `cd` in row group `rg-idx` of `reader`,
    returning a vector of `String`s in local-dict ID order. Returns nil
-   when the row group has no dict page (e.g. all-PLAIN encoding)."
-  [^ParquetFileReader reader rg-idx ^ColumnDescriptor cd]
+   when the row group has no dict page (e.g. all-PLAIN encoding).
+   `decoder-kind` selects the binary→string conversion (UTF-8 vs UUID)."
+  [^ParquetFileReader reader rg-idx ^ColumnDescriptor cd decoder-kind]
   (let [^DictionaryPageReadStore drs (.getDictionaryReader reader (int rg-idx))
         dp (when drs (.readDictionaryPage drs cd))]
     (when dp
@@ -704,61 +878,123 @@
             n (inc (.getMaxId dict))
             out (object-array n)]
         (dotimes [i n]
-          (aset out i (.toStringUsingUTF8 ^Binary (.decodeToBinary dict (int i)))))
+          (aset out i (decode-binary-by-spec
+                       ^Binary (.decodeToBinary dict (int i))
+                       decoder-kind)))
         (vec out)))))
 
-(defn- build-string-global-dict
-  "Walk every row group's dict page for `cd`, merging into a single global
-   `String → long` map. Returns:
-     {:dict     ^objects globalIdx → String
-      :translates [translate-table-per-row-group]
-                 each translate-table is a long[] (local-dict-id → global-id)
-                 or nil if the row group has no dict page (caller falls back).}
+(defn- intern-string!
+  "Intern `s` into the global `String → long` map. Returns the global
+   id. Throws when the cap would be exceeded."
+  ^long [^HashMap global ^long cap col-name s]
+  (let [existing (.get global s)]
+    (if existing
+      (long existing)
+      (let [new-id (.size global)]
+        (when (>= new-id cap)
+          (throw (ex-info
+                  "parquet-dataset string dict cap exceeded — column has too many distinct values"
+                  {:column col-name
+                   :dict-cap cap})))
+        (.put global s (long new-id))
+        new-id))))
 
-   `dict-cap` is the maximum allowed global dict size; throws when crossed
-   (per the Ryan-style high-cardinality OOM guard)."
-  [^ParquetFileReader reader ^ColumnDescriptor cd ^long n-row-groups dict-cap]
+(defn- scan-rg-plain-strings!
+  "For a row group whose data pages aren't dict-encoded, eagerly walk
+   every value via parquet's RecordReader and intern each Binary
+   (decoded by `decoder-kind`) into the global map. Returns nil — the
+   row group has no translation table; later `decode-row-group-string`
+   takes the addBinary hot path against the same global map.
+
+   This keeps strings correct for columns parquet wrote PLAIN (random
+   UUIDs, high-cardinality text) at the cost of one full column scan
+   at open time. Bounded by `dict-cap`; throws on overflow."
+  [^ParquetFileReader reader rg-idx ^ColumnDescriptor cd
+   ^HashMap global cap col-name decoder-kind]
+  (let [full-schema (.getSchema (.getFileMetaData (.getFooter reader)))
+        proj-field (some (fn [^Type f] (when (= col-name (.getName f)) f))
+                         (.getFields ^MessageType full-schema))
+        proj-schema (MessageType. (.getName ^MessageType full-schema)
+                                  ^"[Lorg.apache.parquet.schema.Type;"
+                                  (into-array Type [proj-field]))
+        pages (.readRowGroup reader (int rg-idx))
+        column-io (.getColumnIO (ColumnIOFactory.) proj-schema)
+        n-values (long (.getRowCount ^PageReadStore pages))
+        conv (proxy [PrimitiveConverter] []
+               (addBinary [^Binary v]
+                 (intern-string! global cap col-name
+                                 (decode-binary-by-spec v decoder-kind))))
+        gc (proxy [GroupConverter] []
+             (getConverter [_] conv)
+             (start [])
+             (end []))
+        rm (proxy [RecordMaterializer] []
+             (getRootConverter [] gc)
+             (getCurrentRecord [] nil))
+        rr (.getRecordReader ^MessageColumnIO column-io pages rm)]
+    (dotimes [_ n-values] (.read rr))
+    nil))
+
+(defn- build-string-global-dict
+  "Walk every row group's dict page for `cd`, merging into a single
+   global `String → long` map. For row groups whose data pages aren't
+   dict-encoded (parquet writes UUIDs and other random/high-cardinality
+   strings as PLAIN), eagerly scan that row group's values so the
+   global dict is correct.
+
+   Returns:
+     {:global-map  HashMap<String,Long>  (live)
+      :translates  vec of long[] (local→global) or nil per row group
+      :dict-cap    long (capacity ceiling; respected throughout)}
+
+   `dict-cap` is the maximum allowed global dict size; throws when
+   crossed (avoids high-cardinality OOM)."
+  [^ParquetFileReader reader ^ColumnDescriptor cd n-row-groups
+   decoder-kind dict-cap]
   (let [global ^HashMap (HashMap.)
-        translates (object-array n-row-groups)]
+        translates (object-array n-row-groups)
+        cap (long (or dict-cap Long/MAX_VALUE))
+        col-name (last (.getPath cd))]
     (dotimes [rg-idx n-row-groups]
-      (when-let [rg-dict (read-rg-dict reader rg-idx cd)]
+      (if-let [rg-dict (read-rg-dict reader rg-idx cd decoder-kind)]
         (let [n (count rg-dict)
               tab (long-array n)]
           (dotimes [i n]
-            (let [s ^String (nth rg-dict i)
-                  existing (.get global s)
-                  gid (if existing
-                        (long existing)
-                        (let [new-id (.size global)]
-                          (when (and dict-cap (>= new-id (long dict-cap)))
-                            (throw (ex-info
-                                    "parquet-dataset string dict cap exceeded — column has too many distinct values"
-                                    {:column (last (.getPath cd))
-                                     :dict-cap dict-cap})))
-                          (.put global s (long new-id))
-                          new-id))]
-              (aset ^longs tab i (long gid))))
-          (aset translates rg-idx tab))))
-    (let [n (.size global)
-          arr (make-array String n)]
-      (doseq [^java.util.Map$Entry e (.entrySet global)]
-        (aset ^"[Ljava.lang.String;" arr
-              (int (long (.getValue e))) ^String (.getKey e)))
-      {:dict arr
-       :global-map global             ; for plain-encoded fallbacks
-       :translates (vec translates)})))
+            (let [gid (intern-string! global cap col-name ^String (nth rg-dict i))]
+              (aset ^longs tab i gid)))
+          (aset translates rg-idx tab))
+        ;; No dict page for this row group — eagerly scan values.
+        (scan-rg-plain-strings! reader rg-idx cd global cap col-name
+                                decoder-kind)))
+    {:dict-cap cap
+     :global-map global
+     :translates (vec translates)}))
+
+(defn- finalize-global-dict
+  "Snapshot the live `global-map` HashMap into a String[] sized to the
+   final dict size. Called after all decode-row-group-string fallbacks
+   have had a chance to add plain-encoded values."
+  ^"[Ljava.lang.String;" [^HashMap global]
+  (let [n (.size global)
+        arr (make-array String n)]
+    (doseq [^java.util.Map$Entry e (.entrySet global)]
+      (aset ^"[Ljava.lang.String;" arr
+            (int (long (.getValue e))) ^String (.getKey e)))
+    arr))
 
 (defn- decode-row-group-string
   "Decode a single string column from a single row group into a long[]
    of global-dict IDs. When the row group is dict-encoded we use the
-   translation table for zero-string-allocation; for plain pages we look
-   up the binary in the global map. Long.MIN_VALUE marks NULL."
+   translation table for zero-string-allocation; for plain-encoded
+   pages we materialize each binary, run the column's decoder-kind
+   conversion (UTF-8 or UUID), and look up — or insert — into the
+   live global map. Long.MIN_VALUE marks NULL."
   [^ParquetFileReader reader rg-index ^ColumnDescriptor cd
-   translate ^HashMap global-map length]
+   translate ^HashMap global-map dict-cap decoder-kind length]
   (let [rg-index (int rg-index)
         length (int length)
-        full-schema (.getSchema (.getFileMetaData (.getFooter reader)))
         col-name (last (.getPath cd))
+        full-schema (.getSchema (.getFileMetaData (.getFooter reader)))
         proj-field (some (fn [^Type f] (when (= col-name (.getName f)) f))
                          (.getFields ^MessageType full-schema))
         proj-schema (MessageType. (.getName ^MessageType full-schema)
@@ -780,10 +1016,24 @@
                (addValueFromDictionary [local-id]
                  (aset out (aget cursor 0) (aget translate-arr (int local-id))))
                (addBinary [^Binary v]
-                 (let [s (.toStringUsingUTF8 v)
-                       gid (.get global-map s)]
-                   (aset out (aget cursor 0)
-                         (if gid (long gid) Long/MIN_VALUE)))))
+                 ;; Plain-encoded fallback. The string may be present
+                 ;; in the global dict already (also seen in another
+                 ;; row group's dict page) or new — insert if new,
+                 ;; honoring the dict cap.
+                 (let [s (decode-binary-by-spec v decoder-kind)
+                       existing (.get global-map s)
+                       gid (if existing
+                             (long existing)
+                             (let [new-id (.size global-map)
+                                   cap (long dict-cap)]
+                               (when (>= new-id cap)
+                                 (throw (ex-info
+                                         "parquet-dataset string dict cap exceeded during plain-page decode — column has too many distinct values"
+                                         {:column col-name
+                                          :dict-cap cap})))
+                               (.put global-map s (long new-id))
+                               new-id))]
+                   (aset out (aget cursor 0) gid))))
         gc (proxy [GroupConverter] []
              (getConverter [_] conv)
              (start [])
@@ -818,14 +1068,21 @@
    double[] sized to the row group. One allocation, one decode pass.
 
    Uses parquet's lower-level ColumnReader directly, bypassing the
-   RecordReader+proxy callback path (which dispatches a Clojure proxy
-   per value plus a GroupConverter.end() per row). For flat primitive
-   columns (no rep/def levels beyond NULL/non-NULL), the inner loop is
-   `consume + getLong/getInteger/getDouble + aset` — no virtual call
-   per value beyond the (already-required) ValuesReader."
-  [^ParquetFileReader reader rg-index ^ColumnDescriptor cd datatype length]
+   RecordReader+proxy callback path (Clojure proxy dispatch per value
+   plus a GroupConverter.end() per row). For flat primitive columns the
+   inner loop is `consume + get* + aset` — no virtual call per value
+   beyond what parquet's ValuesReader needs anyway.
+
+   `spec` is the column spec from `classify-parquet-column`; its
+   `:decoder-kind` selects the inner loop and any per-value conversion
+   (Date INT32 → epoch-millis ×86_400_000, TimestampMicros ÷1000,
+   etc.). NULLs (def-level < max) leave the slot at the type's NULL
+   sentinel — Long/MIN_VALUE for int64, Double/NaN for float64."
+  [^ParquetFileReader reader rg-index ^ColumnDescriptor cd spec length]
   (let [rg-index (int rg-index)
         length (int length)
+        datatype (:datatype spec)
+        decoder-kind (:decoder-kind spec)
         full-schema (.getSchema (.getFileMetaData (.getFooter reader)))
         col-name (last (.getPath cd))
         proj-field (some (fn [^Type f] (when (= col-name (.getName f)) f))
@@ -837,7 +1094,6 @@
         proj-schema (MessageType. (.getName ^MessageType full-schema)
                                   ^"[Lorg.apache.parquet.schema.Type;"
                                   (into-array Type [proj-field]))
-        ptn (str (.getPrimitiveTypeName (.getPrimitiveType cd)))
         max-def (.getMaxDefinitionLevel cd)
         ^PageReadStore pages (.readRowGroup reader rg-index)
         created-by (.getCreatedBy (.getFileMetaData (.getFooter reader)))
@@ -846,56 +1102,88 @@
         n (long length)]
     (case datatype
       :int64
-      (let [^longs out (long-array length)
-            int96? (= "INT96" ptn)
-            int? (= "INT32" ptn)
-            bool? (= "BOOLEAN" ptn)]
-        (cond
-          int96?
-          (do (java.util.Arrays/fill out Long/MIN_VALUE)
-              (loop [i 0]
-                (when (< i n)
-                  (when (= max-def (.getCurrentDefinitionLevel cr))
-                    (aset out i (long (int96->epoch-millis (.getBinary cr)))))
-                  (.consume cr)
-                  (recur (unchecked-inc i)))))
-          int?
-          (do (java.util.Arrays/fill out Long/MIN_VALUE)
-              (loop [i 0]
-                (when (< i n)
-                  (when (= max-def (.getCurrentDefinitionLevel cr))
-                    (aset out i (long (.getInteger cr))))
-                  (.consume cr)
-                  (recur (unchecked-inc i)))))
-          bool?
-          (do (java.util.Arrays/fill out Long/MIN_VALUE)
-              (loop [i 0]
-                (when (< i n)
-                  (when (= max-def (.getCurrentDefinitionLevel cr))
-                    (aset out i (if (.getBoolean cr) 1 0)))
-                  (.consume cr)
-                  (recur (unchecked-inc i)))))
-          :else                              ; INT64
-          (do (java.util.Arrays/fill out Long/MIN_VALUE)
-              (loop [i 0]
-                (when (< i n)
-                  (when (= max-def (.getCurrentDefinitionLevel cr))
-                    (aset out i (.getLong cr)))
-                  (.consume cr)
-                  (recur (unchecked-inc i))))))
+      (let [^longs out (long-array length)]
+        (java.util.Arrays/fill out Long/MIN_VALUE)
+        (case decoder-kind
+          :int96-millis
+          (loop [i 0]
+            (when (< i n)
+              (when (= max-def (.getCurrentDefinitionLevel cr))
+                (aset out i (int96->epoch-millis (.getBinary cr))))
+              (.consume cr)
+              (recur (unchecked-inc i))))
+
+          :int32-raw
+          (loop [i 0]
+            (when (< i n)
+              (when (= max-def (.getCurrentDefinitionLevel cr))
+                (aset out i (long (.getInteger cr))))
+              (.consume cr)
+              (recur (unchecked-inc i))))
+
+          :int32-date
+          ;; days-since-epoch → epoch-millis
+          (loop [i 0]
+            (when (< i n)
+              (when (= max-def (.getCurrentDefinitionLevel cr))
+                (aset out i (* (long (.getInteger cr)) 86400000)))
+              (.consume cr)
+              (recur (unchecked-inc i))))
+
+          :boolean
+          (loop [i 0]
+            (when (< i n)
+              (when (= max-def (.getCurrentDefinitionLevel cr))
+                (aset out i (if (.getBoolean cr) 1 0)))
+              (.consume cr)
+              (recur (unchecked-inc i))))
+
+          :int64-raw
+          (loop [i 0]
+            (when (< i n)
+              (when (= max-def (.getCurrentDefinitionLevel cr))
+                (aset out i (.getLong cr)))
+              (.consume cr)
+              (recur (unchecked-inc i))))
+
+          :ts-millis
+          ;; INT64 timestamp, already millis — direct copy
+          (loop [i 0]
+            (when (< i n)
+              (when (= max-def (.getCurrentDefinitionLevel cr))
+                (aset out i (.getLong cr)))
+              (.consume cr)
+              (recur (unchecked-inc i))))
+
+          :ts-micros
+          (loop [i 0]
+            (when (< i n)
+              (when (= max-def (.getCurrentDefinitionLevel cr))
+                (aset out i (quot (.getLong cr) 1000)))
+              (.consume cr)
+              (recur (unchecked-inc i))))
+
+          :ts-nanos
+          (loop [i 0]
+            (when (< i n)
+              (when (= max-def (.getCurrentDefinitionLevel cr))
+                (aset out i (quot (.getLong cr) 1000000)))
+              (.consume cr)
+              (recur (unchecked-inc i)))))
         out)
 
       :float64
-      (let [^doubles out (double-array length)
-            float? (= "FLOAT" ptn)]
+      (let [^doubles out (double-array length)]
         (java.util.Arrays/fill out Double/NaN)
-        (if float?
+        (case decoder-kind
+          :float
           (loop [i 0]
             (when (< i n)
               (when (= max-def (.getCurrentDefinitionLevel cr))
                 (aset out i (double (.getFloat cr))))
               (.consume cr)
               (recur (unchecked-inc i))))
+          :double
           (loop [i 0]
             (when (< i n)
               (when (= max-def (.getCurrentDefinitionLevel cr))
@@ -915,35 +1203,35 @@
           ^ParquetFileReader reader
           ^long rg-index
           ^ColumnDescriptor col-desc
-          datatype                      ; :int64 | :float64 | :string
+          spec                          ; classify-parquet-column result
           ^long length
           translate                     ; long[] (string cols) or nil
           global-map                    ; HashMap (string fallback) or nil
+          ^long dict-cap                ; long; cap on global-map size during decode
           ^:volatile-mutable data       ; nil until first decode; long[] | double[]
           ^:volatile-mutable lock]
 
   chunk/IColChunk
   (chunk-length [_] length)
-  ;; Stratum's :string source-type is presented through the column map's
-  ;; :dict; the underlying chunk is long-encoded, so we report :int64 to
-  ;; satisfy long-vs-double dispatch in the SIMD path. Numeric types map
-  ;; through unchanged.
+  ;; Stratum's :string columns are long-encoded dict IDs at the chunk
+  ;; level (the column map carries the global :dict). Report :int64 so
+  ;; long-vs-double dispatch in the SIMD path picks the long path.
   (chunk-datatype [_]
-    (if (= :string datatype) :int64 datatype))
+    (if (= :string (:datatype spec)) :int64 (:datatype spec)))
 
   (read-value [this idx]
-    (if (= :float64 datatype)
+    (if (= :float64 (:datatype spec))
       (aget ^doubles (chunk/chunk-as-doubles this) (int idx))
       (aget ^longs (chunk/chunk-as-longs this) (int idx))))
   (read-long [this idx]
     (aget ^longs (chunk/chunk-as-longs this) (int idx)))
   (read-double [this idx]
-    (if (= :float64 datatype)
+    (if (= :float64 (:datatype spec))
       (aget ^doubles (chunk/chunk-as-doubles this) (int idx))
       (double (aget ^longs (chunk/chunk-as-longs this) (int idx)))))
 
   (chunk-data [this]
-    (if (= :float64 datatype)
+    (if (= :float64 (:datatype spec))
       (chunk/chunk-as-doubles this)
       (chunk/chunk-as-longs this)))
 
@@ -951,10 +1239,12 @@
     (or data
         (locking lock
           (or data
-              (let [arr (case datatype
-                          :string  (decode-row-group-string reader rg-index col-desc
-                                                            translate global-map length)
-                          (decode-row-group-numeric reader rg-index col-desc datatype length))]
+              (let [arr (case (:datatype spec)
+                          :string  (decode-row-group-string
+                                    reader rg-index col-desc translate global-map
+                                    dict-cap (:decoder-kind spec) length)
+                          (decode-row-group-numeric
+                           reader rg-index col-desc spec length))]
                 (set! data arr)
                 arr)))))
 
@@ -962,7 +1252,7 @@
     (or data
         (locking lock
           (or data
-              (let [arr (decode-row-group-numeric reader rg-index col-desc datatype length)]
+              (let [arr (decode-row-group-numeric reader rg-index col-desc spec length)]
                 (set! data arr)
                 arr)))))
 
@@ -992,20 +1282,17 @@
    the Cleaner action that closes the reader is bound to its
    reachability.
 
-   `dict-info` is nil for numeric columns; for strings it is the map
-   produced by `build-string-global-dict` (translates per row group +
-   global fallback map)."
-  [lifeline ^ParquetFileReader reader ^ColumnDescriptor cd dict-info]
-  (let [datatype (parquet-type->stratum-type cd)
-        ;; Stratum's downstream wiring expects string columns as
-        ;; long-encoded indices into a dict; the chunk reports :int64
-        ;; via `chunk-datatype`, but the PCI we build needs :int64 too
-        ;; so the query engine treats it as a long column.
+   `spec` is the column spec from `classify-parquet-column`. `dict-info`
+   is nil for numeric columns; for strings it is the map from
+   `build-string-global-dict`."
+  [lifeline ^ParquetFileReader reader ^ColumnDescriptor cd spec dict-info]
+  (let [datatype (:datatype spec)
         idx-datatype (if (= :string datatype) :int64 datatype)
         footer (.getFooter reader)
         blocks (vec (.getBlocks footer))
         translates (:translates dict-info)
         global-map (:global-map dict-info)
+        dict-cap (long (or (:dict-cap dict-info) Long/MAX_VALUE))
         cmp idx/chunk-entry-comparator
         empty-tree (pss/sorted-set*
                     {:cmp cmp
@@ -1014,7 +1301,7 @@
                         (let [col-meta (find-column-meta block cd)
                               n (.getValueCount col-meta)
                               base-stats (statistics->chunk-stats
-                                          (.getStatistics col-meta) n datatype)
+                                          (.getStatistics col-meta) n spec)
                               translate (when translates (nth translates rg-idx))
                               ;; For strings: parquet has Binary min/max; we
                               ;; want dict-id min/max (so zone-map and dense
@@ -1025,8 +1312,8 @@
                                          (assoc base-stats :min-val mn :max-val mx))
                                        base-stats)
                               chunk (->ParquetRowGroupChunk
-                                     lifeline reader rg-idx cd datatype n
-                                     translate global-map nil (Object.))]
+                                     lifeline reader rg-idx cd spec n
+                                     translate global-map dict-cap nil (Object.))]
                           (idx/->ChunkEntry [rg-idx] chunk cstats)))
                       (range (count blocks))
                       blocks)
@@ -1065,67 +1352,110 @@
                    :or {dict-cap (long 50000000)}}]
   (let [reader (ParquetFileReader/open
                 (LocalInputFile. (Paths/get path (make-array String 0))))
-        ;; lifeline is the cleanup-anchor object. Both the dataset and
-        ;; every ParquetRowGroupChunk reference it strongly. The Cleaner
-        ;; action runs only when ALL of those references go away — so
-        ;; chunks that outlive the dataset (held via column refs) keep
-        ;; the reader open until they are themselves unreachable.
-        lifeline (Object.)
-        footer (.getFooter reader)
-        schema (.getSchema (.getFileMetaData footer))
-        n-row-groups (count (.getBlocks footer))
-        all-cols (vec (.getColumns schema))
-        proj-cols (if columns
-                    (let [col-set (set columns)]
-                      (vec (filter #(col-set (last (.getPath ^ColumnDescriptor %))) all-cols)))
-                    all-cols)
-        col-map (into {}
-                      (map (fn [^ColumnDescriptor cd]
-                             (let [col-name (last (.getPath cd))
-                                   datatype (parquet-type->stratum-type cd)
-                                   dict-info (when (= :string datatype)
-                                               (build-string-global-dict
-                                                reader cd n-row-groups dict-cap))
-                                   pci (build-parquet-column-index
-                                        lifeline reader cd dict-info)
-                                   col-info (if (= :string datatype)
-                                              ;; String column wired as
-                                              ;; long-encoded dict ID
-                                              ;; against global :dict.
-                                              {:type :int64 :source :index
-                                               :dict (:dict dict-info)
-                                               :dict-type :string
-                                               :dict-alpha-masks
-                                               (ColumnOpsString/buildDictAlphaMasks
-                                                ^"[Ljava.lang.String;" (:dict dict-info))
-                                               :dict-bigram-masks
-                                               (ColumnOpsString/buildDictBigramMasks
-                                                ^"[Ljava.lang.String;" (:dict dict-info))
-                                               :stats-sum-incomplete? true
-                                               :index pci}
-                                              {:type datatype :source :index
-                                               :stats-sum-incomplete? true
-                                               :index pci})]
-                               [(keyword col-name) col-info])))
-                      proj-cols)
-        ds-name (or name (str "parquet:" (.getName (java.io.File. path))))
-        ds (dataset/make-dataset col-map
-                                 {:name ds-name
-                                  :metadata {:source-path path
-                                             :source-type :parquet
-                                             ::reader reader
-                                             ::lifeline lifeline}})]
-    ;; Cleaner watches `lifeline`. As long as any chunk or `ds` holds it,
-    ;; the reader stays open. Closes only after the entire chain drops.
-    (.register ^Cleaner @cleaner lifeline
-               (reify Runnable
-                 (run [_]
-                   (try (.close reader) (catch Exception _ nil)))))
-    ds))
+        success? (volatile! false)]
+    (try
+      (let [;; lifeline is the cleanup-anchor object. Both the dataset
+            ;; and every ParquetRowGroupChunk reference it strongly. The
+            ;; Cleaner action runs only when ALL of those references go
+            ;; away — so chunks that outlive the dataset (held via
+            ;; column refs) keep the reader open until they are
+            ;; themselves unreachable.
+            lifeline (Object.)
+            footer (.getFooter reader)
+            schema (.getSchema (.getFileMetaData footer))
+            n-row-groups (count (.getBlocks footer))
+            all-cols (vec (.getColumns schema))
+            proj-cols (if columns
+                        (let [col-set (set columns)]
+                          (vec (filter #(col-set (last (.getPath ^ColumnDescriptor %))) all-cols)))
+                        all-cols)
+            ;; Step 1: classify every column. If any is unsupported,
+            ;; throw before we allocate any chunk state — the
+            ;; surrounding try/finally closes the reader.
+            specs (mapv (fn [^ColumnDescriptor cd]
+                          [cd (classify-parquet-column cd)])
+                        proj-cols)
+            _ (when-let [bad (some (fn [[^ColumnDescriptor cd s]]
+                                     (when (:reject s)
+                                       [(last (.getPath cd)) (:reject s)]))
+                                   specs)]
+                (throw (ex-info (str "parquet-dataset: " (second bad))
+                                {:column (first bad)
+                                 :reason (second bad)})))
+            col-map (into {}
+                          (map (fn [[^ColumnDescriptor cd spec]]
+                                 (let [col-name (last (.getPath cd))
+                                       datatype (:datatype spec)
+                                       dict-info (when (= :string datatype)
+                                                   (build-string-global-dict
+                                                    reader cd n-row-groups
+                                                    (:decoder-kind spec) dict-cap))
+                                       pci (build-parquet-column-index
+                                            lifeline reader cd spec dict-info)
+                                       col-info
+                                       (if (= :string datatype)
+                                         ;; String column: dict is built
+                                         ;; from row-group dict pages now;
+                                         ;; on first plain-page decode it
+                                         ;; can grow further. We snapshot
+                                         ;; the dict eagerly for the
+                                         ;; alpha/bigram masks; if a
+                                         ;; later plain-page fallback adds
+                                         ;; entries, queries against
+                                         ;; LIKE-fast-paths will see only
+                                         ;; the eager snapshot. (LIKE
+                                         ;; correctness is preserved by
+                                         ;; the SIMD fallback in the
+                                         ;; query engine; only the
+                                         ;; mask-based pruning is
+                                         ;; affected.)
+                                         (let [dict (finalize-global-dict
+                                                     ^HashMap (:global-map dict-info))]
+                                           {:type :int64 :source :index
+                                            :dict dict
+                                            :dict-type :string
+                                            :dict-alpha-masks
+                                            (ColumnOpsString/buildDictAlphaMasks dict)
+                                            :dict-bigram-masks
+                                            (ColumnOpsString/buildDictBigramMasks dict)
+                                            :stats-sum-incomplete? true
+                                            :index pci})
+                                         {:type datatype :source :index
+                                          :stats-sum-incomplete? true
+                                          :index pci})]
+                                   [(keyword col-name) col-info])))
+                          specs)
+            ds-name (or name (str "parquet:" (.getName (java.io.File. path))))
+            ds (dataset/make-dataset col-map
+                                     {:name ds-name
+                                      :metadata {:source-path path
+                                                 :source-type :parquet
+                                                 ::reader reader
+                                                 ::lifeline lifeline}})]
+        ;; Cleaner watches `lifeline`. As long as any chunk or `ds`
+        ;; holds it, the reader stays open. Closes only after the
+        ;; entire chain drops.
+        (.register ^Cleaner @cleaner lifeline
+                   (reify Runnable
+                     (run [_]
+                       (try (.close reader) (catch Exception _ nil)))))
+        (vreset! success? true)
+        ds)
+      (finally
+        (when-not @success?
+          ;; Open succeeded but classification or dict-build threw —
+          ;; close the reader to avoid leaking an OS file handle.
+          (try (.close reader) (catch Exception _ nil)))))))
 
 (defn close-parquet-dataset!
   "Explicitly close the parquet file backing a parquet-dataset.
-   After this call, accessing column data throws."
+   After this call, any subsequent decode attempt throws IOException
+   (\"Stream Closed\").
+
+   Lifecycle is otherwise managed by a Cleaner registered on a shared
+   lifeline; closing happens automatically when the dataset and all
+   chunks become unreachable. Use this only when you need deterministic
+   release (e.g. tests, file rotation)."
   [ds]
-  (when-let [reader (some-> ds meta :metadata ::reader)]
+  (when-let [reader (some-> ds dataset/metadata ::reader)]
     (.close ^ParquetFileReader reader)))
