@@ -17,7 +17,7 @@
 
      ;; Import data
      (st/from-csv \"data/orders.csv\")
-     (st/from-parquet \"data/orders.parquet\")
+     (st/parquet-dataset \"data/orders.parquet\")
 
      ;; Start SQL server
      (def srv (st/start-server {:port 5432}))
@@ -206,10 +206,20 @@
    See stratum.csv/from-csv for options."
   csv/from-csv)
 
-(def from-parquet
-  "Read a Parquet file into a Stratum column map.
-   See stratum.parquet/from-parquet for options."
-  parquet/from-parquet)
+(def parquet-dataset
+  "Open a Parquet file as a read-only, lazy-decode StratumDataset.
+   Constant-time open; row groups become chunks decoded on first
+   touch. Per-row-group statistics from the parquet metadata feed
+   stratum's zone-map pruning. See stratum.parquet/parquet-dataset
+   for options."
+  parquet/parquet-dataset)
+
+(def close-parquet-dataset!
+  "Explicitly release the file handle backing a parquet-dataset.
+   The underlying mmap + reader are otherwise released by a Cleaner
+   when the dataset becomes unreachable; use this when you need
+   deterministic release (long-lived JVMs, tests, file rotation)."
+  parquet/close-parquet-dataset!)
 
 (def from-maps
   "Convert a sequence of maps to a Stratum column map.

@@ -892,12 +892,21 @@
 
           ;; Unfiltered SUM/MIN/MAX/AVG/COUNT on index inputs — stats-only O(chunks).
           ;; Walks chunk-level statistics instead of materializing + SIMD.
+          ;; SUM and AVG read sum from ChunkStats. Sources whose stats do
+          ;; not carry sum (e.g. parquet-dataset row groups — parquet
+          ;; metadata has count/min/max/null-count but not sum) advertise
+          ;; :stats-sum-incomplete? on the column map; in that case SUM
+          ;; and AVG must fall through to the SIMD path.
                         (and (seq aggs)
                              (empty? preds)
                              (not (seq group))
                              (x/all-indices? columns)
-                             (every? (fn [a] (and (#{:sum :min :max :avg :count} (:op a))
-                                                  (nil? (:expr a))))
+                             (every? (fn [a]
+                                       (and (#{:sum :min :max :avg :count} (:op a))
+                                            (nil? (:expr a))
+                                            (or (not (#{:sum :avg} (:op a)))
+                                                (not (:stats-sum-incomplete?
+                                                      (get columns (:col a)))))))
                                      aggs))
                         (let [result-row
                               (reduce

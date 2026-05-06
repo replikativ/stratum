@@ -72,7 +72,9 @@
 
 (def v19_l79 (kind/doc #'st/from-csv))
 
-(def v21_l84 (kind/doc #'st/from-parquet))
+(def v21_l84 (kind/doc #'st/parquet-dataset))
+
+(def v22_l84 (kind/doc #'st/close-parquet-dataset!))
 
 (def v23_l93 (kind/doc #'st/encode-column))
 

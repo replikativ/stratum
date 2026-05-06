@@ -15,9 +15,9 @@ commands:
             fi
 
 executors:
-  clojure-java21:
+  clojure-java22:
     docker:
-      - image: cimg/openjdk:21.0
+      - image: cimg/openjdk:22.0
     working_directory: ~/repo
     resource_class: large
     environment:
@@ -25,7 +25,7 @@ executors:
 
 jobs:
   setup:
-    executor: clojure-java21
+    executor: clojure-java22
     steps:
       - checkout
       - install-clojure
@@ -47,7 +47,7 @@ jobs:
             - repo
 
   build:
-    executor: clojure-java21
+    executor: clojure-java22
     steps:
       - attach_workspace:
           at: ~/
@@ -61,7 +61,7 @@ jobs:
             - repo/target
 
   test:
-    executor: clojure-java21
+    executor: clojure-java22
     steps:
       - attach_workspace:
           at: ~/
@@ -71,7 +71,7 @@ jobs:
           command: clojure -M:release:test
 
   build-uber:
-    executor: clojure-java21
+    executor: clojure-java22
     steps:
       - attach_workspace:
           at: ~/
@@ -85,7 +85,7 @@ jobs:
             - repo/target
 
   deploy:
-    executor: clojure-java21
+    executor: clojure-java22
     steps:
       - attach_workspace:
           at: ~/
@@ -100,7 +100,7 @@ jobs:
             fi
 
   release:
-    executor: clojure-java21
+    executor: clojure-java22
     steps:
       - attach_workspace:
           at: ~/

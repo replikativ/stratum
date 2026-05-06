@@ -590,9 +590,19 @@
       (ir/->PFusedSIMDCount [] scan)
 
       ;; 2. Stats-only (needs chunk statistics → real columns only)
+      ;; SUM and AVG read sum/sum-sq from ChunkStats. Sources whose stats
+      ;; do not carry those (e.g. parquet-dataset row groups — parquet
+      ;; metadata has min/max/count/null-count but not sum) advertise
+      ;; :stats-sum-incomplete? on the column map; in that case SUM and
+      ;; AVG must fall through to the SIMD path.
       (and (seq aggs) no-preds? all-idx? agg-cols-in-scan?
-           (every? #(and (#{:sum :min :max :avg :count} (:op %))
-                         (nil? (:expr %))) aggs))
+           (every? (fn [a]
+                     (and (#{:sum :min :max :avg :count} (:op a))
+                          (nil? (:expr a))
+                          (or (not (#{:sum :avg} (:op a)))
+                              (not (:stats-sum-incomplete?
+                                    (get columns (:col a)))))))
+                   aggs))
       (ir/->PStatsOnlyAgg aggs scan)
 
       ;; 3. Chunked SIMD (single agg, index-backed → real columns only)

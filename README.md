@@ -16,7 +16,7 @@ Stratum is a columnar analytics engine that combines the performance of fused SI
 Start a PostgreSQL-compatible server and query CSV/Parquet files directly:
 
 ```bash
-# Standalone JAR - no Clojure needed, just Java 21+
+# Standalone JAR - no Clojure needed, just Java 22+
 java --add-modules jdk.incubator.vector -jar stratum-standalone.jar --demo
 
 # Or with your own data
@@ -123,8 +123,8 @@ clj -M:olap cb            # ClickBench tier only
 (def taxi (st/from-csv "data/taxi.csv"))
 (st/q {:from taxi :group [:payment_type] :agg [[:avg :tip_amount] [:count]]})
 
-;; Import Parquet
-(def orders (st/from-parquet "data/orders.parquet"))
+;; Open a Parquet file (lazy decode, zone-map pruning)
+(def orders (st/parquet-dataset "data/orders.parquet"))
 (st/q "SELECT product, SUM(revenue) FROM t GROUP BY product" {"t" orders})
 
 ;; From Clojure maps
@@ -289,7 +289,7 @@ JVM flags required:
 
 ### Requirements
 
-- **JDK 21+** (for Vector API incubator module)
+- **JDK 22+** (for Vector API incubator module + foreign-memory API)
 - Clojure 1.12+
 
 ## Development
