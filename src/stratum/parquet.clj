@@ -39,7 +39,7 @@
            [org.apache.parquet.io LocalInputFile]
            [org.apache.parquet.column ColumnDescriptor ColumnReader Dictionary]
            [org.apache.parquet.column.impl ColumnReadStoreImpl]
-           [org.apache.parquet.column.page PageReadStore DictionaryPageReadStore]
+           [org.apache.parquet.column.page PageReadStore PageReader DataPage DataPageV1 DataPageV2 DictionaryPageReadStore]
            [org.apache.parquet.column.statistics Statistics]
            [org.apache.parquet.hadoop.metadata BlockMetaData ColumnChunkMetaData]
            [org.apache.parquet.io ColumnIOFactory MessageColumnIO]
@@ -899,6 +899,8 @@
         (.put global s (long new-id))
         new-id))))
 
+(declare read-rg-projected decode-row-group-numeric-fallback)
+
 (defn- scan-rg-plain-strings!
   "For a row group whose data pages aren't dict-encoded, eagerly walk
    every value via parquet's RecordReader and intern each Binary
@@ -982,28 +984,20 @@
             (int (long (.getValue e))) ^String (.getKey e)))
     arr))
 
-(defn- decode-row-group-string
-  "Decode a single string column from a single row group into a long[]
-   of global-dict IDs. When the row group is dict-encoded we use the
-   translation table for zero-string-allocation; for plain-encoded
-   pages we materialize each binary, run the column's decoder-kind
-   conversion (UTF-8 or UUID), and look up — or insert — into the
-   live global map. Long.MIN_VALUE marks NULL."
+(defn- decode-row-group-string-impl
+  "Inner body of `decode-row-group-string`; runs under the caller's
+   lifeline lock so concurrent decodes on the same reader serialize.
+   Projects parquet's row-group read down to just `cd` first so we
+   only fetch this column's bytes from disk."
   [^ParquetFileReader reader rg-index ^ColumnDescriptor cd
    translate ^HashMap global-map dict-cap decoder-kind length]
   (let [rg-index (int rg-index)
         length (int length)
         col-name (last (.getPath cd))
-        full-schema (.getSchema (.getFileMetaData (.getFooter reader)))
-        proj-field (some (fn [^Type f] (when (= col-name (.getName f)) f))
-                         (.getFields ^MessageType full-schema))
-        proj-schema (MessageType. (.getName ^MessageType full-schema)
-                                  ^"[Lorg.apache.parquet.schema.Type;"
-                                  (into-array Type [proj-field]))
+        [^PageReadStore pages proj-schema] (read-rg-projected reader cd rg-index)
         ^longs out (long-array length)
         _ (java.util.Arrays/fill out Long/MIN_VALUE)
         cursor (int-array 1)
-        pages (.readRowGroup reader rg-index)
         column-io (.getColumnIO (ColumnIOFactory.) proj-schema)
         ^longs translate-arr translate
         conv (proxy [PrimitiveConverter] []
@@ -1045,6 +1039,16 @@
     (dotimes [_ length] (.read rr))
     out))
 
+(defn- decode-row-group-string
+  "Public wrapper: lock on the shared dataset's `lifeline` so concurrent
+   chunks decoding different columns from the same reader serialize
+   their `setRequestedSchema` + `readRowGroup` calls."
+  [^ParquetFileReader reader rg-index ^ColumnDescriptor cd
+   translate ^HashMap global-map dict-cap decoder-kind length lifeline]
+  (locking lifeline
+    (decode-row-group-string-impl
+     reader rg-index cd translate global-map dict-cap decoder-kind length)))
+
 (defn- noop-primitive-converter
   "PrimitiveConverter required by ColumnReadStoreImpl's path-walk; we
    bypass it by reading values directly off the ColumnReader, so the
@@ -1063,27 +1067,16 @@
       (start [])
       (end []))))
 
-(defn- decode-row-group-numeric
-  "Decode a single column from a single row group into a long[] or
-   double[] sized to the row group. One allocation, one decode pass.
+(defn- read-rg-projected
+  "Read a single row group via parquet-mr's `readRowGroup`, but project
+   the requested schema down to just `cd` first so parquet only loads
+   that column's bytes from disk. The `setRequestedSchema` call mutates
+   the reader's state, so callers must serialize concurrent decodes
+   against the same reader (we use `(locking lifeline ...)`).
 
-   Uses parquet's lower-level ColumnReader directly, bypassing the
-   RecordReader+proxy callback path (Clojure proxy dispatch per value
-   plus a GroupConverter.end() per row). For flat primitive columns the
-   inner loop is `consume + get* + aset` — no virtual call per value
-   beyond what parquet's ValuesReader needs anyway.
-
-   `spec` is the column spec from `classify-parquet-column`; its
-   `:decoder-kind` selects the inner loop and any per-value conversion
-   (Date INT32 → epoch-millis ×86_400_000, TimestampMicros ÷1000,
-   etc.). NULLs (def-level < max) leave the slot at the type's NULL
-   sentinel — Long/MIN_VALUE for int64, Double/NaN for float64."
-  [^ParquetFileReader reader rg-index ^ColumnDescriptor cd spec length]
-  (let [rg-index (int rg-index)
-        length (int length)
-        datatype (:datatype spec)
-        decoder-kind (:decoder-kind spec)
-        full-schema (.getSchema (.getFileMetaData (.getFooter reader)))
+   Returns [PageReadStore proj-schema]."
+  [^ParquetFileReader reader ^ColumnDescriptor cd rg-index]
+  (let [full-schema (.getSchema (.getFileMetaData (.getFooter reader)))
         col-name (last (.getPath cd))
         proj-field (some (fn [^Type f] (when (= col-name (.getName f)) f))
                          (.getFields ^MessageType full-schema))
@@ -1093,104 +1086,221 @@
                              :have (mapv #(.getName ^Type %) (.getFields ^MessageType full-schema))})))
         proj-schema (MessageType. (.getName ^MessageType full-schema)
                                   ^"[Lorg.apache.parquet.schema.Type;"
-                                  (into-array Type [proj-field]))
+                                  (into-array Type [proj-field]))]
+    (.setRequestedSchema reader proj-schema)
+    [(.readRowGroup reader (int rg-index)) proj-schema]))
+
+(defn- bulk-decode-pages!
+  "Bulk-decode every PLAIN page in `pr` into `out[off..off+pr-rows)`.
+   `kind` selects how to copy each page's bytes:
+     :long   — `ByteBuffer.asLongBuffer().get(out, off, n)`
+     :double — `asDoubleBuffer().get(out, off, n)`
+     :int    — read as INT32 into a scratch int[], widen to long[]
+   Returns the next offset (long). Returns -1 if any page uses an
+   encoding we can't bulk-decode — caller falls back to ColumnReader."
+  [^PageReader pr out kind off]
+  (let [v-count (.getTotalValueCount pr)
+        cursor (long-array 1)
+        _ (aset cursor 0 (long off))
+        end (+ (long off) v-count)
+        scratch (atom nil)
+        bail? (atom false)]
+    (loop []
+      (when (and (not @bail?) (< (aget cursor 0) end))
+        (let [page (.readPage pr)]
+          (when page
+            (let [n (.getValueCount page)
+                  enc (str (.getValueEncoding ^DataPageV1 page))]
+              (if (= "PLAIN" enc)
+                (let [bb (.toByteBuffer (.getBytes ^DataPageV1 page))
+                      o (int (aget cursor 0))]
+                  (.order bb ByteOrder/LITTLE_ENDIAN)
+                  (case kind
+                    :long   (.get (.asLongBuffer bb) ^longs out o (int n))
+                    :double (.get (.asDoubleBuffer bb) ^doubles out o (int n))
+                    :int    (let [buf (or @scratch
+                                          (let [a (int-array n)] (reset! scratch a) a))
+                                  buf (if (>= (alength ^ints buf) n)
+                                        buf
+                                        (let [a (int-array n)] (reset! scratch a) a))]
+                              (.get (.asIntBuffer bb) ^ints buf 0 (int n))
+                              (dotimes [i n]
+                                (aset ^longs out (int (+ o i))
+                                      (long (aget ^ints buf i))))))
+                  (aset cursor 0 (+ (aget cursor 0) (long n))))
+                (reset! bail? true))))
+          (recur))))
+    (if @bail? -1 (aget cursor 0))))
+
+(defn- decode-row-group-numeric
+  "Decode a single column from a single row group into a long[] or
+   double[] sized to the row group. One allocation, one decode pass.
+
+   Two paths:
+   - **Bulk** for required (max-def=0, max-rep=0) columns whose pages
+     are all PLAIN-encoded INT32 / INT64 / DOUBLE — the page bytes are
+     contiguous fixed-width values, so we slice each page's
+     `ByteBuffer` into a `LongBuffer` / `DoubleBuffer` and call
+     `.get(out, off, n)` for one JNI memcpy per page. ~10× the
+     ColumnReader path on the Ryan-shape fixture.
+   - **Fallback** via parquet's lower-level `ColumnReader` for pages
+     using DICT, DELTA, BYTE_STREAM_SPLIT, or for nullable columns.
+     Inner loop is `consume + get* + aset` — no proxy callback.
+
+   `setRequestedSchema` projects parquet's row-group read down to just
+   the chunk's column, so reading one column doesn't pull in the other
+   22. This is the largest win on the Ryan-shape fixture (3 s → 50 ms
+   per row group). The reader is shared across chunks, so we serialize
+   concurrent decodes via `locking` on `lifeline`."
+  [^ParquetFileReader reader rg-index ^ColumnDescriptor cd spec length lifeline]
+  (let [rg-index (int rg-index)
+        length (int length)
+        datatype (:datatype spec)
+        decoder-kind (:decoder-kind spec)
         max-def (.getMaxDefinitionLevel cd)
-        ^PageReadStore pages (.readRowGroup reader rg-index)
-        created-by (.getCreatedBy (.getFileMetaData (.getFooter reader)))
-        rs (ColumnReadStoreImpl. pages (noop-group-converter) proj-schema created-by)
-        ^ColumnReader cr (.getColumnReader rs cd)
-        n (long length)]
-    (case datatype
-      :int64
-      (let [^longs out (long-array length)]
-        (java.util.Arrays/fill out Long/MIN_VALUE)
-        (case decoder-kind
-          :int96-millis
-          (loop [i 0]
-            (when (< i n)
-              (when (= max-def (.getCurrentDefinitionLevel cr))
-                (aset out i (int96->epoch-millis (.getBinary cr))))
-              (.consume cr)
-              (recur (unchecked-inc i))))
+        max-rep (.getMaxRepetitionLevel cd)
+        bulk-eligible? (and (zero? max-def) (zero? max-rep)
+                            (#{:int64-raw :ts-millis :double :int32-raw} decoder-kind))]
+    (if bulk-eligible?
+      ;; Bulk path: one synchronized read of the projected row group,
+      ;; bulk-decode each page directly from its ByteBuffer.
+      (locking lifeline
+        (let [[^PageReadStore pages _] (read-rg-projected reader cd rg-index)
+              ^PageReader pr (.getPageReader pages cd)]
+          (case decoder-kind
+            (:int64-raw :ts-millis)
+            (let [out (long-array length)
+                  end (bulk-decode-pages! pr out :long 0)]
+              (if (neg? (long end))
+                (decode-row-group-numeric-fallback
+                 reader rg-index cd spec length lifeline)
+                out))
+            :int32-raw
+            (let [out (long-array length)
+                  end (bulk-decode-pages! pr out :int 0)]
+              (if (neg? (long end))
+                (decode-row-group-numeric-fallback
+                 reader rg-index cd spec length lifeline)
+                out))
+            :double
+            (let [out (double-array length)
+                  end (bulk-decode-pages! pr out :double 0)]
+              (if (neg? (long end))
+                (decode-row-group-numeric-fallback
+                 reader rg-index cd spec length lifeline)
+                out)))))
+      (decode-row-group-numeric-fallback
+       reader rg-index cd spec length lifeline))))
 
-          :int32-raw
-          (loop [i 0]
-            (when (< i n)
-              (when (= max-def (.getCurrentDefinitionLevel cr))
-                (aset out i (long (.getInteger cr))))
-              (.consume cr)
-              (recur (unchecked-inc i))))
+(defn- decode-row-group-numeric-fallback
+  "ColumnReader-based decoder used for pages that aren't bulk-eligible
+   (DICT-encoded numerics, nullable columns, INT96 timestamps, Date,
+   Timestamp[Micros|Nanos], boolean, float). Same per-value loop as
+   before — `consume + get* + aset` — but now also takes the lifeline
+   lock and projects the row-group read to just the chunk's column."
+  [^ParquetFileReader reader rg-index ^ColumnDescriptor cd spec length lifeline]
+  (locking lifeline
+    (let [rg-index (int rg-index)
+          length (int length)
+          datatype (:datatype spec)
+          decoder-kind (:decoder-kind spec)
+          [^PageReadStore pages proj-schema] (read-rg-projected reader cd rg-index)
+          max-def (.getMaxDefinitionLevel cd)
+          created-by (.getCreatedBy (.getFileMetaData (.getFooter reader)))
+          rs (ColumnReadStoreImpl. pages (noop-group-converter) proj-schema created-by)
+          ^ColumnReader cr (.getColumnReader rs cd)
+          n (long length)]
+      (case datatype
+        :int64
+        (let [^longs out (long-array length)]
+          (java.util.Arrays/fill out Long/MIN_VALUE)
+          (case decoder-kind
+            :int96-millis
+            (loop [i 0]
+              (when (< i n)
+                (when (= max-def (.getCurrentDefinitionLevel cr))
+                  (aset out i (int96->epoch-millis (.getBinary cr))))
+                (.consume cr)
+                (recur (unchecked-inc i))))
 
-          :int32-date
+            :int32-raw
+            (loop [i 0]
+              (when (< i n)
+                (when (= max-def (.getCurrentDefinitionLevel cr))
+                  (aset out i (long (.getInteger cr))))
+                (.consume cr)
+                (recur (unchecked-inc i))))
+
+            :int32-date
           ;; days-since-epoch → epoch-millis
-          (loop [i 0]
-            (when (< i n)
-              (when (= max-def (.getCurrentDefinitionLevel cr))
-                (aset out i (* (long (.getInteger cr)) 86400000)))
-              (.consume cr)
-              (recur (unchecked-inc i))))
+            (loop [i 0]
+              (when (< i n)
+                (when (= max-def (.getCurrentDefinitionLevel cr))
+                  (aset out i (* (long (.getInteger cr)) 86400000)))
+                (.consume cr)
+                (recur (unchecked-inc i))))
 
-          :boolean
-          (loop [i 0]
-            (when (< i n)
-              (when (= max-def (.getCurrentDefinitionLevel cr))
-                (aset out i (if (.getBoolean cr) 1 0)))
-              (.consume cr)
-              (recur (unchecked-inc i))))
+            :boolean
+            (loop [i 0]
+              (when (< i n)
+                (when (= max-def (.getCurrentDefinitionLevel cr))
+                  (aset out i (if (.getBoolean cr) 1 0)))
+                (.consume cr)
+                (recur (unchecked-inc i))))
 
-          :int64-raw
-          (loop [i 0]
-            (when (< i n)
-              (when (= max-def (.getCurrentDefinitionLevel cr))
-                (aset out i (.getLong cr)))
-              (.consume cr)
-              (recur (unchecked-inc i))))
+            :int64-raw
+            (loop [i 0]
+              (when (< i n)
+                (when (= max-def (.getCurrentDefinitionLevel cr))
+                  (aset out i (.getLong cr)))
+                (.consume cr)
+                (recur (unchecked-inc i))))
 
-          :ts-millis
+            :ts-millis
           ;; INT64 timestamp, already millis — direct copy
-          (loop [i 0]
-            (when (< i n)
-              (when (= max-def (.getCurrentDefinitionLevel cr))
-                (aset out i (.getLong cr)))
-              (.consume cr)
-              (recur (unchecked-inc i))))
+            (loop [i 0]
+              (when (< i n)
+                (when (= max-def (.getCurrentDefinitionLevel cr))
+                  (aset out i (.getLong cr)))
+                (.consume cr)
+                (recur (unchecked-inc i))))
 
-          :ts-micros
-          (loop [i 0]
-            (when (< i n)
-              (when (= max-def (.getCurrentDefinitionLevel cr))
-                (aset out i (quot (.getLong cr) 1000)))
-              (.consume cr)
-              (recur (unchecked-inc i))))
+            :ts-micros
+            (loop [i 0]
+              (when (< i n)
+                (when (= max-def (.getCurrentDefinitionLevel cr))
+                  (aset out i (quot (.getLong cr) 1000)))
+                (.consume cr)
+                (recur (unchecked-inc i))))
 
-          :ts-nanos
-          (loop [i 0]
-            (when (< i n)
-              (when (= max-def (.getCurrentDefinitionLevel cr))
-                (aset out i (quot (.getLong cr) 1000000)))
-              (.consume cr)
-              (recur (unchecked-inc i)))))
-        out)
+            :ts-nanos
+            (loop [i 0]
+              (when (< i n)
+                (when (= max-def (.getCurrentDefinitionLevel cr))
+                  (aset out i (quot (.getLong cr) 1000000)))
+                (.consume cr)
+                (recur (unchecked-inc i)))))
+          out)
 
-      :float64
-      (let [^doubles out (double-array length)]
-        (java.util.Arrays/fill out Double/NaN)
-        (case decoder-kind
-          :float
-          (loop [i 0]
-            (when (< i n)
-              (when (= max-def (.getCurrentDefinitionLevel cr))
-                (aset out i (double (.getFloat cr))))
-              (.consume cr)
-              (recur (unchecked-inc i))))
-          :double
-          (loop [i 0]
-            (when (< i n)
-              (when (= max-def (.getCurrentDefinitionLevel cr))
-                (aset out i (.getDouble cr)))
-              (.consume cr)
-              (recur (unchecked-inc i)))))
-        out))))
+        :float64
+        (let [^doubles out (double-array length)]
+          (java.util.Arrays/fill out Double/NaN)
+          (case decoder-kind
+            :float
+            (loop [i 0]
+              (when (< i n)
+                (when (= max-def (.getCurrentDefinitionLevel cr))
+                  (aset out i (double (.getFloat cr))))
+                (.consume cr)
+                (recur (unchecked-inc i))))
+            :double
+            (loop [i 0]
+              (when (< i n)
+                (when (= max-def (.getCurrentDefinitionLevel cr))
+                  (aset out i (.getDouble cr)))
+                (.consume cr)
+                (recur (unchecked-inc i)))))
+          out)))))
 
 (deftype ParquetRowGroupChunk
          [;; lifeline keeps the underlying ParquetFileReader strongly
@@ -1242,9 +1352,9 @@
               (let [arr (case (:datatype spec)
                           :string  (decode-row-group-string
                                     reader rg-index col-desc translate global-map
-                                    dict-cap (:decoder-kind spec) length)
+                                    dict-cap (:decoder-kind spec) length lifeline)
                           (decode-row-group-numeric
-                           reader rg-index col-desc spec length))]
+                           reader rg-index col-desc spec length lifeline))]
                 (set! data arr)
                 arr)))))
 
@@ -1252,7 +1362,7 @@
     (or data
         (locking lock
           (or data
-              (let [arr (decode-row-group-numeric reader rg-index col-desc spec length)]
+              (let [arr (decode-row-group-numeric reader rg-index col-desc spec length lifeline)]
                 (set! data arr)
                 arr)))))
 
