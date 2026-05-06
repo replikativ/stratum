@@ -22,7 +22,7 @@
         ;; Malli for API specification and validation
         metosin/malli {:mvn/version "0.20.0"}
         ;; JSqlParser for SQL → AST parsing (single JAR, zero transitive deps)
-        com.github.jsqlparser/jsqlparser {:mvn/version "5.1"}
+        com.github.jsqlparser/jsqlparser {:mvn/version "5.2"}
         ;; Parquet import (minimal Hadoop — Configuration class required by ParquetFileReader)
         org.apache.parquet/parquet-column {:mvn/version "1.15.1"}
         org.apache.parquet/parquet-hadoop {:mvn/version "1.15.1"
@@ -173,6 +173,14 @@
               "--enable-native-access=ALL-UNNAMED"
               "-Xmx8g"]
    :main-opts ["-m" "olap-bench"]}
+
+  :asof-bench
+  {:extra-paths ["bench"]
+   :extra-deps {org.duckdb/duckdb_jdbc {:mvn/version "1.4.4.0"}}
+   :jvm-opts ["--add-modules=jdk.incubator.vector"
+              "--enable-native-access=ALL-UNNAMED"
+              "-Xmx8g"]
+   :main-opts ["-m" "asof-bench"]}
 
   :iforest
   {:extra-paths ["bench"]

@@ -163,19 +163,33 @@
 
 (def SJoinType
   "Join type."
-  [:enum :inner :left :right :full])
+  [:enum :inner :left :right :full :asof :asof-left])
+
+(def SJoinOnPred
+  "Single ON-clause predicate: [op left-col right-col].
+   For equi-joins op must be :=; for ASOF joins exactly one predicate must
+   be an inequality (#{:>= :> :<= :<}) and the rest must be :=. The planner
+   enforces this — the schema accepts any allowed operator and lets
+   build-join-tree throw with a clear error on a bad shape."
+  [:tuple [:enum := :>= :> :<= :<] :keyword :keyword])
 
 (def SJoinOn
-  "Join condition: [:= :left-col :right-col] or vector of such."
-  [:or
-   [:tuple [:= :=] :keyword :keyword]
-   [:vector {:min 1} [:tuple [:= :=] :keyword :keyword]]])
+  "ON clause: a single predicate or vector of predicates."
+  [:or SJoinOnPred [:vector {:min 1} SJoinOnPred]])
 
 (def SJoinSpec
-  "Single join specification."
+  "Single join specification.
+
+   For equi-joins (:inner/:left/:right/:full): :on is required and every
+   predicate must use :=.
+
+   For ASOF joins (:asof / :asof-left): :on must contain exactly one
+   inequality predicate (#{:>= :> :<= :<}) and zero or more :=. The
+   inequality picks the closest match per probe row; the equalities
+   partition the search."
   [:map {:closed false}
    [:with SColumnMap]
-   [:on SJoinOn]
+   [:on {:optional true} SJoinOn]
    [:type {:optional true :default :inner} SJoinType]])
 
 (def SWindowOp

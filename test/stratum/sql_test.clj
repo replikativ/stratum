@@ -718,6 +718,181 @@
       (is (= 10 (count results)))
       (is (every? #(pos? (double (:sum %))) results)))))
 
+(deftest sql-join-rejects-non-equi-predicate-test
+  (testing "Non-equality predicate in JOIN ON returns :error with sqlstate 0A000"
+    (let [reg {"a" {:x (long-array [1 2 3])}
+               "b" {:y (long-array [1 2 3])}}
+          r1 (sql/parse-sql "SELECT * FROM a JOIN b ON a.x >= b.y" reg)
+          r2 (sql/parse-sql "SELECT * FROM a JOIN b ON a.x = b.y AND a.x > b.y" reg)]
+      (is (re-find #"Non-equality predicate" (:error r1)))
+      (is (= "0A000" (:sqlstate r1)))
+      (is (re-find #"Non-equality predicate" (:error r2)))
+      (is (= "0A000" (:sqlstate r2))))))
+
+(deftest sql-join-on-with-parentheses-test
+  (testing "JOIN ON (a = b) AND (c = d) — parentheses around equality terms unwrap correctly"
+    (let [reg {"a" {:id   (long-array [1 2 3])
+                    :cat  (long-array [10 20 30])}
+               "b" {:id   (long-array [1 2 3])
+                    :cat  (long-array [10 20 30])
+                    :v    (double-array [1.0 2.0 3.0])}}
+          {:keys [query]} (sql/parse-sql
+                           "SELECT a.id, b.v FROM a JOIN b ON (a.id = b.id) AND (a.cat = b.cat)"
+                           reg)
+          result (q/q query)]
+      (is (= 3 (count result))))))
+
+;; ============================================================================
+;; ASOF JOIN — DuckDB syntax (rewriter strips "ASOF" before parsing)
+;; ============================================================================
+
+(defn- run-asof-sql [sql reg]
+  (let [{:keys [query error]} (sql/parse-sql sql reg)]
+    (when error (throw (ex-info error {})))
+    (q/q query)))
+
+(deftest sql-asof-inner-gte-no-eq-key-test
+  (testing "ASOF JOIN ... ON probe.ts >= build.ts (no equality keys)"
+    (let [reg {"trades" {:probe_ts (long-array [5 15 30])}
+               "prices" {:build_ts (long-array [0 10 20])
+                         :px       (double-array [1.0 2.0 3.0])}}
+          result (run-asof-sql
+                  "SELECT trades.probe_ts, prices.px FROM trades ASOF JOIN prices ON trades.probe_ts >= prices.build_ts"
+                  reg)]
+      (is (= 3 (count result)))
+      (is (= [1.0 2.0 3.0] (mapv :px result))))))
+
+(deftest sql-asof-inner-gte-with-eq-key-test
+  (testing "ASOF JOIN ... ON sym=sym AND probe.ts >= build.ts (mixed equality + inequality)"
+    (let [reg {"trades" {:sym      (long-array [1 2 1])
+                         :probe_ts (long-array [15 25 35])}
+               "prices" {:sym      (long-array [1 1 2])
+                         :build_ts (long-array [10 30 20])
+                         :px       (double-array [101.0 103.0 202.0])}}
+          result (run-asof-sql
+                  (str "SELECT trades.sym, trades.probe_ts, prices.px "
+                       "FROM trades ASOF JOIN prices "
+                       "ON trades.sym = prices.sym AND trades.probe_ts >= prices.build_ts")
+                  reg)]
+      ;; sym=1 ts=15 → newest sym=1 build at-or-before 15 is ts=10 → 101.0
+      ;; sym=2 ts=25 → newest sym=2 build at-or-before 25 is ts=20 → 202.0
+      ;; sym=1 ts=35 → newest sym=1 build at-or-before 35 is ts=30 → 103.0
+      (is (= 3 (count result)))
+      (let [m (into {} (map (fn [r] [[(long (:sym r)) (long (:probe_ts r))] (:px r)])) result)]
+        (is (= 101.0 (get m [1 15])))
+        (is (= 202.0 (get m [2 25])))
+        (is (= 103.0 (get m [1 35])))))))
+
+(deftest sql-asof-left-keeps-unmatched-test
+  (testing "ASOF LEFT JOIN keeps unmatched probe rows with NULL right cols"
+    (let [reg {"trades" {:probe_ts (long-array [5 15 35])}    ; 5 has no build at-or-before
+               "prices" {:build_ts (long-array [10 20 30])
+                         :px       (double-array [1.0 2.0 3.0])}}
+          result (run-asof-sql
+                  "SELECT trades.probe_ts, prices.px FROM trades ASOF LEFT JOIN prices ON trades.probe_ts >= prices.build_ts"
+                  reg)]
+      (is (= 3 (count result)))
+      ;; Probe ts=5  → no match → :px nil
+      ;; Probe ts=15 → ts=10 → 1.0
+      ;; Probe ts=35 → ts=30 → 3.0
+      (let [tagged (into {} (map (fn [r] [(long (:probe_ts r)) (:px r)])) result)]
+        (is (nil? (get tagged 5)))
+        (is (= 1.0 (get tagged 15)))
+        (is (= 3.0 (get tagged 35)))))))
+
+(deftest sql-asof-all-four-operators-test
+  (testing "ASOF JOIN with all four operators :>= :> :<= :<"
+    (let [reg {"l" {:t (long-array [20])}
+               "r" {:t  (long-array [10 20 30])
+                    :v  (double-array [1.0 2.0 3.0])}}
+          ;; build [10,20,30], probe ts=20
+          gte (run-asof-sql "SELECT r.v FROM l ASOF JOIN r ON l.t >= r.t" reg)
+          gt  (run-asof-sql "SELECT r.v FROM l ASOF JOIN r ON l.t >  r.t" reg)
+          lte (run-asof-sql "SELECT r.v FROM l ASOF JOIN r ON l.t <= r.t" reg)
+          lt  (run-asof-sql "SELECT r.v FROM l ASOF JOIN r ON l.t <  r.t" reg)]
+      ;; >=: latest at-or-before 20 → t=20 → v=2.0
+      (is (= 1 (count gte))) (is (= 2.0 (:v (first gte))))
+      ;; >: latest strictly before 20 → t=10 → v=1.0
+      (is (= 1 (count gt)))  (is (= 1.0 (:v (first gt))))
+      ;; <=: smallest at-or-after 20 → t=20 → v=2.0
+      (is (= 1 (count lte))) (is (= 2.0 (:v (first lte))))
+      ;; <: smallest strictly after 20 → t=30 → v=3.0
+      (is (= 1 (count lt)))  (is (= 3.0 (:v (first lt)))))))
+
+(deftest sql-asof-rejects-multiple-inequalities-test
+  (testing "ASOF JOIN with two inequality predicates throws at execute time"
+    (let [reg {"l" {:t (long-array [1])}
+               "r" {:t (long-array [1])}}
+          {:keys [query]} (sql/parse-sql
+                           "SELECT * FROM l ASOF JOIN r ON l.t >= r.t AND l.t <= r.t"
+                           reg)]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"exactly one inequality"
+                            (q/q query))))))
+
+(deftest sql-asof-rejects-no-inequality-test
+  (testing "ASOF JOIN with only equality predicates throws at execute time"
+    (let [reg {"l" {:t (long-array [1])}
+               "r" {:t (long-array [1])}}
+          {:keys [query]} (sql/parse-sql "SELECT * FROM l ASOF JOIN r ON l.t = r.t" reg)]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"exactly one inequality"
+                            (q/q query))))))
+
+(deftest sql-asof-preserves-string-literals-test
+  (testing "Rewriter does not touch 'ASOF' inside string literals"
+    (let [reg {"t" {:label (q/encode-column (into-array String ["ASOF JOIN sample"]))
+                    :v     (double-array [42.0])}}
+          {:keys [query]} (sql/parse-sql
+                           "SELECT label, v FROM t WHERE label = 'ASOF JOIN sample'"
+                           reg)
+          result (q/q query)]
+      ;; If the rewriter mistakenly stripped ASOF inside the string literal,
+      ;; the WHERE comparison would fail.
+      (is (= 1 (count result)))
+      (is (= "ASOF JOIN sample" (:label (first result)))))))
+
+(deftest sql-asof-multi-col-equality-test
+  (testing "ASOF JOIN with multiple equality predicates + one inequality"
+    (let [reg {"l" {:sym  (long-array [1 1 2])
+                    :exch (long-array [1 2 1])
+                    :t    (long-array [10 10 10])}
+               "r" {:sym  (long-array [1 1 2 2])
+                    :exch (long-array [1 2 1 2])
+                    :t    (long-array [5 6 7 8])
+                    :px   (double-array [11.0 12.0 21.0 22.0])}}
+          result (run-asof-sql
+                  (str "SELECT l.sym, l.exch, r.px FROM l ASOF JOIN r "
+                       "ON l.sym = r.sym AND l.exch = r.exch AND l.t >= r.t")
+                  reg)]
+      (is (= 3 (count result)))
+      (let [m (into {} (map (fn [r] [[(long (:sym r)) (long (:exch r))] (:px r)])) result)]
+        (is (= 11.0 (get m [1 1])))
+        (is (= 12.0 (get m [1 2])))
+        (is (= 21.0 (get m [2 1])))))))
+
+(deftest sql-asof-mixed-with-regular-join-test
+  (testing "Multiple joins: regular JOIN followed by ASOF JOIN"
+    (let [reg {"a" {:id (long-array [1 2 3])
+                    :t  (long-array [10 20 30])}
+               "b" {:id   (long-array [1 2 3])
+                    :name (q/encode-column (into-array String ["x" "y" "z"]))}
+               "c" {:t  (long-array [5 15 25])
+                    :px (double-array [1.0 2.0 3.0])}}
+          result (run-asof-sql
+                  (str "SELECT a.t, b.name, c.px FROM a "
+                       "JOIN b ON a.id = b.id "
+                       "ASOF JOIN c ON a.t >= c.t")
+                  reg)]
+      ;; a row 1: id=1, t=10, name=x; latest c.t ≤ 10 is 5 → px=1.0
+      ;; a row 2: id=2, t=20, name=y; latest c.t ≤ 20 is 15 → px=2.0
+      ;; a row 3: id=3, t=30, name=z; latest c.t ≤ 30 is 25 → px=3.0
+      (is (= 3 (count result)))
+      (let [m (into {} (map (fn [r] [(long (:t r)) [(:name r) (:px r)]])) result)]
+        (is (= ["x" 1.0] (get m 10)))
+        (is (= ["y" 2.0] (get m 20)))
+        (is (= ["z" 3.0] (get m 30)))))))
+
 ;; ============================================================================
 ;; Bug Fix Regression Tests
 ;; ============================================================================

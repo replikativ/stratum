@@ -33,6 +33,15 @@
   ;; right     — LScan of dimension columns
            [join-type on-pairs left right])
 
+(defrecord LAsofJoin
+  ;; ASOF join: equality keys partition the search; the inequality column
+  ;; picks the closest match per probe row.
+  ;; join-type        — :inner | :left
+  ;; on-pairs         — [[left-col right-col] ...]   (zero or more equality preds)
+  ;; match-condition  — [op left-col right-col]      (op ∈ #{:>= :> :<= :<})
+  ;; left/right       — child plan nodes
+           [join-type on-pairs match-condition left right])
+
 (defrecord LGroupBy
   ;; Group-by aggregation.
   ;; group-keys — vec of keywords or normalized exprs
@@ -200,6 +209,15 @@
   ;; Targets: ColumnOpsExt/hashJoinBuild + hashJoinProbe
            [join-type on-pairs build-side probe-side])
 
+(defrecord PAsofJoin
+  ;; ASOF join via radix-partition + per-partition sort + two-pointer merge.
+  ;; Targets: stratum.internal.ColumnOpsAsof
+  ;; join-type        — :inner | :left
+  ;; on-pairs         — [[left-col right-col] ...]
+  ;; match-condition  — [op left-col right-col]
+  ;; left/right       — child plan nodes (left is probe, right is build)
+           [join-type on-pairs match-condition left right])
+
 (defrecord PPerfectHashJoin
   ;; Direct-array-indexing join when build-key range is small.
   ;; Targets: ColumnOpsExt/perfectHashJoinBuild + perfectJoinProbeInner
@@ -240,6 +258,7 @@
   "True if node is a logical IR node (not yet physical)."
   [node]
   (or (instance? LScan node) (instance? LFilter node) (instance? LJoin node)
+      (instance? LAsofJoin node)
       (instance? LGroupBy node) (instance? LGlobalAgg node) (instance? LProject node)
       (instance? LWindow node) (instance? LHaving node) (instance? LDistinct node)
       (instance? LSort node) (instance? LLimit node) (instance? LSetOp node)))
@@ -248,10 +267,11 @@
   "Returns the input child of a unary node, or nil for leaves/joins."
   [node]
   (cond
-    (instance? LScan node)   nil
-    (instance? LSetOp node)  nil
-    (instance? LJoin node)   nil ;; use :left/:right directly
-    :else                    (:input node)))
+    (instance? LScan node)     nil
+    (instance? LSetOp node)    nil
+    (instance? LJoin node)     nil ;; use :left/:right directly
+    (instance? LAsofJoin node) nil
+    :else                      (:input node)))
 
 (defn map-input
   "Replace the :input child of a unary node. For joins, use map-join-children."
@@ -265,6 +285,12 @@
   [node f]
   (cond
     (instance? LJoin node)
+    (-> node (update :left f) (update :right f))
+
+    (instance? LAsofJoin node)
+    (-> node (update :left f) (update :right f))
+
+    (instance? PAsofJoin node)
     (-> node (update :left f) (update :right f))
 
     (instance? PHashJoin node)
