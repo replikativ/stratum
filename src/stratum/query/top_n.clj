@@ -170,37 +170,30 @@
 ;; Row fetch — given top-N entries, gather rows from the columns map
 ;; ============================================================================
 
-(defn- chunk-by-id-map
-  "Build {chunk-id → chunk} for an index. Walks the PSS once."
-  [idx]
-  (let [tree (index/idx-tree idx)
-        entries (vec (pss/slice tree nil nil))]
-    (persistent!
-     (reduce (fn [m ^ChunkEntry e]
-               (assoc! m (long (first (.chunk-id ^ChunkEntry e))) (.chunk ^ChunkEntry e)))
-             (transient {})
-             entries))))
+(defn- chunks-by-id-for
+  "Build {chunk-id → chunk} for `idx`, restricted to the supplied
+   `chunk-ids` collection. Each id is fetched via a point-slice on
+   the PSS tree, so the cost is O(N · log K) instead of O(K) — vital
+   for konserve-backed indices where K can be 1000s of chunks per
+   column."
+  [idx chunk-ids]
+  (let [tree (index/idx-tree idx)]
+    (reduce (fn [m id]
+              ;; PSS slice bounds are compared via chunk-entry-comparator
+              ;; which calls `.chunk-id` on each side — so the bounds
+              ;; must be ChunkEntry instances. Build a probe with just
+              ;; the chunk-id set.
+              (let [probe (index/->ChunkEntry [(long id)] nil nil)
+                    e (first (pss/slice tree probe probe))]
+                (if e (assoc m (long id) (.chunk ^ChunkEntry e)) m)))
+            {}
+            chunk-ids)))
 
-(defn- gather-row
-  "Read column `col-name` at the given (chunk-id, local-idx)."
-  [columns col-name chunk-id local-idx]
-  (let [col-info (get columns col-name)]
-    (cond
-      ;; Already-materialized array
-      (:data col-info)
-      (let [d (:data col-info)]
-        (cond
-          (expr/long-array? d)   (aget ^longs d (int local-idx))
-          (expr/double-array? d) (aget ^doubles d (int local-idx))
-          :else                  (nth d local-idx)))
-      ;; Index-backed: look up chunk and read
-      (:index col-info)
-      (let [chk (get (chunk-by-id-map (:index col-info)) chunk-id)]
-        (when chk
-          (case (:type col-info)
-            :float64 (chunk/read-double chk local-idx)
-            (chunk/read-long chk local-idx))))
-      :else nil)))
+;; gather-row used to look up via the full chunk-by-id-map; the
+;; current execute-top-n path inlines the gather using a
+;; surviving-only chunk-by-id map (see `chunks-by-id-for` and
+;; `get-chunk-map` in `execute-top-n`). Keeping this as a placeholder
+;; in case future callers want the standalone helper.
 
 (defn- decode-string-value
   "If `col-info` has a string dict, map a long dict-ID to its string."
@@ -240,15 +233,6 @@
                    (or (nil? select) (= [:*] select)) all-keys
                    (every? keyword? select)           (vec select)
                    :else                              all-keys)
-        ;; Build chunk-by-id maps lazily per output column on first
-        ;; access to keep eligibility (which doesn't touch them) cheap.
-        chunk-maps (volatile! {})
-        get-chunk-map (fn [^clojure.lang.Keyword k]
-                        (or (get @chunk-maps k)
-                            (let [m (when-let [idx (:index (get columns k))]
-                                      (chunk-by-id-map idx))]
-                              (vswap! chunk-maps assoc k m)
-                              m)))
         ;; Phase 1: streaming top-N
         pq (cond
              (:data order-col)  (find-top-n-on-array
@@ -257,7 +241,20 @@
                                  (:index order-col) n dir datatype)
              :else              (throw (ex-info "top-N: order column has neither :data nor :index"
                                                 {:col col-kw})))
-        sorted (drain-heap-sorted pq dir)]
+        sorted (drain-heap-sorted pq dir)
+        ;; Surviving rows live in only a small set of chunk-ids;
+        ;; fetch a per-output-column map of {chunk-id → chunk} for
+        ;; only those ids. On konserve-backed indices with thousands
+        ;; of chunks per column this is the difference between an
+        ;; O(N·K·C) walk (N rows × K chunks × C cols) and O(N·log K·C).
+        surviving-chunk-ids (into #{} (map #(.chunk-id ^TopNEntry %)) sorted)
+        chunk-maps (volatile! {})
+        get-chunk-map (fn [^clojure.lang.Keyword k]
+                        (or (get @chunk-maps k)
+                            (let [m (when-let [idx (:index (get columns k))]
+                                      (chunks-by-id-for idx surviving-chunk-ids))]
+                              (vswap! chunk-maps assoc k m)
+                              m)))]
     ;; Phase 2: fetch rows
     (mapv
      (fn [^TopNEntry e]
