@@ -381,7 +381,14 @@
         (let [first-result (first sub-results)
               to-remove (reduce (fn [acc r] (into acc r)) #{} (rest sub-results))]
           (vec (remove to-remove first-result)))))
-    (if *use-planner*
+    (if (and *use-planner*
+             ;; Anomaly resolution must run AFTER any join (the
+             ;; iforest features can live on either side). The
+             ;; planner currently resolves anomaly pre-join in
+             ;; `prepare-and-build`; for the join + anomaly
+             ;; combination we fall back to the legacy path which
+             ;; resolves at the right point. Tracked as a follow-up.
+             (not (and (seq join) (seq _anomaly-models))))
       ;; === IR Planner path ===
       (do
         (spec/validate! spec/SQuery query {:op :execute})

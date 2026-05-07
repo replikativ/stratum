@@ -762,6 +762,16 @@
         length (if (seq columns)
                  (cols/get-column-length (val (first columns)))
                  0)
+        ;; Anomaly resolution must run before any other lowering —
+        ;; `[:anomaly-score …]` would otherwise reach
+        ;; `normalize-expr` and throw "Unknown expression operator".
+        ;; The legacy `q` runs this immediately after join evaluation;
+        ;; we run it here against the un-joined source columns when
+        ;; `:_anomaly-models` is set on the query map.
+        models (:_anomaly-models query)
+        [query columns] (if (seq models)
+                          (prep/resolve-anomaly-columns query columns length models)
+                          [query columns])
         {:keys [preds aggs group select columns columns-meta]}
         (prep/prepare-query query columns length)
         ;; Rebuild a query map for build-logical-plan with the

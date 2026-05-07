@@ -34,7 +34,8 @@
   (:require [stratum.query.normalization :as norm]
             [stratum.query.expression :as expr]
             [stratum.query.predicate :as pred]
-            [stratum.query.execution :as x]))
+            [stratum.query.execution :as x]
+            [stratum.iforest :as iforest]))
 
 (set! *warn-on-reflection* true)
 
@@ -220,3 +221,157 @@
      :select select-items
      :columns columns
      :columns-meta columns-meta}))
+
+;; ============================================================================
+;; Anomaly model resolution
+;;
+;; `ANOMALY_SCORE / _PREDICT / _PROBA / _CONFIDENCE` reach the engine
+;; as expression vectors (`[:anomaly-score "model" e1 e2]`). They aren't
+;; understood by `normalize-expr` — the legacy `q` body resolves them
+;; before any other normalization by:
+;;   1. collecting every anomaly expression in the query
+;;   2. evaluating its arguments against the (post-join) column map
+;;   3. running the appropriate iforest fn → a synthetic double[]
+;;      column keyed by `:__<op>_<model>`
+;;   4. rewriting the query slots so the anomaly expr becomes a plain
+;;      column keyword reference.
+;; The functions below are the same logic, lifted out of `q` so the IR
+;; planner's `run-query` path can call them too.
+;; ============================================================================
+
+(def anomaly-ops
+  #{:anomaly-score :anomaly-predict :anomaly-proba :anomaly-confidence})
+
+(def ^:private anomaly-op->fn
+  {:anomaly-score      iforest/score
+   :anomaly-predict    iforest/predict
+   :anomaly-proba      iforest/predict-proba
+   :anomaly-confidence iforest/predict-confidence})
+
+(defn- anomaly-expr? [form]
+  (and (vector? form) (seq form) (contains? anomaly-ops (first form))))
+
+(defn collect-anomaly-exprs
+  "Walk a nested structure and return the set of anomaly expression
+   vectors found in it."
+  [form]
+  (cond
+    (anomaly-expr? form) #{form}
+    (sequential? form)   (reduce into #{} (map collect-anomaly-exprs form))
+    :else                #{}))
+
+(defn rewrite-anomaly-exprs
+  "Replace anomaly expressions with the synthetic column keywords
+   `expr->col` maps them to."
+  [form expr->col]
+  (cond
+    (contains? expr->col form) (get expr->col form)
+    (vector? form)             (mapv #(rewrite-anomaly-exprs % expr->col) form)
+    :else                      form))
+
+(defn- select-alias-map
+  "Build a map from anomaly expression → alias keyword for aliased
+   SELECT items (`[:as [:anomaly-score …] :alias]`)."
+  [select-items]
+  (into {}
+        (keep (fn [item]
+                (when (and (sequential? item) (= :as (first item))
+                           (sequential? (second item))
+                           (contains? anomaly-ops (first (second item))))
+                  [(second item) (nth item 2)])))
+        select-items))
+
+(defn resolve-anomaly-columns
+  "Resolve anomaly expressions post-join. Materializes columns,
+   evaluates the expression arguments, scores via iforest, and
+   injects the result as a synthetic column. Rewrites query clauses
+   to reference that synthetic column.
+
+     Short form: `[:anomaly-score \"model\"]`         — uses model's
+                                                        feature names
+     Long form:  `[:anomaly-score \"model\" e1 e2]`   — evaluates
+                                                        each expr
+   Returns `[query columns]` (passed through unchanged when no
+   anomaly expressions are present)."
+  [query columns length models]
+  (let [all-exprs (reduce into #{}
+                          (map #(collect-anomaly-exprs (get query %))
+                               [:select :where :having :order]))]
+    (if (empty? all-exprs)
+      [query columns]
+      (let [aliases    (select-alias-map (:select query))
+            mat-cols   (x/materialize-columns columns)
+            col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)
+            cache      (java.util.HashMap.)
+            {:keys [q expr->col new-columns]}
+            (reduce
+             (fn [{:keys [q expr->col new-columns]} anom-expr]
+               (let [op         (first anom-expr)
+                     model-name (second anom-expr)
+                     model-name (if (string? model-name) model-name (name model-name))
+                     model      (get models model-name)]
+                 (when-not model
+                   (throw (ex-info (str "Unknown model: " model-name)
+                                   {:model     model-name
+                                    :available (keys models)})))
+                 (let [feature-names  (:feature-names model)
+                       explicit-args  (vec (drop 2 anom-expr))
+                       short-form?    (empty? explicit-args)
+                       data
+                       (if short-form?
+                         (into {}
+                               (map (fn [k]
+                                      (let [v (get col-arrays k)]
+                                        (when-not v
+                                          (throw (ex-info (str "Model feature " k
+                                                               " not found in columns. "
+                                                               "Use long form or ensure "
+                                                               "column is available.")
+                                                          {:feature   k
+                                                           :available (vec (keys col-arrays))})))
+                                        [k v])))
+                               feature-names)
+                         (do
+                           (when (not= (count explicit-args) (count feature-names))
+                             (throw (ex-info (str "ANOMALY_SCORE arity mismatch: model '"
+                                                  model-name "' has " (count feature-names)
+                                                  " features but " (count explicit-args)
+                                                  " arguments were provided")
+                                             {:model     model-name
+                                              :expected  (count feature-names)
+                                              :actual    (count explicit-args)
+                                              :features  feature-names})))
+                           (into {}
+                                 (map-indexed
+                                  (fn [i arg]
+                                    (let [feat-name (nth feature-names i)
+                                          norm-arg  (if (and (vector? arg) (not (keyword? arg)))
+                                                      (norm/normalize-expr arg)
+                                                      arg)
+                                          arr       (if (keyword? norm-arg)
+                                                      (get col-arrays norm-arg)
+                                                      (expr/eval-expr-vectorized norm-arg col-arrays length cache))]
+                                      [feat-name arr])))
+                                 explicit-args)))
+                       compute-fn (get anomaly-op->fn op)
+                       result-arr (compute-fn model data)
+                       col-name   (keyword (str "__" (name op) "_" model-name))]
+                   {:q           q
+                    :expr->col   (assoc expr->col anom-expr col-name)
+                    :new-columns (assoc new-columns col-name
+                                        {:type :float64 :data result-arr})})))
+             {:q query :expr->col {} :new-columns columns}
+             all-exprs)
+            expr->alias    (into {}
+                                 (keep (fn [[e _]]
+                                         (when-let [a (get aliases e)]
+                                           [e a])))
+                                 expr->col)
+            expr->col-other (merge expr->col expr->alias)
+            rewritten      (-> q
+                               (assoc :select (rewrite-anomaly-exprs (:select q) expr->col))
+                               (cond->
+                                (:where q)  (assoc :where  (rewrite-anomaly-exprs (:where q) expr->col))
+                                (:having q) (assoc :having (rewrite-anomaly-exprs (:having q) expr->col))
+                                (:order q)  (assoc :order  (rewrite-anomaly-exprs (:order q) expr->col-other))))]
+        [rewritten new-columns]))))
