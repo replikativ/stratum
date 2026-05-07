@@ -134,7 +134,12 @@
                      (ir/->LFilter preds joined)
                      joined)
 
-          ;; 5. Core operation: group-by / global-agg / project / passthrough
+          ;; 5. Core operation: group-by / global-agg / passthrough.
+          ;; Project is held back when a window is present so the
+          ;; window can see all source columns (SQL evaluation order:
+          ;; window functions logically run after GROUP BY / HAVING
+          ;; but before SELECT projection).
+          window? (seq window)
           core (cond
                  (seq group)
                  (ir/->LGroupBy group aggs filtered)
@@ -142,15 +147,45 @@
                  (seq aggs)
                  (ir/->LGlobalAgg aggs filtered)
 
-                 (seq sel)
+                 (and (seq sel) (not window?))
                  (ir/->LProject sel filtered)
 
                  :else filtered)
 
-          ;; 6. Window functions
-          windowed (if (seq window)
+          ;; 6. Window functions (run before any deferred projection).
+          windowed (if window?
                      (ir/->LWindow window core)
                      core)
+
+          ;; 6b. Deferred projection: when select coexisted with
+          ;; window, apply LProject now so window-output columns are
+          ;; visible to the projection. Window-output columns
+          ;; (`:as` of each spec) are auto-appended to the select if
+          ;; the user didn't list them explicitly. When no select
+          ;; was given at all, we synthesize one that exposes both
+          ;; base scan columns and window outputs (mirrors
+          ;; q.clj:807-826).
+          windowed (cond
+                     (and window? (seq sel))
+                     (let [existing (set (map :name sel))
+                           extra    (keep (fn [ws]
+                                            (let [a (:as ws)]
+                                              (when-not (contains? existing a)
+                                                {:name a :ref a})))
+                                          window)
+                           sel'     (into sel extra)]
+                       (ir/->LProject sel' windowed))
+
+                     (and window? (not (seq sel)) (not (seq aggs)) (not (seq group)))
+                     (let [columns (:columns scan)
+                           base-items (mapv (fn [k] {:name k :ref k})
+                                            (remove #{:__mask} (keys columns)))
+                           win-items  (mapv (fn [ws]
+                                              {:name (:as ws) :ref (:as ws)})
+                                            window)]
+                       (ir/->LProject (into base-items win-items) windowed))
+
+                     :else windowed)
 
           ;; 7. Having
           having-node (if (seq having)

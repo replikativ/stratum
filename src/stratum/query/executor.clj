@@ -549,8 +549,10 @@
 (defn- execute-window [node columnar? results]
   (let [results (or results (execute-node (:input node)))
         specs (:specs node)]
-    ;; Window on grouped results (result rows already computed)
-    (if (sequential? results)
+    (cond
+      ;; Path 1: input is already a vector of result rows (window over
+      ;; an aggregated/projected result, e.g. window-on-group-by).
+      (sequential? results)
       (let [grouped-cols (x/results->columns results)
             n-grouped (count results)
             with-windows (win/execute-window-functions grouped-cols n-grouped specs)
@@ -572,7 +574,19 @@
                                      :else (get m k)))))
                         {} all-ks))
               (range n-grouped)))
-      results)))
+
+      ;; Path 2: input is a column context (no upstream aggregate).
+      ;; Mirrors the legacy `q` window block (q.clj:744+): materialize
+      ;; columns, evaluate window specs row-major, return an augmented
+      ;; column ctx that downstream PProject / PHaving / PSort can
+      ;; consume in either columnar or row form.
+      (and (map? results) (:columns results) (:length results))
+      (let [length (long (:length results))
+            mat (cols/materialize-columns (:columns results))
+            with-windows (win/execute-window-functions mat length specs)]
+        (assoc results :columns with-windows :length length))
+
+      :else results)))
 
 ;; --- Expression materialization ----------------------------------------------
 
