@@ -175,20 +175,37 @@
      {:preds <preds>            ; flat predicates referencing real cols
       :aggs <normalized-aggs>   ; aggs whose :col may point at temps
       :group <group>            ; group keys, possibly mixed
-      :select <select>          ; raw select items (caller normalizes)
+      :select <select>          ; normalized select items (or nil)
       :columns <columns>        ; possibly grew by temp-column entries
       :columns-meta <map>}      ; dict-info for `expr/*columns-meta*`
 
    The query map's other slots (`:order`, `:limit`, `:distinct`,
-   `:window`, `:having`, `:join`, `:from`) are not touched here."
-  [{:keys [where agg group select]} columns length]
-  (let [preds (mapv norm/normalize-pred (or where []))
+   `:window`, `:having`, `:join`, `:from`) are not touched here.
+
+   When `:join` is non-empty the predicate-lowering passes (numeric
+   expr, string pred, dict eq, non-SIMD mask) are skipped — the
+   filter applies after the join, when the joined columns are in
+   scope, so the executor's per-filter `prepare-preds` runs them
+   at filter time instead. Predicates are still normalized."
+  [{:keys [where agg group select join]} columns length]
+  (let [has-join? (boolean (seq join))
+        preds (mapv norm/normalize-pred (or where []))
         aggs  (norm/auto-alias-aggs (mapv norm/normalize-agg (or agg [])))
-        [preds columns] (pre-materialize-string-pred-exprs preds columns length)
-        [preds columns] (pre-materialize-numeric-pred-exprs preds columns length)
-        [preds columns] (materialize-string-preds preds columns length)
-        preds            (resolve-dict-equality preds columns)
-        [preds columns] (compile-non-simd-preds-to-mask preds columns length)
+        [preds columns] (if has-join?
+                          [preds columns]
+                          (pre-materialize-string-pred-exprs preds columns length))
+        [preds columns] (if has-join?
+                          [preds columns]
+                          (pre-materialize-numeric-pred-exprs preds columns length))
+        [preds columns] (if has-join?
+                          [preds columns]
+                          (materialize-string-preds preds columns length))
+        preds            (if has-join?
+                           preds
+                           (resolve-dict-equality preds columns))
+        [preds columns] (if has-join?
+                          [preds columns]
+                          (compile-non-simd-preds-to-mask preds columns length))
         [group aggs select columns]
         (pre-materialize-string-group-agg-exprs group aggs select columns length)
         ;; Normalize select items + lift string-producing :expr items
