@@ -1035,7 +1035,7 @@
                                           :dict-cap cap})))
                                (.put global-map s (long new-id))
                                new-id))]
-                   (aset out (aget cursor 0) gid))))
+                   (aset ^longs out (int (aget cursor 0)) (long gid)))))
         gc (proxy [GroupConverter] []
              (getConverter [_] conv)
              (start [])

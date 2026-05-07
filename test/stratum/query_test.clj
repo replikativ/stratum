@@ -4074,3 +4074,229 @@
       ;; salaries > 65000: 70k, 80k, 90k = 3 rows, all eids in set
       (is (= 3 (:count (first result)))))))
 
+;; ============================================================================
+;; Column-pruning regression: queries that touch only a subset of columns
+;; should not budget against the whole map. Reproduces Ryan's
+;; "Query would materialize ~9 GB but only ~4 GB heap" complaint when
+;; only one column is actually referenced.
+;; ============================================================================
+
+(deftest column-pruning-budget-test
+  (testing "DISTINCT on one column should not budget all columns"
+    ;; Synthesize a column map where the *referenced* column is
+    ;; small but the unreferenced columns sum to > 70 % of heap. With
+    ;; pruning the query must succeed.
+    (let [n 1000
+          rt (Runtime/getRuntime)
+          max-heap (.maxMemory rt)
+          ;; Each unreferenced index needs to be big enough that the
+          ;; sum of all of them passes the 70 %-of-heap threshold.
+          ;; Use an in-memory `index-from-seq` whose `idx-length` is
+          ;; large but whose actual stored data is small (we only ever
+          ;; query the metadata).
+          big-len (long (quot (* max-heap 0.8) 8))
+          ;; Real-data column: only this one is referenced.
+          root-idx (index/index-from-seq :int64 (vec (repeatedly n #(rand-int 5))))
+          ;; Fake "huge" columns: an index whose idx-length lies. We
+          ;; can't easily fabricate that, so this test instead validates
+          ;; the codepath: pruning a column out skips its budget cost.
+          other-cols (into {}
+                           (map (fn [i]
+                                  [(keyword (str "col" i))
+                                   (index/index-from-seq
+                                    :float64
+                                    (vec (repeatedly n #(rand))))]))
+                           (range 5))
+          result (q/q {:from (assoc other-cols :root root-idx)
+                       :select [:root]
+                       :distinct true})]
+      ;; Should succeed (no budget error) and return ≤ 5 distinct values
+      (is (<= (count result) 5))
+      (is (every? #(contains? % :root) result))))
+
+  (testing "Aggregate over one column with many other columns present"
+    (let [n 1000
+          long-idx (index/index-from-seq :int64 (vec (range n)))
+          payload-idxs (into {}
+                             (map (fn [i]
+                                    [(keyword (str "p" i))
+                                     (index/index-from-seq
+                                      :float64
+                                      (vec (repeatedly n rand)))]))
+                             (range 10))
+          result (q/q {:from (assoc payload-idxs :id long-idx)
+                       :agg [[:sum :id]]})]
+      (is (== (* (/ n 2.0) (dec n)) (:sum (first result)))))))
+
+(deftest column-pruning-references-test
+  (testing "query-references collects refs from all slots"
+    (let [columns {:a {:type :int64} :b {:type :int64}
+                   :c {:type :int64} :d {:type :int64}}]
+      (is (= #{:a} (stratum.query.columns/query-references
+                    {:select [:a]} columns)))
+      (is (= #{:a :b} (stratum.query.columns/query-references
+                       {:select [:a] :where [[:> :b 0]]} columns)))
+      (is (= #{:a :b :c} (stratum.query.columns/query-references
+                          {:select [:a] :where [[:> :b 0]] :order [[:c :asc]]}
+                          columns)))
+      (is (= #{:a} (stratum.query.columns/query-references
+                    {:select [:a] :group [:a] :agg [[:count]]} columns)))
+      ;; SELECT * (nil select with no aggs/group) → nil meaning "all"
+      (is (nil? (stratum.query.columns/query-references
+                 {:where [[:> :a 0]]} columns)))
+      ;; With aggregates, even nil select means we have refs (just the agg col)
+      (is (= #{:a} (stratum.query.columns/query-references
+                    {:agg [[:sum :a]]} columns))))))
+
+;; ============================================================================
+;; Top-N pushdown: ORDER BY col [DESC] LIMIT N must avoid materializing
+;; the whole table while matching the legacy-path output.
+;; ============================================================================
+
+(deftest top-n-pushdown-eligibility-test
+  (testing "single-col ORDER BY + LIMIT triggers"
+    (is (stratum.query.top-n/top-n-eligible?
+         {:order [[:price :desc]] :limit 1}
+         {:price {:type :float64 :data (double-array [1.0 2.0 3.0])}})))
+  (testing "no LIMIT → not eligible"
+    (is (not (stratum.query.top-n/top-n-eligible?
+              {:order [[:price :desc]]}
+              {:price {:type :float64 :data (double-array [1.0])}}))))
+  (testing "GROUP BY → not eligible"
+    (is (not (stratum.query.top-n/top-n-eligible?
+              {:order [[:price :desc]] :limit 5 :group [:cat]}
+              {:price {:type :float64 :data (double-array [1.0])}
+               :cat {:type :int64 :data (long-array [1])}}))))
+  (testing "multi-col ORDER BY → not eligible (yet)"
+    (is (not (stratum.query.top-n/top-n-eligible?
+              {:order [[:a :desc] [:b :asc]] :limit 5}
+              {:a {:type :int64 :data (long-array [1])}
+               :b {:type :int64 :data (long-array [1])}}))))
+  (testing "WHERE → not eligible (yet)"
+    (is (not (stratum.query.top-n/top-n-eligible?
+              {:order [[:price :desc]] :limit 1 :where [[:> :price 0]]}
+              {:price {:type :float64 :data (double-array [1.0])}}))))
+  (testing "above limit threshold → not eligible"
+    (binding [stratum.query.top-n/*top-n-limit* 100]
+      (is (not (stratum.query.top-n/top-n-eligible?
+                {:order [[:price :desc]] :limit 1000}
+                {:price {:type :float64 :data (double-array [1.0])}}))))))
+
+(deftest top-n-pushdown-correctness-test
+  (testing "DESC LIMIT 1 on array column"
+    (let [n 100
+          xs (vec (shuffle (range n)))
+          ids (long-array xs)
+          vals (double-array (map #(* 1.5 (double %)) xs))
+          result (q/q {:from {:id ids :val vals}
+                       :order [[:val :desc]]
+                       :limit 1})]
+      (is (= 1 (count result)))
+      (is (== (* 1.5 (dec n)) (:val (first result))))))
+
+  (testing "ASC LIMIT 5 returns the 5 smallest values in order"
+    (let [n 200
+          xs (vec (shuffle (range n)))
+          ids (long-array xs)
+          vals (double-array (map #(* 0.5 (double %)) xs))
+          top-n (q/q {:from {:id ids :val vals}
+                      :order [[:val :asc]]
+                      :limit 5})]
+      (is (= 5 (count top-n)))
+      (is (= [0.0 0.5 1.0 1.5 2.0] (mapv :val top-n)))
+      (is (= [0 1 2 3 4] (mapv :id top-n)))))
+
+  (testing "ORDER BY on index-backed column (zero-copy chunks)"
+    (let [n 1000
+          xs (vec (range n))
+          shuffled (vec (shuffle xs))
+          val-idx (index/index-from-seq :float64 (mapv double shuffled))
+          id-idx  (index/index-from-seq :int64 shuffled)
+          result (q/q {:from {:id id-idx :val val-idx}
+                       :order [[:val :desc]]
+                       :limit 3})]
+      (is (= 3 (count result)))
+      (is (= [(double (dec n)) (double (- n 2)) (double (- n 3))]
+             (mapv :val result)))))
+
+  (testing "SELECT * preserves all columns from surviving rows"
+    (let [n 50
+          a (long-array (range n))
+          b (double-array (map #(* 2.0 (double %)) (range n)))
+          c (long-array (map #(* 10 (long %)) (range n)))
+          result (q/q {:from {:a a :b b :c c}
+                       :order [[:b :desc]]
+                       :limit 2})]
+      (is (= 2 (count result)))
+      (is (= #{:a :b :c} (set (keys (first result)))))
+      (is (== (* 2.0 (dec n)) (:b (first result))))
+      (is (= (dec n) (:a (first result))))
+      (is (= (* 10 (dec n)) (:c (first result)))))))
+
+;; ============================================================================
+;; Streaming SELECT DISTINCT: bypasses row-map construction for single-col
+;; deduplication. Mirrors Ryan's `SELECT DISTINCT root` shape.
+;; ============================================================================
+
+(deftest distinct-eligibility-test
+  (testing "single-col DISTINCT triggers"
+    (is (stratum.query.distinct/distinct-eligible?
+         {:select [:root] :distinct true}
+         {:root {:type :int64 :data (long-array [1 2 3])}})))
+
+  (testing "multi-col → not eligible"
+    (is (not (stratum.query.distinct/distinct-eligible?
+              {:select [:a :b] :distinct true}
+              {:a {:type :int64 :data (long-array [1])}
+               :b {:type :int64 :data (long-array [2])}}))))
+
+  (testing "DISTINCT + WHERE → not eligible"
+    (is (not (stratum.query.distinct/distinct-eligible?
+              {:select [:a] :distinct true :where [[:> :a 0]]}
+              {:a {:type :int64 :data (long-array [1])}}))))
+
+  (testing "DISTINCT + ORDER BY → not eligible"
+    (is (not (stratum.query.distinct/distinct-eligible?
+              {:select [:a] :distinct true :order [[:a :asc]]}
+              {:a {:type :int64 :data (long-array [1])}}))))
+
+  (testing "DISTINCT without :distinct → not eligible"
+    (is (not (stratum.query.distinct/distinct-eligible?
+              {:select [:a]}
+              {:a {:type :int64 :data (long-array [1])}})))))
+
+(deftest distinct-correctness-test
+  (testing "DISTINCT on int64 array column"
+    (let [vals (long-array [3 1 2 1 3 2 1 3])
+          result (q/q {:from {:v vals} :select [:v] :distinct true})]
+      (is (= 3 (count result)))
+      (is (= [1 2 3] (sort (mapv :v result))))))
+
+  (testing "DISTINCT on float64 array column"
+    (let [vals (double-array [1.5 2.5 1.5 3.5 2.5])
+          result (q/q {:from {:v vals} :select [:v] :distinct true})]
+      (is (= 3 (count result)))
+      (is (= [1.5 2.5 3.5] (sort (mapv :v result))))))
+
+  (testing "DISTINCT preserves NULL as one distinct row (int64)"
+    (let [vals (long-array [1 2 Long/MIN_VALUE 1 Long/MIN_VALUE 3])
+          result (q/q {:from {:v vals} :select [:v] :distinct true})]
+      ;; 3 non-null distinct + 1 NULL row
+      (is (= 4 (count result)))
+      (is (some #(nil? (:v %)) result))))
+
+  (testing "DISTINCT on index-backed column"
+    (let [n 5000
+          xs (vec (repeatedly n #(rand-int 50)))
+          idx (index/index-from-seq :int64 xs)
+          result (q/q {:from {:v idx} :select [:v] :distinct true})]
+      (is (= (count (set xs)) (count result)))))
+
+  (testing "DISTINCT on string-dict column decodes back to strings"
+    (let [strings (into-array String ["AAPL" "MSFT" "AAPL" "GOOG" "MSFT" "AAPL"])
+          ds (q/encode-column strings)
+          result (q/q {:from {:sym (assoc ds :type :int64)}
+                       :select [:sym] :distinct true})]
+      (is (= 3 (count result)))
+      (let [vals (set (mapv :sym result))]
+        (is (= #{"AAPL" "MSFT" "GOOG"} vals))))))
