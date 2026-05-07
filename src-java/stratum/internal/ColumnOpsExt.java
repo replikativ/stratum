@@ -206,6 +206,254 @@ public final class ColumnOpsExt {
         }
     }
 
+    // =========================================================================
+    // Parallel SELECT DISTINCT — return the actual values (not just count)
+    //
+    // Mirrors countDistinctLongParallel's BitSet/Hash branching, but the
+    // per-thread structures are merged and walked to extract values.
+    // NULL sentinel (Long.MIN_VALUE) is tracked separately and appended at
+    // the end of the result if present (matches SQL "NULL is one distinct
+    // value" semantics). Non-null values come back ascending.
+    // =========================================================================
+
+    /**
+     * Return the distinct values of {@code data[0..length)} as a long[].
+     * Non-null values are returned ascending; if any NULL was seen,
+     * {@code Long.MIN_VALUE} is appended at the end.
+     */
+    public static long[] distinctLongValuesParallel(long[] data, int length) {
+        // Single-threaded fallback for small inputs.
+        if (length < ColumnOps.PARALLEL_THRESHOLD) {
+            return distinctLongValuesSingle(data, length);
+        }
+        // Quick min/max scan; track NULL presence separately.
+        long min = Long.MAX_VALUE, max = Long.MIN_VALUE;
+        boolean hasNull = false;
+        for (int i = 0; i < length; i++) {
+            long v = data[i];
+            if (v == Long.MIN_VALUE) { hasNull = true; continue; }
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+        if (min > max) {
+            return hasNull ? new long[]{ Long.MIN_VALUE } : new long[0];
+        }
+        long range = max - min + 1;
+        long[] vals = (range > 0 && range <= BITSET_RANGE_THRESHOLD)
+                ? distinctLongBitSetParallel(data, length, min, (int) range)
+                : distinctLongHashParallel(data, length);
+        // BitSet path returns ascending; hash path doesn't — sort to make
+        // the output stable in either case.
+        java.util.Arrays.sort(vals);
+        if (hasNull) {
+            long[] out = new long[vals.length + 1];
+            System.arraycopy(vals, 0, out, 0, vals.length);
+            out[vals.length] = Long.MIN_VALUE;
+            return out;
+        }
+        return vals;
+    }
+
+    private static long[] distinctLongValuesSingle(long[] data, int length) {
+        java.util.HashSet<Long> seen = new java.util.HashSet<>();
+        boolean hasNull = false;
+        for (int i = 0; i < length; i++) {
+            long v = data[i];
+            if (v == Long.MIN_VALUE) { hasNull = true; continue; }
+            seen.add(v);
+        }
+        long[] vals = new long[seen.size()];
+        int j = 0;
+        for (Long v : seen) vals[j++] = v.longValue();
+        java.util.Arrays.sort(vals);
+        if (hasNull) {
+            long[] out = new long[vals.length + 1];
+            System.arraycopy(vals, 0, out, 0, vals.length);
+            out[vals.length] = Long.MIN_VALUE;
+            return out;
+        }
+        return vals;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static long[] distinctLongBitSetParallel(long[] data, int length, long min, int range) {
+        int nThreads = POOL.getParallelism();
+        int threadRange = (length + nThreads - 1) / nThreads;
+        Future<java.util.BitSet>[] futures = new Future[nThreads];
+        for (int t = 0; t < nThreads; t++) {
+            final int tS = t * threadRange, tE = Math.min(tS + threadRange, length);
+            if (tS >= length) { futures[t] = null; continue; }
+            final long fMin = min;
+            futures[t] = POOL.submit(() -> {
+                java.util.BitSet bs = new java.util.BitSet(range);
+                for (int i = tS; i < tE; i++) {
+                    if (data[i] == Long.MIN_VALUE) continue;
+                    bs.set((int) (data[i] - fMin));
+                }
+                return bs;
+            });
+        }
+        try {
+            java.util.BitSet merged = null;
+            for (Future<java.util.BitSet> f : futures) {
+                if (f == null) continue;
+                java.util.BitSet bs = f.get();
+                if (merged == null) merged = bs;
+                else merged.or(bs);
+            }
+            if (merged == null) return new long[0];
+            int n = merged.cardinality();
+            long[] out = new long[n];
+            int idx = 0;
+            for (int bit = merged.nextSetBit(0); bit >= 0; bit = merged.nextSetBit(bit + 1)) {
+                out[idx++] = (long) bit + min;
+            }
+            return out;
+        } catch (Exception e) {
+            throw new RuntimeException("Parallel distinct (BitSet) failed", e);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static long[] distinctLongHashParallel(long[] data, int length) {
+        int nThreads = POOL.getParallelism();
+        int threadRange = (length + nThreads - 1) / nThreads;
+        Future<Object[]>[] futures = new Future[nThreads];
+        for (int t = 0; t < nThreads; t++) {
+            final int tS = t * threadRange, tE = Math.min(tS + threadRange, length);
+            if (tS >= length) { futures[t] = null; continue; }
+            futures[t] = POOL.submit(() -> {
+                int len = tE - tS;
+                int cap = Integer.highestOneBit((int) Math.min(Integer.MAX_VALUE / 2,
+                        Math.max(16L, (long) len * 2))) << 1;
+                long[] table = new long[cap];
+                byte[] occupied = new byte[cap];
+                int distinct = 0;
+                long MULT = 0x9E3779B97F4A7C15L;
+                for (int i = tS; i < tE; i++) {
+                    long v = data[i];
+                    if (v == Long.MIN_VALUE) continue;
+                    int slot = (int) ((v * MULT) >>> (64 - Integer.numberOfTrailingZeros(cap))) & (cap - 1);
+                    while (true) {
+                        if (occupied[slot] == 0) {
+                            table[slot] = v;
+                            occupied[slot] = 1;
+                            distinct++;
+                            break;
+                        }
+                        if (table[slot] == v) break;
+                        slot = (slot + 1) & (cap - 1);
+                    }
+                }
+                return new Object[]{ table, occupied, cap, distinct };
+            });
+        }
+        try {
+            long[] mergedTable = null;
+            byte[] mergedOccupied = null;
+            int mergedCap = 0;
+            int mergedDistinct = 0;
+            long MULT = 0x9E3779B97F4A7C15L;
+            for (Future<Object[]> f : futures) {
+                if (f == null) continue;
+                Object[] res = f.get();
+                long[] tbl = (long[]) res[0];
+                byte[] occ = (byte[]) res[1];
+                int cap = (int) res[2];
+                if (mergedTable == null) {
+                    mergedTable = tbl;
+                    mergedOccupied = occ;
+                    mergedCap = cap;
+                    mergedDistinct = (int) res[3];
+                } else {
+                    for (int s = 0; s < cap; s++) {
+                        if (occ[s] == 0) continue;
+                        long v = tbl[s];
+                        if (mergedDistinct * 10 > mergedCap * 7) {
+                            int newCap = mergedCap << 1;
+                            int newMask = newCap - 1;
+                            long[] newTable = new long[newCap];
+                            byte[] newOcc = new byte[newCap];
+                            for (int j = 0; j < mergedCap; j++) {
+                                if (mergedOccupied[j] != 0) {
+                                    long mv = mergedTable[j];
+                                    int ns = (int) ((mv * MULT) >>> (64 - Integer.numberOfTrailingZeros(newCap))) & newMask;
+                                    while (newOcc[ns] != 0) ns = (ns + 1) & newMask;
+                                    newTable[ns] = mv;
+                                    newOcc[ns] = 1;
+                                }
+                            }
+                            mergedTable = newTable;
+                            mergedOccupied = newOcc;
+                            mergedCap = newCap;
+                        }
+                        int mask = mergedCap - 1;
+                        int slot = (int) ((v * MULT) >>> (64 - Integer.numberOfTrailingZeros(mergedCap))) & mask;
+                        while (true) {
+                            if (mergedOccupied[slot] == 0) {
+                                mergedTable[slot] = v;
+                                mergedOccupied[slot] = 1;
+                                mergedDistinct++;
+                                break;
+                            }
+                            if (mergedTable[slot] == v) break;
+                            slot = (slot + 1) & mask;
+                        }
+                    }
+                }
+            }
+            if (mergedTable == null) return new long[0];
+            long[] out = new long[mergedDistinct];
+            int idx = 0;
+            for (int s = 0; s < mergedCap; s++) {
+                if (mergedOccupied[s] != 0) out[idx++] = mergedTable[s];
+            }
+            return out;
+        } catch (Exception e) {
+            throw new RuntimeException("Parallel distinct (hash) failed", e);
+        }
+    }
+
+    /**
+     * Return the distinct values of {@code data[0..length)} as a double[].
+     * NaN is treated as the NULL sentinel and tracked separately; if any
+     * NaN is seen it is appended (as Double.NaN) at the end of the result.
+     * Non-null values come back ascending.
+     */
+    public static double[] distinctDoubleValuesParallel(double[] data, int length) {
+        // Single-threaded HashSet path keeps the implementation small;
+        // for very large inputs the cost is dominated by autoboxing but
+        // is still vastly better than the row-map path. A bit-pattern
+        // open-addressed hash is a follow-up if profiling shows this is
+        // a bottleneck.
+        //
+        // SQL semantics: -0.0 == +0.0, and any NaN bit pattern
+        // collapses to a single NULL row. Java's HashSet<Double> uses
+        // bit-pattern equality (so it would split -0.0 from +0.0 and
+        // separate NaN representations), so we canonicalize before
+        // insertion: -0.0 → +0.0 and NaN → tracked via hasNull.
+        java.util.HashSet<Double> seen = new java.util.HashSet<>();
+        boolean hasNull = false;
+        for (int i = 0; i < length; i++) {
+            double v = data[i];
+            if (Double.isNaN(v)) { hasNull = true; continue; }
+            // Canonicalize -0.0 to +0.0 so HashSet treats them as equal.
+            if (v == 0.0) v = 0.0;
+            seen.add(v);
+        }
+        double[] vals = new double[seen.size()];
+        int j = 0;
+        for (Double d : seen) vals[j++] = d.doubleValue();
+        java.util.Arrays.sort(vals);
+        if (hasNull) {
+            double[] out = new double[vals.length + 1];
+            System.arraycopy(vals, 0, out, 0, vals.length);
+            out[vals.length] = Double.NaN;
+            return out;
+        }
+        return vals;
+    }
+
     /**
      * Parallel COUNT DISTINCT with mask: per-thread hash tables + merge.
      */
