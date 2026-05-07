@@ -21,6 +21,7 @@
             [stratum.query.predicate :as pred]
             [stratum.query.expression :as expr]
             [stratum.query.estimate :as est]
+            [stratum.query.execution :as x-cols]
             [stratum.dataset :as dataset])
   (:import [stratum.query.ir
             LScan LFilter LJoin LGroupBy LGlobalAgg LProject
@@ -41,15 +42,9 @@
 ;; Plan construction — query map → logical IR
 ;; ============================================================================
 
-(defn- normalize-select-item
-  "Normalize a single SELECT item to {:name kw :ref kw :expr expr}."
-  [item idx]
-  (cond
-    (keyword? item) {:name item :ref item}
-    (vector? item)  (let [expr (norm/normalize-expr (vec item))]
-                      {:name (keyword (str "__sel_" idx)) :expr expr})
-    (map? item)     item
-    :else           {:name (keyword (str "__sel_" idx)) :ref item}))
+;; `normalize-select-item` lives in `stratum.query.execution` and
+;; handles :as / literals / expressions / keywords. We delegate to it
+;; instead of duplicating the cases here.
 
 (defn- build-scan
   "Build an LScan from :from, handling both maps and IDataset."
@@ -117,11 +112,22 @@
                    (build-join-tree scan join)
                    scan)
 
-          ;; 3. Normalize predicates, aggs, select items
-          preds   (mapv norm/normalize-pred (or where []))
-          aggs    (norm/auto-alias-aggs (mapv norm/normalize-agg (or agg [])))
+          ;; 3. Normalize predicates, aggs, select items.
+          ;;    When called via `executor/run-query` the lowering step
+          ;;    (prepare-query) has already normalized preds / aggs and
+          ;;    set `::pre-normalized?` on the query map; in that case
+          ;;    skip re-normalization (it isn't idempotent).
+          pre-norm? (::pre-normalized? query)
+          preds   (if pre-norm?
+                    (or where [])
+                    (mapv norm/normalize-pred (or where [])))
+          aggs    (if pre-norm?
+                    (or agg [])
+                    (norm/auto-alias-aggs (mapv norm/normalize-agg (or agg []))))
           sel     (when (seq select)
-                    (vec (map-indexed #(normalize-select-item %2 %1) select)))
+                    (if pre-norm?
+                      (vec select)
+                      (vec (map-indexed #(x-cols/normalize-select-item %2 %1) select))))
 
           ;; 4. Filter
           filtered (if (seq preds)
@@ -485,7 +491,11 @@
 
 (defn- rewrite-expr-group-keys
   "For group-keys that are expressions (not keywords), create PMaterializeExpr
-   nodes and rewrite the keys. Returns [new-keys mat-nodes]."
+   nodes and rewrite the keys. Returns [new-keys mat-nodes].
+
+   Normalizes the expression with `norm/normalize-expr` so the
+   downstream `eval-expr-vectorized` sees `{:op ... :args ...}` form
+   rather than a raw `[:op ...]` vector (which it doesn't accept)."
   [group-keys]
   (loop [idx 0, new-keys [], mat-nodes []]
     (if (>= idx (count group-keys))
@@ -493,10 +503,11 @@
       (let [gk (nth group-keys idx)]
         (if (keyword? gk)
           (recur (inc idx) (conj new-keys gk) mat-nodes)
-          (let [cn (keyword (str "__gk_expr_" idx))]
+          (let [cn (keyword (str "__gk_expr_" idx))
+                normalized (if (map? gk) gk (norm/normalize-expr gk))]
             (recur (inc idx)
                    (conj new-keys cn)
-                   (conj mat-nodes (ir/->PMaterializeExpr cn gk :float64 nil)))))))))
+                   (conj mat-nodes (ir/->PMaterializeExpr cn normalized :float64 nil)))))))))
 
 (defn- chain-materialize
   "Chain PMaterializeExpr nodes on top of an input node (innermost first)."
@@ -1059,6 +1070,25 @@
 ;; Pass 7: Column pruning
 ;; ============================================================================
 
+(defn- collect-expr-refs!
+  "Walk a normalized expression tree (possibly nested) and conj!
+   every column keyword reference into `refs` (a volatile transient)."
+  [refs e]
+  (cond
+    (keyword? e) (vswap! refs conj! e)
+    (map? e)
+    (do
+      (doseq [a (:args e)]
+        (collect-expr-refs! refs a))
+      (when-let [branches (:branches e)]
+        (doseq [b branches]
+          (collect-expr-refs! refs (:val b))
+          (when-let [p (:pred b)]
+            ;; pred form `[op-args...]`; conj keyword args
+            (doseq [x p] (when (keyword? x) (vswap! refs conj! x)))))))
+    (sequential? e)
+    (doseq [a e] (collect-expr-refs! refs a))))
+
 (defn- collect-all-refs
   "Collect all column keywords referenced anywhere in the plan tree."
   [plan]
@@ -1072,19 +1102,29 @@
                         (vswap! refs conj! c)))
         ;; Group keys
                     (when-let [gks (:group-keys node)]
-                      (doseq [gk gks] (when (keyword? gk) (vswap! refs conj! gk))))
-        ;; Aggs
+                      (doseq [gk gks]
+                        (cond
+                          (keyword? gk) (vswap! refs conj! gk)
+                          (map? gk)     (collect-expr-refs! refs gk)
+                          (sequential? gk) (collect-expr-refs! refs gk))))
+        ;; Aggs (post-materialization the :expr field is gone, but
+        ;; before that pass — and for paths that don't lift — we may
+        ;; still see :expr embedded in an agg.)
                     (when-let [aggs (:aggs node)]
                       (doseq [a aggs]
                         (when-let [c (:col a)] (vswap! refs conj! c))
-                        (when-let [cs (:cols a)] (doseq [c cs] (when (keyword? c) (vswap! refs conj! c))))))
+                        (when-let [cs (:cols a)] (doseq [c cs] (when (keyword? c) (vswap! refs conj! c))))
+                        (when-let [e (:expr a)] (collect-expr-refs! refs e))))
                     (when-let [agg (:agg node)]
-                      (when-let [c (:col agg)] (vswap! refs conj! c)))
-        ;; Project items
+                      (when-let [c (:col agg)] (vswap! refs conj! c))
+                      (when-let [cs (:cols agg)] (doseq [c cs] (when (keyword? c) (vswap! refs conj! c))))
+                      (when-let [e (:expr agg)] (collect-expr-refs! refs e)))
+        ;; Project items: each may have :ref OR :expr. Walk both.
                     (when-let [items (:items node)]
                       (doseq [item items]
                         (when-let [r (:ref item)] (vswap! refs conj! r))
-                        (when-let [n (:name item)] (vswap! refs conj! n))))
+                        (when-let [n (:name item)] (vswap! refs conj! n))
+                        (when-let [e (:expr item)] (collect-expr-refs! refs e))))
         ;; Join on-pairs
                     (when-let [on (:on-pairs node)]
                       (doseq [[l r] on] (vswap! refs conj! l) (vswap! refs conj! r)))
@@ -1102,10 +1142,9 @@
         ;; Extract
                     (when-let [ec (:extract-col node)]
                       (vswap! refs conj! ec))
-        ;; Materialized expressions
+        ;; Materialized expressions (PMaterializeExpr top-level :expr)
                     (when-let [e (:expr node)]
-                      (when (map? e)
-                        (doseq [a (:args e)] (when (keyword? a) (vswap! refs conj! a)))))
+                      (collect-expr-refs! refs e))
                     node))
     (persistent! @refs)))
 

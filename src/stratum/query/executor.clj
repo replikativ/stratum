@@ -10,6 +10,7 @@
   (:require [stratum.query.ir :as ir]
             [stratum.query.execution :as x]
             [stratum.query.plan :as plan]
+            [stratum.query.prepare :as prep]
             [stratum.query.normalization :as norm]
             [stratum.query.predicate :as pred]
             [stratum.query.estimate :as est]
@@ -19,6 +20,7 @@
             [stratum.query.join :as jn]
             [stratum.query.postprocess :as post]
             [stratum.query.window :as win]
+            [stratum.dataset :as dataset]
             [stratum.index :as index]
             [stratum.chunk :as chunk])
   (:import [stratum.query.ir
@@ -688,12 +690,47 @@
 ;; High-level entry points (plan → optimize → execute)
 ;; ============================================================================
 
+(defn- prepare-and-build
+  "Run the shared lowering passes (`prepare-query`) and then build a
+   logical plan against the cleaned query. Returns
+   `{:plan logical :columns-meta meta}`. The legacy `q` body has
+   always run these passes inline; the planner needs them too so
+   raw expression vectors don't reach the executor."
+  [query]
+  (let [from   (:from query)
+        columns (cond
+                  (nil? from) {}
+                  (satisfies? dataset/IDataset from) (dataset/columns from)
+                  :else (cols/prepare-columns from))
+        length (if (seq columns)
+                 (cols/get-column-length (val (first columns)))
+                 0)
+        {:keys [preds aggs group select columns columns-meta]}
+        (prep/prepare-query query columns length)
+        ;; Rebuild a query map for build-logical-plan with the
+        ;; lowered slots in place. `:from` becomes the cleaned
+        ;; columns map (containing temp materialized columns).
+        cleaned (-> query
+                    (assoc :from columns
+                           :where preds
+                           :agg   aggs
+                           :group group
+                           :select select
+                           ;; Tell build-logical-plan that preds/aggs
+                           ;; are already normalized — re-running
+                           ;; norm/normalize-pred / normalize-agg on
+                           ;; their output throws.
+                           ::plan/pre-normalized? true))]
+    {:plan         (plan/build-logical-plan cleaned)
+     :columns-meta columns-meta}))
+
 (defn run-query
-  "Build logical plan, optimize to physical, execute."
+  "Lower the query, build logical plan, optimize to physical, execute."
   [query columnar?]
-  (let [logical  (plan/build-logical-plan query)
-        physical (plan/optimize logical)]
-    (execute-physical physical columnar?)))
+  (let [{:keys [plan columns-meta]} (prepare-and-build query)
+        physical (plan/optimize plan)]
+    (binding [expr/*columns-meta* columns-meta]
+      (execute-physical physical columnar?))))
 
 (defn compile-physical
   "Build and optimize a physical plan for a query. The plan captures all
