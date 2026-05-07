@@ -791,13 +791,30 @@
     {:plan         (plan/build-logical-plan cleaned)
      :columns-meta columns-meta}))
 
+(defn- strip-injected-keys
+  "Drop injected keys (`_having-only-keys`, `_order-only-keys`) from
+   result rows. The SQL → IR translation injects extra aggregates
+   into the projection so HAVING / ORDER BY can reference them, but
+   they shouldn't appear in the user-visible output."
+  [results having-only-keys order-only-keys]
+  (let [drop-ks (concat having-only-keys order-only-keys)]
+    (if (and (sequential? results) (seq drop-ks))
+      (mapv #(if (map? %) (apply dissoc % drop-ks) %) results)
+      results)))
+
 (defn run-query
-  "Lower the query, build logical plan, optimize to physical, execute."
+  "Lower the query, build logical plan, optimize to physical, execute.
+   Result rows have the injected order-only / having-only aggregate
+   columns stripped, matching the legacy `q` body."
   [query columnar?]
   (let [{:keys [plan columns-meta]} (prepare-and-build query)
-        physical (plan/optimize plan)]
+        physical (plan/optimize plan)
+        m (meta plan)
+        having-only (::plan/having-only-keys m)
+        order-only  (::plan/order-only-keys  m)]
     (binding [expr/*columns-meta* columns-meta]
-      (execute-physical physical columnar?))))
+      (-> (execute-physical physical columnar?)
+          (strip-injected-keys having-only order-only)))))
 
 (defn compile-physical
   "Build and optimize a physical plan for a query. The plan captures all
@@ -806,11 +823,32 @@
   (let [logical  (plan/build-logical-plan query)]
     (plan/optimize logical)))
 
+(defn- scan-summary
+  "Walk the plan to find the leaf scan and pull (length, n-cols) for
+   the explain output. Mirrors the legacy explain shape so consumers
+   that probe `:n-rows` / `:columns` keep working."
+  [node]
+  (loop [n node]
+    (cond
+      (or (instance? stratum.query.ir.PScan n)
+          (instance? stratum.query.ir.PChunkedScan n)
+          (instance? stratum.query.ir.LScan n))
+      [(:length n) (count (:columns n))]
+      (:input n)         (recur (:input n))
+      (:left n)          (recur (:left n))
+      (:probe-side n)    (recur (:probe-side n))
+      :else              [nil nil])))
+
 (defn explain-query
-  "Build and explain a physical plan."
+  "Build and explain a physical plan. Returns a map with both the
+   planner-native keys (`:plan-tree`, `:strategy`) and legacy-shape
+   keys (`:n-rows`, `:columns`) so existing callers don't break."
   [query]
   (let [logical  (plan/build-logical-plan query)
-        physical (plan/optimize logical)]
+        physical (plan/optimize logical)
+        [n-rows n-cols] (scan-summary physical)]
     {:plan-tree (plan/explain physical)
      :strategy  (keyword (.getSimpleName (class physical)))
+     :n-rows    n-rows
+     :columns   n-cols
      :query     (dissoc query :from)}))

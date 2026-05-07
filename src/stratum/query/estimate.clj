@@ -317,10 +317,20 @@
 (defn- sample-estimate
   "Estimate selectivity by sampling from the column. Returns selectivity or nil."
   [pred col-info]
-  (let [col-key (first pred)
-        op (second pred)]
+  (let [op (second pred)
+        args (when (sequential? pred) (subvec (vec pred) 2))
+        ;; The numeric `eval-pred-on-sample` casts every arg to
+        ;; `double`. Skip sampling whenever an arg is a string (or
+        ;; the column is dict-encoded) — dict resolution on
+        ;; equality predicates happens later in `prepare-query`/
+        ;; executor's `prepare-preds` and the planner can fall back
+        ;; to a heuristic selectivity until then.
+        all-numeric-args? (every? number? args)
+        dict-string?      (= :string (:dict-type col-info))]
     ;; Can't sample :fn, :or, string ops on dict columns, or unknown ops
-    (when (#{:eq :neq :gt :lt :gte :lte :range :not-range :in :not-in} op)
+    (when (and (#{:eq :neq :gt :lt :gte :lte :range :not-range :in :not-in} op)
+               all-numeric-args?
+               (not dict-string?))
       (let [sample (cond
                      (:index col-info) (sample-from-index (:index col-info))
                      (:data col-info)  (sample-from-array (:data col-info))

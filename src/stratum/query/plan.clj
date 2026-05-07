@@ -56,18 +56,24 @@
     (ir/->LScan columns length)))
 
 (defn- build-join-tree
-  "Wrap scan with join nodes for each join spec."
+  "Wrap scan with join nodes for each join spec.
+   `:on` keys may arrive SQL-table-qualified (e.g. `:t1/a`,
+   `:t2/x`); strip namespaces so they match the column-map keys
+   (which are unqualified)."
   [scan join-specs]
   (reduce
    (fn [left join-spec]
      (let [{:keys [with on type]} join-spec
+           strip   norm/strip-ns
            on-pairs (cond
                       ;; [:= :a :b]
                       (and (vector? on) (= := (first on)))
-                      [[(second on) (nth on 2)]]
+                      [[(strip (second on)) (strip (nth on 2))]]
                       ;; [[:= :a :b] [:= :c :d]]
                       (and (vector? on) (every? vector? on))
-                      (mapv (fn [pair] [(second pair) (nth pair 2)]) on)
+                      (mapv (fn [pair]
+                              [(strip (second pair)) (strip (nth pair 2))])
+                            on)
                       :else (throw (ex-info "Unsupported join :on format" {:on on})))
            right-scan (build-scan with)]
        (ir/->LJoin (or type :inner) on-pairs left right-scan)))
@@ -304,21 +310,42 @@
     :else nil))
 
 (defn- pushdown-once
-  "Single pass: push LFilter predicates below LJoin when they reference only one side."
+  "Single pass: push LFilter predicates below LJoin when they
+   reference only one side. Outer joins constrain the rewrite:
+     - LEFT  join: push left-side preds (preserves NULL-padded rows
+                   on the right); right-side preds CANNOT be pushed
+                   because LEFT preserves left rows that have no
+                   right match.
+     - RIGHT join: symmetric — push right, not left.
+     - FULL  join: neither side can be pushed.
+   Only INNER joins allow both."
   [plan]
   (ir/walk-plan plan
                 (fn [node]
                   (if (and (instance? LFilter node)
                            (instance? LJoin (:input node)))
                     (let [join (:input node)
+                          jt   (:join-type join)
                           left-cols  (scan-columns (:left join))
                           right-cols (scan-columns (:right join))]
                       (if (and left-cols right-cols)
                         (let [classified (group-by #(classify-pred-by-side % left-cols right-cols)
                                                    (:predicates node))
-                              left-preds  (vec (get classified :left []))
-                              right-preds (vec (get classified :right []))
-                              cross-preds (vec (get classified :cross []))
+                              left-pushable?  (#{:inner :left}  jt)
+                              right-pushable? (#{:inner :right} jt)
+                              left-preds  (if left-pushable?
+                                            (vec (get classified :left []))
+                                            [])
+                              right-preds (if right-pushable?
+                                            (vec (get classified :right []))
+                                            [])
+                              ;; Anything we can't push stays above the join.
+                              kept-preds  (vec (concat
+                                                (when-not left-pushable?
+                                                  (get classified :left []))
+                                                (when-not right-pushable?
+                                                  (get classified :right []))
+                                                (get classified :cross [])))
                   ;; Wrap join children with pushed-down filters
                               new-left  (if (seq left-preds)
                                           (ir/->LFilter left-preds (:left join))
@@ -327,9 +354,8 @@
                                           (ir/->LFilter right-preds (:right join))
                                           (:right join))
                               new-join (assoc join :left new-left :right new-right)]
-              ;; Keep cross-side predicates above the join (or remove filter if all pushed)
-                          (if (seq cross-preds)
-                            (ir/->LFilter cross-preds new-join)
+                          (if (seq kept-preds)
+                            (ir/->LFilter kept-preds new-join)
                             new-join))
             ;; Can't determine sides → leave as-is
                         node))
@@ -954,17 +980,21 @@
    Requires:
    - INNER join
    - Single-column join key
-   - Parent node doesn't reference any build-side (dim) columns except the join key"
+   - Parent node doesn't reference ANY build-side (dim) columns —
+     including the join key. The semi-join discards the right side
+     after building a presence-bitmap, so a parent SELECT that
+     projects `t2.x` (the join key) would lose its right-side
+     binding even though `t2.x = t1.a` in matched rows. Mirrors the
+     `(not has-select?)` clause of the legacy
+     `query.join/bitmap-semi-join-eligible?`."
   [join-node parent-cols]
   (and parent-cols
        (= :inner (:join-type join-node))
        (= 1 (count (:on-pairs join-node)))
-       (let [build-cols (extract-scan-cols (:build-side join-node))
-             join-key-right (second (first (:on-pairs join-node)))]
+       (let [build-cols (extract-scan-cols (:build-side join-node))]
          (and build-cols
-              ;; No build-side columns (other than join key) used by parent
-              (empty? (disj (clojure.set/intersection build-cols parent-cols)
-                            join-key-right))))))
+              ;; No build-side columns at all referenced by parent.
+              (empty? (clojure.set/intersection build-cols parent-cols))))))
 
 (defn operator-fusion
   "Merge adjacent physical nodes into fused operators where beneficial.
@@ -1321,25 +1351,31 @@
 ;; ============================================================================
 
 (defn optimize
-  "Run all optimization passes on a logical plan, producing a physical plan."
+  "Run all optimization passes on a logical plan, producing a physical plan.
+   Top-level metadata (e.g. ::output-format, ::order-only-keys) is
+   preserved across passes since individual rewrites may drop it."
   [plan]
-  (-> plan
-      annotate
-      predicate-pushdown
-      join-reorder
-      zone-map-annotation
-      expr-materialization
-      ;; Top-N rewrite runs BEFORE strategy-selection so it operates
-      ;; on logical IR (`LLimit (LSort scan)`) rather than physical
-      ;; (`PLimit (PSort scan)`). Also runs BEFORE column-pruning so
-      ;; the `LScan` referenced by `LTopN` keeps all output columns
-      ;; — the streaming top-N fetches each surviving row's full
-      ;; column set, not just the order column.
-      top-n-rewrite
-      strategy-selection
-      operator-fusion
-      stats-propagation
-      column-pruning))
+  (let [m (meta plan)
+        out (-> plan
+                annotate
+                predicate-pushdown
+                join-reorder
+                zone-map-annotation
+                expr-materialization
+                ;; Top-N rewrite runs BEFORE strategy-selection so it operates
+                ;; on logical IR (`LLimit (LSort scan)`) rather than physical
+                ;; (`PLimit (PSort scan)`). Also runs BEFORE column-pruning so
+                ;; the `LScan` referenced by `LTopN` keeps all output columns
+                ;; — the streaming top-N fetches each surviving row's full
+                ;; column set, not just the order column.
+                top-n-rewrite
+                strategy-selection
+                operator-fusion
+                stats-propagation
+                column-pruning)]
+    (if (and m (instance? clojure.lang.IObj out))
+      (vary-meta out merge m)
+      out)))
 
 ;; ============================================================================
 ;; Plan explanation (for debugging and EXPLAIN output)

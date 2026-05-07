@@ -66,9 +66,12 @@
   200000)
 
 (def ^:dynamic *use-planner*
-  "When true, route queries through the IR planner (build-logical-plan → optimize → execute-physical)
-   instead of the hardcoded cond routing. Default false."
-  false)
+  "When true, route queries through the IR planner
+   (`build-logical-plan → optimize → execute-physical`) instead of
+   the legacy `cond` routing. Default true. Bind to `false` to
+   force the legacy path (e.g. for A/B comparison or as an escape
+   hatch for shapes the planner mishandles)."
+  true)
 
 ;; ============================================================================
 ;; Column Type Detection
