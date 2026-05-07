@@ -60,16 +60,22 @@
                 (let [c (get columns col)]
                   (and c
                        (or (:index c) (:data c))
-                       ;; Primitive numeric / string only — top-N over
-                       ;; expressions or non-comparable types takes the
-                       ;; slow path.
-                       (#{:int64 :float64 :string} (:type c)))))))))
+                       ;; Numeric only. String columns are stored as
+                       ;; :int64 dict-IDs; ordering by dict-ID gives
+                       ;; insertion-order, not lexicographic, which is
+                       ;; semantically wrong. Bail until a proper
+                       ;; string-ordering primitive exists.
+                       (#{:int64 :float64} (:type c))
+                       (not= :string (:dict-type c)))))))))
 
 ;; ============================================================================
 ;; Heap-based top-N over an index/array column
 ;; ============================================================================
 
-(deftype ^:private TopNEntry [^double key ^long chunk-id ^long local-idx])
+;; chunk-id is the full ChunkEntry chunk-id vector (e.g. [3] or [3 1]
+;; after a split). Storing only the first element collapses split
+;; chunks together and makes downstream point-slice lookups miss.
+(deftype ^:private TopNEntry [^double key chunk-id ^long local-idx])
 
 (defn- ^Comparator entry-cmp
   "Comparator for the heap. For `:asc` (find smallest N) we want a
@@ -112,7 +118,7 @@
         entries (vec (pss/slice tree nil nil))]
     (doseq [^ChunkEntry entry entries]
       (let [chk (.chunk entry)
-            chunk-id (long (first (.chunk-id entry)))
+            chunk-id (.chunk-id entry)
             chunk-len (long (chunk/chunk-length chk))]
         (loop [i 0]
           (when (< i chunk-len)
@@ -145,8 +151,10 @@
                   :int64   (double (aget ^longs arr i))
                   :string  (double (aget ^longs arr i)))
               ;; For arrays we encode the absolute row index in `local-idx`
-              ;; and use chunk-id 0; row-fetch path treats 0 as "use array".
-              e (TopNEntry. k 0 i)]
+              ;; and use a sentinel chunk-id `nil`; the row-fetch path
+              ;; routes through the `:data` branch when the column has
+              ;; an array source.
+              e (TopNEntry. k nil i)]
           (if (< (.size pq) n)
             (.offer pq e)
             (let [^TopNEntry top (.peek pq)]
@@ -171,21 +179,23 @@
 ;; ============================================================================
 
 (defn- chunks-by-id-for
-  "Build {chunk-id → chunk} for `idx`, restricted to the supplied
-   `chunk-ids` collection. Each id is fetched via a point-slice on
-   the PSS tree, so the cost is O(N · log K) instead of O(K) — vital
-   for konserve-backed indices where K can be 1000s of chunks per
-   column."
+  "Build {chunk-id-vec → chunk} for `idx`, restricted to the supplied
+   `chunk-ids` collection (each is the full chunk-id vector from a
+   ChunkEntry). Each id is fetched via a point-slice on the PSS tree,
+   so the cost is O(N · log K) instead of O(K) — vital for
+   konserve-backed indices where K can be 1000s of chunks per column."
   [idx chunk-ids]
   (let [tree (index/idx-tree idx)]
-    (reduce (fn [m id]
-              ;; PSS slice bounds are compared via chunk-entry-comparator
-              ;; which calls `.chunk-id` on each side — so the bounds
-              ;; must be ChunkEntry instances. Build a probe with just
-              ;; the chunk-id set.
-              (let [probe (index/->ChunkEntry [(long id)] nil nil)
+    (reduce (fn [m id-vec]
+              ;; PSS slice bounds compare via chunk-entry-comparator
+              ;; which calls `.chunk-id` on each side, so the bounds
+              ;; must be ChunkEntry instances. Build a probe carrying
+              ;; the full id vector — split chunks have multi-element
+              ;; ids (e.g. [2 1]) which would collapse if we kept only
+              ;; the first element.
+              (let [probe (index/->ChunkEntry id-vec nil nil)
                     e (first (pss/slice tree probe probe))]
-                (if e (assoc m (long id) (.chunk ^ChunkEntry e)) m)))
+                (if e (assoc m id-vec (.chunk ^ChunkEntry e)) m)))
             {}
             chunk-ids)))
 

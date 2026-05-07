@@ -396,6 +396,37 @@
           (is (= 10 (long (:count (first dbl-null))))))
         (finally (.delete path))))))
 
+(deftest parquet-dataset-null-string-test
+  (testing "NULL string values round-trip via parquet-dataset (bulk-decode
+            path must not run on nullable columns — would corrupt with
+            def-level RLE prefix being read as bit-width)"
+    (let [path (temp-parquet "ds-null-str")
+          schema "message trades {
+                    required int64 row;
+                    optional binary tag (STRING);
+                  }"
+          rows (mapv (fn [i]
+                       (cond-> {"row" (long i)}
+                         (zero? (mod i 3)) (assoc "tag" (str "v" (mod i 5)))))
+                     (range 30))]
+      (try
+        (write-parquet! path schema rows)
+        (let [ds (parquet/parquet-dataset (.getAbsolutePath path))
+              not-null (q/q {:from ds :where [[:is-not-null :tag]]
+                             :agg [[:count]]})
+              is-null (q/q {:from ds :where [[:is-null :tag]]
+                            :agg [[:count]]})
+              distinct-tags (q/q {:from ds :select [:tag] :distinct true})]
+          ;; 10 of 30 have tag (i % 3 == 0); 20 are NULL.
+          (is (= 10 (long (:count (first not-null)))))
+          (is (= 20 (long (:count (first is-null)))))
+          ;; Distinct values seen: v0, v3, v1, v4, v2 (cycling i mod 5
+          ;; over i ∈ {0,3,6,9,12,15,18,21,24,27}), plus the NULL row.
+          (let [vals (set (mapv :tag distinct-tags))]
+            (is (contains? vals nil))
+            (is (= 5 (count (disj vals nil))))))
+        (finally (.delete path))))))
+
 (deftest parquet-dataset-rejects-decimal-test
   (testing "Decimal columns are rejected with a clear error"
     (let [path (temp-parquet "ds-decimal")

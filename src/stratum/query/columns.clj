@@ -22,11 +22,13 @@
   nil)
 
 (def ^:private query-ref-slots
-  "Slots in a query map that can contain column references.
-   Walked by `query-references`. We intentionally exclude `:from` (the
-   data itself) and `:limit` / `:offset` (numeric)."
-  [:where :having :agg :group :order :select :join :window
-   :select-other-cols])
+  "Slots in a query map that can contain column references. Walked by
+   `query-references`. Excludes `:from` (the data) and
+   `:limit`/`:offset` (numeric).
+   HAVING/ORDER columns that aren't projected stay alive via
+   `:agg` injections in the legacy path, so we don't need a separate
+   `:select-other-cols` slot."
+  [:where :having :agg :group :order :select :join :window])
 
 (defn query-references
   "Return the set of column keywords actually referenced anywhere in

@@ -387,7 +387,17 @@
         (spec/validate! spec/SQuery query {:op :execute})
         (when-not (seq join)
           (validate-query from where agg group select))
-        (exec/run-query query (= :columns result)))
+        ;; Bind column-pruning refs here too: even though the planner
+        ;; has its own `column-pruning` pass, materialize-columns and
+        ;; check-memory-budget! inside `exec/run-query` consult this
+        ;; var, so leaving it at the default `nil` (= "all columns")
+        ;; would re-introduce the OOM symptoms the legacy fix solved.
+        (let [resolved-cols (if (satisfies? dataset/IDataset from)
+                              (dataset/columns from)
+                              (x/prepare-columns from))]
+          (binding [cols/*query-column-refs*
+                    (cols/query-references query resolved-cols)]
+            (exec/run-query query (= :columns result)))))
       ;; === Original hardcoded path ===
       (do
   ;; Structural validation via malli specs

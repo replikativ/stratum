@@ -1044,21 +1044,31 @@
         length (int length)
         col-name (last (.getPath cd))
         [^PageReadStore pages proj-schema] (read-rg-projected reader cd rg-index)
+        ;; The bulk path treats the data page payload as starting with
+        ;; the bit-width byte. Nullable / repeated columns prefix the
+        ;; payload with definition / repetition level RLE blocks, which
+        ;; would corrupt the decode. Restrict bulk path to required,
+        ;; flat columns; nullable strings fall through to the proxy
+        ;; which honors def-levels via parquet-mr's RecordReader.
+        max-def (.getMaxDefinitionLevel cd)
+        max-rep (.getMaxRepetitionLevel cd)
+        bulk-eligible? (and (zero? max-def) (zero? max-rep))
         ;; Try bulk path first: dict page + translation table → fast.
-        pr0 (.getPageReader pages cd)
-        dp (.readDictionaryPage pr0)
+        pr0 (when bulk-eligible? (.getPageReader pages cd))
+        dp (when pr0 (.readDictionaryPage pr0))
         ^longs translate-arr translate
         bulk-out
-        (when (and dp translate-arr)
+        (when (and pr0 dp translate-arr)
           (let [out (long-array length)
                 _ (java.util.Arrays/fill out Long/MIN_VALUE)
                 end (bulk-decode-dict-pages-translate! pr0 out translate-arr 0)]
             (when (not (neg? (long end))) out)))]
     (if bulk-out
       bulk-out
-      ;; Bulk path bailed (mid-row-group) or no dict page — fall back
-      ;; to the proxy decoder. Re-read the row group since pages from
-      ;; pr0 above were consumed.
+      ;; Bulk path bailed (mid-row-group) or no dict page or column is
+      ;; nullable / repeated. Fall back to the proxy decoder; it
+      ;; re-reads the row group via `read-rg-projected` since pages
+      ;; from `pr0` above were consumed.
       (decode-row-group-string-impl-proxy
        reader rg-index cd translate global-map dict-cap decoder-kind length))))
 

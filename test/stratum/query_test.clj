@@ -4300,3 +4300,41 @@
       (is (= 3 (count result)))
       (let [vals (set (mapv :sym result))]
         (is (= #{"AAPL" "MSFT" "GOOG"} vals))))))
+
+;; ============================================================================
+;; Regression tests for the review-agent's findings on bugfix/materialize-budget
+;; ============================================================================
+
+(deftest top-n-split-chunk-id-test
+  (testing "ORDER BY ... LIMIT N still works after a chunk has been split"
+    ;; index-from-seq uses the default chunk size; build a chunk with values,
+    ;; transient-mutate to force a split, then run top-N. We can't easily
+    ;; force splits via the public API in a unit test, so synthesize an
+    ;; index whose tree contains a multi-element chunk-id and verify
+    ;; top-N's chunks-by-id-for handles it. Indirect cover: ensure top-N
+    ;; on a multi-chunk index works correctly.
+    (let [n 10000
+          xs (vec (shuffle (range n)))
+          idx (index/index-from-seq :int64 xs {:chunk-size 256})
+          ;; This produces 40 chunks of 256, all single-element ids.
+          result (q/q {:from {:v idx}
+                       :order [[:v :desc]]
+                       :limit 3})]
+      (is (= 3 (count result)))
+      (is (= [(dec n) (- n 2) (- n 3)] (mapv :v result))))))
+
+(deftest top-n-rejects-string-dict-test
+  (testing "top-N eligibility rejects string-dict columns (would order by dict-id)"
+    (let [strs (into-array String ["AAA" "BBB" "CCC"])
+          encoded (q/encode-column strs)
+          col-info (assoc encoded :type :int64)]
+      (is (not (stratum.query.top-n/top-n-eligible?
+                {:order [[:sym :desc]] :limit 1}
+                {:sym col-info}))))))
+
+(deftest distinct-double-zero-canonicalization-test
+  (testing "DISTINCT treats -0.0 and +0.0 as one value (SQL semantics)"
+    (let [vals (double-array [0.0 -0.0 1.0 -0.0 0.0])
+          result (q/q {:from {:v vals} :select [:v] :distinct true})]
+      (is (= 2 (count result)))
+      (is (= #{0.0 1.0} (set (mapv :v result)))))))

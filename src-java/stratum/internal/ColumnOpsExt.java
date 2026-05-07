@@ -426,11 +426,19 @@ public final class ColumnOpsExt {
         // is still vastly better than the row-map path. A bit-pattern
         // open-addressed hash is a follow-up if profiling shows this is
         // a bottleneck.
+        //
+        // SQL semantics: -0.0 == +0.0, and any NaN bit pattern
+        // collapses to a single NULL row. Java's HashSet<Double> uses
+        // bit-pattern equality (so it would split -0.0 from +0.0 and
+        // separate NaN representations), so we canonicalize before
+        // insertion: -0.0 → +0.0 and NaN → tracked via hasNull.
         java.util.HashSet<Double> seen = new java.util.HashSet<>();
         boolean hasNull = false;
         for (int i = 0; i < length; i++) {
             double v = data[i];
             if (Double.isNaN(v)) { hasNull = true; continue; }
+            // Canonicalize -0.0 to +0.0 so HashSet treats them as equal.
+            if (v == 0.0) v = 0.0;
             seen.add(v);
         }
         double[] vals = new double[seen.size()];
