@@ -1180,6 +1180,29 @@
         ;; Materialized expressions (PMaterializeExpr top-level :expr)
                     (when-let [e (:expr node)]
                       (collect-expr-refs! refs e))
+        ;; LTopN — order column + projection items. When :select is
+        ;; nil (SELECT *) the streaming top-N fetches every scan
+        ;; column at the surviving rows, so we conj every column of
+        ;; the input LScan to keep column-pruning from dropping them.
+                    (when (instance? stratum.query.ir.LTopN node)
+                      (let [os (:order-spec node)
+                            [c _] (if (vector? os) os [os :asc])]
+                        (when (keyword? c) (vswap! refs conj! c)))
+                      (if-let [items (:select node)]
+                        (doseq [item items]
+                          (when-let [r (:ref item)] (vswap! refs conj! r))
+                          (when-let [e (:expr item)] (collect-expr-refs! refs e)))
+                        ;; SELECT *: top-N fetches every column from
+                        ;; the input scan. The input may be either an
+                        ;; LScan (rewrite ran before strategy-selection)
+                        ;; or PScan/PChunkedScan (column-pruning is
+                        ;; running later in the pipeline).
+                        (let [in (:input node)]
+                          (when (or (instance? stratum.query.ir.LScan in)
+                                    (instance? stratum.query.ir.PScan in)
+                                    (instance? stratum.query.ir.PChunkedScan in))
+                            (doseq [k (keys (:columns in))]
+                              (vswap! refs conj! k))))))
                     node))
     (persistent! @refs)))
 
@@ -1198,6 +1221,102 @@
                       node)))))
 
 ;; ============================================================================
+;; Pass: top-N pushdown rewrite
+;; ============================================================================
+
+(def ^:dynamic *top-n-limit*
+  "Maximum LIMIT value at which the planner rewrites LLimit-over-LSort
+   into LTopN. Above this the legacy materialize-and-sort path runs.
+   Mirrors `stratum.query.top-n/*top-n-limit*`."
+  1024)
+
+(defn- peel-project
+  "If the node is `(LProject items LScan)`, return `[items LScan]`,
+   otherwise `[nil node]`. Lets top-N capture an explicit SELECT
+   projection while keeping the underlying scan for column lookup."
+  [node]
+  (cond
+    (and (instance? stratum.query.ir.LProject node)
+         (instance? stratum.query.ir.LScan (:input node)))
+    [(:items node) (:input node)]
+
+    (instance? stratum.query.ir.LScan node)
+    [nil node]
+
+    :else
+    [nil nil]))
+
+(defn- top-n-eligible-input?
+  "An input below LSort qualifies if it's a plain scan or a project
+   directly over a scan. The legacy `query.top-n/top-n-eligible?`
+   gate requires `(empty? where)`, so anything with predicates
+   (LFilter), joins, or aggregates leaves the materialize-and-sort
+   path running."
+  [node]
+  (let [[_ scan] (peel-project node)]
+    (some? scan)))
+
+(defn- top-n-order-eligible?
+  "Single ORDER BY on a numeric column (`:int64` or `:float64`) that
+   isn't a string-dict — same gate as `query.top-n/top-n-eligible?`."
+  [order-specs scan-cols]
+  (and (= 1 (count order-specs))
+       (let [spec (first order-specs)
+             [col _dir] (if (vector? spec) spec [spec :asc])]
+         (and (keyword? col)
+              (let [c (get scan-cols col)]
+                (and c
+                     (#{:int64 :float64} (:type c))
+                     (not= :string (:dict-type c))))))))
+
+(defn- find-scan-cols
+  "Return the `:columns` map of the leaf LScan reachable through an
+   optional LProject layer."
+  [node]
+  (let [[_ scan] (peel-project node)]
+    (when scan (:columns scan))))
+
+(defn top-n-rewrite
+  "Rewrite `LLimit { limit N input: LSort [single-spec] subtree }`
+   into a single `LTopN`, when N ≤ *top-n-limit* and the input is
+   filter/scan only. The executor delegates LTopN to
+   `query.top-n/execute-top-n`, which streams the order column,
+   keeps a fixed-size heap, and fetches just the surviving rows.
+
+   Only applied to top-level LLimit (no other rewrites between LSort
+   and LLimit) — anything more elaborate stays on the legacy
+   materialize-and-sort path."
+  [plan]
+  (let [limit-node? (instance? stratum.query.ir.LLimit plan)
+        sort-node   (when limit-node? (:input plan))
+        sort?       (and sort-node (instance? stratum.query.ir.LSort sort-node))
+        sort-input  (when sort? (:input sort-node))
+        eligible-input? (and sort? (top-n-eligible-input? sort-input))
+        scan-cols   (when eligible-input? (find-scan-cols sort-input))
+        order-ok?   (and scan-cols
+                         (top-n-order-eligible? (:order-specs sort-node)
+                                                scan-cols))
+        no-offset?  (and limit-node?
+                         (or (nil? (:offset plan)) (zero? (long (:offset plan)))))
+        small?      (and limit-node?
+                         (some? (:limit plan))
+                         (<= 0 (long (:limit plan)))
+                         (<= (long (:limit plan)) (long *top-n-limit*)))]
+    (if (and limit-node? sort? eligible-input? order-ok? no-offset? small?)
+      ;; Capture any LProject between LSort and the scan: top-N's
+      ;; row-fetch can apply the projection itself, dropping the
+      ;; LProject so the LScan keeps every column the projection
+      ;; references.
+      (let [[items scan] (peel-project sort-input)]
+        (with-meta
+          (ir/->LTopN (first (:order-specs sort-node))
+                      (long (:limit plan))
+                      items
+                      scan)
+          (meta plan)))
+      plan)))
+
+;; ============================================================================
 ;; Composite: full optimization pipeline
 ;; ============================================================================
 
@@ -1210,6 +1329,13 @@
       join-reorder
       zone-map-annotation
       expr-materialization
+      ;; Top-N rewrite runs BEFORE strategy-selection so it operates
+      ;; on logical IR (`LLimit (LSort scan)`) rather than physical
+      ;; (`PLimit (PSort scan)`). Also runs BEFORE column-pruning so
+      ;; the `LScan` referenced by `LTopN` keeps all output columns
+      ;; — the streaming top-N fetches each surviving row's full
+      ;; column set, not just the order column.
+      top-n-rewrite
       strategy-selection
       operator-fusion
       stats-propagation

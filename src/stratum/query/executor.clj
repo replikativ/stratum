@@ -19,6 +19,7 @@
             [stratum.query.group-by :as gb]
             [stratum.query.join :as jn]
             [stratum.query.postprocess :as post]
+            [stratum.query.top-n :as top-n]
             [stratum.query.window :as win]
             [stratum.dataset :as dataset]
             [stratum.index :as index]
@@ -32,7 +33,7 @@
             PFusedExtractCount PBitmapSemiJoin PHashJoin
             PPerfectHashJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
             PProject PWindow PHaving PSort PDistinct PLimit
-            PMaterializeExpr]
+            PMaterializeExpr LTopN]
            [stratum.internal ColumnOps ColumnOpsExt ColumnOpsAnalytics]))
 
 (set! *warn-on-reflection* true)
@@ -601,6 +602,36 @@
     (assoc ctx :columns (assoc mat-cols (:col-name node)
                                {:type (or (:target node) :float64) :data arr}))))
 
+;; --- Top-N pushdown ---------------------------------------------------------
+
+(defn- execute-top-n-node
+  "Run the streaming top-N pushdown by delegating to
+   `stratum.query.top-n/execute-top-n`. The IR's `LTopN` node carries
+   the (single) order-spec, the LIMIT, and the (LProject) items it
+   absorbed (or nil for SELECT *). We assemble the synthetic query
+   map that `top-n/execute-top-n` expects from those fields plus the
+   input column context."
+  [node]
+  (let [ctx (execute-node (:input node))
+        columns (ctx-columns ctx)
+        items   (:select node)
+        ;; `top-n/execute-top-n` accepts a vector of plain column
+        ;; keywords (or nil for SELECT *). Convert LProject items to
+        ;; that shape; literal/computed projections fall back to nil
+        ;; (which means SELECT all from the scan), and the planner's
+        ;; eligibility gate ensures the project items are
+        ;; keyword-only when LProject was peeled.
+        select  (when (seq items)
+                  (let [refs (mapv :ref items)]
+                    (when (every? keyword? refs) refs)))
+        order-spec (:order-spec node)
+        order-spec (if (vector? order-spec) order-spec [order-spec :asc])]
+    (top-n/execute-top-n
+     {:order [order-spec]
+      :limit (:limit node)
+      :select select}
+     columns)))
+
 ;; --- Post-processing --------------------------------------------------------
 
 (defn- execute-having [node results]
@@ -662,6 +693,10 @@
 
      ;; Expression materialization
      (instance? PMaterializeExpr node) (execute-materialize-expr node)
+
+     ;; Top-N pushdown — LTopN is recognized directly (no separate
+     ;; physical record) and dispatched to the streaming primitive.
+     (instance? LTopN node) (execute-top-n-node node)
 
      ;; Projection
      (instance? PProject node)  (execute-project node columnar?)

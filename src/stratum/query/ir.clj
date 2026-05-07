@@ -67,6 +67,15 @@
 
 (defrecord LLimit [limit offset input])
 
+(defrecord LTopN
+  ;; Streaming `ORDER BY col [DESC] LIMIT N` over a single numeric
+  ;; column. The optimizer recognizes the LLimit-over-LSort shape
+  ;; and rewrites to this; the executor delegates to
+  ;; `stratum.query.top-n/execute-top-n`. `select` is the (already
+  ;; normalized) projection (or nil for SELECT *) so the rewrite can
+  ;; happen below the LProject layer.
+           [order-spec limit select input])
+
 (defrecord LSetOp
   ;; Union/Intersect/Except over sub-queries.
   ;; op      — :union | :intersect | :except
@@ -228,6 +237,12 @@
 (defrecord PSort    [order-specs limit offset input])
 (defrecord PDistinct [input])
 (defrecord PLimit   [limit offset input])
+
+(defrecord PTopN
+  ;; Physical counterpart of LTopN. The executor delegates to
+  ;; `stratum.query.top-n/execute-top-n` after recovering the column
+  ;; context from the input scan.
+           [order-spec limit select input])
 
 ;; --- Expression materialization (inserted by passes) ------------------------
 
