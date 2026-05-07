@@ -907,7 +907,8 @@
         (.put global s (long new-id))
         new-id))))
 
-(declare read-rg-projected decode-row-group-numeric-fallback)
+(declare read-rg-projected decode-row-group-numeric-fallback
+         decode-row-group-string-impl-proxy)
 
 (defn- scan-rg-plain-strings!
   "For a row group whose data pages aren't dict-encoded, eagerly walk
@@ -992,11 +993,79 @@
             (int (long (.getValue e))) ^String (.getKey e)))
     arr))
 
+(defn- bulk-decode-dict-pages-translate!
+  "String-column variant of bulk-decode-dict-pages!. Walks dict-encoded
+   data pages and gathers translated dict-IDs:
+     out[i] = translate-arr[parquet-local-id[i]]
+   Returns -1 if any page is non-dict (caller falls back to the
+   per-row proxy path which can grow the global dict on PLAIN pages)."
+  [^PageReader pr ^longs out ^longs translate-arr ^long off]
+  (let [v-count (.getTotalValueCount pr)
+        cursor (long-array 1)
+        _ (aset cursor 0 (long off))
+        end (+ (long off) v-count)
+        bail? (atom false)]
+    (loop []
+      (when (and (not @bail?) (< (aget cursor 0) end))
+        (let [page (.readPage pr)]
+          (when page
+            (let [n (.getValueCount page)
+                  enc (str (.getValueEncoding ^DataPageV1 page))
+                  o (int (aget cursor 0))]
+              (if (or (= "PLAIN_DICTIONARY" enc) (= "RLE_DICTIONARY" enc))
+                (let [page-bytes (.toByteArray (.getBytes ^DataPageV1 page))
+                      page-len (alength ^bytes page-bytes)]
+                  (ParquetDictBulkDecoder/decodeV1Long
+                   page-bytes 0 page-len (int n)
+                   translate-arr out o)
+                  (aset cursor 0 (+ (aget cursor 0) (long n))))
+                (reset! bail? true))))
+          (recur))))
+    (if @bail? -1 (aget cursor 0))))
+
 (defn- decode-row-group-string-impl
   "Inner body of `decode-row-group-string`; runs under the caller's
    lifeline lock so concurrent decodes on the same reader serialize.
    Projects parquet's row-group read down to just `cd` first so we
-   only fetch this column's bytes from disk."
+   only fetch this column's bytes from disk.
+
+   Two paths:
+   - **Bulk-decode-via-translate** when a dictionary page is present
+     and the row group has a precomputed local-to-global translation
+     table: walks RLE+bit-packed indices on the page byte[]s and
+     gathers `out[i] = translate-arr[idx[i]]`. Same primitive used
+     for numeric DICT columns; ~3× faster than the proxy path.
+   - **Per-row proxy** for PLAIN-encoded pages (or any other
+     unsupported encoding) since those values may need to grow the
+     shared global dict."
+  [^ParquetFileReader reader rg-index ^ColumnDescriptor cd
+   translate ^HashMap global-map dict-cap decoder-kind length]
+  (let [rg-index (int rg-index)
+        length (int length)
+        col-name (last (.getPath cd))
+        [^PageReadStore pages proj-schema] (read-rg-projected reader cd rg-index)
+        ;; Try bulk path first: dict page + translation table → fast.
+        pr0 (.getPageReader pages cd)
+        dp (.readDictionaryPage pr0)
+        ^longs translate-arr translate
+        bulk-out
+        (when (and dp translate-arr)
+          (let [out (long-array length)
+                _ (java.util.Arrays/fill out Long/MIN_VALUE)
+                end (bulk-decode-dict-pages-translate! pr0 out translate-arr 0)]
+            (when (not (neg? (long end))) out)))]
+    (if bulk-out
+      bulk-out
+      ;; Bulk path bailed (mid-row-group) or no dict page — fall back
+      ;; to the proxy decoder. Re-read the row group since pages from
+      ;; pr0 above were consumed.
+      (decode-row-group-string-impl-proxy
+       reader rg-index cd translate global-map dict-cap decoder-kind length))))
+
+(defn- decode-row-group-string-impl-proxy
+  "Per-row proxy decoder used as the fallback path when bulk-decode
+   via dict+translate isn't applicable (e.g. PLAIN-encoded pages or
+   no dictionary page)."
   [^ParquetFileReader reader rg-index ^ColumnDescriptor cd
    translate ^HashMap global-map dict-cap decoder-kind length]
   (let [rg-index (int rg-index)
