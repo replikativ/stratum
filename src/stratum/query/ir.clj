@@ -133,8 +133,10 @@
 
 (defrecord PFusedSIMDCount
   ;; JIT-isolated COUNT path (avoids JIT poisoning from aggType switch).
-  ;; Targets: ColumnOps/fusedSimdCountParallel
-           [predicates input])
+  ;; Targets: ColumnOps/fusedSimdCountParallel.
+  ;; `agg` carries the normalized COUNT spec so the result is keyed by
+  ;; the user's `:as` alias (e.g. `SELECT COUNT(*) AS cnt → :cnt`).
+           [predicates agg input])
 
 (defrecord PChunkedSIMDAgg
   ;; Stream index chunks with SIMD filter+aggregate.
@@ -143,13 +145,17 @@
 
 (defrecord PChunkedSIMDCount
   ;; JIT-isolated chunked COUNT.
-  ;; Targets: ColumnOpsExt/fusedSimdChunkedCountParallel
-           [predicates input])
+  ;; Targets: ColumnOpsExt/fusedSimdChunkedCountParallel.
+  ;; `agg` carries the COUNT spec so the result honors the user's
+  ;; `:as` alias (parallel to PFusedSIMDCount).
+           [predicates agg input])
 
 (defrecord PBlockSkipCount
   ;; Block-skip COUNT on arrays using min/max statistics.
-  ;; Targets: ColumnOpsExt/fusedSimdCountBlockSkipParallel
-           [predicates input])
+  ;; Targets: ColumnOpsExt/fusedSimdCountBlockSkipParallel.
+  ;; `agg` carries the COUNT spec so the result honors the user's
+  ;; `:as` alias (parallel to PFusedSIMDCount / PChunkedSIMDCount).
+           [predicates agg input])
 
 (defrecord PFusedMultiSum
   ;; Single-pass multiple SUM/AVG/COUNT aggs (<= 4 non-COUNT).

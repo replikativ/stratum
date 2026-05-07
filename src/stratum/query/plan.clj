@@ -598,7 +598,7 @@
     (cond
       ;; 1. Unfiltered COUNT
       (and (= 1 n-aggs) (= :count (:op first-agg)) no-preds?)
-      (ir/->PFusedSIMDCount [] scan)
+      (ir/->PFusedSIMDCount [] first-agg scan)
 
       ;; 2. Stats-only (needs chunk statistics → real columns only)
       ;; SUM and AVG read sum/sum-sq from ChunkStats. Sources whose stats
@@ -621,7 +621,7 @@
       ;; index columns because zone maps can skip entire chunks.
       (and all-idx? agg-cols-in-scan? (= 1 n-aggs) simd-ok? no-expr?)
       (if (= :count (:op first-agg))
-        (ir/->PChunkedSIMDCount preds scan)
+        (ir/->PChunkedSIMDCount preds first-agg scan)
         (ir/->PChunkedSIMDAgg preds first-agg scan))
 
       ;; 4. Block-skip COUNT on arrays
@@ -629,7 +629,7 @@
       ;; blocks using min/max stats on materialized arrays.
       (and (= 1 n-aggs) (= :count (:op first-agg)) (seq preds)
            (not all-idx?) simd-ok? no-expr?)
-      (ir/->PBlockSkipCount preds scan)
+      (ir/->PBlockSkipCount preds first-agg scan)
 
       ;; 4b. Cost-aware: for very selective non-COUNT single-agg on arrays,
       ;; block-skip then SIMD on survivors would be faster than full SIMD.

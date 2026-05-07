@@ -220,14 +220,15 @@
 
 (defn- execute-fused-simd-count [node columnar?]
   (let [ctx (execute-node (:input node))
-        [preds columns length] (prepare-node-preds (:predicates node) ctx)]
+        [preds columns length] (prepare-node-preds (:predicates node) ctx)
+        agg (or (:agg node) {:op :count :as nil})]
     (if (empty? preds)
       ;; Unfiltered count — short-circuit
-      (post/format-fused-result {:result 0.0 :count length} {:op :count :as nil})
+      (post/format-fused-result {:result 0.0 :count length} agg)
       (let [mat-cols (cols/materialize-columns columns)]
         (post/format-fused-result
          (x/execute-fused preds nil mat-cols length)
-         {:op :count :as nil})))))
+         agg)))))
 
 (defn- execute-chunked-simd-agg [node columnar?]
   (let [ctx (execute-node (:input node))
@@ -247,10 +248,11 @@
 
 (defn- execute-chunked-simd-count [node columnar?]
   (let [ctx (execute-node (:input node))
-        [preds columns length] (prepare-node-preds (:predicates node) ctx)]
+        [preds columns length] (prepare-node-preds (:predicates node) ctx)
+        agg (or (:agg node) {:op :count :as nil})]
     (post/format-fused-result
      (x/execute-chunked-fused-count preds columns length)
-     {:op :count :as nil})))
+     agg)))
 
 (defn- execute-block-skip-count [node columnar?]
   (let [ctx (execute-node (:input node))
@@ -268,8 +270,9 @@
                     ^"[[D" (:dbl-cols pp)
                     ^doubles (:dbl-lo pp)
                     ^doubles (:dbl-hi pp)
-                    (int length))]
-    (post/format-fused-result {:result 0.0 :count (long (aget r 1))} {:op :count :as nil})))
+                    (int length))
+        agg (or (:agg node) {:op :count :as nil})]
+    (post/format-fused-result {:result 0.0 :count (long (aget r 1))} agg)))
 
 (defn- execute-fused-multi-sum [node columnar?]
   (let [ctx (execute-node (:input node))
@@ -664,27 +667,32 @@
 
 (defn execute-physical
   "Execute a physical plan tree, returning result rows.
-   columnar? controls output format (arrays vs row maps)."
+   columnar? controls output format (arrays vs row maps).
+
+   `expr/*columns-meta*` is bound by `run-query` from `prepare-query`'s
+   output and must NOT be re-bound here — overriding it with `{}`
+   would lose the dict info that string-expression evaluation depends
+   on (LENGTH, etc.). When `execute-physical` is called directly
+   without a prior binding, the var's root value (`{}`) applies."
   ([plan] (execute-physical plan false))
   ([plan columnar?]
-   (binding [expr/*columns-meta* {}]
-     (let [result (execute-node plan columnar?)]
+   (let [result (execute-node plan columnar?)]
        ;; If the result is a column context (no agg/project), count matching rows
-       (if (and (map? result) (:columns result) (:length result) (not (:n-rows result)))
-         (let [preds (or (:preds result) [])
-               columns (:columns result)
-               length (long (:length result))]
-           (if (empty? preds)
-             [{:_count length}]
-             (let [mat-cols (cols/materialize-columns columns)
-                   col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)]
-               [{:_count (loop [i 0 cnt 0]
-                           (if (>= i length)
-                             cnt
-                             (if (every? #(gb/eval-pred-scalar col-arrays i %) preds)
-                               (recur (inc i) (inc cnt))
-                               (recur (inc i) cnt))))}])))
-         result)))))
+     (if (and (map? result) (:columns result) (:length result) (not (:n-rows result)))
+       (let [preds (or (:preds result) [])
+             columns (:columns result)
+             length (long (:length result))]
+         (if (empty? preds)
+           [{:_count length}]
+           (let [mat-cols (cols/materialize-columns columns)
+                 col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)]
+             [{:_count (loop [i 0 cnt 0]
+                         (if (>= i length)
+                           cnt
+                           (if (every? #(gb/eval-pred-scalar col-arrays i %) preds)
+                             (recur (inc i) (inc cnt))
+                             (recur (inc i) cnt))))}])))
+       result))))
 
 ;; ============================================================================
 ;; High-level entry points (plan → optimize → execute)
