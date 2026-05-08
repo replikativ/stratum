@@ -700,10 +700,10 @@
 (defn- execute-top-n-node
   "Run the streaming top-N pushdown by delegating to
    `stratum.query.top-n/execute-top-n`. The IR's `LTopN` node carries
-   the (single) order-spec, the LIMIT, and the (LProject) items it
-   absorbed (or nil for SELECT *). We assemble the synthetic query
-   map that `top-n/execute-top-n` expects from those fields plus the
-   input column context."
+   one or more `:order-specs`, the LIMIT, and the (LProject) items
+   it absorbed (or nil for SELECT *). We assemble the synthetic
+   query map that `top-n/execute-top-n` expects from those fields
+   plus the input column context."
   [node]
   (let [ctx (execute-node (:input node))
         columns (ctx-columns ctx)
@@ -717,11 +717,19 @@
         select  (when (seq items)
                   (let [refs (mapv :ref items)]
                     (when (every? keyword? refs) refs)))
-        order-spec (:order-spec node)
-        order-spec (if (vector? order-spec) order-spec [order-spec :asc])]
+        ;; `:order-specs` is the canonical multi-key form (vec of
+        ;; `[col dir]` pairs). Caller may have stored a single
+        ;; bare-keyword spec from the legacy single-key path —
+        ;; normalize back to that vector shape here.
+        order-specs (let [os (:order-specs node)]
+                      (cond
+                        (and (vector? os) (every? vector? os)) os
+                        (and (vector? os) (keyword? (first os))) [os]
+                        (keyword? os) [[os :asc]]
+                        :else (vec os)))]
     (top-n/execute-top-n
-     {:order [order-spec]
-      :limit (:limit node)
+     {:order  (vec order-specs)
+      :limit  (:limit node)
       :select select}
      columns)))
 

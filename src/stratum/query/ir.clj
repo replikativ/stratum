@@ -77,13 +77,21 @@
 (defrecord LLimit [limit offset input])
 
 (defrecord LTopN
-  ;; Streaming `ORDER BY col [DESC] LIMIT N` over a single numeric
-  ;; column. The optimizer recognizes the LLimit-over-LSort shape
-  ;; and rewrites to this; the executor delegates to
-  ;; `stratum.query.top-n/execute-top-n`. `select` is the (already
-  ;; normalized) projection (or nil for SELECT *) so the rewrite can
-  ;; happen below the LProject layer.
-           [order-spec limit select input])
+  ;; Streaming `ORDER BY col [DESC] [, col2 [DESC] ...] LIMIT N` over
+  ;; one or more numeric columns. The optimizer recognizes the
+  ;; LLimit-over-LSort shape and rewrites to this; the executor
+  ;; delegates to `stratum.query.top-n/execute-top-n`, which keeps a
+  ;; fixed-size heap and fetches only the surviving rows. `select`
+  ;; is the (already normalized) projection (or nil for SELECT *)
+  ;; so the rewrite can happen below the LProject layer.
+  ;;
+  ;; `order-specs` is a vec of `[col dir]` pairs (or bare `col` for
+  ;; ASC). The heap walks them in declared order; mixed
+  ;; `:asc`/`:desc` is supported. Cross-column comparison uses the
+  ;; same `key-double` cast as the single-key path (loses precision
+  ;; only for int64 values >2^53, which doesn't occur in typical
+  ;; timestamps or dict-IDs).
+           [order-specs limit select input])
 
 (defrecord LHead
   ;; LIMIT N without ORDER BY — return the first N rows in scan

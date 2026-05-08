@@ -481,6 +481,69 @@
         (recur p' (inc n))))))
 
 ;; ============================================================================
+;; Pass 1b: HAVING → WHERE pushdown (filter through aggregate)
+;; ============================================================================
+
+(defn having-to-where-pushdown
+  "Push `LHaving` predicates that only reference `LGroupBy` group
+   columns (not aggregate aliases) down as pre-aggregate `LFilter`
+   preds. Mirrors DuckDB's `FilterPushdown::PushdownAggregate`
+   (`src/optimizer/pushdown/pushdown_aggregate.cpp`):
+
+     HAVING g > 5  (where g is in GROUP BY)  →  WHERE g > 5
+     HAVING SUM(x) > 100                       stays on LHaving
+
+   The user's HAVING clause is the SQL spec point for filtering
+   post-aggregate; the planner is free to evaluate any predicate
+   pre-aggregate when it doesn't depend on the aggregate output.
+   Pushing such predicates eliminates rows before they enter the
+   group-by hash table, which is the same constraint-as-early-as-
+   possible principle as predicate-pushdown-through-join.
+
+   Constraints:
+     - Only `LHaving` directly above `LGroupBy` (skips `LWindow` /
+       `LProject` between them — their reference resolution is more
+       subtle; the existing `window-having-pushdown` handles the
+       window case separately).
+     - Skips `LGlobalAgg` (no group columns to filter on, matching
+       DuckDB's `aggr.groups.empty()` short-circuit).
+     - Only keyword group keys count (expression group keys
+       reference `__gk_expr_N` synthetic columns that
+       `expr-materialization` introduces later in the pipeline).
+     - When a downstream `LFilter` already wraps the `LGroupBy`'s
+       input (the WHERE clause), the pushed predicates merge into
+       that filter — keeps the IR shape clean."
+  [plan]
+  (ir/walk-plan
+   plan
+   (fn [node]
+     (if (and (instance? LHaving node)
+              (instance? LGroupBy (:input node)))
+       (let [groupby     (:input node)
+             group-cols  (set (filter keyword? (:group-keys groupby)))
+             classify    (fn [pred]
+                           (let [cols (pred-columns pred)]
+                             (if (and (seq cols) (every? group-cols cols))
+                               :pushable
+                               :kept)))
+             grouped     (group-by classify (:predicates node))
+             pushable    (vec (get grouped :pushable []))
+             kept        (vec (get grouped :kept []))]
+         (if (empty? pushable)
+           node
+           (let [child     (:input groupby)
+                 new-child (if (instance? LFilter child)
+                             (ir/->LFilter
+                              (into (vec (:predicates child)) pushable)
+                              (:input child))
+                             (ir/->LFilter pushable child))
+                 new-gb    (assoc groupby :input new-child)]
+             (if (empty? kept)
+               new-gb
+               (ir/->LHaving kept new-gb)))))
+       node))))
+
+;; ============================================================================
 ;; Pass 1.5: Join reordering (DP-based)
 ;; ============================================================================
 
@@ -1446,9 +1509,9 @@
                       (doseq [{:keys [expr]} (:items node)]
                         (collect-expr-refs! refs expr)))
                     (when (instance? stratum.query.ir.LTopN node)
-                      (let [os (:order-spec node)
-                            [c _] (if (vector? os) os [os :asc])]
-                        (when (keyword? c) (vswap! refs conj! c)))
+                      (doseq [spec (:order-specs node)]
+                        (let [[c _] (if (vector? spec) spec [spec :asc])]
+                          (when (keyword? c) (vswap! refs conj! c))))
                       (if-let [items (:select node)]
                         (doseq [item items]
                           (when-let [r (:ref item)] (vswap! refs conj! r))
@@ -1534,17 +1597,20 @@
     (some? scan)))
 
 (defn- top-n-order-eligible?
-  "Single ORDER BY on a numeric column (`:int64` or `:float64`) that
-   isn't a string-dict — same gate as `query.top-n/top-n-eligible?`."
+  "Every ORDER BY column must be primitive numeric (`:int64` or
+   `:float64`) and not a dict-string. The streaming heap supports
+   any number of keys (multi-key compared in declared order, mixed
+   asc/desc allowed) — same gate as `query.top-n/top-n-eligible?`."
   [order-specs scan-cols]
-  (and (= 1 (count order-specs))
-       (let [spec (first order-specs)
-             [col _dir] (if (vector? spec) spec [spec :asc])]
-         (and (keyword? col)
-              (let [c (get scan-cols col)]
-                (and c
-                     (#{:int64 :float64} (:type c))
-                     (not= :string (:dict-type c))))))))
+  (and (>= (count order-specs) 1)
+       (every? (fn [spec]
+                 (let [[col _dir] (if (vector? spec) spec [spec :asc])]
+                   (and (keyword? col)
+                        (let [c (get scan-cols col)]
+                          (and c
+                               (#{:int64 :float64} (:type c))
+                               (not= :string (:dict-type c)))))))
+               order-specs)))
 
 (defn- find-scan-cols
   "Return the `:columns` map of the leaf LScan reachable through an
@@ -1595,7 +1661,7 @@
       ;; references.
       (let [[items scan] (peel-project sort-input)]
         (with-meta
-          (ir/->LTopN (first (:order-specs sort-node))
+          (ir/->LTopN (vec (:order-specs sort-node))
                       (long (:limit plan))
                       items
                       scan)
@@ -1714,6 +1780,17 @@
         out (-> plan
                 annotate
                 predicate-pushdown
+                ;; HAVING → WHERE runs immediately after WHERE pushdown
+                ;; so any predicates we lift below LGroupBy can in turn
+                ;; be pushed further down (through joins, etc.) by the
+                ;; next pass that touches `LFilter`. Currently the only
+                ;; such pass is `predicate-pushdown` itself, but its
+                ;; fixpoint loop already exited; re-running it would be
+                ;; correct but rarely useful (HAVING preds reference
+                ;; group columns from `LGroupBy`, which is above any
+                ;; join). Position is for symmetry with DuckDB's
+                ;; FilterPushdown.
+                having-to-where-pushdown
                 join-reorder
                 zone-map-annotation
                 ;; Window-having pushdown runs before expr-materialization

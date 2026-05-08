@@ -107,3 +107,126 @@
           rows (q/q {:from data :limit 100})]
       (is (= 5 (count rows)))
       (is (= [10 20 30 40 50] (mapv :a rows))))))
+
+;; ============================================================================
+;; HAVING → WHERE pushdown (F12)
+;; ============================================================================
+
+(deftest having-rewrites-group-col-pred-to-where
+  (testing "HAVING g > 1 (group col) is pushed below LGroupBy"
+    (let [data {:cat (long-array [1 1 2 2 3 3])
+                :amt (double-array [10 20 30 40 50 60])}
+          plan (optimize {:from data :group [:cat]
+                          :agg [[:as [:sum :amt] :total]]
+                          :having [[:> :cat 1]]})]
+      ;; The pushdown converts the HAVING into a scan-level filter.
+      ;; After strategy-selection that surfaces as a non-trivial
+      ;; selectivity on the dense group-by; the plan must NOT carry
+      ;; a PHaving wrapper.
+      (is (not (instance? stratum.query.ir.PHaving plan))
+          (str "Expected no PHaving wrapper, got "
+               (.getSimpleName (class plan)))))))
+
+(deftest having-keeps-aggregate-pred
+  (testing "HAVING SUM(x) > 100 (agg alias) stays on LHaving"
+    (let [data {:cat (long-array [1 1 2 2 3 3])
+                :amt (double-array [10 20 30 40 50 60])}
+          plan (optimize {:from data :group [:cat]
+                          :agg [[:as [:sum :amt] :total]]
+                          :having [[:> :total 100]]})]
+      (is (instance? stratum.query.ir.PHaving plan)
+          "Aggregate-referencing predicate must stay on PHaving"))))
+
+(deftest having-mixed-splits-correctly
+  (testing "HAVING with both group-col and agg-alias preds: pushed pred goes to WHERE, kept stays on PHaving"
+    (let [data {:cat (long-array [1 1 2 2 3 3])
+                :amt (double-array [10 20 30 40 50 60])}
+          ;; (q/q) sanity-check that the rewrite doesn't change results
+          via-having (q/q {:from data :group [:cat]
+                           :agg [[:as [:sum :amt] :total]]
+                           :having [[:> :cat 1] [:> :total 50]]
+                           :order [[:cat :asc]]})
+          via-where  (q/q {:from data :where [[:> :cat 1]]
+                           :group [:cat]
+                           :agg [[:as [:sum :amt] :total]]
+                           :having [[:> :total 50]]
+                           :order [[:cat :asc]]})]
+      (is (= via-having via-where)
+          "HAVING(g) + HAVING(agg) must equal WHERE(g) + HAVING(agg)"))))
+
+(deftest having-skips-global-aggregate
+  (testing "HAVING on LGlobalAgg (no GROUP BY) cannot push down"
+    (let [data {:amt (double-array [10 20 30 40 50])}
+          plan (optimize {:from data
+                          :agg [[:as [:sum :amt] :total]]
+                          :having [[:> :total 100]]})]
+      (is (instance? stratum.query.ir.PHaving plan)))))
+
+;; ============================================================================
+;; Multi-key Top-N (F13)
+;; ============================================================================
+
+(deftest topn-multi-key-rewrite-eligible
+  (testing "Two-column ORDER BY + LIMIT routes through LTopN"
+    (let [data {:cat (long-array [1 2 1 2 1 3])
+                :pri (long-array [10 20 30 40 50 60])}
+          plan (optimize {:from data :order [[:cat :asc] [:pri :desc]] :limit 3})]
+      (is (instance? LTopN plan))
+      (is (= [[:cat :asc] [:pri :desc]] (:order-specs plan))))))
+
+(deftest topn-multi-key-matches-naive-sort
+  (testing "Multi-key ASC/DESC produces identical ordering to a naive sort+limit"
+    (let [data {:a (long-array [3 1 2 3 1 2])
+                :b (long-array [10 20 30 40 50 60])}
+          via-topn (q/q {:from data :order [[:a :asc] [:b :desc]] :limit 6})]
+      ;; Expected: a ASC primary, b DESC tiebreak.
+      (is (= [{:a 1 :b 50} {:a 1 :b 20} {:a 2 :b 60}
+              {:a 2 :b 30} {:a 3 :b 40} {:a 3 :b 10}]
+             (mapv #(select-keys % [:a :b]) via-topn))))))
+
+(deftest topn-single-key-still-works
+  (testing "Single-key ORDER BY (regression after multi-key refactor)"
+    (let [data {:x (long-array [5 3 8 1 9 2 7])}
+          rows (q/q {:from data :order [[:x :asc]] :limit 3})]
+      (is (= [1 2 3] (mapv :x rows))))))
+
+(deftest topn-index-backed-multi-key
+  (testing "Multi-key TopN over index-backed columns produces correct order"
+    (let [n 5000
+          rng (java.util.Random. 7)
+          cat-idx (index/index-from-seq :int64 (repeatedly n #(.nextInt rng 4)))
+          pri-idx (index/index-from-seq :int64 (repeatedly n #(.nextInt rng 1000)))
+          data {:cat cat-idx :pri pri-idx}
+          rows (q/q {:from data :order [[:cat :asc] [:pri :desc]] :limit 10})]
+      (is (= 10 (count rows)))
+      ;; cat must be monotonically non-decreasing in the result.
+      (is (= (sort (mapv :cat rows)) (mapv :cat rows))))))
+
+;; ============================================================================
+;; Row-group ordering for ORDER BY + LIMIT on monotonic columns (F14)
+;; ============================================================================
+
+(deftest topn-sorted-input-correctness
+  (testing "Top-N on a strictly-ascending column returns first N values"
+    (let [n 50000
+          ts-idx (index/index-from-seq :int64 (range n))
+          rows (q/q {:from {:ts ts-idx} :order [[:ts :asc]] :limit 10})]
+      (is (= (vec (range 10)) (mapv :ts rows))))))
+
+(deftest topn-sorted-input-desc-correctness
+  (testing "Top-N DESC on a strictly-ascending column returns last N values"
+    (let [n 50000
+          ts-idx (index/index-from-seq :int64 (range n))
+          rows (q/q {:from {:ts ts-idx} :order [[:ts :desc]] :limit 10})]
+      (is (= (vec (reverse (range (- n 10) n))) (mapv :ts rows))))))
+
+(deftest topn-pruning-doesnt-affect-random-input
+  (testing "Top-N still correct on random input (pruning never triggers, but
+   chunk reordering shouldn't change correctness)"
+    (let [n 10000
+          rng (java.util.Random. 42)
+          values (vec (repeatedly n #(.nextLong rng)))
+          ts-idx (index/index-from-seq :int64 values)
+          rows (q/q {:from {:ts ts-idx} :order [[:ts :asc]] :limit 5})]
+      ;; Result must be the 5 smallest values, in ascending order.
+      (is (= (vec (take 5 (sort values))) (mapv :ts rows))))))
