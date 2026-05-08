@@ -34,7 +34,7 @@
             PFusedExtractCount PBitmapSemiJoin PHashJoin
             PPerfectHashJoin PAsofJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
             PProject PWindow PHaving PSort PDistinct PLimit
-            PMaterializeExpr LTopN LSetOp LAnomaly LStringMaterialize]
+            PMaterializeExpr LTopN LHead LSetOp LAnomaly LStringMaterialize]
            [stratum.internal ColumnOps ColumnOpsExt ColumnOpsAnalytics]))
 
 (set! *warn-on-reflection* true)
@@ -725,6 +725,57 @@
       :select select}
      columns)))
 
+(defn- execute-head-node
+  "Run the LIMIT-without-ORDER-BY pushdown — return the first N rows
+   in scan order. Each output column is materialized via
+   `cols/take-prefix-column`, which fetches only the prefix needed
+   (a single chunk for typical small limits over a multi-million-row
+   index) and never decodes the full column. Mirrors
+   `execute-top-n-node` but skips the heap.
+
+   Output is a vec of row maps (the LLimit's normal shape).
+   Dict-encoded columns flow through with their dict intact, so
+   downstream string decoding still works in the per-row reads."
+  [node]
+  (let [ctx     (execute-node (:input node))
+        columns (ctx-columns ctx)
+        length  (long (ctx-length ctx))
+        n       (Math/min (long (:limit node)) length)
+        items   (:select node)
+        all-keys (vec (keys columns))
+        out-cols (cond
+                   (nil? items) all-keys
+                   :else (let [refs (keep :ref items)]
+                           (if (every? keyword? refs) (vec refs) all-keys)))
+        ;; Materialize only the first N rows of each referenced column.
+        prefixed (into {}
+                       (map (fn [k] [k (cols/take-prefix-column (get columns k) n)]))
+                       out-cols)
+        ;; Per-key reader fn that decodes the i-th row, applying dict
+        ;; lookup for dict-encoded string columns.
+        reader  (fn [k]
+                  (let [col (get prefixed k)
+                        data (:data col)
+                        dict (:dict col)
+                        dict-string? (and dict (= :string (:dict-type col)))]
+                    (cond
+                      (and dict-string? (instance? (Class/forName "[J") data))
+                      (fn [^long i]
+                        (let [code (aget ^longs data i)]
+                          (when (>= code 0)
+                            (aget ^"[Ljava.lang.String;" dict (int code)))))
+                      (instance? (Class/forName "[J") data)
+                      (fn [^long i] (aget ^longs data i))
+                      (instance? (Class/forName "[D") data)
+                      (fn [^long i] (aget ^doubles data i))
+                      (instance? (Class/forName "[Ljava.lang.String;") data)
+                      (fn [^long i] (aget ^"[Ljava.lang.String;" data i))
+                      :else (fn [^long _i] nil))))
+        readers (into {} (map (juxt identity reader)) out-cols)]
+    (mapv (fn [^long i]
+            (into {} (map (fn [k] [k ((get readers k) i)])) out-cols))
+          (range n))))
+
 ;; --- Post-processing --------------------------------------------------------
 
 (defn- col-array
@@ -877,6 +928,10 @@
      ;; Top-N pushdown — LTopN is recognized directly (no separate
      ;; physical record) and dispatched to the streaming primitive.
      (instance? LTopN node) (execute-top-n-node node)
+
+     ;; LIMIT-without-ORDER-BY pushdown — same shape as LTopN, but
+     ;; no order column: first N rows in scan order.
+     (instance? LHead node) (execute-head-node node)
 
      ;; Anomaly score materialization (post-join). Resolves at the
      ;; right point in the pipeline so the iforest sees joined

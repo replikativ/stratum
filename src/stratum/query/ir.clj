@@ -85,6 +85,18 @@
   ;; happen below the LProject layer.
            [order-spec limit select input])
 
+(defrecord LHead
+  ;; LIMIT N without ORDER BY — return the first N rows in scan
+  ;; order. The optimizer recognizes the LLimit-over-LScan
+  ;; (optionally wrapped in LProject) shape and rewrites to this;
+  ;; the executor materializes only the first N rows of each scan
+  ;; column via `cols/take-prefix-column`, so a `SELECT * LIMIT 3`
+  ;; over a multi-GB index touches a single chunk per column instead
+  ;; of decoding the entire dataset. `select` is the (already
+  ;; normalized) projection (or nil for SELECT *), mirroring
+  ;; `LTopN`.
+           [limit select input])
+
 (defrecord LSetOp
   ;; Union/Intersect/Except over sub-queries.
   ;; op      — :union | :intersect | :except
@@ -306,7 +318,8 @@
       (instance? LGroupBy node) (instance? LGlobalAgg node) (instance? LProject node)
       (instance? LWindow node) (instance? LHaving node) (instance? LDistinct node)
       (instance? LSort node) (instance? LLimit node) (instance? LSetOp node)
-      (instance? LAnomaly node) (instance? LStringMaterialize node)))
+      (instance? LAnomaly node) (instance? LStringMaterialize node)
+      (instance? LHead node)))
 
 (defn input-node
   "Returns the input child of a unary node, or nil for leaves/joins."

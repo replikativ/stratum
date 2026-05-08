@@ -1464,6 +1464,22 @@
                                     (instance? stratum.query.ir.PChunkedScan in))
                             (doseq [k (keys (:columns in))]
                               (vswap! refs conj! k))))))
+        ;; LHead — same shape as LTopN minus the order column. The
+        ;; head executor materializes a prefix of every column it
+        ;; touches, so the live-set must include either the
+        ;; explicit `:select` items or the full scan column set
+        ;; (SELECT *).
+                    (when (instance? stratum.query.ir.LHead node)
+                      (if-let [items (:select node)]
+                        (doseq [item items]
+                          (when-let [r (:ref item)] (vswap! refs conj! r))
+                          (when-let [e (:expr item)] (collect-expr-refs! refs e)))
+                        (let [in (:input node)]
+                          (when (or (instance? stratum.query.ir.LScan in)
+                                    (instance? stratum.query.ir.PScan in)
+                                    (instance? stratum.query.ir.PChunkedScan in))
+                            (doseq [k (keys (:columns in))]
+                              (vswap! refs conj! k))))))
                     node))
     (persistent! @refs)))
 
@@ -1537,6 +1553,15 @@
   (let [[_ scan] (peel-project node)]
     (when scan (:columns scan))))
 
+(def ^:dynamic *head-limit*
+  "Maximum LIMIT value at which the planner rewrites a top-level
+   `LLimit` (no `ORDER BY`, no filter, no aggregate) over a scan
+   into `LHead`. Above this we fall through to the regular path
+   (which materializes the whole scan via `PProject` /
+   `materialize-columns`); for tiny LIMITs we'd rather pay one
+   chunk fetch per column than decode every row group."
+  100000)
+
 (defn top-n-rewrite
   "Rewrite `LLimit { limit N input: LSort [single-spec] subtree }`
    into a single `LTopN`, when N ≤ *top-n-limit* and the input is
@@ -1575,6 +1600,51 @@
                       items
                       scan)
           (meta plan)))
+      plan)))
+
+(defn head-rewrite
+  "Rewrite `LLimit { limit N input: LScan }` (optionally with an
+   intermediate `LProject` of bare column refs) into a single
+   `LHead`, when N ≤ `*head-limit*` and there's no `ORDER BY`,
+   `WHERE`, aggregate, join or window between the limit and the
+   scan. The executor materializes only the first N rows of each
+   referenced column, so `SELECT * FROM huge LIMIT 3` over an
+   index-backed scan touches a single chunk per column instead of
+   decoding the entire dataset.
+
+   This is the LIMIT-without-ORDER-BY counterpart to
+   `top-n-rewrite`. Bigger LIMITs (above `*head-limit*`) fall
+   through to the regular `PProject + PLimit` path. The rewrite
+   runs before `top-n-rewrite` would pick up an `LLimit (LSort)`,
+   so it never competes with that pass — this only fires when
+   there is no `LSort` in between."
+  [plan]
+  (let [limit-node? (instance? stratum.query.ir.LLimit plan)
+        input       (when limit-node? (:input plan))
+        ;; Eligible input shapes: bare LScan, or LProject items
+        ;; (all bare column refs) over LScan. Anything else (sort,
+        ;; filter, join, aggregate, window) means the LIMIT is
+        ;; semantically tied to row order or count after that
+        ;; operator, so we leave it on the regular path.
+        [items scan] (when input (peel-project input))
+        eligible?   (and limit-node?
+                         scan
+                         (instance? stratum.query.ir.LScan scan)
+                         (or (nil? items)
+                             (every? (fn [it]
+                                       (and (:ref it) (keyword? (:ref it))
+                                            (not (:expr it))))
+                                     items)))
+        no-offset?  (and limit-node?
+                         (or (nil? (:offset plan)) (zero? (long (:offset plan)))))
+        small?      (and limit-node?
+                         (some? (:limit plan))
+                         (<= 0 (long (:limit plan)))
+                         (<= (long (:limit plan)) (long *head-limit*)))]
+    (if (and eligible? no-offset? small?)
+      (with-meta
+        (ir/->LHead (long (:limit plan)) items scan)
+        (meta plan))
       plan)))
 
 ;; ============================================================================
@@ -1658,6 +1728,12 @@
                 ;; — the streaming top-N fetches each surviving row's full
                 ;; column set, not just the order column.
                 top-n-rewrite
+                ;; Head rewrite is the LIMIT-without-ORDER-BY counterpart.
+                ;; Same constraints (runs before strategy-selection so it
+                ;; sees `LLimit (LScan)` / `LLimit (LProject LScan)`, and
+                ;; before column-pruning so the LScan keeps every column
+                ;; the head fetches).
+                head-rewrite
                 strategy-selection
                 operator-fusion
                 stats-propagation

@@ -88,6 +88,62 @@
     col-info
     (assoc col-info :data (index/idx-materialize-to-array (:index col-info)))))
 
+(def ^:private long-array-class    (Class/forName "[J"))
+(def ^:private double-array-class  (Class/forName "[D"))
+(def ^:private string-array-class  (Class/forName "[Ljava.lang.String;"))
+
+(defn- alength-any
+  "Length of a typed Java array. Throws on unsupported types so the
+   caller can't silently get nil."
+  ^long [arr]
+  (cond
+    (instance? long-array-class arr)   (alength ^longs arr)
+    (instance? double-array-class arr) (alength ^doubles arr)
+    (instance? string-array-class arr) (alength ^"[Ljava.lang.String;" arr)
+    :else (throw (ex-info "alength-any: unsupported array type"
+                          {:class (class arr)}))))
+
+(defn- copy-prefix
+  "Return a fresh array of the same component type containing the
+   first `n` elements of `arr` (n is clamped to `arr`'s length by
+   the caller via `take-prefix-column`)."
+  [arr ^long n]
+  (cond
+    (instance? long-array-class arr)
+    (java.util.Arrays/copyOfRange ^longs arr 0 (int n))
+    (instance? double-array-class arr)
+    (java.util.Arrays/copyOfRange ^doubles arr 0 (int n))
+    (instance? string-array-class arr)
+    (java.util.Arrays/copyOfRange ^"[Ljava.lang.String;" arr 0 (int n))
+    :else (throw (ex-info "copy-prefix: unsupported array type"
+                          {:class (class arr)}))))
+
+(defn take-prefix-column
+  "Materialize the first `n` rows of a column entry into a heap-array
+   `:data` slot, preserving everything else (`:type`, `:dict`,
+   `:dict-type`). Used by the `LHead` LIMIT-without-ORDER-BY
+   pushdown so a `SELECT * LIMIT N` on a large index touches only the
+   first chunk(s).
+
+   For arrays, copies the prefix via `Arrays/copyOfRange`. For
+   indices, uses `index/idx-materialize-to-array-prefix`. Dict
+   metadata (`:dict`, `:dict-type`) is carried through verbatim — the
+   prefix codes still index into the same dict."
+  [col-info ^long n]
+  (cond
+    ;; Already a raw array (long[] / double[] / String[]).
+    (:data col-info)
+    (let [data (:data col-info)
+          take-n (Math/min n (long (alength-any data)))]
+      (assoc col-info :data (copy-prefix data take-n)))
+
+    ;; Index-backed — fetch only the first N rows.
+    (:index col-info)
+    (assoc col-info :data (index/idx-materialize-to-array-prefix (:index col-info) n))
+
+    :else
+    col-info))
+
 (defn check-memory-budget!
   "Throw if materializing index columns would likely OOM.
    Estimates required bytes from the lengths of *referenced* index
