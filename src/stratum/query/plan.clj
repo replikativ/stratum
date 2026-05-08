@@ -194,8 +194,16 @@
                      :else windowed)
 
           ;; 7. Having
-          having-node (if (seq having)
-                        (ir/->LHaving having windowed)
+          ;; Normalize predicates here so every consumer (planner
+          ;; rewrites, executor, post/apply-having) can rely on the
+          ;; `[col op & args]` shape. `normalize-pred` is idempotent,
+          ;; so we always run it — `prepare-query` does NOT cover
+          ;; HAVING in its `pre-normalized?` flag (only `:where` and
+          ;; `:agg`), and we want the pushdown classifier to read
+          ;; the canonical form unconditionally.
+          having-preds (mapv norm/normalize-pred (or having []))
+          having-node (if (seq having-preds)
+                        (ir/->LHaving having-preds windowed)
                         windowed)
 
           ;; 8. Distinct
@@ -556,7 +564,17 @@
 
    Normalizes the expression with `norm/normalize-expr` so the
    downstream `eval-expr-vectorized` sees `{:op ... :args ...}` form
-   rather than a raw `[:op ...]` vector (which it doesn't accept)."
+   rather than a raw `[:op ...]` vector (which it doesn't accept).
+
+   The target type is `:int64` for group-by expressions: group keys
+   are discrete by definition, the executor's `eval-expr-to-long`
+   path returns `long[]` directly for date-trunc/date-add/extract
+   ops (skipping the `long → double → long` round-trip), and
+   downstream dense group-by accumulators dispatch on the column's
+   `:int64` type for the all-long fast path. Mirrors the legacy
+   block at `q.clj:700-718`. Closes the CB-Q43 perf gap (date-trunc
+   minute group-by was 40× slower under the planner because the
+   `:float64` round-trip blocked the long fast-path)."
   [group-keys]
   (loop [idx 0, new-keys [], mat-nodes []]
     (if (>= idx (count group-keys))
@@ -568,7 +586,7 @@
                 normalized (if (map? gk) gk (norm/normalize-expr gk))]
             (recur (inc idx)
                    (conj new-keys cn)
-                   (conj mat-nodes (ir/->PMaterializeExpr cn normalized :float64 nil)))))))))
+                   (conj mat-nodes (ir/->PMaterializeExpr cn normalized :int64 nil)))))))))
 
 (defn- chain-materialize
   "Chain PMaterializeExpr nodes on top of an input node (innermost first)."
@@ -792,6 +810,50 @@
     (instance? PMaskFilter input)  [(:predicates input) (:input input)]
     :else                          [[] input]))
 
+(def ^:private fused-extract-ops
+  "Subset of single-arg date-extract ops the Java fused path handles
+   (`ColumnOpsExt/fusedExtractCountDenseParallel`). `:day-of-week`
+   uses Hinnant's civil-date arithmetic; the rest are O(1) modular.
+   `:date-trunc` and full timestamps stay on the materialize +
+   dense-group-by path because they don't share the small bounded
+   key space the fast-path assumes."
+  #{:minute :hour :second :day-of-week})
+
+(defn- try-fused-extract-count
+  "Return a `PFusedExtractCount` node if the LGroupBy shape is the
+   canonical 'EXTRACT(unit, col) GROUP BY → COUNT' fused-fast-path
+   shape, else nil. Mirrors the legacy `fused-extract?` gate at
+   `q.clj:680-696`. The expression has already been lifted to a
+   `PMaterializeExpr` by `expr-materialization`, so we walk back
+   through it to the underlying scan and emit the fused operator
+   that absorbs the extraction. Closes the CB-Q19 10× gap."
+  [{:keys [group-keys aggs input]}]
+  (let [[mat-chain inner] (peel-materialize input)
+        [preds scan] (peel-filter-scan inner)]
+    (when (and (= 1 (count group-keys))
+               (= 1 (count mat-chain))
+               (seq aggs)
+               (every? #(= :count (:op %)) aggs)
+               (empty? preds)
+               (or (instance? PScan scan) (instance? PChunkedScan scan)))
+      (let [mat (first mat-chain)
+            gk  (first group-keys)
+            e   (:expr mat)]
+        (when (and (= (:col-name mat) gk)
+                   (map? e)
+                   (contains? fused-extract-ops (:op e))
+                   (= 1 (count (:args e)))
+                   (keyword? (first (:args e))))
+          (let [src-col  (first (:args e))
+                col-info (get (:columns scan) src-col)]
+            (when (and col-info
+                       (or (= :int64 (:type col-info))
+                           (expr/long-array? (:data col-info))))
+              (vary-meta
+               (ir/->PFusedExtractCount (:op e) src-col aggs scan)
+               assoc ::estimated-rows (:length scan)
+               ::selectivity 1.0))))))))
+
 (defn strategy-selection
   "Replace logical nodes with physical nodes based on data characteristics.
 
@@ -817,14 +879,18 @@
                         (assoc phys :input (rechain-materialize mat-chain (:input phys)))
                         phys))
 
-        ;; LGroupBy — same peeling
+        ;; LGroupBy — try fused-extract+count first, otherwise peel
+        ;; the materialize/filter chain and pick a regular strategy.
+        ;; The fused operator absorbs the extraction so the matching
+        ;; PMaterializeExpr is intentionally dropped from the chain.
                     (instance? LGroupBy node)
-                    (let [[mat-chain inner] (peel-materialize (:input node))
-                          [preds scan] (peel-filter-scan inner)
-                          phys (select-group-by-strategy node scan preds)]
-                      (if (seq mat-chain)
-                        (assoc phys :input (rechain-materialize mat-chain (:input phys)))
-                        phys))
+                    (or (try-fused-extract-count node)
+                        (let [[mat-chain inner] (peel-materialize (:input node))
+                              [preds scan] (peel-filter-scan inner)
+                              phys (select-group-by-strategy node scan preds)]
+                          (if (seq mat-chain)
+                            (assoc phys :input (rechain-materialize mat-chain (:input phys)))
+                            phys)))
 
         ;; LJoin
                     (instance? LJoin node)
@@ -1092,16 +1158,41 @@
         (est/estimate-output-rows preds columns child-rows)
         child-rows))
 
-    ;; Joins: FK→PK heuristic
+    ;; Joins: NDV-based cardinality.
+    ;; Output = probe_rows × build_rows / max(probe_ndv, build_ndv)
+    ;; for the (first) join key. Falls back to the FK→PK heuristic
+    ;; (`min(1.0, build_rows/build_total)`) when a side's scan or
+    ;; key column isn't reachable, so multi-key / non-trivial join
+    ;; chains keep producing a sensible number.
     (instance? PHashJoin node)
-    (let [probe-rows (long (or (::estimated-rows (meta (:probe-side node)))
-                               (:length (:probe-side node))
-                               1000000))
+    (let [probe-rows  (long (or (::estimated-rows (meta (:probe-side node)))
+                                (:length (:probe-side node))
+                                1000000))
           build-total (long (or (:length (:build-side node)) 1000000))
-          build-rows (long (or (::estimated-rows (meta (:build-side node)))
-                               build-total))
-          sel (min 1.0 (/ (double build-rows) (max 1.0 (double build-total))))]
-      (max 1 (long (* probe-rows sel))))
+          build-rows  (long (or (::estimated-rows (meta (:build-side node)))
+                                build-total))
+          [probe-key build-key] (first (:on-pairs node))
+          probe-scan (let [n (:probe-side node)]
+                       (cond (instance? PScan n) n
+                             (instance? PChunkedScan n) n
+                             (instance? PSIMDFilter n) (:input n)
+                             (instance? PMaskFilter n) (:input n)
+                             :else nil))
+          build-scan (let [n (:build-side node)]
+                       (cond (instance? PScan n) n
+                             (instance? PChunkedScan n) n
+                             (instance? PSIMDFilter n) (:input n)
+                             (instance? PMaskFilter n) (:input n)
+                             :else nil))
+          probe-col (when probe-scan (get-in probe-scan [:columns probe-key]))
+          build-col (when build-scan (get-in build-scan [:columns build-key]))
+          probe-ndv (when probe-col (est/estimate-ndv probe-col probe-rows))
+          build-ndv (when build-col (est/estimate-ndv build-col build-rows))]
+      (if (and probe-ndv build-ndv)
+        (max 1 (long (/ (* (double probe-rows) (double build-rows))
+                        (double (max (long probe-ndv) (long build-ndv))))))
+        (let [sel (min 1.0 (/ (double build-rows) (max 1.0 (double build-total))))]
+          (max 1 (long (* probe-rows sel))))))
 
     ;; Global agg always produces 1 row
     (or (instance? PStatsOnlyAgg node)
@@ -1373,11 +1464,10 @@
        (let [proj    (:input node)
              win     (:input proj)
              items   (:items proj)
-             ;; LHaving carries the user's raw predicates; normalize
-             ;; before classifying columns since `pred-columns`
-             ;; expects `[col op & args]` shape.
-             preds        (:predicates node)
-             norm-preds   (mapv norm/normalize-pred preds)
+             ;; LHaving's `:predicates` are already normalized at
+             ;; `build-logical-plan` time, so `pred-columns` can read
+             ;; them directly.
+             preds   (:predicates node)
              ;; Only push when project is trivial (no expr items)
              simple? (every? (fn [it]
                                (and (:ref it)
@@ -1391,15 +1481,11 @@
                           (instance? LFilter n) (recur (:input n))
                           :else                 #{}))
              visible  (clojure.set/union win-out win-in)
-             pred-cols (mapcat pred-columns norm-preds)
+             pred-cols (mapcat pred-columns preds)
              refs-window? (some win-out pred-cols)
              refs-only-visible?
              (every? #(contains? visible %) pred-cols)]
          (if (and simple? refs-window? refs-only-visible?)
-           ;; Keep the original (un-normalized) preds on `LHaving` so
-           ;; the executor's standard normalization runs once. The
-           ;; classification above only needed normalized columns,
-           ;; not normalized storage.
            (ir/->LProject items
                           (ir/->LHaving preds win))
            node))

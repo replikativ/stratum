@@ -33,7 +33,7 @@
             PFusedExtractCount PBitmapSemiJoin PHashJoin
             PPerfectHashJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
             PProject PWindow PHaving PSort PDistinct PLimit
-            PMaterializeExpr LTopN]
+            PMaterializeExpr LTopN LSetOp]
            [stratum.internal ColumnOps ColumnOpsExt ColumnOpsAnalytics]))
 
 (set! *warn-on-reflection* true)
@@ -407,6 +407,70 @@
   ;; Same as dense — execute-group-by internally decides dense vs hash
   (execute-dense-group-by node columnar?))
 
+(defn- execute-fused-extract-count
+  "Run the fused EXTRACT(unit, col) GROUP BY → COUNT operator. The
+   planner emits this when a `LGroupBy` over a single
+   `PMaterializeExpr {:op #{:minute :hour :second :day-of-week}}`
+   has only `:count` aggs and no filter. We pull the source column
+   straight from the scan (skipping the materialization), call
+   `ColumnOpsExt/fusedExtractCountDenseParallel`, then decode the
+   per-key accumulator array into row maps or columnar output. The
+   decode mirrors the legacy block at `q.clj:858-908`."
+  [node columnar?]
+  (let [scan-ctx  (execute-node (:input node))
+        col-key   (:extract-col node)
+        col-info  (get (:columns scan-ctx) col-key)
+        ;; Long-typed source — either a materialized array or an
+        ;; index that we materialize once. The planner's eligibility
+        ;; gate guarantees the column is :int64.
+        ^longs raw-col (or (:data col-info)
+                           (when-let [idx (:index col-info)]
+                             (index/idx-materialize-to-array idx)))
+        op       (:extract-op node)
+        op-const (case op
+                   :minute      ColumnOpsExt/EXTRACT_MINUTE
+                   :hour        ColumnOpsExt/EXTRACT_HOUR
+                   :second      ColumnOpsExt/EXTRACT_SECOND
+                   :day-of-week ColumnOpsExt/EXTRACT_DAY_OF_WEEK)
+        aggs     (:aggs node)
+        n-aggs   (int (count aggs))
+        length   (long (or (:length scan-ctx) (alength raw-col)))
+        ^"[[D" result-array
+        (ColumnOpsExt/fusedExtractCountDenseParallel
+         raw-col (int op-const) n-aggs (int length))
+        max-key  (int (ColumnOpsExt/extractMaxKey (int op-const)))
+        group-col-name (keyword (name op))
+        agg-aliases    (mapv #(or (:as %) (:op %)) aggs)]
+    (if columnar?
+      (let [key-list (java.util.ArrayList.)
+            _ (dotimes [k max-key]
+                (let [^doubles accs (aget result-array k)]
+                  (when (and accs (> (aget accs 1) 0.0))
+                    (.add key-list (long k)))))
+            n        (.size key-list)
+            keys-arr (long-array n)
+            _        (dotimes [i n] (aset keys-arr i (long (.get key-list i))))
+            agg-arrs (mapv (fn [_a-idx]
+                             (let [la (long-array n)]
+                               (dotimes [i n]
+                                 (let [k (long (.get key-list i))
+                                       ^doubles accs (aget result-array (int k))]
+                                   (aset la i (long (aget accs 1)))))
+                               la))
+                           (range n-aggs))]
+        (-> {group-col-name keys-arr :n-rows n}
+            (into (map vector agg-aliases agg-arrs))))
+      (let [results (transient [])]
+        (dotimes [k max-key]
+          (let [^doubles accs (aget result-array k)]
+            (when (and accs (> (aget accs 1) 0.0))
+              (let [cnt (long (aget accs 1))
+                    row (-> {group-col-name (long k)}
+                            (into (map (fn [a] [a cnt]) agg-aliases))
+                            (assoc :_count cnt))]
+                (conj! results row)))))
+        (persistent! results)))))
+
 ;; --- Mask realization -------------------------------------------------------
 
 (defn- realize-mask
@@ -597,10 +661,19 @@
         length  (ctx-length ctx)
         mat-cols (cols/materialize-columns columns)
         col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)
-        cache (java.util.HashMap.)
-        arr (expr/eval-expr-vectorized (:expr node) col-arrays length cache)]
+        cache  (java.util.HashMap.)
+        target (or (:target node) :float64)
+        ;; `:int64` target → use `eval-expr-to-long` so date-trunc /
+        ;; date-add / extract ops emit a `long[]` directly. The
+        ;; alternative (`eval-expr-vectorized` then double→long
+        ;; cast) blocks the dense group-by all-long fast path and
+        ;; reintroduces the round-trip the legacy code already
+        ;; eliminated. Mirrors `q.clj:712-718`.
+        arr (if (= target :int64)
+              (expr/eval-expr-to-long (:expr node) col-arrays length cache)
+              (expr/eval-expr-vectorized (:expr node) col-arrays length cache))]
     (assoc ctx :columns (assoc mat-cols (:col-name node)
-                               {:type (or (:target node) :float64) :data arr}))))
+                               {:type target :data arr}))))
 
 ;; --- Top-N pushdown ---------------------------------------------------------
 
@@ -677,11 +750,12 @@
    `PWindow` immediately below). Evaluates each predicate on the raw
    column arrays, gathers only the surviving rows, and returns a new
    column context the parent `PProject` can finish materializing.
-   Mirrors the legacy `q` window-having pushdown."
+   Mirrors the legacy `q` window-having pushdown.
+   `preds` are already normalized (by `build-logical-plan`)."
   [ctx preds]
   (let [length  (long (:length ctx))
         columns (:columns ctx)
-        normalized (mapv norm/normalize-pred preds)
+        normalized preds
         matches (java.util.ArrayList.)]
     (dotimes [i (int length)]
       (when (every? #(having-pred-matches? columns i %) normalized)
@@ -767,7 +841,7 @@
      (instance? PChunkedDenseGroupBy node) (execute-chunked-dense-group-by node columnar?)
      (instance? PDenseGroupBy node)        (execute-dense-group-by node columnar?)
      (instance? PHashGroupBy node)         (execute-hash-group-by node columnar?)
-     (instance? PFusedExtractCount node)   (throw (ex-info "TODO: PFusedExtractCount" {}))
+     (instance? PFusedExtractCount node)   (execute-fused-extract-count node columnar?)
 
      ;; Join
      (instance? PHashJoin node)             (execute-hash-join node)
@@ -782,6 +856,30 @@
      ;; Top-N pushdown — LTopN is recognized directly (no separate
      ;; physical record) and dispatched to the streaming primitive.
      (instance? LTopN node) (execute-top-n-node node)
+
+     ;; Set ops — UNION/INTERSECT/EXCEPT. The runtime path in
+     ;; `stratum.query/q` short-circuits these before the planner
+     ;; runs, but `compile-physical` / `explain-query` callers can
+     ;; still hand us an `LSetOp`. Recurse via `q` so each
+     ;; sub-query goes through its own planner pass and the result
+     ;; combination matches the legacy semantics in `q.clj:372–386`.
+     (instance? LSetOp node)
+     (let [q-fn @(requiring-resolve 'stratum.query/q)
+           sub-results (mapv q-fn (:queries node))]
+       (case (:op node)
+         :union
+         (let [combined (vec (apply concat sub-results))]
+           (if (:all? node)
+             combined
+             (vec (clojure.core/distinct combined))))
+         :intersect
+         (let [first-r (set (first sub-results))]
+           (vec (reduce #(clojure.set/intersection %1 (set %2))
+                        first-r (rest sub-results))))
+         :except
+         (let [first-r (first sub-results)
+               to-remove (reduce (fn [acc r] (into acc r)) #{} (rest sub-results))]
+           (vec (remove to-remove first-r)))))
 
      ;; Projection
      (instance? PProject node)  (execute-project node columnar?)

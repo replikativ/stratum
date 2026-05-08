@@ -102,6 +102,38 @@
                 frac (if (zero? range-size) 0.5 (/ (- mx threshold) range-size))]
             (recur (next es) full-pass (+ partial-est (* (double cnt) frac)) (+ total cnt))))))))
 
+(defn- zone-map-estimate-gte
+  "Estimate selectivity of (col >= threshold) from chunk stats.
+   Differs from `zone-map-estimate-gt` only at the chunk-boundary
+   tests, which use inclusive bounds. Required for floats — the
+   `:gt (threshold-1)` reduction the planner used previously
+   over-estimated when `mn` fell strictly between `threshold-1`
+   and `threshold` (e.g. `mn=4.5, threshold=5.0`)."
+  ^double [chunk-entries ^double threshold]
+  (loop [es (seq chunk-entries)
+         full-pass (long 0)
+         partial-est 0.0
+         total (long 0)]
+    (if-not es
+      (if (zero? total) 0.5
+          (/ (+ (double full-pass) partial-est) (double total)))
+      (let [^ChunkEntry e (first es)
+            ^ChunkStats s (.stats e)
+            cnt (long (:count s))
+            mn (double (:min-val s))
+            mx (double (:max-val s))]
+        (cond
+          (>= mn threshold)
+          (recur (next es) (+ full-pass cnt) partial-est (+ total cnt))
+
+          (< mx threshold)
+          (recur (next es) full-pass partial-est (+ total cnt))
+
+          :else
+          (let [range-size (- mx mn)
+                frac (if (zero? range-size) 0.5 (/ (- mx threshold) range-size))]
+            (recur (next es) full-pass (+ partial-est (* (double cnt) frac)) (+ total cnt))))))))
+
 (defn- zone-map-estimate-lt
   "Estimate selectivity of (col < threshold) from chunk stats."
   ^double [chunk-entries ^double threshold]
@@ -122,6 +154,34 @@
           (recur (next es) (+ full-pass cnt) partial-est (+ total cnt))
 
           (>= mn threshold)
+          (recur (next es) full-pass partial-est (+ total cnt))
+
+          :else
+          (let [range-size (- mx mn)
+                frac (if (zero? range-size) 0.5 (/ (- threshold mn) range-size))]
+            (recur (next es) full-pass (+ partial-est (* (double cnt) frac)) (+ total cnt))))))))
+
+(defn- zone-map-estimate-lte
+  "Estimate selectivity of (col <= threshold) from chunk stats —
+   inclusive-upper variant of `zone-map-estimate-lt`."
+  ^double [chunk-entries ^double threshold]
+  (loop [es (seq chunk-entries)
+         full-pass (long 0)
+         partial-est 0.0
+         total (long 0)]
+    (if-not es
+      (if (zero? total) 0.5
+          (/ (+ (double full-pass) partial-est) (double total)))
+      (let [^ChunkEntry e (first es)
+            ^ChunkStats s (.stats e)
+            cnt (long (:count s))
+            mn (double (:min-val s))
+            mx (double (:max-val s))]
+        (cond
+          (<= mx threshold)
+          (recur (next es) (+ full-pass cnt) partial-est (+ total cnt))
+
+          (> mn threshold)
           (recur (next es) full-pass partial-est (+ total cnt))
 
           :else
@@ -204,10 +264,10 @@
         (let [op (second pred)
               args (subvec pred 2)]
           (case op
-            :gt  (zone-map-estimate-gt entries (double (first args)))
-            :gte (zone-map-estimate-gt entries (dec (double (first args))))
-            :lt  (zone-map-estimate-lt entries (double (first args)))
-            :lte (zone-map-estimate-lt entries (inc (double (first args))))
+            :gt  (zone-map-estimate-gt  entries (double (first args)))
+            :gte (zone-map-estimate-gte entries (double (first args)))
+            :lt  (zone-map-estimate-lt  entries (double (first args)))
+            :lte (zone-map-estimate-lte entries (double (first args)))
             :eq  (zone-map-estimate-eq entries (double (first args)))
             :neq (- 1.0 (zone-map-estimate-eq entries (double (first args))))
             :range (zone-map-estimate-range entries
@@ -339,6 +399,112 @@
           (eval-pred-on-sample pred sample))))))
 
 ;; ============================================================================
+;; Tier 2b: String-predicate sampling
+;; ============================================================================
+
+(def ^:private ^:const MAX_DICT_SAMPLE 256)
+
+(def ^:private string-array-class
+  (Class/forName "[Ljava.lang.String;"))
+
+(defn- like->regex
+  "Compile a SQL `LIKE` pattern to a `java.util.regex.Pattern`. `%`
+   is `.*`, `_` is `.`, every other regex metacharacter is quoted.
+   `Pattern/DOTALL` so `.` covers embedded newlines."
+  ^java.util.regex.Pattern [^String pat]
+  (let [sb (StringBuilder.)
+        n  (.length pat)]
+    (loop [i 0]
+      (if (>= i n)
+        (java.util.regex.Pattern/compile (.toString sb)
+                                         java.util.regex.Pattern/DOTALL)
+        (let [c (.charAt pat i)]
+          (case c
+            \% (.append sb ".*")
+            \_ (.append sb ".")
+            (do (when (or (= c \\) (= c \.) (= c \()
+                          (= c \)) (= c \[) (= c \])
+                          (= c \{) (= c \}) (= c \^)
+                          (= c \$) (= c \|) (= c \?)
+                          (= c \*) (= c \+))
+                  (.append sb \\))
+                (.append sb c)))
+          (recur (inc i)))))))
+
+(defn- compile-string-matcher
+  "Return a `(fn [^String s])` that returns true if the row passes
+   the string predicate. Returns nil for unsupported ops or arg
+   shapes — the caller falls back to heuristic selectivity."
+  [op args]
+  (when (= 1 (count args))
+    (let [pat (first args)]
+      (when (string? pat)
+        (case op
+          :contains    (fn [^String s] (and s (.contains    s ^String pat)))
+          :starts-with (fn [^String s] (and s (.startsWith  s ^String pat)))
+          :ends-with   (fn [^String s] (and s (.endsWith    s ^String pat)))
+          :like        (let [re (like->regex pat)]
+                         (fn [^String s] (and s (.matches (.matcher re s)))))
+          :not-like    (let [re (like->regex pat)]
+                         (fn [^String s] (or (nil? s)
+                                             (not (.matches (.matcher re s))))))
+          :ilike       (let [re (like->regex (.toLowerCase ^String pat))]
+                         (fn [^String s] (and s (.matches (.matcher re (.toLowerCase s))))))
+          :not-ilike   (let [re (like->regex (.toLowerCase ^String pat))]
+                         (fn [^String s] (or (nil? s)
+                                             (not (.matches (.matcher re (.toLowerCase s)))))))
+          nil)))))
+
+(defn- string-sample
+  "Return up to `MAX_DICT_SAMPLE` strings from a column. Prefers the
+   dict (one entry per distinct value, faster + more representative
+   for high-cardinality columns) and falls back to the raw `String[]`
+   data otherwise."
+  ^java.util.ArrayList [col-info]
+  (let [^"[Ljava.lang.String;" src
+        (cond
+          (instance? string-array-class (:dict col-info)) (:dict col-info)
+          (instance? string-array-class (:data col-info)) (:data col-info)
+          :else nil)]
+    (when src
+      (let [n      (alength src)
+            k      (min n (long MAX_DICT_SAMPLE))
+            stride (max 1 (quot n k))
+            result (java.util.ArrayList. (int k))]
+        (loop [i 0]
+          (when (and (< i n) (< (.size result) (int k)))
+            (.add result (aget src i))
+            (recur (+ i stride))))
+        result))))
+
+(defn- string-sample-estimate
+  "Estimate selectivity for a string predicate (`:like`, `:ilike`,
+   `:contains`, `:starts-with`, `:ends-with`, plus their negations)
+   by applying the matcher to a sample of the column's distinct
+   string values. For a dict-encoded column the dict IS the set of
+   distinct values, so the rate maps directly to row selectivity
+   under a uniform-frequency assumption — a much better default
+   than the 0.05 / 0.10 heuristic. Returns nil for unsupported
+   shapes."
+  [pred col-info]
+  (let [op   (second pred)
+        args (subvec (vec pred) 2)]
+    (when-let [matcher (compile-string-matcher op args)]
+      (when-let [sample (string-sample col-info)]
+        (let [n (.size sample)]
+          (when (pos? n)
+            (let [hits
+                  (loop [i 0, h 0]
+                    (if (>= i n)
+                      h
+                      (recur (inc i)
+                             (if (matcher (.get sample i)) (inc h) h))))]
+              ;; Clamp to keep DP cost-comparisons from collapsing
+              ;; on "no hits in sample" — rare events still cost
+              ;; *something*.
+              (max 0.001 (min 1.0 (/ (double hits) (double n)))))))))))
+
+;; ============================================================================
 ;; Tier 3: Heuristic fallback
 ;; ============================================================================
 
@@ -372,9 +538,10 @@
         (if-not col-info
           ;; Unknown column (expression pred, cross-side, etc.) — heuristic
           (heuristic-estimate pred)
-          ;; Try zone-map ��� sample → heuristic
+          ;; Try zone-map → numeric sample → string sample → heuristic
           (or (zone-map-estimate pred col-info)
               (sample-estimate pred col-info)
+              (string-sample-estimate pred col-info)
               (heuristic-estimate pred)))))))
 
 (defn estimate-all-selectivities
@@ -397,3 +564,54 @@
    Returns a long >= 1 (clamped to at least 1 to avoid division by zero)."
   ^long [preds columns ^long length]
   (max 1 (long (* (estimate-combined-selectivity preds columns) length))))
+
+;; ============================================================================
+;; Cardinality / NDV
+;; ============================================================================
+
+(defn- ndv-from-chunk-stats
+  "Approximate distinct count for an int-typed indexed column from
+   `min`/`max` across all chunks. Uses `min(length, max-min+1)`,
+   the same identity zone-map-estimate-eq relies on for inclusive
+   integer ranges. Returns nil when no chunk entries are available
+   (e.g. the index hasn't been built yet)."
+  [idx ^long length]
+  (let [entries (seq (gb/collect-chunk-entries idx))]
+    (when entries
+      (loop [es entries, mn Long/MAX_VALUE, mx Long/MIN_VALUE]
+        (if-not es
+          (when (<= mn mx)
+            (max 1 (min length (inc (- mx mn)))))
+          (let [^ChunkEntry e (first es)
+                ^ChunkStats s (.stats e)
+                cmn (long (:min-val s))
+                cmx (long (:max-val s))]
+            (recur (next es) (min mn cmn) (max mx cmx))))))))
+
+(defn estimate-ndv
+  "Approximate the number of distinct values in a column. Used by
+   join cardinality and other planner cost estimates that need
+   `count_distinct(col)`. Returns a positive long.
+
+   Heuristics, in order:
+   - Dict-encoded string column: dict length (exact upper bound on
+     distinct row values; may exceed actual NDV when not every
+     dict entry is referenced).
+   - Indexed int64 column: `min(length, max-min+1)` from chunk
+     stats — exact for densely-populated ranges, an upper bound
+     elsewhere.
+   - Otherwise: `max(1, length/10)` — the legacy heuristic, kept
+     as a backstop so unknown columns don't collapse cardinality
+     to zero."
+  ^long [col-info ^long length]
+  (cond
+    (instance? string-array-class (:dict col-info))
+    (max 1 (alength ^"[Ljava.lang.String;" (:dict col-info)))
+
+    (and (:index col-info)
+         (or (= :int64 (:type col-info)) (nil? (:type col-info))))
+    (or (ndv-from-chunk-stats (:index col-info) length)
+        (max 1 (quot length 10)))
+
+    :else
+    (max 1 (quot length 10))))

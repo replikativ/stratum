@@ -121,8 +121,39 @@
    :not=    :neq
    :between :between})
 
+(def ^:private all-pred-op-keywords
+  "Every keyword that can appear in either slot 0 (raw user form) or
+   slot 1 (normalized internal form) of a predicate vector. Used by
+   `normalized-pred?` to decide whether `normalize-pred` would be a
+   no-op on its input. Keep in sync with the cond branches below."
+  #{:< :> :<= :>= := :== :!= :not= :between
+    :lt :gt :lte :gte :eq :neq :range :not-range
+    :in :not-in :like :not-like :ilike :not-ilike
+    :contains :starts-with :ends-with :is-null :is-not-null
+    :or :and :not :fn :__or})
+
+(defn- normalized-pred?
+  "True iff `pred` is already in normalized `[col op & args]` form.
+   Slot 1 must be a known op keyword AND slot 0 must be either a
+   column keyword (not itself an op), a map (expression LHS), or
+   the synthetic `:__or` head."
+  [pred]
+  (and (vector? pred)
+       (>= (count pred) 2)
+       (let [head (first pred)
+             op   (second pred)]
+         (and (keyword? op)
+              (contains? all-pred-op-keywords op)
+              (or (and (keyword? head) (not (contains? all-pred-op-keywords head)))
+                  (map? head)
+                  (= :__or head))))))
+
 (defn normalize-pred
   "Normalize a predicate to internal form [col-name op & args].
+
+   Idempotent: a predicate already in `[col op & args]` shape (slot 1
+   is a known op, slot 0 is a column / expression LHS) is returned
+   unchanged. Callers can therefore re-normalize freely.
 
    Accepts both keyword operators (Stratum-style) and symbol operators
    (Datahike/Datomic-style):
@@ -135,91 +166,93 @@
      [:or pred1 pred2 ...]      → [:__or :or pred1 pred2 ...]
      [:in :col 1 2 3]           → [:col :in #{1 2 3}]"
   [pred]
-  (let [items  (vec pred)
-        items  (if (and (>= (count items) 2) (keyword? (second items)))
-                 (assoc items 1 (strip-ns (second items)))
-                 items)
-        op-raw (first items)]
-    (cond
-      (or (= :or op-raw) (= 'or op-raw))
-      (into [:__or :or] (mapv normalize-pred (subvec items 1)))
+  (if (normalized-pred? pred)
+    pred
+    (let [items  (vec pred)
+          items  (if (and (>= (count items) 2) (keyword? (second items)))
+                   (assoc items 1 (strip-ns (second items)))
+                   items)
+          op-raw (first items)]
+      (cond
+        (or (= :or op-raw) (= 'or op-raw))
+        (into [:__or :or] (mapv normalize-pred (subvec items 1)))
 
-      (or (= :not op-raw) (= 'not op-raw))
-      (let [inner      (normalize-pred (second items))
-            inner-col  (first inner)
-            inner-op   (second inner)
-            negated-op (case inner-op
-                         :lt          :gte
-                         :gt          :lte
-                         :lte         :gt
-                         :gte         :lt
-                         :eq          :neq
-                         :neq         :eq
-                         :range       :not-range
-                         :not-range   :range
-                         :in          :not-in
-                         :not-in      :in
-                         :like        :not-like
-                         :not-like    :like
-                         :ilike       :not-ilike
-                         :not-ilike   :ilike
-                         :is-null     :is-not-null
-                         :is-not-null :is-null
-                         (throw (ex-info (str "Cannot negate op: " inner-op) {:pred pred})))]
-        (into [inner-col negated-op] (subvec inner 2)))
+        (or (= :not op-raw) (= 'not op-raw))
+        (let [inner      (normalize-pred (second items))
+              inner-col  (first inner)
+              inner-op   (second inner)
+              negated-op (case inner-op
+                           :lt          :gte
+                           :gt          :lte
+                           :lte         :gt
+                           :gte         :lt
+                           :eq          :neq
+                           :neq         :eq
+                           :range       :not-range
+                           :not-range   :range
+                           :in          :not-in
+                           :not-in      :in
+                           :like        :not-like
+                           :not-like    :like
+                           :ilike       :not-ilike
+                           :not-ilike   :ilike
+                           :is-null     :is-not-null
+                           :is-not-null :is-null
+                           (throw (ex-info (str "Cannot negate op: " inner-op) {:pred pred})))]
+          (into [inner-col negated-op] (subvec inner 2)))
 
-      (or (= :in op-raw) (= 'in op-raw))
-      (let [col      (second items)
-            raw-vals (subvec items 2)
-            vals     (if (every? number? raw-vals)
-                       (set (mapv double raw-vals))
-                       (set raw-vals))]
-        [col :in vals])
+        (or (= :in op-raw) (= 'in op-raw))
+        (let [col      (second items)
+              raw-vals (subvec items 2)
+              vals     (if (every? number? raw-vals)
+                         (set (mapv double raw-vals))
+                         (set raw-vals))]
+          [col :in vals])
 
-      (or (= :not-in op-raw) (= 'not-in op-raw))
-      (let [col      (second items)
-            raw-vals (subvec items 2)
-            vals     (if (every? number? raw-vals)
-                       (set (mapv double raw-vals))
-                       (set raw-vals))]
-        [col :not-in vals])
+        (or (= :not-in op-raw) (= 'not-in op-raw))
+        (let [col      (second items)
+              raw-vals (subvec items 2)
+              vals     (if (every? number? raw-vals)
+                         (set (mapv double raw-vals))
+                         (set raw-vals))]
+          [col :not-in vals])
 
-      (or (= :is-null op-raw)     (= 'is-null op-raw))     [(second items) :is-null]
-      (or (= :is-not-null op-raw) (= 'is-not-null op-raw)) [(second items) :is-not-null]
-      (or (= :like op-raw)        (= 'like op-raw))        [(second items) :like     (nth items 2)]
-      (or (= :not-like op-raw)    (= 'not-like op-raw))    [(second items) :not-like (nth items 2)]
-      (or (= :ilike op-raw)       (= 'ilike op-raw))       [(second items) :ilike    (nth items 2)]
-      (or (= :not-ilike op-raw)   (= 'not-ilike op-raw))   [(second items) :not-ilike (nth items 2)]
-      (or (= :contains op-raw)    (= 'contains op-raw))    [(second items) :contains   (nth items 2)]
-      (or (= :starts-with op-raw) (= 'starts-with op-raw)) [(second items) :starts-with (nth items 2)]
-      (or (= :ends-with op-raw)   (= 'ends-with op-raw))   [(second items) :ends-with   (nth items 2)]
+        (or (= :is-null op-raw)     (= 'is-null op-raw))     [(second items) :is-null]
+        (or (= :is-not-null op-raw) (= 'is-not-null op-raw)) [(second items) :is-not-null]
+        (or (= :like op-raw)        (= 'like op-raw))        [(second items) :like     (nth items 2)]
+        (or (= :not-like op-raw)    (= 'not-like op-raw))    [(second items) :not-like (nth items 2)]
+        (or (= :ilike op-raw)       (= 'ilike op-raw))       [(second items) :ilike    (nth items 2)]
+        (or (= :not-ilike op-raw)   (= 'not-ilike op-raw))   [(second items) :not-ilike (nth items 2)]
+        (or (= :contains op-raw)    (= 'contains op-raw))    [(second items) :contains   (nth items 2)]
+        (or (= :starts-with op-raw) (= 'starts-with op-raw)) [(second items) :starts-with (nth items 2)]
+        (or (= :ends-with op-raw)   (= 'ends-with op-raw))   [(second items) :ends-with   (nth items 2)]
 
       ;; Function predicate: [:fn :col f] → [:col :fn f]
       ;; f is (fn [^long value] boolean) applied per row on the column value.
-      (or (= :fn op-raw) (= 'fn op-raw))
-      [(strip-ns (second items)) :fn (nth items 2)]
+        (or (= :fn op-raw) (= 'fn op-raw))
+        [(strip-ns (second items)) :fn (nth items 2)]
 
-      (keyword? op-raw)
-      (let [op   (get keyword->pred-op op-raw op-raw)
-            col  (second items)
-            args (subvec items 2)]
-        (if (= op :between)
-          (into [(if (sequential? col) (normalize-expr col) col) :range] args)
-          (into [(if (sequential? col) (normalize-expr col) col) op] args)))
+        (keyword? op-raw)
+        (let [op   (get keyword->pred-op op-raw op-raw)
+              col  (second items)
+              args (subvec items 2)]
+          (if (= op :between)
+            (into [(if (sequential? col) (normalize-expr col) col) :range] args)
+            (into [(if (sequential? col) (normalize-expr col) col) op] args)))
 
-      (symbol? op-raw)
-      (let [op   (get symbol->pred-op op-raw)
-            col  (second items)
-            args (subvec items 2)]
-        (when-not op
-          (throw (ex-info (str "Unknown predicate operator: " op-raw)
-                          {:op op-raw :pred pred})))
-        (if (= op :between)
-          (into [(if (sequential? col) (normalize-expr col) col) :range] args)
-          (into [(if (sequential? col) (normalize-expr col) col) op] args)))
+        (symbol? op-raw)
+        (let [op   (get symbol->pred-op op-raw)
+              col  (second items)
+              args (subvec items 2)]
+          (when-not op
+            (throw (ex-info (str "Unknown predicate operator: " op-raw)
+                            {:op op-raw :pred pred})))
+          (if (= op :between)
+            (into [(if (sequential? col) (normalize-expr col) col) :range] args)
+            (into [(if (sequential? col) (normalize-expr col) col) op] args)))
 
-      :else
-      (throw (ex-info (str "Invalid predicate format: " pred) {:pred pred})))))
+        :else
+        (throw (ex-info (str "Invalid predicate format: " pred) {:pred pred}))))))
 
 ;; ============================================================================
 ;; Aggregation normalization
