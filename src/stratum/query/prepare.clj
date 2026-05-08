@@ -130,9 +130,12 @@
       [simd-preds columns])))
 
 (defn- pre-materialize-string-group-agg-exprs
-  "Pass 5a: lift string-producing expressions out of GROUP BY and
-   aggregate slots into dict-encoded temp columns. Mirrors the legacy
-   `expr/materialize-string-exprs` call in `q`."
+  "Pass 5a (no-join eager path): lift string-producing expressions
+   out of GROUP BY and aggregate slots into dict-encoded temp
+   columns. Mirrors the legacy `expr/materialize-string-exprs`
+   call in `q`. Used only when no join is present — see
+   `string-expr-spec-group-agg` for the deferred (post-join)
+   counterpart."
   [group aggs select columns length]
   (let [has-string-expr?
         (or (some #(and (sequential? %)
@@ -146,10 +149,10 @@
       [group aggs select columns])))
 
 (defn- normalize-and-materialize-select-items
-  "Pass 5b: normalize SELECT items via x/normalize-select-item, then
-   lift any `:expr` slot whose normalized expression is
-   string-producing into a dict-encoded temp column. Mirrors the
-   legacy block at q.clj:722-740."
+  "Pass 5b (no-join eager path): normalize SELECT items via
+   `x/normalize-select-item`, then lift any `:expr` slot whose
+   normalized expression is string-producing into a dict-encoded
+   temp column. Mirrors the legacy block at q.clj:722-740."
   [select columns length]
   (when (seq select)
     (let [items (vec (map-indexed #(x/normalize-select-item %2 %1) select))
@@ -169,6 +172,80 @@
                   [[] columns]
                   items))
         [items columns]))))
+
+;; ============================================================================
+;; Static string-expr lowering (deferred materialization for join queries)
+;; ============================================================================
+;;
+;; When a join is present we can't run `eval-string-expr` here — it would
+;; size the materialized column to the pre-join row count, breaking after
+;; the join. The two functions below mirror the eager passes above but
+;; only REWRITE the slots and emit a runtime spec; the actual evaluation
+;; happens at `LStringMaterialize` execute time, with a post-join column
+;; ctx in scope.
+;;
+;; Spec items have the shape `{:col-name kw :expr normalized-expr}` and
+;; the synthetic name is `__str_expr_N` for both group/agg and select
+;; sources (a single counter is threaded through so names don't collide).
+
+(defn- string-expr-spec-group-agg
+  "Walk `:group` and `:agg :expr` slots for string-producing expressions,
+   replace each with a fresh `__str_expr_N` keyword and emit the matching
+   `{:col-name :expr}` spec entry. Returns
+   `{:group :aggs :select :items :next-counter}`. `select` is passed
+   through unchanged — pass 5b's own deferred variant handles SELECT
+   string exprs."
+  [group aggs select start-counter]
+  (let [counter (atom (long (or start-counter 0)))
+        items   (java.util.ArrayList.)
+        synth   (fn [expr]
+                  (swap! counter inc)
+                  (let [col-name (keyword (str "__str_expr_" @counter))]
+                    (.add items {:col-name col-name :expr expr})
+                    col-name))
+        new-group (mapv (fn [g]
+                          (if (keyword? g)
+                            g
+                            (let [norm-g (norm/normalize-expr (vec g))]
+                              (if (expr/string-producing-expr? norm-g)
+                                (synth norm-g)
+                                g))))
+                        group)
+        new-aggs  (mapv (fn [agg]
+                          (if-let [e (:expr agg)]
+                            (if (expr/string-producing-expr? e)
+                              (-> agg (dissoc :expr) (assoc :col (synth e)))
+                              agg)
+                            agg))
+                        aggs)]
+    {:group         new-group
+     :aggs          new-aggs
+     :select        select
+     :items         (vec items)
+     :next-counter  @counter}))
+
+(defn- string-expr-spec-select
+  "Walk normalized SELECT items for `:expr` slots whose expression is
+   string-producing, replace each with a `:ref` to a synthetic
+   `__str_expr_N` column, and emit the matching spec entry. Reuses
+   the counter from `string-expr-spec-group-agg` so names stay unique
+   across both passes."
+  [select-items start-counter]
+  (when (seq select-items)
+    (let [counter (atom (long (or start-counter 0)))
+          items   (java.util.ArrayList.)
+          new-items
+          (mapv (fn [sel]
+                  (if (and (:expr sel) (expr/string-producing-expr? (:expr sel)))
+                    (let [n        (swap! counter inc)
+                          col-name (keyword (str "__str_expr_" n))]
+                      (.add items {:col-name col-name :expr (:expr sel)})
+                      (-> sel (dissoc :expr) (assoc :ref col-name)))
+                    sel))
+                select-items)]
+      {:select       new-items
+       :items        (vec items)
+       :next-counter @counter})))
 
 (defn prepare-query
   "Lower `query` against `columns` (length=`length`) into engine-ready
@@ -207,20 +284,42 @@
         [preds columns] (if has-join?
                           [preds columns]
                           (compile-non-simd-preds-to-mask preds columns length))
-        [group aggs select columns]
-        (pre-materialize-string-group-agg-exprs group aggs select columns length)
-        ;; Normalize select items + lift string-producing :expr items
-        ;; into temp columns.
-        [select-items columns]
-        (let [r (normalize-and-materialize-select-items select columns length)]
-          (or r [nil columns]))
+        ;; Pass 5a — string-producing exprs in :group / aggs :expr.
+        ;; No-join: materialize eagerly into `columns` (legacy
+        ;; behaviour). Join: emit a deferred spec; the planner
+        ;; inserts an `LStringMaterialize` node post-join and the
+        ;; executor evaluates against the joined column ctx.
+        [group aggs select columns string-items-1]
+        (if has-join?
+          (let [{:keys [group aggs select items]}
+                (string-expr-spec-group-agg group aggs select 0)]
+            [group aggs select columns items])
+          (let [[g a s c] (pre-materialize-string-group-agg-exprs
+                           group aggs select columns length)]
+            [g a s c nil]))
+        ;; Pass 5b — string-producing :expr items in SELECT.
+        ;; Same split: eager when no join, deferred otherwise.
+        [select-items columns string-items-2]
+        (if has-join?
+          (let [normalized (when (seq select)
+                             (vec (map-indexed #(x/normalize-select-item %2 %1) select)))]
+            (if-let [{:keys [select items]}
+                     (string-expr-spec-select normalized (count string-items-1))]
+              [select columns items]
+              [normalized columns nil]))
+          (let [r (normalize-and-materialize-select-items select columns length)]
+            (if r
+              [(first r) (second r) nil]
+              [nil columns nil])))
+        string-items (into (or string-items-1 []) (or string-items-2 []))
         columns-meta (into {} (keep (fn [[k v]] (when (:dict v) [k v]))) columns)]
     {:preds preds
      :aggs aggs
      :group group
      :select select-items
      :columns columns
-     :columns-meta columns-meta}))
+     :columns-meta columns-meta
+     :string-items string-items}))
 
 ;; ============================================================================
 ;; Anomaly model resolution
@@ -281,8 +380,133 @@
                   [(second item) (nth item 2)])))
         select-items))
 
+(defn- anomaly-synthetic-col
+  "Synthetic column keyword `__<op>_<model-name>` for an anomaly
+   expression. Deterministic from the expression alone, so the same
+   expression always lifts to the same column name (and equal
+   expressions in different clauses share the same materialization)."
+  [anom-expr]
+  (let [op         (first anom-expr)
+        model-name (second anom-expr)
+        model-name (if (string? model-name) model-name (name model-name))]
+    (keyword (str "__" (name op) "_" model-name))))
+
+(defn anomaly-spec
+  "Static analysis of an anomaly query. Walks `:select`, `:where`,
+   `:having`, `:order` to find every `[:anomaly-* model …]`
+   expression and returns
+
+     {:expr->col   {anom-expr → synthetic-col-keyword}
+      :query       <query with anomaly exprs replaced by refs>}
+
+   The synthetic column for each expression is named and the query
+   is rewritten in-place — but no scoring runs. Both the no-join
+   `resolve-anomaly-columns` (which scores immediately) and the
+   join path (which defers via `LAnomaly`) share this front-end so
+   the synthetic naming and the rewrite stay in lockstep."
+  [query]
+  (let [exprs (reduce into #{}
+                      (map #(collect-anomaly-exprs (get query %))
+                           [:select :where :having :order]))]
+    (if (empty? exprs)
+      {:expr->col {} :query query}
+      (let [aliases   (select-alias-map (:select query))
+            expr->col (into {}
+                            (map (juxt identity anomaly-synthetic-col))
+                            exprs)
+            ;; ORDER BY may reference the alias the SELECT gave to an
+            ;; anomaly expr — `expr->alias` keeps that working.
+            expr->alias    (into {}
+                                 (keep (fn [[e _]]
+                                         (when-let [a (get aliases e)]
+                                           [e a])))
+                                 expr->col)
+            expr->col-other (merge expr->col expr->alias)
+            rewritten      (-> query
+                               (assoc :select (rewrite-anomaly-exprs (:select query) expr->col))
+                               (cond->
+                                (:where query)  (assoc :where  (rewrite-anomaly-exprs (:where query) expr->col))
+                                (:having query) (assoc :having (rewrite-anomaly-exprs (:having query) expr->col))
+                                (:order query)  (assoc :order  (rewrite-anomaly-exprs (:order query) expr->col-other))))]
+        {:expr->col expr->col :query rewritten}))))
+
+(defn- score-anomaly-expr
+  "Run the iforest computation for one anomaly expression against
+   the materialized `col-arrays` and return the resulting `double[]`."
+  [anom-expr models col-arrays length cache]
+  (let [op            (first anom-expr)
+        model-name    (let [m (second anom-expr)]
+                        (if (string? m) m (name m)))
+        model         (get models model-name)]
+    (when-not model
+      (throw (ex-info (str "Unknown model: " model-name)
+                      {:model     model-name
+                       :available (keys models)})))
+    (let [feature-names (:feature-names model)
+          explicit-args (vec (drop 2 anom-expr))
+          short-form?   (empty? explicit-args)
+          data
+          (if short-form?
+            (into {}
+                  (map (fn [k]
+                         (let [v (get col-arrays k)]
+                           (when-not v
+                             (throw (ex-info (str "Model feature " k
+                                                  " not found in columns. "
+                                                  "Use long form or ensure "
+                                                  "column is available.")
+                                             {:feature   k
+                                              :available (vec (keys col-arrays))})))
+                           [k v])))
+                  feature-names)
+            (do
+              (when (not= (count explicit-args) (count feature-names))
+                (throw (ex-info (str "ANOMALY_SCORE arity mismatch: model '"
+                                     model-name "' has " (count feature-names)
+                                     " features but " (count explicit-args)
+                                     " arguments were provided")
+                                {:model     model-name
+                                 :expected  (count feature-names)
+                                 :actual    (count explicit-args)
+                                 :features  feature-names})))
+              (into {}
+                    (map-indexed
+                     (fn [i arg]
+                       (let [feat-name (nth feature-names i)
+                             norm-arg  (if (and (vector? arg) (not (keyword? arg)))
+                                         (norm/normalize-expr arg)
+                                         arg)
+                             arr       (if (keyword? norm-arg)
+                                         (get col-arrays norm-arg)
+                                         (expr/eval-expr-vectorized norm-arg col-arrays length cache))]
+                         [feat-name arr])))
+                    explicit-args)))
+          compute-fn (get anomaly-op->fn op)]
+      (compute-fn model data))))
+
+(defn materialize-anomaly
+  "Score every anomaly expression in `expr->col` against the
+   `columns` map and return a new columns map with one synthetic
+   `{:type :float64 :data <double[]>}` entry per expression. The
+   inputs (and length) are evaluated against the materialized form
+   of the columns so this works equally well on the no-join
+   prepare-time call and the post-join `LAnomaly` execute-time
+   call."
+  [expr->col columns ^long length models]
+  (if (empty? expr->col)
+    columns
+    (let [mat-cols   (x/materialize-columns columns)
+          col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)
+          cache      (java.util.HashMap.)]
+      (reduce-kv
+       (fn [cs anom-expr col-name]
+         (let [arr (score-anomaly-expr anom-expr models col-arrays length cache)]
+           (assoc cs col-name {:type :float64 :data arr})))
+       mat-cols
+       expr->col))))
+
 (defn resolve-anomaly-columns
-  "Resolve anomaly expressions post-join. Materializes columns,
+  "Resolve anomaly expressions eagerly. Materializes columns,
    evaluates the expression arguments, scores via iforest, and
    injects the result as a synthetic column. Rewrites query clauses
    to reference that synthetic column.
@@ -291,87 +515,14 @@
                                                         feature names
      Long form:  `[:anomaly-score \"model\" e1 e2]`   — evaluates
                                                         each expr
-   Returns `[query columns]` (passed through unchanged when no
-   anomaly expressions are present)."
+
+   Used by the no-join planner path (the source columns are already
+   in scope at prepare-time). The join path defers materialization
+   to the executor's `LAnomaly` case via `anomaly-spec` +
+   `materialize-anomaly`. Returns `[query columns]` (passed through
+   unchanged when no anomaly expressions are present)."
   [query columns length models]
-  (let [all-exprs (reduce into #{}
-                          (map #(collect-anomaly-exprs (get query %))
-                               [:select :where :having :order]))]
-    (if (empty? all-exprs)
+  (let [{:keys [expr->col query]} (anomaly-spec query)]
+    (if (empty? expr->col)
       [query columns]
-      (let [aliases    (select-alias-map (:select query))
-            mat-cols   (x/materialize-columns columns)
-            col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)
-            cache      (java.util.HashMap.)
-            {:keys [q expr->col new-columns]}
-            (reduce
-             (fn [{:keys [q expr->col new-columns]} anom-expr]
-               (let [op         (first anom-expr)
-                     model-name (second anom-expr)
-                     model-name (if (string? model-name) model-name (name model-name))
-                     model      (get models model-name)]
-                 (when-not model
-                   (throw (ex-info (str "Unknown model: " model-name)
-                                   {:model     model-name
-                                    :available (keys models)})))
-                 (let [feature-names  (:feature-names model)
-                       explicit-args  (vec (drop 2 anom-expr))
-                       short-form?    (empty? explicit-args)
-                       data
-                       (if short-form?
-                         (into {}
-                               (map (fn [k]
-                                      (let [v (get col-arrays k)]
-                                        (when-not v
-                                          (throw (ex-info (str "Model feature " k
-                                                               " not found in columns. "
-                                                               "Use long form or ensure "
-                                                               "column is available.")
-                                                          {:feature   k
-                                                           :available (vec (keys col-arrays))})))
-                                        [k v])))
-                               feature-names)
-                         (do
-                           (when (not= (count explicit-args) (count feature-names))
-                             (throw (ex-info (str "ANOMALY_SCORE arity mismatch: model '"
-                                                  model-name "' has " (count feature-names)
-                                                  " features but " (count explicit-args)
-                                                  " arguments were provided")
-                                             {:model     model-name
-                                              :expected  (count feature-names)
-                                              :actual    (count explicit-args)
-                                              :features  feature-names})))
-                           (into {}
-                                 (map-indexed
-                                  (fn [i arg]
-                                    (let [feat-name (nth feature-names i)
-                                          norm-arg  (if (and (vector? arg) (not (keyword? arg)))
-                                                      (norm/normalize-expr arg)
-                                                      arg)
-                                          arr       (if (keyword? norm-arg)
-                                                      (get col-arrays norm-arg)
-                                                      (expr/eval-expr-vectorized norm-arg col-arrays length cache))]
-                                      [feat-name arr])))
-                                 explicit-args)))
-                       compute-fn (get anomaly-op->fn op)
-                       result-arr (compute-fn model data)
-                       col-name   (keyword (str "__" (name op) "_" model-name))]
-                   {:q           q
-                    :expr->col   (assoc expr->col anom-expr col-name)
-                    :new-columns (assoc new-columns col-name
-                                        {:type :float64 :data result-arr})})))
-             {:q query :expr->col {} :new-columns columns}
-             all-exprs)
-            expr->alias    (into {}
-                                 (keep (fn [[e _]]
-                                         (when-let [a (get aliases e)]
-                                           [e a])))
-                                 expr->col)
-            expr->col-other (merge expr->col expr->alias)
-            rewritten      (-> q
-                               (assoc :select (rewrite-anomaly-exprs (:select q) expr->col))
-                               (cond->
-                                (:where q)  (assoc :where  (rewrite-anomaly-exprs (:where q) expr->col))
-                                (:having q) (assoc :having (rewrite-anomaly-exprs (:having q) expr->col))
-                                (:order q)  (assoc :order  (rewrite-anomaly-exprs (:order q) expr->col-other))))]
-        [rewritten new-columns]))))
+      [query (materialize-anomaly expr->col columns length models)])))

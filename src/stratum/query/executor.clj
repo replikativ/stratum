@@ -33,7 +33,7 @@
             PFusedExtractCount PBitmapSemiJoin PHashJoin
             PPerfectHashJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
             PProject PWindow PHaving PSort PDistinct PLimit
-            PMaterializeExpr LTopN LSetOp]
+            PMaterializeExpr LTopN LSetOp LAnomaly LStringMaterialize]
            [stratum.internal ColumnOps ColumnOpsExt ColumnOpsAnalytics]))
 
 (set! *warn-on-reflection* true)
@@ -857,6 +857,39 @@
      ;; physical record) and dispatched to the streaming primitive.
      (instance? LTopN node) (execute-top-n-node node)
 
+     ;; Anomaly score materialization (post-join). Resolves at the
+     ;; right point in the pipeline so the iforest sees joined
+     ;; columns. The plan's frontend has already rewritten the
+     ;; surrounding query to reference the synthetic columns
+     ;; produced here. Pure column-ctx → column-ctx — no row decode.
+     (instance? LAnomaly node)
+     (let [ctx       (execute-node (:input node))
+           columns   (:columns ctx)
+           length    (long (:length ctx))
+           new-cols  (prep/materialize-anomaly (:expr->col node)
+                                               columns length
+                                               (:models node))]
+       (assoc ctx :columns new-cols))
+
+     ;; Post-join string-expression materialization. The frontend
+     ;; has rewritten `:group` / aggs / `:select` to reference the
+     ;; synthetic `__str_expr_N` columns produced here. Each item
+     ;; runs `expr/eval-string-expr` against the post-join
+     ;; (materialized) column ctx, so dict-encoded results are
+     ;; sized to the joined row count.
+     (instance? LStringMaterialize node)
+     (let [ctx       (execute-node (:input node))
+           columns   (:columns ctx)
+           length    (long (:length ctx))
+           mat-cols  (cols/materialize-columns columns)
+           new-cols  (reduce
+                      (fn [cs {:keys [col-name expr]}]
+                        (let [entry (expr/eval-string-expr expr cs length)]
+                          (assoc cs col-name entry)))
+                      mat-cols
+                      (:items node))]
+       (assoc ctx :columns new-cols))
+
      ;; Set ops — UNION/INTERSECT/EXCEPT. The runtime path in
      ;; `stratum.query/q` short-circuits these before the planner
      ;; runs, but `compile-physical` / `explain-query` callers can
@@ -945,17 +978,33 @@
         length (if (seq columns)
                  (cols/get-column-length (val (first columns)))
                  0)
-        ;; Anomaly resolution must run before any other lowering —
-        ;; `[:anomaly-score …]` would otherwise reach
-        ;; `normalize-expr` and throw "Unknown expression operator".
-        ;; The legacy `q` runs this immediately after join evaluation;
-        ;; we run it here against the un-joined source columns when
-        ;; `:_anomaly-models` is set on the query map.
-        models (:_anomaly-models query)
-        [query columns] (if (seq models)
-                          (prep/resolve-anomaly-columns query columns length models)
-                          [query columns])
-        {:keys [preds aggs group select columns columns-meta]}
+        ;; Anomaly resolution. `[:anomaly-score …]` would otherwise
+        ;; reach `normalize-expr` and throw "Unknown expression
+        ;; operator". Two cases:
+        ;;   - No join: resolve eagerly here. The pre-join columns
+        ;;     are the only columns the iforest will ever see, so
+        ;;     scoring at prepare time and inlining the synthetic
+        ;;     column into `columns` is fine.
+        ;;   - Join: defer to the executor's `LAnomaly` case so the
+        ;;     iforest sees post-join columns. We still rewrite the
+        ;;     query here (via `anomaly-spec`) so synthetic refs
+        ;;     are visible to `prepare-query` / `build-logical-plan`,
+        ;;     and we thread the spec + models through the cleaned
+        ;;     query for `build-logical-plan` to attach to `LAnomaly`.
+        models  (:_anomaly-models query)
+        has-join? (seq (:join query))
+        [query columns anomaly-spec]
+        (cond
+          (and (seq models) (not has-join?))
+          (let [[q' cols'] (prep/resolve-anomaly-columns query columns length models)]
+            [q' cols' nil])
+
+          (and (seq models) has-join?)
+          (let [{:keys [expr->col query]} (prep/anomaly-spec query)]
+            [query columns {:expr->col expr->col :models models}])
+
+          :else [query columns nil])
+        {:keys [preds aggs group select columns columns-meta string-items]}
         (prep/prepare-query query columns length)
         ;; Rebuild a query map for build-logical-plan with the
         ;; lowered slots in place. `:from` becomes the cleaned
@@ -970,7 +1019,13 @@
                            ;; are already normalized — re-running
                            ;; norm/normalize-pred / normalize-agg on
                            ;; their output throws.
-                           ::plan/pre-normalized? true))]
+                           ::plan/pre-normalized? true)
+                    (cond->
+                     anomaly-spec
+                      (assoc ::plan/anomaly-expr->col (:expr->col anomaly-spec)
+                             ::plan/anomaly-models    (:models    anomaly-spec))
+                      (seq string-items)
+                      (assoc ::plan/string-items string-items)))]
     {:plan         (plan/build-logical-plan cleaned)
      :columns-meta columns-meta}))
 

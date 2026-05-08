@@ -118,6 +118,32 @@
                    (build-join-tree scan join)
                    scan)
 
+          ;; 2b. Anomaly score materialization (post-join, pre-filter).
+          ;; The frontend (`prepare-and-build`) has rewritten
+          ;; `:where`/`:select`/etc. so they reference synthetic
+          ;; columns; the actual scoring runs at LAnomaly execute
+          ;; time so post-join columns are visible to iforest.
+          ;; For the no-join case, the frontend already resolved
+          ;; eagerly and `::anomaly-expr->col` is empty.
+          anomaly-expr->col (::anomaly-expr->col query)
+          anomaly-models    (::anomaly-models query)
+          joined (if (seq anomaly-expr->col)
+                   (ir/->LAnomaly anomaly-expr->col anomaly-models joined)
+                   joined)
+
+          ;; 2c. Post-join string-expression materialization. The
+          ;; frontend has rewritten `:group` / aggs / `:select` to
+          ;; reference synthetic `__str_expr_N` columns; the actual
+          ;; `eval-string-expr` calls run at `LStringMaterialize`
+          ;; execute time, with the joined column ctx in scope.
+          ;; `:string-items` is empty for non-join queries (passes
+          ;; 5a/5b ran eagerly in `prepare-query` and folded the
+          ;; results into the columns map).
+          string-items (::string-items query)
+          joined (if (seq string-items)
+                   (ir/->LStringMaterialize string-items joined)
+                   joined)
+
           ;; 3. Normalize predicates, aggs, select items.
           ;;    When called via `executor/run-query` the lowering step
           ;;    (prepare-query) has already normalized preds / aggs and
@@ -1305,6 +1331,35 @@
         ;; nil (SELECT *) the streaming top-N fetches every scan
         ;; column at the surviving rows, so we conj every column of
         ;; the input LScan to keep column-pruning from dropping them.
+        ;; LAnomaly — every column referenced by an anomaly
+        ;; expression's arguments is live AFTER the join, so flag
+        ;; them here so column-pruning keeps them on the build /
+        ;; probe scans. Both short form (`[:anomaly-score "model"]`,
+        ;; which falls through to the model's `:feature-names`) and
+        ;; long form (`[:anomaly-score "model" e1 e2]`) are walked.
+                    (when (instance? stratum.query.ir.LAnomaly node)
+                      (doseq [[anom-expr _col-name] (:expr->col node)]
+                        (let [explicit-args (drop 2 anom-expr)]
+                          (if (seq explicit-args)
+                            (doseq [a explicit-args]
+                              (cond
+                                (keyword? a) (vswap! refs conj! a)
+                                (sequential? a) (collect-expr-refs! refs a)))
+                            ;; Short form — pull feature names from the
+                            ;; model. Models map keys are strings; the
+                            ;; anomaly expression's second slot is the
+                            ;; model name (string or keyword).
+                            (let [model-name (let [m (second anom-expr)]
+                                               (if (string? m) m (name m)))
+                                  model      (get (:models node) model-name)]
+                              (doseq [k (:feature-names model)]
+                                (when (keyword? k)
+                                  (vswap! refs conj! k))))))))
+        ;; LStringMaterialize — every column referenced by a
+        ;; deferred string expression is live post-join.
+                    (when (instance? stratum.query.ir.LStringMaterialize node)
+                      (doseq [{:keys [expr]} (:items node)]
+                        (collect-expr-refs! refs expr)))
                     (when (instance? stratum.query.ir.LTopN node)
                       (let [os (:order-spec node)
                             [c _] (if (vector? os) os [os :asc])]

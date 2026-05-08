@@ -83,6 +83,29 @@
   ;; all?    — boolean (UNION ALL)
            [op queries all?])
 
+(defrecord LAnomaly
+  ;; Materialize iforest-derived synthetic columns post-join.
+  ;; expr->col — map from `[:anomaly-* model …]` expression vector
+  ;;             to the synthetic column keyword the surrounding
+  ;;             query has been rewritten to reference.
+  ;; models    — `{model-name → trained-model}` carried through to
+  ;;             the executor (anomaly is an enrichment, so models
+  ;;             aren't available via column metadata).
+  ;; input     — child plan whose output column ctx the executor
+  ;;             scores against.
+           [expr->col models input])
+
+(defrecord LStringMaterialize
+  ;; Evaluate string-producing expressions (`:upper`, `:lower`,
+  ;; `:concat`, `:trim`, …) against the post-join column ctx and
+  ;; inject the dict-encoded results as synthetic columns. The
+  ;; surrounding query has already been rewritten so `:group` /
+  ;; aggs / `:select` reference the synthetic column keywords.
+  ;; items — vec of `{:col-name :expr}` pairs (col-name is a
+  ;;         `__str_expr_N` keyword; expr is a normalized
+  ;;         expression map).
+           [items input])
+
 ;; ============================================================================
 ;; Annotations — attached to logical nodes by analysis passes
 ;; ============================================================================
@@ -263,7 +286,8 @@
   (or (instance? LScan node) (instance? LFilter node) (instance? LJoin node)
       (instance? LGroupBy node) (instance? LGlobalAgg node) (instance? LProject node)
       (instance? LWindow node) (instance? LHaving node) (instance? LDistinct node)
-      (instance? LSort node) (instance? LLimit node) (instance? LSetOp node)))
+      (instance? LSort node) (instance? LLimit node) (instance? LSetOp node)
+      (instance? LAnomaly node) (instance? LStringMaterialize node)))
 
 (defn input-node
   "Returns the input child of a unary node, or nil for leaves/joins."
