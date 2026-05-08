@@ -21,6 +21,7 @@
             [stratum.query.predicate :as pred]
             [stratum.query.expression :as expr]
             [stratum.query.estimate :as est]
+            [stratum.query.execution :as x-cols]
             [stratum.dataset :as dataset])
   (:import [stratum.query.ir
             LScan LFilter LJoin LGroupBy LGlobalAgg LProject
@@ -41,15 +42,9 @@
 ;; Plan construction — query map → logical IR
 ;; ============================================================================
 
-(defn- normalize-select-item
-  "Normalize a single SELECT item to {:name kw :ref kw :expr expr}."
-  [item idx]
-  (cond
-    (keyword? item) {:name item :ref item}
-    (vector? item)  (let [expr (norm/normalize-expr (vec item))]
-                      {:name (keyword (str "__sel_" idx)) :expr expr})
-    (map? item)     item
-    :else           {:name (keyword (str "__sel_" idx)) :ref item}))
+;; `normalize-select-item` lives in `stratum.query.execution` and
+;; handles :as / literals / expressions / keywords. We delegate to it
+;; instead of duplicating the cases here.
 
 (defn- build-scan
   "Build an LScan from :from, handling both maps and IDataset."
@@ -61,18 +56,24 @@
     (ir/->LScan columns length)))
 
 (defn- build-join-tree
-  "Wrap scan with join nodes for each join spec."
+  "Wrap scan with join nodes for each join spec.
+   `:on` keys may arrive SQL-table-qualified (e.g. `:t1/a`,
+   `:t2/x`); strip namespaces so they match the column-map keys
+   (which are unqualified)."
   [scan join-specs]
   (reduce
    (fn [left join-spec]
      (let [{:keys [with on type]} join-spec
+           strip   norm/strip-ns
            on-pairs (cond
                       ;; [:= :a :b]
                       (and (vector? on) (= := (first on)))
-                      [[(second on) (nth on 2)]]
+                      [[(strip (second on)) (strip (nth on 2))]]
                       ;; [[:= :a :b] [:= :c :d]]
                       (and (vector? on) (every? vector? on))
-                      (mapv (fn [pair] [(second pair) (nth pair 2)]) on)
+                      (mapv (fn [pair]
+                              [(strip (second pair)) (strip (nth pair 2))])
+                            on)
                       :else (throw (ex-info "Unsupported join :on format" {:on on})))
            right-scan (build-scan with)]
        (ir/->LJoin (or type :inner) on-pairs left right-scan)))
@@ -117,18 +118,60 @@
                    (build-join-tree scan join)
                    scan)
 
-          ;; 3. Normalize predicates, aggs, select items
-          preds   (mapv norm/normalize-pred (or where []))
-          aggs    (norm/auto-alias-aggs (mapv norm/normalize-agg (or agg [])))
+          ;; 2b. Anomaly score materialization (post-join, pre-filter).
+          ;; The frontend (`prepare-and-build`) has rewritten
+          ;; `:where`/`:select`/etc. so they reference synthetic
+          ;; columns; the actual scoring runs at LAnomaly execute
+          ;; time so post-join columns are visible to iforest.
+          ;; For the no-join case, the frontend already resolved
+          ;; eagerly and `::anomaly-expr->col` is empty.
+          anomaly-expr->col (::anomaly-expr->col query)
+          anomaly-models    (::anomaly-models query)
+          joined (if (seq anomaly-expr->col)
+                   (ir/->LAnomaly anomaly-expr->col anomaly-models joined)
+                   joined)
+
+          ;; 2c. Post-join string-expression materialization. The
+          ;; frontend has rewritten `:group` / aggs / `:select` to
+          ;; reference synthetic `__str_expr_N` columns; the actual
+          ;; `eval-string-expr` calls run at `LStringMaterialize`
+          ;; execute time, with the joined column ctx in scope.
+          ;; `:string-items` is empty for non-join queries (passes
+          ;; 5a/5b ran eagerly in `prepare-query` and folded the
+          ;; results into the columns map).
+          string-items (::string-items query)
+          joined (if (seq string-items)
+                   (ir/->LStringMaterialize string-items joined)
+                   joined)
+
+          ;; 3. Normalize predicates, aggs, select items.
+          ;;    When called via `executor/run-query` the lowering step
+          ;;    (prepare-query) has already normalized preds / aggs and
+          ;;    set `::pre-normalized?` on the query map; in that case
+          ;;    skip re-normalization (it isn't idempotent).
+          pre-norm? (::pre-normalized? query)
+          preds   (if pre-norm?
+                    (or where [])
+                    (mapv norm/normalize-pred (or where [])))
+          aggs    (if pre-norm?
+                    (or agg [])
+                    (norm/auto-alias-aggs (mapv norm/normalize-agg (or agg []))))
           sel     (when (seq select)
-                    (vec (map-indexed #(normalize-select-item %2 %1) select)))
+                    (if pre-norm?
+                      (vec select)
+                      (vec (map-indexed #(x-cols/normalize-select-item %2 %1) select))))
 
           ;; 4. Filter
           filtered (if (seq preds)
                      (ir/->LFilter preds joined)
                      joined)
 
-          ;; 5. Core operation: group-by / global-agg / project / passthrough
+          ;; 5. Core operation: group-by / global-agg / passthrough.
+          ;; Project is held back when a window is present so the
+          ;; window can see all source columns (SQL evaluation order:
+          ;; window functions logically run after GROUP BY / HAVING
+          ;; but before SELECT projection).
+          window? (seq window)
           core (cond
                  (seq group)
                  (ir/->LGroupBy group aggs filtered)
@@ -136,19 +179,57 @@
                  (seq aggs)
                  (ir/->LGlobalAgg aggs filtered)
 
-                 (seq sel)
+                 (and (seq sel) (not window?))
                  (ir/->LProject sel filtered)
 
                  :else filtered)
 
-          ;; 6. Window functions
-          windowed (if (seq window)
+          ;; 6. Window functions (run before any deferred projection).
+          windowed (if window?
                      (ir/->LWindow window core)
                      core)
 
+          ;; 6b. Deferred projection: when select coexisted with
+          ;; window, apply LProject now so window-output columns are
+          ;; visible to the projection. Window-output columns
+          ;; (`:as` of each spec) are auto-appended to the select if
+          ;; the user didn't list them explicitly. When no select
+          ;; was given at all, we synthesize one that exposes both
+          ;; base scan columns and window outputs (mirrors
+          ;; q.clj:807-826).
+          windowed (cond
+                     (and window? (seq sel))
+                     (let [existing (set (map :name sel))
+                           extra    (keep (fn [ws]
+                                            (let [a (:as ws)]
+                                              (when-not (contains? existing a)
+                                                {:name a :ref a})))
+                                          window)
+                           sel'     (into sel extra)]
+                       (ir/->LProject sel' windowed))
+
+                     (and window? (not (seq sel)) (not (seq aggs)) (not (seq group)))
+                     (let [columns (:columns scan)
+                           base-items (mapv (fn [k] {:name k :ref k})
+                                            (remove #{:__mask} (keys columns)))
+                           win-items  (mapv (fn [ws]
+                                              {:name (:as ws) :ref (:as ws)})
+                                            window)]
+                       (ir/->LProject (into base-items win-items) windowed))
+
+                     :else windowed)
+
           ;; 7. Having
-          having-node (if (seq having)
-                        (ir/->LHaving having windowed)
+          ;; Normalize predicates here so every consumer (planner
+          ;; rewrites, executor, post/apply-having) can rely on the
+          ;; `[col op & args]` shape. `normalize-pred` is idempotent,
+          ;; so we always run it — `prepare-query` does NOT cover
+          ;; HAVING in its `pre-normalized?` flag (only `:where` and
+          ;; `:agg`), and we want the pushdown classifier to read
+          ;; the canonical form unconditionally.
+          having-preds (mapv norm/normalize-pred (or having []))
+          having-node (if (seq having-preds)
+                        (ir/->LHaving having-preds windowed)
                         windowed)
 
           ;; 8. Distinct
@@ -263,21 +344,42 @@
     :else nil))
 
 (defn- pushdown-once
-  "Single pass: push LFilter predicates below LJoin when they reference only one side."
+  "Single pass: push LFilter predicates below LJoin when they
+   reference only one side. Outer joins constrain the rewrite:
+     - LEFT  join: push left-side preds (preserves NULL-padded rows
+                   on the right); right-side preds CANNOT be pushed
+                   because LEFT preserves left rows that have no
+                   right match.
+     - RIGHT join: symmetric — push right, not left.
+     - FULL  join: neither side can be pushed.
+   Only INNER joins allow both."
   [plan]
   (ir/walk-plan plan
                 (fn [node]
                   (if (and (instance? LFilter node)
                            (instance? LJoin (:input node)))
                     (let [join (:input node)
+                          jt   (:join-type join)
                           left-cols  (scan-columns (:left join))
                           right-cols (scan-columns (:right join))]
                       (if (and left-cols right-cols)
                         (let [classified (group-by #(classify-pred-by-side % left-cols right-cols)
                                                    (:predicates node))
-                              left-preds  (vec (get classified :left []))
-                              right-preds (vec (get classified :right []))
-                              cross-preds (vec (get classified :cross []))
+                              left-pushable?  (#{:inner :left}  jt)
+                              right-pushable? (#{:inner :right} jt)
+                              left-preds  (if left-pushable?
+                                            (vec (get classified :left []))
+                                            [])
+                              right-preds (if right-pushable?
+                                            (vec (get classified :right []))
+                                            [])
+                              ;; Anything we can't push stays above the join.
+                              kept-preds  (vec (concat
+                                                (when-not left-pushable?
+                                                  (get classified :left []))
+                                                (when-not right-pushable?
+                                                  (get classified :right []))
+                                                (get classified :cross [])))
                   ;; Wrap join children with pushed-down filters
                               new-left  (if (seq left-preds)
                                           (ir/->LFilter left-preds (:left join))
@@ -286,9 +388,8 @@
                                           (ir/->LFilter right-preds (:right join))
                                           (:right join))
                               new-join (assoc join :left new-left :right new-right)]
-              ;; Keep cross-side predicates above the join (or remove filter if all pushed)
-                          (if (seq cross-preds)
-                            (ir/->LFilter cross-preds new-join)
+                          (if (seq kept-preds)
+                            (ir/->LFilter kept-preds new-join)
                             new-join))
             ;; Can't determine sides → leave as-is
                         node))
@@ -485,7 +586,21 @@
 
 (defn- rewrite-expr-group-keys
   "For group-keys that are expressions (not keywords), create PMaterializeExpr
-   nodes and rewrite the keys. Returns [new-keys mat-nodes]."
+   nodes and rewrite the keys. Returns [new-keys mat-nodes].
+
+   Normalizes the expression with `norm/normalize-expr` so the
+   downstream `eval-expr-vectorized` sees `{:op ... :args ...}` form
+   rather than a raw `[:op ...]` vector (which it doesn't accept).
+
+   The target type is `:int64` for group-by expressions: group keys
+   are discrete by definition, the executor's `eval-expr-to-long`
+   path returns `long[]` directly for date-trunc/date-add/extract
+   ops (skipping the `long → double → long` round-trip), and
+   downstream dense group-by accumulators dispatch on the column's
+   `:int64` type for the all-long fast path. Mirrors the legacy
+   block at `q.clj:700-718`. Closes the CB-Q43 perf gap (date-trunc
+   minute group-by was 40× slower under the planner because the
+   `:float64` round-trip blocked the long fast-path)."
   [group-keys]
   (loop [idx 0, new-keys [], mat-nodes []]
     (if (>= idx (count group-keys))
@@ -493,10 +608,11 @@
       (let [gk (nth group-keys idx)]
         (if (keyword? gk)
           (recur (inc idx) (conj new-keys gk) mat-nodes)
-          (let [cn (keyword (str "__gk_expr_" idx))]
+          (let [cn (keyword (str "__gk_expr_" idx))
+                normalized (if (map? gk) gk (norm/normalize-expr gk))]
             (recur (inc idx)
                    (conj new-keys cn)
-                   (conj mat-nodes (ir/->PMaterializeExpr cn gk :float64 nil)))))))))
+                   (conj mat-nodes (ir/->PMaterializeExpr cn normalized :int64 nil)))))))))
 
 (defn- chain-materialize
   "Chain PMaterializeExpr nodes on top of an input node (innermost first)."
@@ -587,7 +703,7 @@
     (cond
       ;; 1. Unfiltered COUNT
       (and (= 1 n-aggs) (= :count (:op first-agg)) no-preds?)
-      (ir/->PFusedSIMDCount [] scan)
+      (ir/->PFusedSIMDCount [] first-agg scan)
 
       ;; 2. Stats-only (needs chunk statistics → real columns only)
       ;; SUM and AVG read sum/sum-sq from ChunkStats. Sources whose stats
@@ -610,7 +726,7 @@
       ;; index columns because zone maps can skip entire chunks.
       (and all-idx? agg-cols-in-scan? (= 1 n-aggs) simd-ok? no-expr?)
       (if (= :count (:op first-agg))
-        (ir/->PChunkedSIMDCount preds scan)
+        (ir/->PChunkedSIMDCount preds first-agg scan)
         (ir/->PChunkedSIMDAgg preds first-agg scan))
 
       ;; 4. Block-skip COUNT on arrays
@@ -618,7 +734,7 @@
       ;; blocks using min/max stats on materialized arrays.
       (and (= 1 n-aggs) (= :count (:op first-agg)) (seq preds)
            (not all-idx?) simd-ok? no-expr?)
-      (ir/->PBlockSkipCount preds scan)
+      (ir/->PBlockSkipCount preds first-agg scan)
 
       ;; 4b. Cost-aware: for very selective non-COUNT single-agg on arrays,
       ;; block-skip then SIMD on survivors would be faster than full SIMD.
@@ -720,6 +836,50 @@
     (instance? PMaskFilter input)  [(:predicates input) (:input input)]
     :else                          [[] input]))
 
+(def ^:private fused-extract-ops
+  "Subset of single-arg date-extract ops the Java fused path handles
+   (`ColumnOpsExt/fusedExtractCountDenseParallel`). `:day-of-week`
+   uses Hinnant's civil-date arithmetic; the rest are O(1) modular.
+   `:date-trunc` and full timestamps stay on the materialize +
+   dense-group-by path because they don't share the small bounded
+   key space the fast-path assumes."
+  #{:minute :hour :second :day-of-week})
+
+(defn- try-fused-extract-count
+  "Return a `PFusedExtractCount` node if the LGroupBy shape is the
+   canonical 'EXTRACT(unit, col) GROUP BY → COUNT' fused-fast-path
+   shape, else nil. Mirrors the legacy `fused-extract?` gate at
+   `q.clj:680-696`. The expression has already been lifted to a
+   `PMaterializeExpr` by `expr-materialization`, so we walk back
+   through it to the underlying scan and emit the fused operator
+   that absorbs the extraction. Closes the CB-Q19 10× gap."
+  [{:keys [group-keys aggs input]}]
+  (let [[mat-chain inner] (peel-materialize input)
+        [preds scan] (peel-filter-scan inner)]
+    (when (and (= 1 (count group-keys))
+               (= 1 (count mat-chain))
+               (seq aggs)
+               (every? #(= :count (:op %)) aggs)
+               (empty? preds)
+               (or (instance? PScan scan) (instance? PChunkedScan scan)))
+      (let [mat (first mat-chain)
+            gk  (first group-keys)
+            e   (:expr mat)]
+        (when (and (= (:col-name mat) gk)
+                   (map? e)
+                   (contains? fused-extract-ops (:op e))
+                   (= 1 (count (:args e)))
+                   (keyword? (first (:args e))))
+          (let [src-col  (first (:args e))
+                col-info (get (:columns scan) src-col)]
+            (when (and col-info
+                       (or (= :int64 (:type col-info))
+                           (expr/long-array? (:data col-info))))
+              (vary-meta
+               (ir/->PFusedExtractCount (:op e) src-col aggs scan)
+               assoc ::estimated-rows (:length scan)
+               ::selectivity 1.0))))))))
+
 (defn strategy-selection
   "Replace logical nodes with physical nodes based on data characteristics.
 
@@ -745,14 +905,18 @@
                         (assoc phys :input (rechain-materialize mat-chain (:input phys)))
                         phys))
 
-        ;; LGroupBy — same peeling
+        ;; LGroupBy — try fused-extract+count first, otherwise peel
+        ;; the materialize/filter chain and pick a regular strategy.
+        ;; The fused operator absorbs the extraction so the matching
+        ;; PMaterializeExpr is intentionally dropped from the chain.
                     (instance? LGroupBy node)
-                    (let [[mat-chain inner] (peel-materialize (:input node))
-                          [preds scan] (peel-filter-scan inner)
-                          phys (select-group-by-strategy node scan preds)]
-                      (if (seq mat-chain)
-                        (assoc phys :input (rechain-materialize mat-chain (:input phys)))
-                        phys))
+                    (or (try-fused-extract-count node)
+                        (let [[mat-chain inner] (peel-materialize (:input node))
+                              [preds scan] (peel-filter-scan inner)
+                              phys (select-group-by-strategy node scan preds)]
+                          (if (seq mat-chain)
+                            (assoc phys :input (rechain-materialize mat-chain (:input phys)))
+                            phys)))
 
         ;; LJoin
                     (instance? LJoin node)
@@ -908,17 +1072,21 @@
    Requires:
    - INNER join
    - Single-column join key
-   - Parent node doesn't reference any build-side (dim) columns except the join key"
+   - Parent node doesn't reference ANY build-side (dim) columns —
+     including the join key. The semi-join discards the right side
+     after building a presence-bitmap, so a parent SELECT that
+     projects `t2.x` (the join key) would lose its right-side
+     binding even though `t2.x = t1.a` in matched rows. Mirrors the
+     `(not has-select?)` clause of the legacy
+     `query.join/bitmap-semi-join-eligible?`."
   [join-node parent-cols]
   (and parent-cols
        (= :inner (:join-type join-node))
        (= 1 (count (:on-pairs join-node)))
-       (let [build-cols (extract-scan-cols (:build-side join-node))
-             join-key-right (second (first (:on-pairs join-node)))]
+       (let [build-cols (extract-scan-cols (:build-side join-node))]
          (and build-cols
-              ;; No build-side columns (other than join key) used by parent
-              (empty? (disj (clojure.set/intersection build-cols parent-cols)
-                            join-key-right))))))
+              ;; No build-side columns at all referenced by parent.
+              (empty? (clojure.set/intersection build-cols parent-cols))))))
 
 (defn operator-fusion
   "Merge adjacent physical nodes into fused operators where beneficial.
@@ -1016,16 +1184,41 @@
         (est/estimate-output-rows preds columns child-rows)
         child-rows))
 
-    ;; Joins: FK→PK heuristic
+    ;; Joins: NDV-based cardinality.
+    ;; Output = probe_rows × build_rows / max(probe_ndv, build_ndv)
+    ;; for the (first) join key. Falls back to the FK→PK heuristic
+    ;; (`min(1.0, build_rows/build_total)`) when a side's scan or
+    ;; key column isn't reachable, so multi-key / non-trivial join
+    ;; chains keep producing a sensible number.
     (instance? PHashJoin node)
-    (let [probe-rows (long (or (::estimated-rows (meta (:probe-side node)))
-                               (:length (:probe-side node))
-                               1000000))
+    (let [probe-rows  (long (or (::estimated-rows (meta (:probe-side node)))
+                                (:length (:probe-side node))
+                                1000000))
           build-total (long (or (:length (:build-side node)) 1000000))
-          build-rows (long (or (::estimated-rows (meta (:build-side node)))
-                               build-total))
-          sel (min 1.0 (/ (double build-rows) (max 1.0 (double build-total))))]
-      (max 1 (long (* probe-rows sel))))
+          build-rows  (long (or (::estimated-rows (meta (:build-side node)))
+                                build-total))
+          [probe-key build-key] (first (:on-pairs node))
+          probe-scan (let [n (:probe-side node)]
+                       (cond (instance? PScan n) n
+                             (instance? PChunkedScan n) n
+                             (instance? PSIMDFilter n) (:input n)
+                             (instance? PMaskFilter n) (:input n)
+                             :else nil))
+          build-scan (let [n (:build-side node)]
+                       (cond (instance? PScan n) n
+                             (instance? PChunkedScan n) n
+                             (instance? PSIMDFilter n) (:input n)
+                             (instance? PMaskFilter n) (:input n)
+                             :else nil))
+          probe-col (when probe-scan (get-in probe-scan [:columns probe-key]))
+          build-col (when build-scan (get-in build-scan [:columns build-key]))
+          probe-ndv (when probe-col (est/estimate-ndv probe-col probe-rows))
+          build-ndv (when build-col (est/estimate-ndv build-col build-rows))]
+      (if (and probe-ndv build-ndv)
+        (max 1 (long (/ (* (double probe-rows) (double build-rows))
+                        (double (max (long probe-ndv) (long build-ndv))))))
+        (let [sel (min 1.0 (/ (double build-rows) (max 1.0 (double build-total))))]
+          (max 1 (long (* probe-rows sel))))))
 
     ;; Global agg always produces 1 row
     (or (instance? PStatsOnlyAgg node)
@@ -1059,6 +1252,25 @@
 ;; Pass 7: Column pruning
 ;; ============================================================================
 
+(defn- collect-expr-refs!
+  "Walk a normalized expression tree (possibly nested) and conj!
+   every column keyword reference into `refs` (a volatile transient)."
+  [refs e]
+  (cond
+    (keyword? e) (vswap! refs conj! e)
+    (map? e)
+    (do
+      (doseq [a (:args e)]
+        (collect-expr-refs! refs a))
+      (when-let [branches (:branches e)]
+        (doseq [b branches]
+          (collect-expr-refs! refs (:val b))
+          (when-let [p (:pred b)]
+            ;; pred form `[op-args...]`; conj keyword args
+            (doseq [x p] (when (keyword? x) (vswap! refs conj! x)))))))
+    (sequential? e)
+    (doseq [a e] (collect-expr-refs! refs a))))
+
 (defn- collect-all-refs
   "Collect all column keywords referenced anywhere in the plan tree."
   [plan]
@@ -1072,19 +1284,29 @@
                         (vswap! refs conj! c)))
         ;; Group keys
                     (when-let [gks (:group-keys node)]
-                      (doseq [gk gks] (when (keyword? gk) (vswap! refs conj! gk))))
-        ;; Aggs
+                      (doseq [gk gks]
+                        (cond
+                          (keyword? gk) (vswap! refs conj! gk)
+                          (map? gk)     (collect-expr-refs! refs gk)
+                          (sequential? gk) (collect-expr-refs! refs gk))))
+        ;; Aggs (post-materialization the :expr field is gone, but
+        ;; before that pass — and for paths that don't lift — we may
+        ;; still see :expr embedded in an agg.)
                     (when-let [aggs (:aggs node)]
                       (doseq [a aggs]
                         (when-let [c (:col a)] (vswap! refs conj! c))
-                        (when-let [cs (:cols a)] (doseq [c cs] (when (keyword? c) (vswap! refs conj! c))))))
+                        (when-let [cs (:cols a)] (doseq [c cs] (when (keyword? c) (vswap! refs conj! c))))
+                        (when-let [e (:expr a)] (collect-expr-refs! refs e))))
                     (when-let [agg (:agg node)]
-                      (when-let [c (:col agg)] (vswap! refs conj! c)))
-        ;; Project items
+                      (when-let [c (:col agg)] (vswap! refs conj! c))
+                      (when-let [cs (:cols agg)] (doseq [c cs] (when (keyword? c) (vswap! refs conj! c))))
+                      (when-let [e (:expr agg)] (collect-expr-refs! refs e)))
+        ;; Project items: each may have :ref OR :expr. Walk both.
                     (when-let [items (:items node)]
                       (doseq [item items]
                         (when-let [r (:ref item)] (vswap! refs conj! r))
-                        (when-let [n (:name item)] (vswap! refs conj! n))))
+                        (when-let [n (:name item)] (vswap! refs conj! n))
+                        (when-let [e (:expr item)] (collect-expr-refs! refs e))))
         ;; Join on-pairs
                     (when-let [on (:on-pairs node)]
                       (doseq [[l r] on] (vswap! refs conj! l) (vswap! refs conj! r)))
@@ -1102,10 +1324,61 @@
         ;; Extract
                     (when-let [ec (:extract-col node)]
                       (vswap! refs conj! ec))
-        ;; Materialized expressions
+        ;; Materialized expressions (PMaterializeExpr top-level :expr)
                     (when-let [e (:expr node)]
-                      (when (map? e)
-                        (doseq [a (:args e)] (when (keyword? a) (vswap! refs conj! a)))))
+                      (collect-expr-refs! refs e))
+        ;; LTopN — order column + projection items. When :select is
+        ;; nil (SELECT *) the streaming top-N fetches every scan
+        ;; column at the surviving rows, so we conj every column of
+        ;; the input LScan to keep column-pruning from dropping them.
+        ;; LAnomaly — every column referenced by an anomaly
+        ;; expression's arguments is live AFTER the join, so flag
+        ;; them here so column-pruning keeps them on the build /
+        ;; probe scans. Both short form (`[:anomaly-score "model"]`,
+        ;; which falls through to the model's `:feature-names`) and
+        ;; long form (`[:anomaly-score "model" e1 e2]`) are walked.
+                    (when (instance? stratum.query.ir.LAnomaly node)
+                      (doseq [[anom-expr _col-name] (:expr->col node)]
+                        (let [explicit-args (drop 2 anom-expr)]
+                          (if (seq explicit-args)
+                            (doseq [a explicit-args]
+                              (cond
+                                (keyword? a) (vswap! refs conj! a)
+                                (sequential? a) (collect-expr-refs! refs a)))
+                            ;; Short form — pull feature names from the
+                            ;; model. Models map keys are strings; the
+                            ;; anomaly expression's second slot is the
+                            ;; model name (string or keyword).
+                            (let [model-name (let [m (second anom-expr)]
+                                               (if (string? m) m (name m)))
+                                  model      (get (:models node) model-name)]
+                              (doseq [k (:feature-names model)]
+                                (when (keyword? k)
+                                  (vswap! refs conj! k))))))))
+        ;; LStringMaterialize — every column referenced by a
+        ;; deferred string expression is live post-join.
+                    (when (instance? stratum.query.ir.LStringMaterialize node)
+                      (doseq [{:keys [expr]} (:items node)]
+                        (collect-expr-refs! refs expr)))
+                    (when (instance? stratum.query.ir.LTopN node)
+                      (let [os (:order-spec node)
+                            [c _] (if (vector? os) os [os :asc])]
+                        (when (keyword? c) (vswap! refs conj! c)))
+                      (if-let [items (:select node)]
+                        (doseq [item items]
+                          (when-let [r (:ref item)] (vswap! refs conj! r))
+                          (when-let [e (:expr item)] (collect-expr-refs! refs e)))
+                        ;; SELECT *: top-N fetches every column from
+                        ;; the input scan. The input may be either an
+                        ;; LScan (rewrite ran before strategy-selection)
+                        ;; or PScan/PChunkedScan (column-pruning is
+                        ;; running later in the pipeline).
+                        (let [in (:input node)]
+                          (when (or (instance? stratum.query.ir.LScan in)
+                                    (instance? stratum.query.ir.PScan in)
+                                    (instance? stratum.query.ir.PChunkedScan in))
+                            (doseq [k (keys (:columns in))]
+                              (vswap! refs conj! k))))))
                     node))
     (persistent! @refs)))
 
@@ -1124,22 +1397,189 @@
                       node)))))
 
 ;; ============================================================================
+;; Pass: top-N pushdown rewrite
+;; ============================================================================
+
+(def ^:dynamic *top-n-limit*
+  "Maximum LIMIT value at which the planner rewrites LLimit-over-LSort
+   into LTopN. Above this the legacy materialize-and-sort path runs.
+   Mirrors `stratum.query.top-n/*top-n-limit*`."
+  1024)
+
+(defn- peel-project
+  "If the node is `(LProject items LScan)`, return `[items LScan]`,
+   otherwise `[nil node]`. Lets top-N capture an explicit SELECT
+   projection while keeping the underlying scan for column lookup."
+  [node]
+  (cond
+    (and (instance? stratum.query.ir.LProject node)
+         (instance? stratum.query.ir.LScan (:input node)))
+    [(:items node) (:input node)]
+
+    (instance? stratum.query.ir.LScan node)
+    [nil node]
+
+    :else
+    [nil nil]))
+
+(defn- top-n-eligible-input?
+  "An input below LSort qualifies if it's a plain scan or a project
+   directly over a scan. The legacy `query.top-n/top-n-eligible?`
+   gate requires `(empty? where)`, so anything with predicates
+   (LFilter), joins, or aggregates leaves the materialize-and-sort
+   path running."
+  [node]
+  (let [[_ scan] (peel-project node)]
+    (some? scan)))
+
+(defn- top-n-order-eligible?
+  "Single ORDER BY on a numeric column (`:int64` or `:float64`) that
+   isn't a string-dict — same gate as `query.top-n/top-n-eligible?`."
+  [order-specs scan-cols]
+  (and (= 1 (count order-specs))
+       (let [spec (first order-specs)
+             [col _dir] (if (vector? spec) spec [spec :asc])]
+         (and (keyword? col)
+              (let [c (get scan-cols col)]
+                (and c
+                     (#{:int64 :float64} (:type c))
+                     (not= :string (:dict-type c))))))))
+
+(defn- find-scan-cols
+  "Return the `:columns` map of the leaf LScan reachable through an
+   optional LProject layer."
+  [node]
+  (let [[_ scan] (peel-project node)]
+    (when scan (:columns scan))))
+
+(defn top-n-rewrite
+  "Rewrite `LLimit { limit N input: LSort [single-spec] subtree }`
+   into a single `LTopN`, when N ≤ *top-n-limit* and the input is
+   filter/scan only. The executor delegates LTopN to
+   `query.top-n/execute-top-n`, which streams the order column,
+   keeps a fixed-size heap, and fetches just the surviving rows.
+
+   Only applied to top-level LLimit (no other rewrites between LSort
+   and LLimit) — anything more elaborate stays on the legacy
+   materialize-and-sort path."
+  [plan]
+  (let [limit-node? (instance? stratum.query.ir.LLimit plan)
+        sort-node   (when limit-node? (:input plan))
+        sort?       (and sort-node (instance? stratum.query.ir.LSort sort-node))
+        sort-input  (when sort? (:input sort-node))
+        eligible-input? (and sort? (top-n-eligible-input? sort-input))
+        scan-cols   (when eligible-input? (find-scan-cols sort-input))
+        order-ok?   (and scan-cols
+                         (top-n-order-eligible? (:order-specs sort-node)
+                                                scan-cols))
+        no-offset?  (and limit-node?
+                         (or (nil? (:offset plan)) (zero? (long (:offset plan)))))
+        small?      (and limit-node?
+                         (some? (:limit plan))
+                         (<= 0 (long (:limit plan)))
+                         (<= (long (:limit plan)) (long *top-n-limit*)))]
+    (if (and limit-node? sort? eligible-input? order-ok? no-offset? small?)
+      ;; Capture any LProject between LSort and the scan: top-N's
+      ;; row-fetch can apply the projection itself, dropping the
+      ;; LProject so the LScan keeps every column the projection
+      ;; references.
+      (let [[items scan] (peel-project sort-input)]
+        (with-meta
+          (ir/->LTopN (first (:order-specs sort-node))
+                      (long (:limit plan))
+                      items
+                      scan)
+          (meta plan)))
+      plan)))
+
+;; ============================================================================
+;; Pass: window-having pushdown
+;; ============================================================================
+
+(defn window-having-pushdown
+  "Rewrite `LHaving (LProject items (LWindow specs input))` →
+   `LProject items (LHaving preds (LWindow specs input))` when:
+   - all `:items` are bare `{:name x :ref x}` column refs (no
+     `:expr` projection items that materialize new columns), AND
+   - every having predicate references a column produced by the
+     window (output names) or already present in the LWindow input.
+
+   Mirrors the legacy `query.clj` window-having pushdown
+   (q.clj:758-816): evaluating the having against raw column arrays
+   before LProject avoids materializing every input row when only
+   a tiny fraction survive the post-window filter (e.g. ROW_NUMBER
+   <= 2). H2O-Q8 (6M → 120K) is the canonical win."
+  [plan]
+  (ir/walk-plan
+   plan
+   (fn [node]
+     (if (and (instance? LHaving node)
+              (instance? LProject (:input node))
+              (instance? LWindow (:input (:input node))))
+       (let [proj    (:input node)
+             win     (:input proj)
+             items   (:items proj)
+             ;; LHaving's `:predicates` are already normalized at
+             ;; `build-logical-plan` time, so `pred-columns` can read
+             ;; them directly.
+             preds   (:predicates node)
+             ;; Only push when project is trivial (no expr items)
+             simple? (every? (fn [it]
+                               (and (:ref it)
+                                    (keyword? (:ref it))
+                                    (not (:expr it))))
+                             items)
+             win-out  (set (map :as (:specs win)))
+             win-in   (loop [n (:input win)]
+                        (cond
+                          (instance? LScan n)   (set (keys (:columns n)))
+                          (instance? LFilter n) (recur (:input n))
+                          :else                 #{}))
+             visible  (clojure.set/union win-out win-in)
+             pred-cols (mapcat pred-columns preds)
+             refs-window? (some win-out pred-cols)
+             refs-only-visible?
+             (every? #(contains? visible %) pred-cols)]
+         (if (and simple? refs-window? refs-only-visible?)
+           (ir/->LProject items
+                          (ir/->LHaving preds win))
+           node))
+       node))))
+
+;; ============================================================================
 ;; Composite: full optimization pipeline
 ;; ============================================================================
 
 (defn optimize
-  "Run all optimization passes on a logical plan, producing a physical plan."
+  "Run all optimization passes on a logical plan, producing a physical plan.
+   Top-level metadata (e.g. ::output-format, ::order-only-keys) is
+   preserved across passes since individual rewrites may drop it."
   [plan]
-  (-> plan
-      annotate
-      predicate-pushdown
-      join-reorder
-      zone-map-annotation
-      expr-materialization
-      strategy-selection
-      operator-fusion
-      stats-propagation
-      column-pruning))
+  (let [m (meta plan)
+        out (-> plan
+                annotate
+                predicate-pushdown
+                join-reorder
+                zone-map-annotation
+                ;; Window-having pushdown runs before expr-materialization
+                ;; so the rewritten `LHaving (LWindow ...)` shape is the
+                ;; one strategy-selection sees.
+                window-having-pushdown
+                expr-materialization
+                ;; Top-N rewrite runs BEFORE strategy-selection so it operates
+                ;; on logical IR (`LLimit (LSort scan)`) rather than physical
+                ;; (`PLimit (PSort scan)`). Also runs BEFORE column-pruning so
+                ;; the `LScan` referenced by `LTopN` keeps all output columns
+                ;; — the streaming top-N fetches each surviving row's full
+                ;; column set, not just the order column.
+                top-n-rewrite
+                strategy-selection
+                operator-fusion
+                stats-propagation
+                column-pruning)]
+    (if (and m (instance? clojure.lang.IObj out))
+      (vary-meta out merge m)
+      out)))
 
 ;; ============================================================================
 ;; Plan explanation (for debugging and EXPLAIN output)

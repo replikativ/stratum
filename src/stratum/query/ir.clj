@@ -67,12 +67,44 @@
 
 (defrecord LLimit [limit offset input])
 
+(defrecord LTopN
+  ;; Streaming `ORDER BY col [DESC] LIMIT N` over a single numeric
+  ;; column. The optimizer recognizes the LLimit-over-LSort shape
+  ;; and rewrites to this; the executor delegates to
+  ;; `stratum.query.top-n/execute-top-n`. `select` is the (already
+  ;; normalized) projection (or nil for SELECT *) so the rewrite can
+  ;; happen below the LProject layer.
+           [order-spec limit select input])
+
 (defrecord LSetOp
   ;; Union/Intersect/Except over sub-queries.
   ;; op      — :union | :intersect | :except
   ;; queries — vec of sub-query maps (each built into its own plan)
   ;; all?    — boolean (UNION ALL)
            [op queries all?])
+
+(defrecord LAnomaly
+  ;; Materialize iforest-derived synthetic columns post-join.
+  ;; expr->col — map from `[:anomaly-* model …]` expression vector
+  ;;             to the synthetic column keyword the surrounding
+  ;;             query has been rewritten to reference.
+  ;; models    — `{model-name → trained-model}` carried through to
+  ;;             the executor (anomaly is an enrichment, so models
+  ;;             aren't available via column metadata).
+  ;; input     — child plan whose output column ctx the executor
+  ;;             scores against.
+           [expr->col models input])
+
+(defrecord LStringMaterialize
+  ;; Evaluate string-producing expressions (`:upper`, `:lower`,
+  ;; `:concat`, `:trim`, …) against the post-join column ctx and
+  ;; inject the dict-encoded results as synthetic columns. The
+  ;; surrounding query has already been rewritten so `:group` /
+  ;; aggs / `:select` reference the synthetic column keywords.
+  ;; items — vec of `{:col-name :expr}` pairs (col-name is a
+  ;;         `__str_expr_N` keyword; expr is a normalized
+  ;;         expression map).
+           [items input])
 
 ;; ============================================================================
 ;; Annotations — attached to logical nodes by analysis passes
@@ -133,8 +165,10 @@
 
 (defrecord PFusedSIMDCount
   ;; JIT-isolated COUNT path (avoids JIT poisoning from aggType switch).
-  ;; Targets: ColumnOps/fusedSimdCountParallel
-           [predicates input])
+  ;; Targets: ColumnOps/fusedSimdCountParallel.
+  ;; `agg` carries the normalized COUNT spec so the result is keyed by
+  ;; the user's `:as` alias (e.g. `SELECT COUNT(*) AS cnt → :cnt`).
+           [predicates agg input])
 
 (defrecord PChunkedSIMDAgg
   ;; Stream index chunks with SIMD filter+aggregate.
@@ -143,13 +177,17 @@
 
 (defrecord PChunkedSIMDCount
   ;; JIT-isolated chunked COUNT.
-  ;; Targets: ColumnOpsExt/fusedSimdChunkedCountParallel
-           [predicates input])
+  ;; Targets: ColumnOpsExt/fusedSimdChunkedCountParallel.
+  ;; `agg` carries the COUNT spec so the result honors the user's
+  ;; `:as` alias (parallel to PFusedSIMDCount).
+           [predicates agg input])
 
 (defrecord PBlockSkipCount
   ;; Block-skip COUNT on arrays using min/max statistics.
-  ;; Targets: ColumnOpsExt/fusedSimdCountBlockSkipParallel
-           [predicates input])
+  ;; Targets: ColumnOpsExt/fusedSimdCountBlockSkipParallel.
+  ;; `agg` carries the COUNT spec so the result honors the user's
+  ;; `:as` alias (parallel to PFusedSIMDCount / PChunkedSIMDCount).
+           [predicates agg input])
 
 (defrecord PFusedMultiSum
   ;; Single-pass multiple SUM/AVG/COUNT aggs (<= 4 non-COUNT).
@@ -223,6 +261,12 @@
 (defrecord PDistinct [input])
 (defrecord PLimit   [limit offset input])
 
+(defrecord PTopN
+  ;; Physical counterpart of LTopN. The executor delegates to
+  ;; `stratum.query.top-n/execute-top-n` after recovering the column
+  ;; context from the input scan.
+           [order-spec limit select input])
+
 ;; --- Expression materialization (inserted by passes) ------------------------
 
 (defrecord PMaterializeExpr
@@ -242,7 +286,8 @@
   (or (instance? LScan node) (instance? LFilter node) (instance? LJoin node)
       (instance? LGroupBy node) (instance? LGlobalAgg node) (instance? LProject node)
       (instance? LWindow node) (instance? LHaving node) (instance? LDistinct node)
-      (instance? LSort node) (instance? LLimit node) (instance? LSetOp node)))
+      (instance? LSort node) (instance? LLimit node) (instance? LSetOp node)
+      (instance? LAnomaly node) (instance? LStringMaterialize node)))
 
 (defn input-node
   "Returns the input child of a unary node, or nil for leaves/joins."

@@ -10,6 +10,7 @@
   (:require [stratum.query.ir :as ir]
             [stratum.query.execution :as x]
             [stratum.query.plan :as plan]
+            [stratum.query.prepare :as prep]
             [stratum.query.normalization :as norm]
             [stratum.query.predicate :as pred]
             [stratum.query.estimate :as est]
@@ -18,7 +19,9 @@
             [stratum.query.group-by :as gb]
             [stratum.query.join :as jn]
             [stratum.query.postprocess :as post]
+            [stratum.query.top-n :as top-n]
             [stratum.query.window :as win]
+            [stratum.dataset :as dataset]
             [stratum.index :as index]
             [stratum.chunk :as chunk])
   (:import [stratum.query.ir
@@ -30,7 +33,7 @@
             PFusedExtractCount PBitmapSemiJoin PHashJoin
             PPerfectHashJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
             PProject PWindow PHaving PSort PDistinct PLimit
-            PMaterializeExpr]
+            PMaterializeExpr LTopN LSetOp LAnomaly LStringMaterialize]
            [stratum.internal ColumnOps ColumnOpsExt ColumnOpsAnalytics]))
 
 (set! *warn-on-reflection* true)
@@ -218,14 +221,15 @@
 
 (defn- execute-fused-simd-count [node columnar?]
   (let [ctx (execute-node (:input node))
-        [preds columns length] (prepare-node-preds (:predicates node) ctx)]
+        [preds columns length] (prepare-node-preds (:predicates node) ctx)
+        agg (or (:agg node) {:op :count :as nil})]
     (if (empty? preds)
       ;; Unfiltered count — short-circuit
-      (post/format-fused-result {:result 0.0 :count length} {:op :count :as nil})
+      (post/format-fused-result {:result 0.0 :count length} agg)
       (let [mat-cols (cols/materialize-columns columns)]
         (post/format-fused-result
          (x/execute-fused preds nil mat-cols length)
-         {:op :count :as nil})))))
+         agg)))))
 
 (defn- execute-chunked-simd-agg [node columnar?]
   (let [ctx (execute-node (:input node))
@@ -245,10 +249,11 @@
 
 (defn- execute-chunked-simd-count [node columnar?]
   (let [ctx (execute-node (:input node))
-        [preds columns length] (prepare-node-preds (:predicates node) ctx)]
+        [preds columns length] (prepare-node-preds (:predicates node) ctx)
+        agg (or (:agg node) {:op :count :as nil})]
     (post/format-fused-result
      (x/execute-chunked-fused-count preds columns length)
-     {:op :count :as nil})))
+     agg)))
 
 (defn- execute-block-skip-count [node columnar?]
   (let [ctx (execute-node (:input node))
@@ -266,8 +271,9 @@
                     ^"[[D" (:dbl-cols pp)
                     ^doubles (:dbl-lo pp)
                     ^doubles (:dbl-hi pp)
-                    (int length))]
-    (post/format-fused-result {:result 0.0 :count (long (aget r 1))} {:op :count :as nil})))
+                    (int length))
+        agg (or (:agg node) {:op :count :as nil})]
+    (post/format-fused-result {:result 0.0 :count (long (aget r 1))} agg)))
 
 (defn- execute-fused-multi-sum [node columnar?]
   (let [ctx (execute-node (:input node))
@@ -400,6 +406,70 @@
 (defn- execute-hash-group-by [node columnar?]
   ;; Same as dense — execute-group-by internally decides dense vs hash
   (execute-dense-group-by node columnar?))
+
+(defn- execute-fused-extract-count
+  "Run the fused EXTRACT(unit, col) GROUP BY → COUNT operator. The
+   planner emits this when a `LGroupBy` over a single
+   `PMaterializeExpr {:op #{:minute :hour :second :day-of-week}}`
+   has only `:count` aggs and no filter. We pull the source column
+   straight from the scan (skipping the materialization), call
+   `ColumnOpsExt/fusedExtractCountDenseParallel`, then decode the
+   per-key accumulator array into row maps or columnar output. The
+   decode mirrors the legacy block at `q.clj:858-908`."
+  [node columnar?]
+  (let [scan-ctx  (execute-node (:input node))
+        col-key   (:extract-col node)
+        col-info  (get (:columns scan-ctx) col-key)
+        ;; Long-typed source — either a materialized array or an
+        ;; index that we materialize once. The planner's eligibility
+        ;; gate guarantees the column is :int64.
+        ^longs raw-col (or (:data col-info)
+                           (when-let [idx (:index col-info)]
+                             (index/idx-materialize-to-array idx)))
+        op       (:extract-op node)
+        op-const (case op
+                   :minute      ColumnOpsExt/EXTRACT_MINUTE
+                   :hour        ColumnOpsExt/EXTRACT_HOUR
+                   :second      ColumnOpsExt/EXTRACT_SECOND
+                   :day-of-week ColumnOpsExt/EXTRACT_DAY_OF_WEEK)
+        aggs     (:aggs node)
+        n-aggs   (int (count aggs))
+        length   (long (or (:length scan-ctx) (alength raw-col)))
+        ^"[[D" result-array
+        (ColumnOpsExt/fusedExtractCountDenseParallel
+         raw-col (int op-const) n-aggs (int length))
+        max-key  (int (ColumnOpsExt/extractMaxKey (int op-const)))
+        group-col-name (keyword (name op))
+        agg-aliases    (mapv #(or (:as %) (:op %)) aggs)]
+    (if columnar?
+      (let [key-list (java.util.ArrayList.)
+            _ (dotimes [k max-key]
+                (let [^doubles accs (aget result-array k)]
+                  (when (and accs (> (aget accs 1) 0.0))
+                    (.add key-list (long k)))))
+            n        (.size key-list)
+            keys-arr (long-array n)
+            _        (dotimes [i n] (aset keys-arr i (long (.get key-list i))))
+            agg-arrs (mapv (fn [_a-idx]
+                             (let [la (long-array n)]
+                               (dotimes [i n]
+                                 (let [k (long (.get key-list i))
+                                       ^doubles accs (aget result-array (int k))]
+                                   (aset la i (long (aget accs 1)))))
+                               la))
+                           (range n-aggs))]
+        (-> {group-col-name keys-arr :n-rows n}
+            (into (map vector agg-aliases agg-arrs))))
+      (let [results (transient [])]
+        (dotimes [k max-key]
+          (let [^doubles accs (aget result-array k)]
+            (when (and accs (> (aget accs 1) 0.0))
+              (let [cnt (long (aget accs 1))
+                    row (-> {group-col-name (long k)}
+                            (into (map (fn [a] [a cnt]) agg-aliases))
+                            (assoc :_count cnt))]
+                (conj! results row)))))
+        (persistent! results)))))
 
 ;; --- Mask realization -------------------------------------------------------
 
@@ -544,8 +614,10 @@
 (defn- execute-window [node columnar? results]
   (let [results (or results (execute-node (:input node)))
         specs (:specs node)]
-    ;; Window on grouped results (result rows already computed)
-    (if (sequential? results)
+    (cond
+      ;; Path 1: input is already a vector of result rows (window over
+      ;; an aggregated/projected result, e.g. window-on-group-by).
+      (sequential? results)
       (let [grouped-cols (x/results->columns results)
             n-grouped (count results)
             with-windows (win/execute-window-functions grouped-cols n-grouped specs)
@@ -567,7 +639,19 @@
                                      :else (get m k)))))
                         {} all-ks))
               (range n-grouped)))
-      results)))
+
+      ;; Path 2: input is a column context (no upstream aggregate).
+      ;; Mirrors the legacy `q` window block (q.clj:744+): materialize
+      ;; columns, evaluate window specs row-major, return an augmented
+      ;; column ctx that downstream PProject / PHaving / PSort can
+      ;; consume in either columnar or row form.
+      (and (map? results) (:columns results) (:length results))
+      (let [length (long (:length results))
+            mat (cols/materialize-columns (:columns results))
+            with-windows (win/execute-window-functions mat length specs)]
+        (assoc results :columns with-windows :length length))
+
+      :else results)))
 
 ;; --- Expression materialization ----------------------------------------------
 
@@ -577,16 +661,141 @@
         length  (ctx-length ctx)
         mat-cols (cols/materialize-columns columns)
         col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)
-        cache (java.util.HashMap.)
-        arr (expr/eval-expr-vectorized (:expr node) col-arrays length cache)]
+        cache  (java.util.HashMap.)
+        target (or (:target node) :float64)
+        ;; `:int64` target → use `eval-expr-to-long` so date-trunc /
+        ;; date-add / extract ops emit a `long[]` directly. The
+        ;; alternative (`eval-expr-vectorized` then double→long
+        ;; cast) blocks the dense group-by all-long fast path and
+        ;; reintroduces the round-trip the legacy code already
+        ;; eliminated. Mirrors `q.clj:712-718`.
+        arr (if (= target :int64)
+              (expr/eval-expr-to-long (:expr node) col-arrays length cache)
+              (expr/eval-expr-vectorized (:expr node) col-arrays length cache))]
     (assoc ctx :columns (assoc mat-cols (:col-name node)
-                               {:type (or (:target node) :float64) :data arr}))))
+                               {:type target :data arr}))))
+
+;; --- Top-N pushdown ---------------------------------------------------------
+
+(defn- execute-top-n-node
+  "Run the streaming top-N pushdown by delegating to
+   `stratum.query.top-n/execute-top-n`. The IR's `LTopN` node carries
+   the (single) order-spec, the LIMIT, and the (LProject) items it
+   absorbed (or nil for SELECT *). We assemble the synthetic query
+   map that `top-n/execute-top-n` expects from those fields plus the
+   input column context."
+  [node]
+  (let [ctx (execute-node (:input node))
+        columns (ctx-columns ctx)
+        items   (:select node)
+        ;; `top-n/execute-top-n` accepts a vector of plain column
+        ;; keywords (or nil for SELECT *). Convert LProject items to
+        ;; that shape; literal/computed projections fall back to nil
+        ;; (which means SELECT all from the scan), and the planner's
+        ;; eligibility gate ensures the project items are
+        ;; keyword-only when LProject was peeled.
+        select  (when (seq items)
+                  (let [refs (mapv :ref items)]
+                    (when (every? keyword? refs) refs)))
+        order-spec (:order-spec node)
+        order-spec (if (vector? order-spec) order-spec [order-spec :asc])]
+    (top-n/execute-top-n
+     {:order [order-spec]
+      :limit (:limit node)
+      :select select}
+     columns)))
 
 ;; --- Post-processing --------------------------------------------------------
 
+(defn- col-array
+  "Return the underlying primitive array for a column entry. Accepts
+   either `{:type :data}` maps or raw arrays."
+  [v]
+  (if (map? v) (:data v) v))
+
+(defn- having-pred-matches?
+  "Scalar evaluation of one normalized having predicate at row `i`,
+   using the materialized `columns` map. Mirrors the operator set the
+   legacy `q` window-having pushdown supports."
+  [columns ^long i pred]
+  (let [col-key (first pred)
+        op      (second pred)
+        col     (get columns col-key)
+        data    (col-array col)
+        v (cond
+            (expr/double-array? data) (aget ^doubles data i)
+            (expr/long-array? data)   (double (aget ^longs data i))
+            :else nil)]
+    (cond
+      (= op :is-null)     (or (nil? v) (Double/isNaN v))
+      (= op :is-not-null) (and (some? v) (not (Double/isNaN v)))
+      (nil? v) false
+      (Double/isNaN v) false
+      :else
+      (let [arg (when (> (count pred) 2) (double (nth pred 2)))]
+        (case op
+          :lt  (< v arg)
+          :gt  (> v arg)
+          :lte (<= v arg)
+          :gte (>= v arg)
+          :eq  (== v arg)
+          :neq (not (== v arg))
+          :range (let [lo arg
+                       hi (double (nth pred 3))]
+                   (and (>= v lo) (< v hi)))
+          true)))))
+
+(defn- having-fast-path-on-ctx
+  "Fast path for `PHaving` whose input is a column context (e.g. a
+   `PWindow` immediately below). Evaluates each predicate on the raw
+   column arrays, gathers only the surviving rows, and returns a new
+   column context the parent `PProject` can finish materializing.
+   Mirrors the legacy `q` window-having pushdown.
+   `preds` are already normalized (by `build-logical-plan`)."
+  [ctx preds]
+  (let [length  (long (:length ctx))
+        columns (:columns ctx)
+        normalized preds
+        matches (java.util.ArrayList.)]
+    (dotimes [i (int length)]
+      (when (every? #(having-pred-matches? columns i %) normalized)
+        (.add matches (int i))))
+    (let [n (.size matches)]
+      (if (= n length)
+        ctx
+        (let [indices (int-array n)
+              _ (dotimes [k n] (aset indices k (int (.get matches k))))
+              new-cols
+              (reduce-kv
+               (fn [m k v]
+                 (let [data (col-array v)]
+                   (assoc m k
+                          (cond
+                            (expr/long-array? data)
+                            (let [g (ColumnOps/gatherLong ^longs data indices (int n))]
+                              (if (map? v) (assoc v :data g) g))
+                            (expr/double-array? data)
+                            (let [g (ColumnOps/gatherDouble ^doubles data indices (int n))]
+                              (if (map? v) (assoc v :data g) g))
+                            (expr/string-array? data)
+                            (let [out (make-array String n)]
+                              (dotimes [k n]
+                                (aset ^"[Ljava.lang.String;" out k
+                                      (aget ^"[Ljava.lang.String;" data (aget indices k))))
+                              (if (map? v) (assoc v :data out) out))
+                            :else v))))
+               {} columns)]
+          (-> ctx (assoc :columns new-cols :length n)))))))
+
 (defn- execute-having [node results]
   (let [results (or results (execute-node (:input node)))]
-    (post/apply-having results (:predicates node))))
+    ;; Fast path: column-context input (e.g. PWindow → PHaving after the
+    ;; window-having pushdown rewrite). Filter on raw column arrays and
+    ;; return a column ctx so the next PProject only materializes
+    ;; surviving rows.
+    (if (and (map? results) (:columns results) (:length results))
+      (having-fast-path-on-ctx results (:predicates node))
+      (post/apply-having results (:predicates node)))))
 
 (defn- execute-sort [node results]
   (let [results (or results (execute-node (:input node)))]
@@ -632,7 +841,7 @@
      (instance? PChunkedDenseGroupBy node) (execute-chunked-dense-group-by node columnar?)
      (instance? PDenseGroupBy node)        (execute-dense-group-by node columnar?)
      (instance? PHashGroupBy node)         (execute-hash-group-by node columnar?)
-     (instance? PFusedExtractCount node)   (throw (ex-info "TODO: PFusedExtractCount" {}))
+     (instance? PFusedExtractCount node)   (execute-fused-extract-count node columnar?)
 
      ;; Join
      (instance? PHashJoin node)             (execute-hash-join node)
@@ -643,6 +852,67 @@
 
      ;; Expression materialization
      (instance? PMaterializeExpr node) (execute-materialize-expr node)
+
+     ;; Top-N pushdown — LTopN is recognized directly (no separate
+     ;; physical record) and dispatched to the streaming primitive.
+     (instance? LTopN node) (execute-top-n-node node)
+
+     ;; Anomaly score materialization (post-join). Resolves at the
+     ;; right point in the pipeline so the iforest sees joined
+     ;; columns. The plan's frontend has already rewritten the
+     ;; surrounding query to reference the synthetic columns
+     ;; produced here. Pure column-ctx → column-ctx — no row decode.
+     (instance? LAnomaly node)
+     (let [ctx       (execute-node (:input node))
+           columns   (:columns ctx)
+           length    (long (:length ctx))
+           new-cols  (prep/materialize-anomaly (:expr->col node)
+                                               columns length
+                                               (:models node))]
+       (assoc ctx :columns new-cols))
+
+     ;; Post-join string-expression materialization. The frontend
+     ;; has rewritten `:group` / aggs / `:select` to reference the
+     ;; synthetic `__str_expr_N` columns produced here. Each item
+     ;; runs `expr/eval-string-expr` against the post-join
+     ;; (materialized) column ctx, so dict-encoded results are
+     ;; sized to the joined row count.
+     (instance? LStringMaterialize node)
+     (let [ctx       (execute-node (:input node))
+           columns   (:columns ctx)
+           length    (long (:length ctx))
+           mat-cols  (cols/materialize-columns columns)
+           new-cols  (reduce
+                      (fn [cs {:keys [col-name expr]}]
+                        (let [entry (expr/eval-string-expr expr cs length)]
+                          (assoc cs col-name entry)))
+                      mat-cols
+                      (:items node))]
+       (assoc ctx :columns new-cols))
+
+     ;; Set ops — UNION/INTERSECT/EXCEPT. The runtime path in
+     ;; `stratum.query/q` short-circuits these before the planner
+     ;; runs, but `compile-physical` / `explain-query` callers can
+     ;; still hand us an `LSetOp`. Recurse via `q` so each
+     ;; sub-query goes through its own planner pass and the result
+     ;; combination matches the legacy semantics in `q.clj:372–386`.
+     (instance? LSetOp node)
+     (let [q-fn @(requiring-resolve 'stratum.query/q)
+           sub-results (mapv q-fn (:queries node))]
+       (case (:op node)
+         :union
+         (let [combined (vec (apply concat sub-results))]
+           (if (:all? node)
+             combined
+             (vec (clojure.core/distinct combined))))
+         :intersect
+         (let [first-r (set (first sub-results))]
+           (vec (reduce #(clojure.set/intersection %1 (set %2))
+                        first-r (rest sub-results))))
+         :except
+         (let [first-r (first sub-results)
+               to-remove (reduce (fn [acc r] (into acc r)) #{} (rest sub-results))]
+           (vec (remove to-remove first-r)))))
 
      ;; Projection
      (instance? PProject node)  (execute-project node columnar?)
@@ -662,38 +932,127 @@
 
 (defn execute-physical
   "Execute a physical plan tree, returning result rows.
-   columnar? controls output format (arrays vs row maps)."
+   columnar? controls output format (arrays vs row maps).
+
+   `expr/*columns-meta*` is bound by `run-query` from `prepare-query`'s
+   output and must NOT be re-bound here — overriding it with `{}`
+   would lose the dict info that string-expression evaluation depends
+   on (LENGTH, etc.). When `execute-physical` is called directly
+   without a prior binding, the var's root value (`{}`) applies."
   ([plan] (execute-physical plan false))
   ([plan columnar?]
-   (binding [expr/*columns-meta* {}]
-     (let [result (execute-node plan columnar?)]
+   (let [result (execute-node plan columnar?)]
        ;; If the result is a column context (no agg/project), count matching rows
-       (if (and (map? result) (:columns result) (:length result) (not (:n-rows result)))
-         (let [preds (or (:preds result) [])
-               columns (:columns result)
-               length (long (:length result))]
-           (if (empty? preds)
-             [{:_count length}]
-             (let [mat-cols (cols/materialize-columns columns)
-                   col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)]
-               [{:_count (loop [i 0 cnt 0]
-                           (if (>= i length)
-                             cnt
-                             (if (every? #(gb/eval-pred-scalar col-arrays i %) preds)
-                               (recur (inc i) (inc cnt))
-                               (recur (inc i) cnt))))}])))
-         result)))))
+     (if (and (map? result) (:columns result) (:length result) (not (:n-rows result)))
+       (let [preds (or (:preds result) [])
+             columns (:columns result)
+             length (long (:length result))]
+         (if (empty? preds)
+           [{:_count length}]
+           (let [mat-cols (cols/materialize-columns columns)
+                 col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)]
+             [{:_count (loop [i 0 cnt 0]
+                         (if (>= i length)
+                           cnt
+                           (if (every? #(gb/eval-pred-scalar col-arrays i %) preds)
+                             (recur (inc i) (inc cnt))
+                             (recur (inc i) cnt))))}])))
+       result))))
 
 ;; ============================================================================
 ;; High-level entry points (plan → optimize → execute)
 ;; ============================================================================
 
+(defn- prepare-and-build
+  "Run the shared lowering passes (`prepare-query`) and then build a
+   logical plan against the cleaned query. Returns
+   `{:plan logical :columns-meta meta}`. The legacy `q` body has
+   always run these passes inline; the planner needs them too so
+   raw expression vectors don't reach the executor."
+  [query]
+  (let [from   (:from query)
+        columns (cond
+                  (nil? from) {}
+                  (satisfies? dataset/IDataset from) (dataset/columns from)
+                  :else (cols/prepare-columns from))
+        length (if (seq columns)
+                 (cols/get-column-length (val (first columns)))
+                 0)
+        ;; Anomaly resolution. `[:anomaly-score …]` would otherwise
+        ;; reach `normalize-expr` and throw "Unknown expression
+        ;; operator". Two cases:
+        ;;   - No join: resolve eagerly here. The pre-join columns
+        ;;     are the only columns the iforest will ever see, so
+        ;;     scoring at prepare time and inlining the synthetic
+        ;;     column into `columns` is fine.
+        ;;   - Join: defer to the executor's `LAnomaly` case so the
+        ;;     iforest sees post-join columns. We still rewrite the
+        ;;     query here (via `anomaly-spec`) so synthetic refs
+        ;;     are visible to `prepare-query` / `build-logical-plan`,
+        ;;     and we thread the spec + models through the cleaned
+        ;;     query for `build-logical-plan` to attach to `LAnomaly`.
+        models  (:_anomaly-models query)
+        has-join? (seq (:join query))
+        [query columns anomaly-spec]
+        (cond
+          (and (seq models) (not has-join?))
+          (let [[q' cols'] (prep/resolve-anomaly-columns query columns length models)]
+            [q' cols' nil])
+
+          (and (seq models) has-join?)
+          (let [{:keys [expr->col query]} (prep/anomaly-spec query)]
+            [query columns {:expr->col expr->col :models models}])
+
+          :else [query columns nil])
+        {:keys [preds aggs group select columns columns-meta string-items]}
+        (prep/prepare-query query columns length)
+        ;; Rebuild a query map for build-logical-plan with the
+        ;; lowered slots in place. `:from` becomes the cleaned
+        ;; columns map (containing temp materialized columns).
+        cleaned (-> query
+                    (assoc :from columns
+                           :where preds
+                           :agg   aggs
+                           :group group
+                           :select select
+                           ;; Tell build-logical-plan that preds/aggs
+                           ;; are already normalized — re-running
+                           ;; norm/normalize-pred / normalize-agg on
+                           ;; their output throws.
+                           ::plan/pre-normalized? true)
+                    (cond->
+                     anomaly-spec
+                      (assoc ::plan/anomaly-expr->col (:expr->col anomaly-spec)
+                             ::plan/anomaly-models    (:models    anomaly-spec))
+                      (seq string-items)
+                      (assoc ::plan/string-items string-items)))]
+    {:plan         (plan/build-logical-plan cleaned)
+     :columns-meta columns-meta}))
+
+(defn- strip-injected-keys
+  "Drop injected keys (`_having-only-keys`, `_order-only-keys`) from
+   result rows. The SQL → IR translation injects extra aggregates
+   into the projection so HAVING / ORDER BY can reference them, but
+   they shouldn't appear in the user-visible output."
+  [results having-only-keys order-only-keys]
+  (let [drop-ks (concat having-only-keys order-only-keys)]
+    (if (and (sequential? results) (seq drop-ks))
+      (mapv #(if (map? %) (apply dissoc % drop-ks) %) results)
+      results)))
+
 (defn run-query
-  "Build logical plan, optimize to physical, execute."
+  "Lower the query, build logical plan, optimize to physical, execute.
+   Result rows have the injected order-only / having-only aggregate
+   columns stripped, matching the legacy `q` body."
   [query columnar?]
-  (let [logical  (plan/build-logical-plan query)
-        physical (plan/optimize logical)]
-    (execute-physical physical columnar?)))
+  (let [{:keys [plan columns-meta]} (prepare-and-build query)
+        physical (plan/optimize plan)
+        m (meta plan)
+        having-only (::plan/having-only-keys m)
+        order-only  (::plan/order-only-keys  m)]
+    (binding [expr/*columns-meta* columns-meta]
+      (-> (execute-physical physical columnar?)
+          (strip-injected-keys having-only order-only)))))
 
 (defn compile-physical
   "Build and optimize a physical plan for a query. The plan captures all
@@ -702,11 +1061,32 @@
   (let [logical  (plan/build-logical-plan query)]
     (plan/optimize logical)))
 
+(defn- scan-summary
+  "Walk the plan to find the leaf scan and pull (length, n-cols) for
+   the explain output. Mirrors the legacy explain shape so consumers
+   that probe `:n-rows` / `:columns` keep working."
+  [node]
+  (loop [n node]
+    (cond
+      (or (instance? stratum.query.ir.PScan n)
+          (instance? stratum.query.ir.PChunkedScan n)
+          (instance? stratum.query.ir.LScan n))
+      [(:length n) (count (:columns n))]
+      (:input n)         (recur (:input n))
+      (:left n)          (recur (:left n))
+      (:probe-side n)    (recur (:probe-side n))
+      :else              [nil nil])))
+
 (defn explain-query
-  "Build and explain a physical plan."
+  "Build and explain a physical plan. Returns a map with both the
+   planner-native keys (`:plan-tree`, `:strategy`) and legacy-shape
+   keys (`:n-rows`, `:columns`) so existing callers don't break."
   [query]
   (let [logical  (plan/build-logical-plan query)
-        physical (plan/optimize logical)]
+        physical (plan/optimize logical)
+        [n-rows n-cols] (scan-summary physical)]
     {:plan-tree (plan/explain physical)
      :strategy  (keyword (.getSimpleName (class physical)))
+     :n-rows    n-rows
+     :columns   n-cols
      :query     (dissoc query :from)}))

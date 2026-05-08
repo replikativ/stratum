@@ -21,13 +21,26 @@
     [{(keyword alias) value
       :_count cnt}]))
 
+(defn- canonicalize-distinct-val
+  "Normalize a value before hashing for DISTINCT comparison so SQL
+   semantics hold:
+     -0.0 ≡ +0.0   (Java Double bit-pattern equality would split them)
+   NaN handling could be added similarly if needed; SQL leaves NaN
+   semantics implementation-defined."
+  [v]
+  (if (and (double? v) (zero? (double v)))
+    0.0
+    v))
+
 (defn apply-distinct
-  "Apply SELECT DISTINCT: deduplicate result rows using a HashSet on value vectors.
-   Excludes internal :_count key from deduplication comparison."
+  "Apply SELECT DISTINCT: deduplicate result rows using a HashSet on
+   value vectors. Excludes internal :_count key. Numeric +0.0 / -0.0
+   are canonicalized so they compare equal."
   [results]
   (let [seen (java.util.HashSet.)]
     (filterv (fn [row]
-               (let [vals (vec (sort-by key (dissoc row :_count)))]
+               (let [pairs (sort-by key (dissoc row :_count))
+                     vals  (mapv (fn [[_ v]] (canonicalize-distinct-val v)) pairs)]
                  (.add seen vals)))
              results)))
 
