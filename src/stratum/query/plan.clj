@@ -1347,6 +1347,65 @@
       plan)))
 
 ;; ============================================================================
+;; Pass: window-having pushdown
+;; ============================================================================
+
+(defn window-having-pushdown
+  "Rewrite `LHaving (LProject items (LWindow specs input))` →
+   `LProject items (LHaving preds (LWindow specs input))` when:
+   - all `:items` are bare `{:name x :ref x}` column refs (no
+     `:expr` projection items that materialize new columns), AND
+   - every having predicate references a column produced by the
+     window (output names) or already present in the LWindow input.
+
+   Mirrors the legacy `query.clj` window-having pushdown
+   (q.clj:758-816): evaluating the having against raw column arrays
+   before LProject avoids materializing every input row when only
+   a tiny fraction survive the post-window filter (e.g. ROW_NUMBER
+   <= 2). H2O-Q8 (6M → 120K) is the canonical win."
+  [plan]
+  (ir/walk-plan
+   plan
+   (fn [node]
+     (if (and (instance? LHaving node)
+              (instance? LProject (:input node))
+              (instance? LWindow (:input (:input node))))
+       (let [proj    (:input node)
+             win     (:input proj)
+             items   (:items proj)
+             ;; LHaving carries the user's raw predicates; normalize
+             ;; before classifying columns since `pred-columns`
+             ;; expects `[col op & args]` shape.
+             preds        (:predicates node)
+             norm-preds   (mapv norm/normalize-pred preds)
+             ;; Only push when project is trivial (no expr items)
+             simple? (every? (fn [it]
+                               (and (:ref it)
+                                    (keyword? (:ref it))
+                                    (not (:expr it))))
+                             items)
+             win-out  (set (map :as (:specs win)))
+             win-in   (loop [n (:input win)]
+                        (cond
+                          (instance? LScan n)   (set (keys (:columns n)))
+                          (instance? LFilter n) (recur (:input n))
+                          :else                 #{}))
+             visible  (clojure.set/union win-out win-in)
+             pred-cols (mapcat pred-columns norm-preds)
+             refs-window? (some win-out pred-cols)
+             refs-only-visible?
+             (every? #(contains? visible %) pred-cols)]
+         (if (and simple? refs-window? refs-only-visible?)
+           ;; Keep the original (un-normalized) preds on `LHaving` so
+           ;; the executor's standard normalization runs once. The
+           ;; classification above only needed normalized columns,
+           ;; not normalized storage.
+           (ir/->LProject items
+                          (ir/->LHaving preds win))
+           node))
+       node))))
+
+;; ============================================================================
 ;; Composite: full optimization pipeline
 ;; ============================================================================
 
@@ -1361,6 +1420,10 @@
                 predicate-pushdown
                 join-reorder
                 zone-map-annotation
+                ;; Window-having pushdown runs before expr-materialization
+                ;; so the rewritten `LHaving (LWindow ...)` shape is the
+                ;; one strategy-selection sees.
+                window-having-pushdown
                 expr-materialization
                 ;; Top-N rewrite runs BEFORE strategy-selection so it operates
                 ;; on logical IR (`LLimit (LSort scan)`) rather than physical

@@ -634,9 +634,94 @@
 
 ;; --- Post-processing --------------------------------------------------------
 
+(defn- col-array
+  "Return the underlying primitive array for a column entry. Accepts
+   either `{:type :data}` maps or raw arrays."
+  [v]
+  (if (map? v) (:data v) v))
+
+(defn- having-pred-matches?
+  "Scalar evaluation of one normalized having predicate at row `i`,
+   using the materialized `columns` map. Mirrors the operator set the
+   legacy `q` window-having pushdown supports."
+  [columns ^long i pred]
+  (let [col-key (first pred)
+        op      (second pred)
+        col     (get columns col-key)
+        data    (col-array col)
+        v (cond
+            (expr/double-array? data) (aget ^doubles data i)
+            (expr/long-array? data)   (double (aget ^longs data i))
+            :else nil)]
+    (cond
+      (= op :is-null)     (or (nil? v) (Double/isNaN v))
+      (= op :is-not-null) (and (some? v) (not (Double/isNaN v)))
+      (nil? v) false
+      (Double/isNaN v) false
+      :else
+      (let [arg (when (> (count pred) 2) (double (nth pred 2)))]
+        (case op
+          :lt  (< v arg)
+          :gt  (> v arg)
+          :lte (<= v arg)
+          :gte (>= v arg)
+          :eq  (== v arg)
+          :neq (not (== v arg))
+          :range (let [lo arg
+                       hi (double (nth pred 3))]
+                   (and (>= v lo) (< v hi)))
+          true)))))
+
+(defn- having-fast-path-on-ctx
+  "Fast path for `PHaving` whose input is a column context (e.g. a
+   `PWindow` immediately below). Evaluates each predicate on the raw
+   column arrays, gathers only the surviving rows, and returns a new
+   column context the parent `PProject` can finish materializing.
+   Mirrors the legacy `q` window-having pushdown."
+  [ctx preds]
+  (let [length  (long (:length ctx))
+        columns (:columns ctx)
+        normalized (mapv norm/normalize-pred preds)
+        matches (java.util.ArrayList.)]
+    (dotimes [i (int length)]
+      (when (every? #(having-pred-matches? columns i %) normalized)
+        (.add matches (int i))))
+    (let [n (.size matches)]
+      (if (= n length)
+        ctx
+        (let [indices (int-array n)
+              _ (dotimes [k n] (aset indices k (int (.get matches k))))
+              new-cols
+              (reduce-kv
+               (fn [m k v]
+                 (let [data (col-array v)]
+                   (assoc m k
+                          (cond
+                            (expr/long-array? data)
+                            (let [g (ColumnOps/gatherLong ^longs data indices (int n))]
+                              (if (map? v) (assoc v :data g) g))
+                            (expr/double-array? data)
+                            (let [g (ColumnOps/gatherDouble ^doubles data indices (int n))]
+                              (if (map? v) (assoc v :data g) g))
+                            (expr/string-array? data)
+                            (let [out (make-array String n)]
+                              (dotimes [k n]
+                                (aset ^"[Ljava.lang.String;" out k
+                                      (aget ^"[Ljava.lang.String;" data (aget indices k))))
+                              (if (map? v) (assoc v :data out) out))
+                            :else v))))
+               {} columns)]
+          (-> ctx (assoc :columns new-cols :length n)))))))
+
 (defn- execute-having [node results]
   (let [results (or results (execute-node (:input node)))]
-    (post/apply-having results (:predicates node))))
+    ;; Fast path: column-context input (e.g. PWindow → PHaving after the
+    ;; window-having pushdown rewrite). Filter on raw column arrays and
+    ;; return a column ctx so the next PProject only materializes
+    ;; surviving rows.
+    (if (and (map? results) (:columns results) (:length results))
+      (having-fast-path-on-ctx results (:predicates node))
+      (post/apply-having results (:predicates node)))))
 
 (defn- execute-sort [node results]
   (let [results (or results (execute-node (:input node)))]
