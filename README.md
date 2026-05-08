@@ -97,8 +97,9 @@ Run benchmarks yourself:
 ```bash
 clj -M:olap              # All tiers, 10M rows (default)
 clj -M:olap 1000000      # Custom scale
-clj -M:olap h2o           # H2O tier only
-clj -M:olap cb            # ClickBench tier only
+clj -M:olap h2o          # H2O tier only
+clj -M:olap cb           # ClickBench tier only
+clj -M:olap asof         # ASOF JOIN tier only (3 canonical shapes)
 ```
 
 ## Clojure Quick Start
@@ -161,7 +162,9 @@ Every Stratum dataset is a copy-on-write value. Fork one in O(1) to create an is
 
 **DML**: SELECT, INSERT, UPDATE, DELETE, UPSERT (INSERT ON CONFLICT), UPDATE FROM (joined updates), CREATE TABLE, DROP TABLE
 
-**Joins**: INNER, LEFT, RIGHT, FULL - single and multi-column keys
+**Joins**: INNER, LEFT, RIGHT, FULL, ASOF (with optional LEFT outer) - single and multi-column keys
+
+**ASOF JOIN**: `ASOF [LEFT] JOIN dim ON l.key = r.key AND l.ts >= r.ts` - DuckDB-style syntax. Each probe row matches the closest preceding (or following) build row per partition. Radix-partitioned, parallel, two-pointer merge.
 
 **Window functions**: ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK, CUME_DIST, LAG, LEAD, SUM/AVG/COUNT/MIN/MAX OVER - with PARTITION BY, ORDER BY, and frame clauses
 
@@ -246,6 +249,7 @@ All share copy-on-write semantics and can be branched together via Yggdrasil.
 ## Features
 
 - **SQL**: PostgreSQL wire protocol (v3), full DML, CTEs, window functions, joins, subqueries
+- **Query planner**: cost-based IR planner with predicate pushdown, top-N rewrite, window-having pushdown, NDV-based join cardinality, operator fusion, column pruning
 - **Performance**: SIMD filter/aggregate/group-by via Java Vector API, fused single-pass execution, zone map pruning, parallel execution
 - **Persistence**: O(1) CoW snapshots, branching, time-travel, lazy loading from storage
 - **Data**: CSV/Parquet import, dictionary-encoded strings, PostgreSQL NULL semantics, ad-hoc file queries
@@ -257,14 +261,23 @@ All share copy-on-write semantics and can be branched together via Yggdrasil.
 ```
 User → stratum.api/q
          ├── SQL string → query map
-         └── query map → execution strategy
-                           ├── Fused SIMD (filter+agg, single pass)
-                           ├── Dense/hash group-by
-                           ├── Chunked streaming (index inputs)
-                           └── Scalar fallback
-                                  ↓
-                           Copy-on-write columnar storage
-                           (branch, snapshot, lazy load)
+         └── query map
+              ↓
+         IR Planner (build-logical-plan → optimize → execute-physical)
+              ├── Predicate pushdown, top-N rewrite, window-having pushdown
+              ├── Strategy selection (SIMD vs chunked vs hash, dense vs hash group-by)
+              ├── Operator fusion (join+group, join+global-agg, bitmap semi-join)
+              └── Cardinality-aware join reordering (NDV-based)
+              ↓
+         Physical execution
+              ├── Fused SIMD (filter+agg, single pass)
+              ├── Dense/hash group-by (radix-partitioned)
+              ├── Chunked streaming (index inputs, zone-map pruning)
+              ├── ASOF / hash join (parallel, fused with adjacent ops)
+              └── Scalar fallback
+              ↓
+         Copy-on-write columnar storage
+         (branch, snapshot, lazy load)
 ```
 
 **Data representations:**
@@ -316,12 +329,17 @@ After modifying Java files in `src-java/`:
 ```bash
 clj -T:build compile-java
 
-# or in Java
+# or directly with javac (must list every Java file we ship)
 javac --add-modules jdk.incubator.vector -d target/classes \
   src-java/stratum/internal/ColumnOps.java \
   src-java/stratum/internal/ColumnOpsExt.java \
+  src-java/stratum/internal/ColumnOpsLong.java \
+  src-java/stratum/internal/ColumnOpsString.java \
+  src-java/stratum/internal/ColumnOpsVar.java \
   src-java/stratum/internal/ColumnOpsChunked.java \
   src-java/stratum/internal/ColumnOpsChunkedSimd.java \
+  src-java/stratum/internal/ColumnOpsChunkedLong.java \
+  src-java/stratum/internal/ColumnOpsAsof.java \
   src-java/stratum/internal/ColumnOpsAnalytics.java
 # Restart REPL (JVM can't reload classes)
 ```

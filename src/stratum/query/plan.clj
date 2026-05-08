@@ -24,7 +24,7 @@
             [stratum.query.execution :as x-cols]
             [stratum.dataset :as dataset])
   (:import [stratum.query.ir
-            LScan LFilter LJoin LGroupBy LGlobalAgg LProject
+            LScan LFilter LJoin LAsofJoin LGroupBy LGlobalAgg LProject
             LWindow LHaving LDistinct LSort LLimit LSetOp
             PScan PChunkedScan PSIMDFilter PMaskFilter
             PStatsOnlyAgg PFusedSIMDAgg PFusedSIMDCount
@@ -32,7 +32,7 @@
             PFusedMultiSum PPercentileAgg PScalarAgg
             PChunkedDenseGroupBy PDenseGroupBy PHashGroupBy
             PFusedExtractCount PBitmapSemiJoin PHashJoin
-            PPerfectHashJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
+            PPerfectHashJoin PAsofJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
             PProject PWindow PHaving PSort PDistinct PLimit
             PMaterializeExpr]))
 
@@ -55,28 +55,89 @@
         length  (cols/get-column-length (val (first columns)))]
     (ir/->LScan columns length)))
 
+(def ^:private asof-ops #{:>= :> :<= :<})
+
+(defn- parse-on-preds
+  "Normalize a `:on` spec into a flat vec of `[op left-col right-col]`
+   tuples. Accepts `nil` / empty, a single `[op a b]`, or a vec of
+   `[op a b]` clauses. Table-qualified namespace prefixes (`:t1/a`,
+   `:t2/x`) are stripped so callers can compare against the
+   unqualified column-map keys.
+
+   ASOF joins fold equality (`:=`) and inequality (`:>=` / `:>` /
+   `:<=` / `:<`) predicates into the same `:on` slot;
+   `split-asof-on` separates them when needed. Non-ASOF joins
+   accept only `:=` (enforced in `build-join-tree`)."
+  [on]
+  (cond
+    (nil? on) []
+    (and (vector? on) (keyword? (first on)) (= 3 (count on)))
+    [[(first on) (norm/strip-ns (second on)) (norm/strip-ns (nth on 2))]]
+    (and (vector? on) (every? vector? on))
+    (mapv (fn [pred]
+            (when-not (and (= 3 (count pred)) (keyword? (first pred)))
+              (throw (ex-info "Join :on predicate must be [op left-col right-col]"
+                              {:predicate pred})))
+            [(first pred) (norm/strip-ns (second pred)) (norm/strip-ns (nth pred 2))])
+          on)
+    (and (sequential? on) (empty? on)) []
+    :else (throw (ex-info "Unsupported join :on format" {:on on}))))
+
+(defn- split-asof-on
+  "Split parsed ON predicates into equality keys and the single inequality.
+   Returns {:on-pairs [[l r] ...] :match-condition [op l r]}.
+   Throws if the inequality count is not exactly 1."
+  [preds join-spec]
+  (let [eq (filterv #(= := (first %)) preds)
+        ineq (filterv #(contains? asof-ops (first %)) preds)
+        other (filterv #(and (not= := (first %))
+                             (not (contains? asof-ops (first %)))) preds)]
+    (when (seq other)
+      (throw (ex-info (str "ASOF join :on supports only := and inequality operators "
+                           "(#{:>= :> :<= :<}); got " (mapv first other))
+                      {:join-spec join-spec :unsupported-ops (mapv first other)})))
+    (when-not (= 1 (count ineq))
+      (throw (ex-info (str "ASOF join :on must contain exactly one inequality predicate "
+                           "(#{:>= :> :<= :<}), got " (count ineq))
+                      {:join-spec join-spec :inequality-count (count ineq)})))
+    {:on-pairs (mapv (fn [[_ l r]] [l r]) eq)
+     :match-condition (first ineq)}))
+
 (defn- build-join-tree
-  "Wrap scan with join nodes for each join spec.
-   `:on` keys may arrive SQL-table-qualified (e.g. `:t1/a`,
-   `:t2/x`); strip namespaces so they match the column-map keys
-   (which are unqualified)."
+  "Wrap scan with join nodes for each join spec. Supports
+   equi-joins (`:inner` / `:left` / `:right` / `:full`) and ASOF
+   joins (`:asof` / `:asof-left`).
+
+   For ASOF joins, the inequality (one of `#{:>= :> :<= :<}`) lives
+   inside `:on` alongside the equality predicates — the same shape
+   DuckDB's SQL form uses. `split-asof-on` separates them into
+   `:on-pairs` and `:match-condition` on the `LAsofJoin` IR node.
+
+   Table-qualified `:on` keys (e.g. `:t1/a`) are stripped by
+   `parse-on-preds` so they match the unqualified column-map keys."
   [scan join-specs]
   (reduce
    (fn [left join-spec]
      (let [{:keys [with on type]} join-spec
-           strip   norm/strip-ns
-           on-pairs (cond
-                      ;; [:= :a :b]
-                      (and (vector? on) (= := (first on)))
-                      [[(strip (second on)) (strip (nth on 2))]]
-                      ;; [[:= :a :b] [:= :c :d]]
-                      (and (vector? on) (every? vector? on))
-                      (mapv (fn [pair]
-                              [(strip (second pair)) (strip (nth pair 2))])
-                            on)
-                      :else (throw (ex-info "Unsupported join :on format" {:on on})))
-           right-scan (build-scan with)]
-       (ir/->LJoin (or type :inner) on-pairs left right-scan)))
+           jt (or type :inner)
+           right-scan (build-scan with)
+           preds (parse-on-preds on)]
+       (cond
+         (#{:asof :asof-left} jt)
+         (let [{:keys [on-pairs match-condition]} (split-asof-on preds join-spec)
+               jt' (if (= jt :asof-left) :left :inner)]
+           (ir/->LAsofJoin jt' on-pairs match-condition left right-scan))
+
+         :else
+         (do
+           (when (empty? preds)
+             (throw (ex-info "Join :on is required for non-ASOF joins" {:join-spec join-spec})))
+           (when-let [bad (seq (filter #(not= := (first %)) preds))]
+             (throw (ex-info (str "Non-equality predicate in :on clause is not supported for "
+                                  jt " join. Use :type :asof for inequality matches. Got: "
+                                  (mapv first bad))
+                             {:join-spec join-spec :bad-ops (mapv first bad)})))
+           (ir/->LJoin jt (mapv (fn [[_ l r]] [l r]) preds) left right-scan)))))
    scan
    join-specs))
 
@@ -331,33 +392,40 @@
 
 (defn- scan-columns
   "Get the set of column keywords reachable from a subtree.
-   Recurses through LFilter and LJoin so that predicate pushdown works
+   Recurses through LFilter and join nodes so that predicate pushdown works
    through chained joins (e.g. fact → join1 → join2)."
   [node]
   (cond
-    (instance? LScan node)   (set (keys (:columns node)))
-    (instance? LFilter node) (recur (:input node))
-    (instance? LJoin node)   (let [l (scan-columns (:left node))
-                                   r (scan-columns (:right node))]
-                               (when (and l r)
-                                 (into l r)))
+    (instance? LScan node)     (set (keys (:columns node)))
+    (instance? LFilter node)   (recur (:input node))
+    (instance? LJoin node)     (let [l (scan-columns (:left node))
+                                     r (scan-columns (:right node))]
+                                 (when (and l r)
+                                   (into l r)))
+    (instance? LAsofJoin node) (let [l (scan-columns (:left node))
+                                     r (scan-columns (:right node))]
+                                 (when (and l r)
+                                   (into l r)))
     :else nil))
 
 (defn- pushdown-once
-  "Single pass: push LFilter predicates below LJoin when they
-   reference only one side. Outer joins constrain the rewrite:
+  "Single pass: push LFilter predicates below LJoin / LAsofJoin
+   when they reference only one side. Outer joins constrain the
+   rewrite:
      - LEFT  join: push left-side preds (preserves NULL-padded rows
                    on the right); right-side preds CANNOT be pushed
                    because LEFT preserves left rows that have no
                    right match.
      - RIGHT join: symmetric — push right, not left.
      - FULL  join: neither side can be pushed.
-   Only INNER joins allow both."
+   Only INNER joins allow both. ASOF joins behave like LEFT
+   (`:asof-left`) or INNER (`:asof`) for pushdown purposes."
   [plan]
   (ir/walk-plan plan
                 (fn [node]
                   (if (and (instance? LFilter node)
-                           (instance? LJoin (:input node)))
+                           (or (instance? LJoin (:input node))
+                               (instance? LAsofJoin (:input node))))
                     (let [join (:input node)
                           jt   (:join-type join)
                           left-cols  (scan-columns (:left join))
@@ -922,6 +990,12 @@
                     (instance? LJoin node)
                     (select-join-strategy node nil)
 
+        ;; LAsofJoin → PAsofJoin (single strategy for now; revisit if we add NLJ alt)
+                    (instance? LAsofJoin node)
+                    (ir/->PAsofJoin (:join-type node) (:on-pairs node)
+                                    (:match-condition node)
+                                    (:left node) (:right node))
+
         ;; LFilter without a parent agg (standalone filter, e.g. filter-only query)
         ;; Strategy selection for filter-under-agg is handled above.
                     (instance? LFilter node)
@@ -1220,6 +1294,13 @@
         (let [sel (min 1.0 (/ (double build-rows) (max 1.0 (double build-total))))]
           (max 1 (long (* probe-rows sel))))))
 
+    ;; ASOF: each probe row matches ≤1 build row. LEFT preserves all probes;
+    ;; INNER drops unmatched. Without selectivity stats we keep probe count.
+    (instance? PAsofJoin node)
+    (long (or (::estimated-rows (meta (:left node)))
+              (:length (:left node))
+              1000000))
+
     ;; Global agg always produces 1 row
     (or (instance? PStatsOnlyAgg node)
         (instance? PFusedSIMDAgg node) (instance? PFusedSIMDCount node)
@@ -1312,6 +1393,10 @@
                       (doseq [[l r] on] (vswap! refs conj! l) (vswap! refs conj! r)))
                     (when-let [js (:join-spec node)]
                       (doseq [[l r] (:on-pairs js)] (vswap! refs conj! l) (vswap! refs conj! r)))
+        ;; ASOF match-condition columns
+                    (when-let [mc (:match-condition node)]
+                      (vswap! refs conj! (nth mc 1))
+                      (vswap! refs conj! (nth mc 2)))
         ;; Window specs
                     (when-let [specs (:specs node)]
                       (doseq [s specs]
@@ -1632,6 +1717,11 @@
                 (instance? PFusedJoinGlobalAgg node)
                 (str "aggs=" (mapv :op (:aggs node)) " join=" (:join-spec node))
 
+                (instance? PAsofJoin node)
+                (str "type=" (:join-type node)
+                     " on=" (:on-pairs node)
+                     " match=" (:match-condition node))
+
                 (instance? PMaterializeExpr node)
                 (str "col=" (:col-name node) " expr=" (:expr node))
 
@@ -1651,6 +1741,14 @@
                     (instance? LJoin plan)
                     [(str indent "  left:\n" (explain (:left plan) (+ depth 2)))
                      (str indent "  right:\n" (explain (:right plan) (+ depth 2)))]
+
+                    (instance? LAsofJoin plan)
+                    [(str indent "  left:\n" (explain (:left plan) (+ depth 2)))
+                     (str indent "  right:\n" (explain (:right plan) (+ depth 2)))]
+
+                    (instance? PAsofJoin plan)
+                    [(str indent "  probe:\n" (explain (:left plan) (+ depth 2)))
+                     (str indent "  build:\n" (explain (:right plan) (+ depth 2)))]
 
                     (instance? PHashJoin plan)
                     [(str indent "  build:\n" (explain (:build-side plan) (+ depth 2)))
