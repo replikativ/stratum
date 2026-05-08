@@ -391,7 +391,20 @@
              ;; `prepare-and-build`; for the join + anomaly
              ;; combination we fall back to the legacy path which
              ;; resolves at the right point. Tracked as a follow-up.
-             (not (and (seq join) (seq _anomaly-models))))
+             (not (and (seq join) (seq _anomaly-models)))
+             ;; String-producing expressions in GROUP BY / SELECT
+             ;; need to be materialized AFTER joins so the temp
+             ;; columns line up with post-join row count.
+             ;; `prepare-query`'s pass-5a/5b run before the planner
+             ;; sees the join, so we fall back when the combo
+             ;; appears. Tracked as a follow-up — porting the
+             ;; materialization to a post-join planner pass.
+             (not (and (seq join)
+                       (let [string-producing? #(and (sequential? %)
+                                                     (expr/string-producing-expr?
+                                                      (norm/normalize-expr (vec %))))]
+                         (or (some string-producing? group)
+                             (some string-producing? (or select [])))))))
       ;; === IR Planner path ===
       (do
         (spec/validate! spec/SQuery query {:op :execute})
