@@ -877,16 +877,29 @@
    Requires: no SUM_PRODUCT, no COUNT-DISTINCT, no COUNT-NON-NULL,
    and all SUM/MIN/MAX/AVG source columns must be long[].
    AVG is eligible because it's SUM/COUNT in the accumulator —
-   division to double happens at decode time."
+   division to double happens at decode time.
+
+   For SUM/AVG additionally requires that the per-row bound × `length`
+   fits in `Long` — otherwise long-accumulator addition wraps and we
+   silently return wrong sums (see CB-Q3 with `UserID` ≈ 2^60 columns).
+   MIN/MAX have no overflow concern."
   [aggs col-arrays ^long length]
   (every? (fn [a]
             (case (:op a)
               :count true
-              (:sum :min :max :avg)
+              (:min :max)
               (if-let [e (:expr a)]
                 (let [result (expr/eval-expr-polymorphic e col-arrays length nil)]
                   (expr/long-array? result))
                 (expr/long-array? (get col-arrays (:col a))))
+              (:sum :avg)
+              (if-let [e (:expr a)]
+                (let [result (expr/eval-expr-polymorphic e col-arrays length nil)]
+                  (and (expr/long-array? result)
+                       (not (qc/long-sum-overflow-risk? result length))))
+                (let [d (get col-arrays (:col a))]
+                  (and (expr/long-array? d)
+                       (not (qc/long-sum-overflow-risk? d length)))))
               false))
           aggs))
 

@@ -689,12 +689,18 @@
                                             (loop [idx 0, new-group [], new-cols columns]
                                               (if (>= idx (count group))
                                                 [new-group new-cols]
-                                                (let [g (nth group idx)]
-                                                  (if (keyword? g)
-                                                    (recur (inc idx) (conj new-group g) new-cols)
-                                                    (let [expr (norm/normalize-expr (vec g))
+                                                (let [g (nth group idx)
+                                                      ;; Recognize `[:as expr alias]` so users can name
+                                                      ;; expression group keys; fall back to a positional
+                                                      ;; synthetic when no alias is supplied.
+                                                      [raw alias] (if (and (vector? g) (= :as (first g)) (= 3 (count g)))
+                                                                    [(nth g 1) (nth g 2)]
+                                                                    [g nil])]
+                                                  (if (keyword? raw)
+                                                    (recur (inc idx) (conj new-group raw) new-cols)
+                                                    (let [expr (norm/normalize-expr (vec raw))
                                                           la (expr/eval-expr-to-long expr col-arrays length cache)
-                                                          col-name (keyword (str "__grp_" idx))]
+                                                          col-name (or alias (keyword (str "__grp_" idx)))]
                                                       (recur (inc idx)
                                                              (conj new-group col-name)
                                                              (assoc new-cols col-name {:type :int64 :data la}))))))))

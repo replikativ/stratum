@@ -132,6 +132,34 @@
 (def ^:private ^Class long-array-class (Class/forName "[J"))
 (defn- long-array? [x] (instance? long-array-class x))
 
+(defn long-sum-overflow-risk?
+  "True iff summing `length` longs from `data` could overflow `Long` range.
+   Computes min/max in one pass and tests `abs-max * length > Long/MAX_VALUE`
+   without performing the multiplication (so the check itself can't
+   overflow). Treats `Long/MIN_VALUE` (the null marker / unrepresentable
+   negation) as a hard overflow signal — its absolute value is not
+   representable as a positive long.
+
+   This is the gate for routing SUM(long-col) onto the LongVector
+   accumulator path: when bounds are tight (small counters, dict
+   codes, modest IDs) the long path is safe and 2-5× faster than
+   the double path; when bounds are wide (e.g. epoch-nano timestamps,
+   billion-scale dict codes) we route to the double accumulator and
+   pay a `longToDouble` conversion in exchange for correctness."
+  [^longs data ^long length]
+  (if (zero? length)
+    false
+    (let [mn (ColumnOps/arrayMinLong data (int length))
+          mx (ColumnOps/arrayMaxLong data (int length))]
+      (cond
+        (= mn Long/MIN_VALUE) true
+        (= mx Long/MIN_VALUE) true
+        :else
+        (let [abs-mn (Math/abs mn)
+              abs-mx (Math/abs mx)
+              abs-max (Math/max abs-mn abs-mx)]
+          (> abs-max (quot Long/MAX_VALUE length)))))))
+
 (defn- prepare-aggregation
   "Prepare aggregation arrays for Java methods.
    Returns [agg-type agg-col1 agg-col2 long-agg?].
@@ -149,7 +177,11 @@
     :sum
     (let [[_ col] aggregate
           data (:data (get columns col))]
-      (if (long-array? data)
+      ;; Long fast-path is only safe when the per-row bound × row count
+      ;; fits in `Long`. Otherwise route to the double accumulator —
+      ;; correctness over the 2-5× perf gain. See `long-sum-overflow-risk?`.
+      (if (and (long-array? data)
+               (not (long-sum-overflow-risk? data length)))
         [(int ColumnOps/AGG_SUM) data (long-array 0) true]
         [(int ColumnOps/AGG_SUM) (ensure-doubles (get columns col) length) (double-array 0) false]))
 

@@ -137,9 +137,17 @@
    `string-expr-spec-group-agg` for the deferred (post-join)
    counterpart."
   [group aggs select columns length]
-  (let [has-string-expr?
-        (or (some #(and (sequential? %)
-                        (expr/string-producing-expr? (norm/normalize-expr (vec %))))
+  (let [;; A group key may be: keyword | bare expr (sequential) |
+        ;; aliased expr ({:expr e :as a}). Pull the raw expression out
+        ;; for the string-producing check; non-expressions skip.
+        group-expr (fn [g]
+                     (cond
+                       (map? g)        (:expr g)
+                       (sequential? g) g
+                       :else           nil))
+        has-string-expr?
+        (or (some #(when-let [e (group-expr %)]
+                     (expr/string-producing-expr? (norm/normalize-expr (vec e))))
                   group)
             (some #(and (:expr %)
                         (expr/string-producing-expr? (:expr %)))
@@ -204,8 +212,21 @@
                     (.add items {:col-name col-name :expr expr})
                     col-name))
         new-group (mapv (fn [g]
-                          (if (keyword? g)
-                            g
+                          (cond
+                            (keyword? g) g
+
+                            ;; Alias-wrapped expression: keep the alias
+                            ;; on the synthetic temp column when string-
+                            ;; producing, so the downstream IR carries
+                            ;; the user-facing name into the result.
+                            (map? g)
+                            (let [e (:expr g)
+                                  norm-g (norm/normalize-expr (vec e))]
+                              (if (expr/string-producing-expr? norm-g)
+                                (synth norm-g)
+                                g))
+
+                            :else
                             (let [norm-g (norm/normalize-expr (vec g))]
                               (if (expr/string-producing-expr? norm-g)
                                 (synth norm-g)
@@ -267,6 +288,17 @@
    at filter time instead. Predicates are still normalized."
   [{:keys [where agg group select join]} columns length]
   (let [has-join? (boolean (seq join))
+        ;; Recognize the `[:as expr alias]` shape on `:group` and rewrite
+        ;; into the canonical `{:expr expr :as alias}` marker map so the
+        ;; downstream `normalize-expr` calls (string-producing-expr?
+        ;; checks) can handle them uniformly via `(:expr g)`. Plain
+        ;; keywords and bare expressions pass through unchanged.
+        group (when group
+                (mapv (fn [g]
+                        (if (and (vector? g) (= :as (first g)) (= 3 (count g)))
+                          {:expr (nth g 1) :as (nth g 2)}
+                          g))
+                      group))
         preds (mapv norm/normalize-pred (or where []))
         aggs  (norm/auto-alias-aggs (mapv norm/normalize-agg (or agg [])))
         [preds columns] (if has-join?

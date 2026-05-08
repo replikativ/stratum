@@ -153,11 +153,16 @@
         n-sum    (count sum-aggs)
         ;; Check if ALL sum columns are long[] (including SUM_PRODUCT with both cols long[])
         ;; → use all-long path (LongVector accumulators, no longToDouble allocation)
-        ;; Double predicates are OK — they're orthogonal to agg column type
+        ;; Double predicates are OK — they're orthogonal to agg column type.
+        ;; SUM/AVG additionally must not overflow `Long` when summed across
+        ;; `length` rows; SUM_PRODUCT's overflow is handled below by
+        ;; `arrayMulLongChecked`.
         all-long? (every? (fn [a]
                             (case (:op a)
                               (:sum :avg)
-                              (expr/long-array? (:data (get columns (:col a))))
+                              (let [d (:data (get columns (:col a)))]
+                                (and (expr/long-array? d)
+                                     (not (qc/long-sum-overflow-risk? d length))))
                               :sum-product
                               (and (expr/long-array? (:data (get columns (first (:cols a)))))
                                    (expr/long-array? (:data (get columns (second (:cols a))))))
