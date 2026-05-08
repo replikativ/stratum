@@ -33,7 +33,8 @@
             [clojure.set])
   (:import [stratum.internal ColumnOps]
            [java.io BufferedReader InputStreamReader]
-           [java.sql DriverManager Connection Statement ResultSet]))
+           [java.sql DriverManager Connection Statement ResultSet]
+           [org.duckdb DuckDBConnection DuckDBAppender]))
 
 (set! *warn-on-reflection* true)
 
@@ -1422,6 +1423,247 @@
        :duckdb-1t (:median rd-1t) :duckdb (:median rd)})))
 
 ;; ============================================================================
+;; Tier 9: ASOF JOIN Benchmarks
+;; ============================================================================
+;;
+;; Three canonical ASOF shapes lifted from the established benchmark canon:
+;;   ASOF-Q1 dense    — DuckDB micro/asof_join.benchmark + ClickHouse asof.xml
+;;                      5M build × 5M probe, 50 keys, sorted, every probe matches
+;;   ASOF-Q2 unpart   — DuckDB micro/asof_join_unpartitioned.benchmark
+;;                      10M build × 100K probe, no equality key, random ts
+;;   ASOF-Q3 mismatch — ClickHouse 03146_asof_join_ddb_merge_long
+;;                      6M build / 1.6K probe, 2 keys, sec vs hour granularity
+
+(defn- ^:private lcg-next ^long [^long s]
+  ;; Numerical Recipes parameters; deterministic, reasonable distribution.
+  (unchecked-add (unchecked-multiply s 1664525) 1013904223))
+
+(defn- ^:private shuffled-unique-ts
+  "Return long[] of length n with a deterministic permutation of 0..n-1.
+   Random-looking via Fisher-Yates with seeded LCG."
+  ^longs [^long n ^long seed]
+  (let [out (long-array n)]
+    (dotimes [i n] (aset out i (long i)))
+    (loop [i (dec n) s seed]
+      (when (pos? i)
+        (let [s' (lcg-next s)
+              j  (long (mod (Math/abs s') (inc i)))
+              ti (aget out i)
+              tj (aget out j)]
+          (aset out i tj)
+          (aset out j ti)
+          (recur (dec i) s'))))
+    out))
+
+;; --- ASOF-Q1 dense: 50 keys × 100K minutes, probe shifted -30s ---
+
+(defn- gen-asof-q1 [^long n-mins ^long n-keys]
+  (let [n   (* n-keys n-mins)
+        b-k (long-array n)
+        b-t (long-array n)
+        b-v (long-array n)]
+    (dotimes [k n-keys]
+      (dotimes [v n-mins]
+        (let [i (+ (* (long k) n-mins) v)]
+          (aset b-k i (long k))
+          (aset b-t i (* (long v) 60))
+          (aset b-v i (long v)))))
+    (let [p-k (long-array n)
+          p-t (long-array n)]
+      (dotimes [i n]
+        (aset p-k i (* 2 (aget b-k i)))
+        (aset p-t i (- (aget b-t i) 30)))
+      {:build-k b-k :build-t b-t :build-v b-v
+       :probe-k p-k :probe-t p-t :n n})))
+
+;; --- ASOF-Q2 unpart: 10M build × 100K probe, ts shuffled but unique per side ---
+
+(defn- gen-asof-q2 [^long n-build ^long n-probe]
+  (let [b-t (shuffled-unique-ts n-build 1234567)
+        b-v (long-array n-build)
+        p-t (long-array n-probe)]
+    (dotimes [i n-build] (aset b-v i (long i)))
+    (let [stride (max 1 (long (/ n-build n-probe)))]
+      (dotimes [i n-probe]
+        (aset p-t i (long (* i stride)))))
+    (let [seed 7654321
+          n n-probe]
+      (loop [i (dec n) s seed]
+        (when (pos? i)
+          (let [s' (lcg-next s)
+                j  (long (mod (Math/abs s') (inc i)))
+                ti (aget p-t i)
+                tj (aget p-t j)]
+            (aset p-t i tj)
+            (aset p-t j ti)
+            (recur (dec i) s')))))
+    {:build-t b-t :build-v b-v :probe-t p-t :n-build n-build :n-probe n-probe}))
+
+;; --- ASOF-Q3 granularity mismatch: 6M build / 1.6K probe, 2 keys, sec vs hour ---
+
+(defn- gen-asof-q3 [^long build-per-key ^long probe-per-key]
+  (let [n-keys 2
+        n-build (* n-keys build-per-key)
+        n-probe (* n-keys probe-per-key)
+        b-k (long-array n-build)
+        b-t (long-array n-build)
+        b-v (long-array n-build)
+        p-k (long-array n-probe)
+        p-t (long-array n-probe)]
+    (dotimes [k n-keys]
+      (dotimes [i build-per-key]
+        (let [idx (+ (* (long k) build-per-key) i)]
+          (aset b-k idx (long k))
+          (aset b-t idx (long i))
+          (aset b-v idx (long i)))))
+    (dotimes [k n-keys]
+      (dotimes [i probe-per-key]
+        (let [idx (+ (* (long k) probe-per-key) i)]
+          (aset p-k idx (long k))
+          (aset p-t idx (long (* i 3600))))))
+    {:build-k b-k :build-t b-t :build-v b-v
+     :probe-k p-k :probe-t p-t
+     :n-build n-build :n-probe n-probe}))
+
+;; --- DuckDB Appender-based bulk loaders ---
+
+(defn- ^DuckDBConnection ->duck-conn [^Connection conn]
+  (.unwrap conn DuckDBConnection))
+
+(defn- load-asof-q1-into-duckdb! [^Connection conn data]
+  (println "  Loading Q1 data into DuckDB...")
+  (duckdb-jdbc-exec! conn "DROP TABLE IF EXISTS asof_q1_b")
+  (duckdb-jdbc-exec! conn "DROP TABLE IF EXISTS asof_q1_p")
+  (let [n (long (:n data))
+        ^longs bk (:build-k data) ^longs bt (:build-t data) ^longs bv (:build-v data)
+        ^longs pk (:probe-k data) ^longs pt (:probe-t data)
+        dconn (->duck-conn conn)]
+    (duckdb-jdbc-exec! conn "CREATE TABLE asof_q1_b (k BIGINT, t BIGINT, v BIGINT)")
+    (duckdb-jdbc-exec! conn "CREATE TABLE asof_q1_p (k BIGINT, t BIGINT)")
+    (with-open [^DuckDBAppender app (.createAppender dconn "main" "asof_q1_b")]
+      (dotimes [i n]
+        (.beginRow app) (.append app (aget bk i)) (.append app (aget bt i)) (.append app (aget bv i)) (.endRow app)))
+    (with-open [^DuckDBAppender app (.createAppender dconn "main" "asof_q1_p")]
+      (dotimes [i n]
+        (.beginRow app) (.append app (aget pk i)) (.append app (aget pt i)) (.endRow app)))
+    (println (format "  build=%s probe=%s" n n))))
+
+(defn- load-asof-q2-into-duckdb! [^Connection conn data]
+  (println "  Loading Q2 data into DuckDB...")
+  (duckdb-jdbc-exec! conn "DROP TABLE IF EXISTS asof_q2_b")
+  (duckdb-jdbc-exec! conn "DROP TABLE IF EXISTS asof_q2_p")
+  (let [^longs bt (:build-t data) ^longs bv (:build-v data) ^longs pt (:probe-t data)
+        nb (long (:n-build data)) np (long (:n-probe data))
+        dconn (->duck-conn conn)]
+    (duckdb-jdbc-exec! conn "CREATE TABLE asof_q2_b (t BIGINT, v BIGINT)")
+    (duckdb-jdbc-exec! conn "CREATE TABLE asof_q2_p (t BIGINT)")
+    (with-open [^DuckDBAppender app (.createAppender dconn "main" "asof_q2_b")]
+      (dotimes [i nb]
+        (.beginRow app) (.append app (aget bt i)) (.append app (aget bv i)) (.endRow app)))
+    (with-open [^DuckDBAppender app (.createAppender dconn "main" "asof_q2_p")]
+      (dotimes [i np]
+        (.beginRow app) (.append app (aget pt i)) (.endRow app)))
+    (println (format "  build=%s probe=%s" nb np))))
+
+(defn- load-asof-q3-into-duckdb! [^Connection conn data]
+  (println "  Loading Q3 data into DuckDB...")
+  (duckdb-jdbc-exec! conn "DROP TABLE IF EXISTS asof_q3_b")
+  (duckdb-jdbc-exec! conn "DROP TABLE IF EXISTS asof_q3_p")
+  (let [^longs bk (:build-k data) ^longs bt (:build-t data) ^longs bv (:build-v data)
+        ^longs pk (:probe-k data) ^longs pt (:probe-t data)
+        nb (long (:n-build data)) np (long (:n-probe data))
+        dconn (->duck-conn conn)]
+    (duckdb-jdbc-exec! conn "CREATE TABLE asof_q3_b (k BIGINT, t BIGINT, v BIGINT)")
+    (duckdb-jdbc-exec! conn "CREATE TABLE asof_q3_p (k BIGINT, t BIGINT)")
+    (with-open [^DuckDBAppender app (.createAppender dconn "main" "asof_q3_b")]
+      (dotimes [i nb]
+        (.beginRow app) (.append app (aget bk i)) (.append app (aget bt i)) (.append app (aget bv i)) (.endRow app)))
+    (with-open [^DuckDBAppender app (.createAppender dconn "main" "asof_q3_p")]
+      (dotimes [i np]
+        (.beginRow app) (.append app (aget pk i)) (.append app (aget pt i)) (.endRow app)))
+    (println (format "  build=%s probe=%s" nb np))))
+
+;; --- Stratum query fns ---
+
+(defn- asof-q1-stratum [data]
+  (q/q {:from {:k (:probe-k data) :pt (:probe-t data)}
+        :join [{:with {:k (:build-k data) :bt (:build-t data) :v (:build-v data)}
+                :type :asof
+                :on [[:= :k :k] [:>= :pt :bt]]}]
+        :agg [[:sum :v]]}))
+
+(def ^:private asof-q1-sql
+  "SELECT SUM(v) FROM asof_q1_p p ASOF JOIN asof_q1_b b ON p.k = b.k AND p.t >= b.t")
+
+(defn- asof-q2-stratum [data]
+  (q/q {:from {:pt (:probe-t data)}
+        :join [{:with {:bt (:build-t data) :v (:build-v data)}
+                :type :asof
+                :on [:>= :pt :bt]}]
+        :agg [[:sum :v]]}))
+
+(def ^:private asof-q2-sql
+  "SELECT SUM(v) FROM asof_q2_p p ASOF JOIN asof_q2_b b ON p.t >= b.t")
+
+(defn- asof-q3-stratum [data]
+  (q/q {:from {:k (:probe-k data) :pt (:probe-t data)}
+        :join [{:with {:k (:build-k data) :bt (:build-t data) :v (:build-v data)}
+                :type :asof
+                :on [[:= :k :k] [:>= :pt :bt]]}]
+        :agg [[:sum :v]]}))
+
+(def ^:private asof-q3-sql
+  "SELECT SUM(v) FROM asof_q3_p p ASOF JOIN asof_q3_b b ON p.k = b.k AND p.t >= b.t")
+
+;; --- Bench runner: returns the standard {:stratum-1t :stratum :duckdb-1t :duckdb} shape ---
+
+(defn- run-asof-bench [name stratum-fn ^Connection conn duckdb-sql]
+  (println (str "\n=== " name " ==="))
+  (gc!)
+  (let [row (first (stratum-fn))
+        s-val (long (or (:sum row) 0))
+        d-val (Long/parseLong (or (duckdb-jdbc-query-scalar conn duckdb-sql) "0"))]
+    (println (format "  Stratum SUM=%d  DuckDB SUM=%d  %s"
+                     s-val d-val
+                     (if (= s-val d-val) "MATCH" "*** MISMATCH ***"))))
+  (gc!)
+  (let [s-1t (bench-1t stratum-fn) _ (gc!)
+        s-nt (bench    stratum-fn) _ (gc!)
+        d-1t (duckdb-bench conn duckdb-sql :threads 1) _ (gc!)
+        d-nt (duckdb-bench conn duckdb-sql)]
+    (println (format "  Stratum (1T): %s | (NT): %s"
+                     (fmt-ms (:median s-1t)) (fmt-ms (:median s-nt))))
+    (println (format "  DuckDB  (1T): %s | (NT): %s"
+                     (fmt-ms (:median d-1t)) (fmt-ms (:median d-nt))))
+    (println (format "  Ratio 1T: %s" (fmt-ratio (:median s-1t) (:median d-1t))))
+    {:stratum-1t (:median s-1t) :stratum (:median s-nt)
+     :duckdb-1t  (:median d-1t) :duckdb  (:median d-nt)}))
+
+(defn- bench-asof-q1 [^Connection conn]
+  (println "\n--- ASOF-Q1 dense (5M build × 5M probe, 50 keys, sorted) ---")
+  (let [t0 (System/nanoTime)
+        data (gen-asof-q1 100000 50)
+        _ (println (format "  Gen: %.1fs" (/ (- (System/nanoTime) t0) 1e9)))]
+    (load-asof-q1-into-duckdb! conn data)
+    (run-asof-bench "ASOF-Q1 dense" #(asof-q1-stratum data) conn asof-q1-sql)))
+
+(defn- bench-asof-q2 [^Connection conn]
+  (println "\n--- ASOF-Q2 unpartitioned (10M build × 100K probe, random ts) ---")
+  (let [t0 (System/nanoTime)
+        data (gen-asof-q2 10000000 100000)
+        _ (println (format "  Gen: %.1fs" (/ (- (System/nanoTime) t0) 1e9)))]
+    (load-asof-q2-into-duckdb! conn data)
+    (run-asof-bench "ASOF-Q2 unpart" #(asof-q2-stratum data) conn asof-q2-sql)))
+
+(defn- bench-asof-q3 [^Connection conn]
+  (println "\n--- ASOF-Q3 granularity-mismatch (6M build / 1.6K probe, 2 keys, sec vs hour) ---")
+  (let [t0 (System/nanoTime)
+        data (gen-asof-q3 3000000 800)
+        _ (println (format "  Gen: %.1fs" (/ (- (System/nanoTime) t0) 1e9)))]
+    (load-asof-q3-into-duckdb! conn data)
+    (run-asof-bench "ASOF-Q3 mismatch" #(asof-q3-stratum data) conn asof-q3-sql)))
+
+;; ============================================================================
 ;; Bitmap Semi-Join Benchmarks
 ;; ============================================================================
 
@@ -2453,7 +2695,11 @@
                     [:taxi-q3 "NYC-Q3: COUNT GROUP BY hour,dow"]
                     [:taxi-q4 "NYC-Q4: SUM WHERE fare>10 GROUP BY mo"]
                     [:section "Tier 5: Hash Join"]
-                    [:join-q1 "JOIN-Q1: Fact JOIN Dim, GROUP BY, SUM"]]]
+                    [:join-q1 "JOIN-Q1: Fact JOIN Dim, GROUP BY, SUM"]
+                    [:section "Tier 9: ASOF JOIN"]
+                    [:asof-q1 "ASOF-Q1: dense 5M×5M, 50 keys, sorted"]
+                    [:asof-q2 "ASOF-Q2: unpart 10M×100K, random ts"]
+                    [:asof-q3 "ASOF-Q3: mismatch 6M×1.6K, sec vs hour"]]]
     ;; Walk bench-defs: print section headers only when following data exists
     (let [pending-section (atom nil)]
       (doseq [[k label] bench-defs]
@@ -2804,7 +3050,8 @@
                      "t5" "5" "join"
                      "t6" "6" "stat" "statistical"
                      "t7" "7" "win" "window"
-                     "t8" "8" "tpcds" "ds"}
+                     "t8" "8" "tpcds" "ds"
+                     "t9" "9" "asof"}
         parsed (group-by #(try (Long/parseLong %) :n (catch Exception _ :tier)) args)
         n (if-let [ns (:n parsed)] (Long/parseLong (first ns)) default-n)
         ;; Scale-adaptive warmup & iterations
@@ -3123,6 +3370,21 @@
           (try
             (when-let [jr (bench-join n conn)]
               (swap! all-results merge-best jr))
+            (finally (.close conn)))))
+
+      ;; === Tier 9: ASOF JOIN ===
+      ;; Three canonical shapes (dense / unpartitioned / granularity
+      ;; mismatch). Data scale is fixed per shape — `n` is ignored
+      ;; here so the shapes match the established benchmark canon
+      ;; (DuckDB micro/* + ClickHouse 03146).
+      (when (run-tier? "t9" "9" "asof")
+        (println "\n\n=== Tier 9: ASOF JOIN ===")
+        (gc!)
+        (let [conn (duckdb-jdbc-connect "")]
+          (try
+            (when (run-q? "q1") (gc!) (swap! all-results merge-best {:asof-q1 (bench-asof-q1 conn)}))
+            (when (run-q? "q2") (gc!) (swap! all-results merge-best {:asof-q2 (bench-asof-q2 conn)}))
+            (when (run-q? "q3") (gc!) (swap! all-results merge-best {:asof-q3 (bench-asof-q3 conn)}))
             (finally (.close conn)))))
 
       ;; === Tier 7: Window Function Micro-Benchmark ===
