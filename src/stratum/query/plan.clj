@@ -481,6 +481,69 @@
         (recur p' (inc n))))))
 
 ;; ============================================================================
+;; Pass 1b: HAVING → WHERE pushdown (filter through aggregate)
+;; ============================================================================
+
+(defn having-to-where-pushdown
+  "Push `LHaving` predicates that only reference `LGroupBy` group
+   columns (not aggregate aliases) down as pre-aggregate `LFilter`
+   preds. Mirrors DuckDB's `FilterPushdown::PushdownAggregate`
+   (`src/optimizer/pushdown/pushdown_aggregate.cpp`):
+
+     HAVING g > 5  (where g is in GROUP BY)  →  WHERE g > 5
+     HAVING SUM(x) > 100                       stays on LHaving
+
+   The user's HAVING clause is the SQL spec point for filtering
+   post-aggregate; the planner is free to evaluate any predicate
+   pre-aggregate when it doesn't depend on the aggregate output.
+   Pushing such predicates eliminates rows before they enter the
+   group-by hash table, which is the same constraint-as-early-as-
+   possible principle as predicate-pushdown-through-join.
+
+   Constraints:
+     - Only `LHaving` directly above `LGroupBy` (skips `LWindow` /
+       `LProject` between them — their reference resolution is more
+       subtle; the existing `window-having-pushdown` handles the
+       window case separately).
+     - Skips `LGlobalAgg` (no group columns to filter on, matching
+       DuckDB's `aggr.groups.empty()` short-circuit).
+     - Only keyword group keys count (expression group keys
+       reference `__gk_expr_N` synthetic columns that
+       `expr-materialization` introduces later in the pipeline).
+     - When a downstream `LFilter` already wraps the `LGroupBy`'s
+       input (the WHERE clause), the pushed predicates merge into
+       that filter — keeps the IR shape clean."
+  [plan]
+  (ir/walk-plan
+   plan
+   (fn [node]
+     (if (and (instance? LHaving node)
+              (instance? LGroupBy (:input node)))
+       (let [groupby     (:input node)
+             group-cols  (set (filter keyword? (:group-keys groupby)))
+             classify    (fn [pred]
+                           (let [cols (pred-columns pred)]
+                             (if (and (seq cols) (every? group-cols cols))
+                               :pushable
+                               :kept)))
+             grouped     (group-by classify (:predicates node))
+             pushable    (vec (get grouped :pushable []))
+             kept        (vec (get grouped :kept []))]
+         (if (empty? pushable)
+           node
+           (let [child     (:input groupby)
+                 new-child (if (instance? LFilter child)
+                             (ir/->LFilter
+                              (into (vec (:predicates child)) pushable)
+                              (:input child))
+                             (ir/->LFilter pushable child))
+                 new-gb    (assoc groupby :input new-child)]
+             (if (empty? kept)
+               new-gb
+               (ir/->LHaving kept new-gb)))))
+       node))))
+
+;; ============================================================================
 ;; Pass 1.5: Join reordering (DP-based)
 ;; ============================================================================
 
@@ -1446,9 +1509,9 @@
                       (doseq [{:keys [expr]} (:items node)]
                         (collect-expr-refs! refs expr)))
                     (when (instance? stratum.query.ir.LTopN node)
-                      (let [os (:order-spec node)
-                            [c _] (if (vector? os) os [os :asc])]
-                        (when (keyword? c) (vswap! refs conj! c)))
+                      (doseq [spec (:order-specs node)]
+                        (let [[c _] (if (vector? spec) spec [spec :asc])]
+                          (when (keyword? c) (vswap! refs conj! c))))
                       (if-let [items (:select node)]
                         (doseq [item items]
                           (when-let [r (:ref item)] (vswap! refs conj! r))
@@ -1458,6 +1521,22 @@
                         ;; LScan (rewrite ran before strategy-selection)
                         ;; or PScan/PChunkedScan (column-pruning is
                         ;; running later in the pipeline).
+                        (let [in (:input node)]
+                          (when (or (instance? stratum.query.ir.LScan in)
+                                    (instance? stratum.query.ir.PScan in)
+                                    (instance? stratum.query.ir.PChunkedScan in))
+                            (doseq [k (keys (:columns in))]
+                              (vswap! refs conj! k))))))
+        ;; LHead — same shape as LTopN minus the order column. The
+        ;; head executor materializes a prefix of every column it
+        ;; touches, so the live-set must include either the
+        ;; explicit `:select` items or the full scan column set
+        ;; (SELECT *).
+                    (when (instance? stratum.query.ir.LHead node)
+                      (if-let [items (:select node)]
+                        (doseq [item items]
+                          (when-let [r (:ref item)] (vswap! refs conj! r))
+                          (when-let [e (:expr item)] (collect-expr-refs! refs e)))
                         (let [in (:input node)]
                           (when (or (instance? stratum.query.ir.LScan in)
                                     (instance? stratum.query.ir.PScan in)
@@ -1518,17 +1597,20 @@
     (some? scan)))
 
 (defn- top-n-order-eligible?
-  "Single ORDER BY on a numeric column (`:int64` or `:float64`) that
-   isn't a string-dict — same gate as `query.top-n/top-n-eligible?`."
+  "Every ORDER BY column must be primitive numeric (`:int64` or
+   `:float64`) and not a dict-string. The streaming heap supports
+   any number of keys (multi-key compared in declared order, mixed
+   asc/desc allowed) — same gate as `query.top-n/top-n-eligible?`."
   [order-specs scan-cols]
-  (and (= 1 (count order-specs))
-       (let [spec (first order-specs)
-             [col _dir] (if (vector? spec) spec [spec :asc])]
-         (and (keyword? col)
-              (let [c (get scan-cols col)]
-                (and c
-                     (#{:int64 :float64} (:type c))
-                     (not= :string (:dict-type c))))))))
+  (and (>= (count order-specs) 1)
+       (every? (fn [spec]
+                 (let [[col _dir] (if (vector? spec) spec [spec :asc])]
+                   (and (keyword? col)
+                        (let [c (get scan-cols col)]
+                          (and c
+                               (#{:int64 :float64} (:type c))
+                               (not= :string (:dict-type c)))))))
+               order-specs)))
 
 (defn- find-scan-cols
   "Return the `:columns` map of the leaf LScan reachable through an
@@ -1536,6 +1618,15 @@
   [node]
   (let [[_ scan] (peel-project node)]
     (when scan (:columns scan))))
+
+(def ^:dynamic *head-limit*
+  "Maximum LIMIT value at which the planner rewrites a top-level
+   `LLimit` (no `ORDER BY`, no filter, no aggregate) over a scan
+   into `LHead`. Above this we fall through to the regular path
+   (which materializes the whole scan via `PProject` /
+   `materialize-columns`); for tiny LIMITs we'd rather pay one
+   chunk fetch per column than decode every row group."
+  100000)
 
 (defn top-n-rewrite
   "Rewrite `LLimit { limit N input: LSort [single-spec] subtree }`
@@ -1570,11 +1661,56 @@
       ;; references.
       (let [[items scan] (peel-project sort-input)]
         (with-meta
-          (ir/->LTopN (first (:order-specs sort-node))
+          (ir/->LTopN (vec (:order-specs sort-node))
                       (long (:limit plan))
                       items
                       scan)
           (meta plan)))
+      plan)))
+
+(defn head-rewrite
+  "Rewrite `LLimit { limit N input: LScan }` (optionally with an
+   intermediate `LProject` of bare column refs) into a single
+   `LHead`, when N ≤ `*head-limit*` and there's no `ORDER BY`,
+   `WHERE`, aggregate, join or window between the limit and the
+   scan. The executor materializes only the first N rows of each
+   referenced column, so `SELECT * FROM huge LIMIT 3` over an
+   index-backed scan touches a single chunk per column instead of
+   decoding the entire dataset.
+
+   This is the LIMIT-without-ORDER-BY counterpart to
+   `top-n-rewrite`. Bigger LIMITs (above `*head-limit*`) fall
+   through to the regular `PProject + PLimit` path. The rewrite
+   runs before `top-n-rewrite` would pick up an `LLimit (LSort)`,
+   so it never competes with that pass — this only fires when
+   there is no `LSort` in between."
+  [plan]
+  (let [limit-node? (instance? stratum.query.ir.LLimit plan)
+        input       (when limit-node? (:input plan))
+        ;; Eligible input shapes: bare LScan, or LProject items
+        ;; (all bare column refs) over LScan. Anything else (sort,
+        ;; filter, join, aggregate, window) means the LIMIT is
+        ;; semantically tied to row order or count after that
+        ;; operator, so we leave it on the regular path.
+        [items scan] (when input (peel-project input))
+        eligible?   (and limit-node?
+                         scan
+                         (instance? stratum.query.ir.LScan scan)
+                         (or (nil? items)
+                             (every? (fn [it]
+                                       (and (:ref it) (keyword? (:ref it))
+                                            (not (:expr it))))
+                                     items)))
+        no-offset?  (and limit-node?
+                         (or (nil? (:offset plan)) (zero? (long (:offset plan)))))
+        small?      (and limit-node?
+                         (some? (:limit plan))
+                         (<= 0 (long (:limit plan)))
+                         (<= (long (:limit plan)) (long *head-limit*)))]
+    (if (and eligible? no-offset? small?)
+      (with-meta
+        (ir/->LHead (long (:limit plan)) items scan)
+        (meta plan))
       plan)))
 
 ;; ============================================================================
@@ -1644,6 +1780,17 @@
         out (-> plan
                 annotate
                 predicate-pushdown
+                ;; HAVING → WHERE runs immediately after WHERE pushdown
+                ;; so any predicates we lift below LGroupBy can in turn
+                ;; be pushed further down (through joins, etc.) by the
+                ;; next pass that touches `LFilter`. Currently the only
+                ;; such pass is `predicate-pushdown` itself, but its
+                ;; fixpoint loop already exited; re-running it would be
+                ;; correct but rarely useful (HAVING preds reference
+                ;; group columns from `LGroupBy`, which is above any
+                ;; join). Position is for symmetry with DuckDB's
+                ;; FilterPushdown.
+                having-to-where-pushdown
                 join-reorder
                 zone-map-annotation
                 ;; Window-having pushdown runs before expr-materialization
@@ -1658,6 +1805,12 @@
                 ;; — the streaming top-N fetches each surviving row's full
                 ;; column set, not just the order column.
                 top-n-rewrite
+                ;; Head rewrite is the LIMIT-without-ORDER-BY counterpart.
+                ;; Same constraints (runs before strategy-selection so it
+                ;; sees `LLimit (LScan)` / `LLimit (LProject LScan)`, and
+                ;; before column-pruning so the LScan keeps every column
+                ;; the head fetches).
+                head-rewrite
                 strategy-selection
                 operator-fusion
                 stats-propagation

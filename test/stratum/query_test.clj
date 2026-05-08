@@ -4167,11 +4167,11 @@
               {:order [[:price :desc]] :limit 5 :group [:cat]}
               {:price {:type :float64 :data (double-array [1.0])}
                :cat {:type :int64 :data (long-array [1])}}))))
-  (testing "multi-col ORDER BY → not eligible (yet)"
-    (is (not (stratum.query.top-n/top-n-eligible?
-              {:order [[:a :desc] [:b :asc]] :limit 5}
-              {:a {:type :int64 :data (long-array [1])}
-               :b {:type :int64 :data (long-array [1])}}))))
+  (testing "multi-col ORDER BY → eligible (multi-key heap)"
+    (is (stratum.query.top-n/top-n-eligible?
+         {:order [[:a :desc] [:b :asc]] :limit 5}
+         {:a {:type :int64 :data (long-array [1])}
+          :b {:type :int64 :data (long-array [1])}})))
   (testing "WHERE → not eligible (yet)"
     (is (not (stratum.query.top-n/top-n-eligible?
               {:order [[:price :desc]] :limit 1 :where [[:> :price 0]]}

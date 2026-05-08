@@ -33,16 +33,35 @@
 ;; Eligibility
 ;; ============================================================================
 
+(defn- order-spec-col-and-dir
+  "Decompose an `:order` entry into `[col dir]`. Accepts both
+   `[:col :asc]` / `[:col :desc]` and bare `:col` (defaults to ASC)."
+  [spec]
+  (if (vector? spec) spec [spec :asc]))
+
+(defn- order-col-eligible?
+  "An order column is eligible for the streaming heap when it's
+   index- or array-backed and primitive (`:int64`/`:float64`),
+   excluding dict-encoded strings (whose dict-ID order ≠
+   lexicographic order)."
+  [col-info]
+  (and col-info
+       (or (:index col-info) (:data col-info))
+       (#{:int64 :float64} (:type col-info))
+       (not= :string (:dict-type col-info))))
+
 (defn top-n-eligible?
   "Returns true if `query` over `columns` is a clean top-N shape:
-   single-column ORDER BY, LIMIT ≤ *top-n-limit*, no
-   GROUP/AGG/HAVING/JOIN/WHERE/WINDOW/DISTINCT, and the order column
-   is index- or array-backed and primitive."
+   1-or-more-column ORDER BY (each numeric, non-string), LIMIT ≤
+   `*top-n-limit*`, no GROUP/AGG/HAVING/JOIN/WHERE/WINDOW/DISTINCT,
+   no OFFSET. Multi-key ORDER BY uses a packed `^doubles` sort key
+   per row in the heap; comparison walks keys in declared order
+   (matching DuckDB's `CreateSortKey` blob comparison)."
   [query columns]
   (let [{:keys [order limit group agg having join distinct where window
                 offset]} query]
     (and order
-         (= 1 (count order))
+         (>= (count order) 1)
          limit
          (<= 0 (long limit))
          (<= (long limit) (long *top-n-limit*))
@@ -54,19 +73,13 @@
          (empty? where)
          (empty? window)
          (not distinct)
-         (let [first-spec (first order)
-               [col _dir] (if (vector? first-spec) first-spec [first-spec :asc])]
-           (and (keyword? col)
-                (let [c (get columns col)]
-                  (and c
-                       (or (:index c) (:data c))
-                       ;; Numeric only. String columns are stored as
-                       ;; :int64 dict-IDs; ordering by dict-ID gives
-                       ;; insertion-order, not lexicographic, which is
-                       ;; semantically wrong. Bail until a proper
-                       ;; string-ordering primitive exists.
-                       (#{:int64 :float64} (:type c))
-                       (not= :string (:dict-type c)))))))))
+         ;; Every order column must be present, primitive-numeric,
+         ;; and not a dict-string.
+         (every? (fn [spec]
+                   (let [[col _] (order-spec-col-and-dir spec)]
+                     (and (keyword? col)
+                          (order-col-eligible? (get columns col)))))
+                 order))))
 
 ;; ============================================================================
 ;; Heap-based top-N over an index/array column
@@ -75,25 +88,51 @@
 ;; chunk-id is the full ChunkEntry chunk-id vector (e.g. [3] or [3 1]
 ;; after a split). Storing only the first element collapses split
 ;; chunks together and makes downstream point-slice lookups miss.
-(deftype ^:private TopNEntry [^double key chunk-id ^long local-idx])
+;; `keys` is a `double[]` carrying one encoded key per ORDER BY
+;; column (length 1 for the common single-key case). Casting int64
+;; to double is fine for typical ranges (timestamps in millis up to
+;; year 287396, dict-IDs up to 2^53); precise multi-key comparison
+;; over very large longs would require a packed byte[] encoding —
+;; matches DuckDB's `CreateSortKey` blob — and isn't worth the
+;; complexity until we hit it.
+(deftype ^:private TopNEntry [^doubles keys chunk-id ^long local-idx])
 
 (defn- ^Comparator entry-cmp
-  "Comparator for the heap. For `:asc` (find smallest N) we want a
-   max-heap so we evict the largest. For `:desc` (find largest N) we
-   want a min-heap. Java's PriorityQueue is a min-heap, so for ASC we
-   reverse-compare keys."
-  [^clojure.lang.Keyword dir]
-  (if (= :desc dir)
+  "Comparator for the heap. The PriorityQueue is a min-heap, so the
+   comparator must return positive when `a` is *better* than `b`
+   (where `a` evicts the worst-kept `b` at the heap's peek). For ASC
+   that means smaller-is-better; for DESC larger-is-better. With
+   multi-key ORDER BY we walk the keys in declared order, returning
+   the first non-zero per-key result. Mixed direction (`ORDER BY x
+   ASC, y DESC`) is supported — `dirs[i] ∈ {+1, -1}` flips the per-
+   key sense."
+  [^ints dirs]
+  (let [n (alength dirs)]
     (reify Comparator
       (compare [_ a b]
-        (let [ka (.key ^TopNEntry a)
-              kb (.key ^TopNEntry b)]
-          (Double/compare ka kb))))
-    (reify Comparator
-      (compare [_ a b]
-        (let [ka (.key ^TopNEntry a)
-              kb (.key ^TopNEntry b)]
-          (Double/compare kb ka))))))
+        (let [^doubles ka (.keys ^TopNEntry a)
+              ^doubles kb (.keys ^TopNEntry b)]
+          (loop [i 0]
+            (if (>= i n)
+              0
+              (let [va (aget ka i)
+                    vb (aget kb i)
+                    d  (long (aget dirs i))
+                    c  (if (= d 1)
+                         ;; ASC: smaller a is better → +1 when va < vb
+                         (Double/compare vb va)
+                         ;; DESC: larger a is better → +1 when va > vb
+                         (Double/compare va vb))]
+                (if (zero? c)
+                  (recur (unchecked-inc i))
+                  c)))))))))
+
+(defn- ^ints dirs->int-array
+  "Convert a vec of `:asc`/`:desc` keywords into a primitive int[]
+   (`+1` for ASC, `-1` for DESC). Cheaper than re-checking keywords
+   per row inside the heap comparator."
+  [dirs]
+  (int-array (map #(if (= % :desc) -1 1) dirs)))
 
 (defn- key-double
   "Extract a double key from a chunk's value at index `i`. For string
@@ -108,66 +147,164 @@
     :int64   (double (chunk/read-long chk i))
     :string  (double (chunk/read-long chk i))))
 
-(defn- find-top-n-on-index
-  "Stream chunks of `idx`, return up to `n` (key, chunk-id, local-idx)
-   entries representing the top-N rows by `dir`."
-  [idx ^long n dir datatype]
-  (let [^Comparator cmp (entry-cmp dir)
-        pq (PriorityQueue. (max 1 (int n)) cmp)
-        tree (index/idx-tree idx)
-        entries (vec (pss/slice tree nil nil))]
-    (doseq [^ChunkEntry entry entries]
-      (let [chk (.chunk entry)
-            chunk-id (.chunk-id entry)
-            chunk-len (long (chunk/chunk-length chk))]
-        (loop [i 0]
-          (when (< i chunk-len)
-            (let [k (key-double chk i datatype)
-                  e (TopNEntry. k chunk-id i)]
-              (if (< (.size pq) n)
-                (.offer pq e)
-                (let [^TopNEntry top (.peek pq)]
-                  (when (pos? (.compare cmp e top))
-                    ;; e is "better" than the worst kept → evict
-                    (.poll pq)
-                    (.offer pq e)))))
-            (recur (unchecked-inc i))))))
-    pq))
+(defn- key-double-from-array
+  "Same as `key-double` but pulls from a heap array (long[]/double[])."
+  ^double [arr ^long i datatype]
+  (case datatype
+    :float64 (aget ^doubles arr i)
+    :int64   (double (aget ^longs arr i))
+    :string  (double (aget ^longs arr i))))
 
-(defn- find-top-n-on-array
-  "Stream a heap-array column to find top-N. Used when the source
-   column already has `:data` (no index)."
-  [arr ^long n dir datatype]
-  (let [^Comparator cmp (entry-cmp dir)
-        pq (PriorityQueue. (max 1 (int n)) cmp)
-        len (long (case datatype
-                    :float64 (alength ^doubles arr)
-                    :int64   (alength ^longs arr)
-                    :string  (alength ^longs arr)))]
+(defn- maybe-evict-and-offer!
+  "Heap-fill or evict-and-replace logic shared between the index and
+   array paths. `scratch` carries this row's encoded keys; on insert
+   we copy it (so the in-heap entry doesn't alias the next row).
+   `n` and `local-idx` are passed boxed-long since Clojure's primitive
+   fn rule caps `^long`/`^double` args at four."
+  [^PriorityQueue pq ^Comparator cmp n ^doubles scratch chunk-id local-idx]
+  (let [n-keys     (alength scratch)
+        n-long     (long n)
+        local-long (long local-idx)]
+    (if (< (.size pq) n-long)
+      (let [keys (java.util.Arrays/copyOf scratch n-keys)]
+        (.offer pq (TopNEntry. keys chunk-id local-long)))
+      (let [^TopNEntry top (.peek pq)
+            tmp-entry (TopNEntry. scratch chunk-id local-long)]
+        (when (pos? (.compare cmp tmp-entry top))
+          (.poll pq)
+          (let [keys (java.util.Arrays/copyOf scratch n-keys)]
+            (.offer pq (TopNEntry. keys chunk-id local-long))))))))
+
+(defn- find-top-n-on-arrays
+  "Multi-column array path. Iterates row-by-row across `arrs`, fills a
+   reused `scratch` keys array per row, and feeds the heap. Single-
+   key callers pass a 1-element `arrs`/`datatypes` vec."
+  [arrs ^long n dirs datatypes]
+  (let [n-keys   (count arrs)
+        ^Comparator cmp (entry-cmp (dirs->int-array dirs))
+        pq       (PriorityQueue. (max 1 (int n)) cmp)
+        scratch  (double-array n-keys)
+        ;; All arrays share the same length (rows of a single table).
+        first-arr (nth arrs 0)
+        first-dt  (nth datatypes 0)
+        len      (long (case first-dt
+                         :float64 (alength ^doubles first-arr)
+                         :int64   (alength ^longs first-arr)
+                         :string  (alength ^longs first-arr)))]
     (loop [i 0]
       (when (< i len)
-        (let [k (case datatype
-                  :float64 (aget ^doubles arr i)
-                  :int64   (double (aget ^longs arr i))
-                  :string  (double (aget ^longs arr i)))
-              ;; For arrays we encode the absolute row index in `local-idx`
-              ;; and use a sentinel chunk-id `nil`; the row-fetch path
-              ;; routes through the `:data` branch when the column has
-              ;; an array source.
-              e (TopNEntry. k nil i)]
-          (if (< (.size pq) n)
-            (.offer pq e)
-            (let [^TopNEntry top (.peek pq)]
-              (when (pos? (.compare cmp e top))
-                (.poll pq)
-                (.offer pq e)))))
+        ;; Fill scratch with this row's keys.
+        (loop [k 0]
+          (when (< k n-keys)
+            (aset scratch k (key-double-from-array (nth arrs k) i (nth datatypes k)))
+            (recur (unchecked-inc k))))
+        (maybe-evict-and-offer! pq cmp n scratch nil i)
         (recur (unchecked-inc i))))
     pq))
 
+(defn- chunk-primary-bound
+  "Lower (ASC) / upper (DESC) bound of `chunk-i`'s primary order
+   column. Used by `find-top-n-on-indices` to (a) order chunk
+   iteration and (b) decide when remaining chunks can no longer
+   contribute. The primary order column is always the first key
+   in `:order`; tiebreaker keys aren't used for chunk pruning."
+  ^double [first-entries ^long chunk-i ^clojure.lang.Keyword first-dir]
+  (let [^ChunkEntry e (nth first-entries chunk-i)
+        ^ChunkStats s (.stats e)]
+    (if (= first-dir :desc)
+      (double (:max-val s))
+      (double (:min-val s)))))
+
+(defn- chunk-iteration-order
+  "Permutation `[0..n-chunks)` sorted so the most promising chunks
+   come first — ascending min for ASC, descending max for DESC.
+   Walking in this order lets `can-prune-rest?` cut off the loop
+   the moment a chunk's primary bound can no longer beat the heap's
+   worst kept value (DuckDB calls this `RowGroupPruner`'s
+   set_scan_order; we apply the same idea but to streaming top-N
+   instead of a separate scan-reorder pass)."
+  [first-entries ^clojure.lang.Keyword first-dir]
+  (let [n (count first-entries)
+        positions (range n)]
+    (case first-dir
+      :desc (vec (sort-by (fn [^long i]
+                            (- (chunk-primary-bound first-entries i :desc)))
+                          positions))
+      (vec (sort-by (fn [^long i]
+                      (chunk-primary-bound first-entries i :asc))
+                    positions)))))
+
+(defn- can-prune-rest?
+  "When the heap is full, no future chunk whose primary bound is
+   already worse than the heap's worst-kept primary key can
+   contribute a winning row. For ASC: skip when `chunk-min >=
+   heap-worst-primary` (strict-positive comparator means equal
+   values don't evict, so the `>=` is sound). For DESC: skip when
+   `chunk-max <= heap-worst-primary`."
+  [^PriorityQueue pq ^long n ^clojure.lang.Keyword first-dir ^double bound]
+  (when (= n (.size pq))
+    (let [^TopNEntry top (.peek pq)
+          worst (aget ^doubles (.keys top) 0)]
+      (if (= first-dir :desc)
+        (<= bound worst)
+        (>= bound worst)))))
+
+(defn- find-top-n-on-indices
+  "Multi-column index path. Walks chunks in primary-order (ASC: min
+   ascending; DESC: max descending) so that once the heap is full,
+   the next chunk's primary bound either beats every kept row
+   (process it) or can't (stop). For sorted-on-disk inputs (Parquet
+   time-series, append-only logs) this fires immediately after the
+   first chunk; for random-order inputs it has no overhead beyond
+   the upfront stats sort.
+
+   All order indices must share chunk boundaries — true for
+   stratum's column store (chunks are dataset-level)."
+  [indices ^long n dirs datatypes]
+  (let [n-keys (count indices)
+        ^Comparator cmp (entry-cmp (dirs->int-array dirs))
+        pq (PriorityQueue. (max 1 (int n)) cmp)
+        scratch (double-array n-keys)
+        per-col-entries (mapv (fn [idx] (vec (pss/slice (index/idx-tree idx) nil nil)))
+                              indices)
+        n-chunks (long (count (first per-col-entries)))
+        first-entries (first per-col-entries)
+        first-dir (first dirs)
+        ;; Visit chunks ordered by primary-key stats — promising chunks first.
+        sorted-positions (chunk-iteration-order first-entries first-dir)]
+    (loop [pos-idx 0]
+      (when (< pos-idx n-chunks)
+        (let [chunk-i (long (nth sorted-positions pos-idx))
+              bound  (chunk-primary-bound first-entries chunk-i first-dir)]
+          (if (can-prune-rest? pq n first-dir bound)
+            ;; All remaining chunks (in primary order) are at least as
+            ;; bad as `bound`; nothing they contain can dethrone the
+            ;; heap. Stop iterating.
+            nil
+            (let [^"[Ljava.lang.Object;" chunks (object-array n-keys)
+                  _ (loop [k 0]
+                      (when (< k n-keys)
+                        (let [^ChunkEntry e (nth (nth per-col-entries k) chunk-i)]
+                          (aset chunks k (.chunk e)))
+                        (recur (unchecked-inc k))))
+                  chunk-id (.chunk-id ^ChunkEntry (nth first-entries chunk-i))
+                  chunk-len (long (chunk/chunk-length (aget chunks 0)))]
+              (loop [i 0]
+                (when (< i chunk-len)
+                  (loop [k 0]
+                    (when (< k n-keys)
+                      (aset scratch k (key-double (aget chunks k) i (nth datatypes k)))
+                      (recur (unchecked-inc k))))
+                  (maybe-evict-and-offer! pq cmp n scratch chunk-id i)
+                  (recur (unchecked-inc i))))
+              (recur (unchecked-inc pos-idx)))))))
+    pq))
+
 (defn- drain-heap-sorted
-  "Drain `pq` into a vector ordered by `dir` (largest-first for :desc,
-   smallest-first for :asc)."
-  [^PriorityQueue pq dir]
+  "Drain `pq` into a vector ordered by the multi-key direction
+   (best-first per the comparator, which inverts to largest-first
+   for DESC and smallest-first for ASC on each key)."
+  [^PriorityQueue pq]
   (let [out (java.util.ArrayList. (.size pq))]
     (while (pos? (.size pq))
       (.add out (.poll pq)))
@@ -225,17 +362,27 @@
   "Run the top-N pushdown path. Returns a vector of result rows.
    Caller has already verified `top-n-eligible?`.
 
-   `select` may be nil (= all columns) or a vector of column kws."
+   `select` may be nil (= all columns) or a vector of column kws.
+   `:order` may carry one or more `[col dir]` specs (or bare `col`
+   shorthand for ASC); the heap walks all keys in declared order
+   for tie-breaking, mixed `:asc`/`:desc` is supported."
   [query columns]
   (let [{:keys [order limit select]} query
-        first-spec (first order)
-        [^clojure.lang.Keyword col-kw dir] (if (vector? first-spec)
-                                             first-spec
-                                             [first-spec :asc])
-        n (long limit)
-        order-col (get columns col-kw)
-        datatype (:type order-col)
-        all-keys (vec (keys columns))
+        n          (long limit)
+        ;; Decompose every `:order` spec into [col dir] pairs.
+        decomposed (mapv order-spec-col-and-dir order)
+        order-cols (mapv first decomposed)
+        dirs       (mapv second decomposed)
+        order-infos (mapv (fn [k] (get columns k)) order-cols)
+        datatypes   (mapv :type order-infos)
+        ;; Same-source assumption: either every order column has
+        ;; `:data`, or every order column has `:index`. Mixed isn't
+        ;; supported (it would imply the order columns came from
+        ;; different sources, which the eligibility gate disallows
+        ;; via the `order-col-eligible?` check).
+        all-data?   (every? :data order-infos)
+        all-index?  (every? :index order-infos)
+        all-keys    (vec (keys columns))
         ;; Determine output projection. select may include :as
         ;; aliases or expressions; we restrict to plain keyword refs
         ;; in the eligibility gate so this is straightforward.
@@ -245,13 +392,13 @@
                    :else                              all-keys)
         ;; Phase 1: streaming top-N
         pq (cond
-             (:data order-col)  (find-top-n-on-array
-                                 (:data order-col) n dir datatype)
-             (:index order-col) (find-top-n-on-index
-                                 (:index order-col) n dir datatype)
-             :else              (throw (ex-info "top-N: order column has neither :data nor :index"
-                                                {:col col-kw})))
-        sorted (drain-heap-sorted pq dir)
+             all-data?  (find-top-n-on-arrays
+                         (mapv :data order-infos) n dirs datatypes)
+             all-index? (find-top-n-on-indices
+                         (mapv :index order-infos) n dirs datatypes)
+             :else (throw (ex-info "top-N: order columns must all be array- or all index-backed"
+                                   {:order-cols order-cols})))
+        sorted (drain-heap-sorted pq)
         ;; Surviving rows live in only a small set of chunk-ids;
         ;; fetch a per-output-column map of {chunk-id → chunk} for
         ;; only those ids. On konserve-backed indices with thousands

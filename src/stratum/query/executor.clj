@@ -34,7 +34,7 @@
             PFusedExtractCount PBitmapSemiJoin PHashJoin
             PPerfectHashJoin PAsofJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
             PProject PWindow PHaving PSort PDistinct PLimit
-            PMaterializeExpr LTopN LSetOp LAnomaly LStringMaterialize]
+            PMaterializeExpr LTopN LHead LSetOp LAnomaly LStringMaterialize]
            [stratum.internal ColumnOps ColumnOpsExt ColumnOpsAnalytics]))
 
 (set! *warn-on-reflection* true)
@@ -700,10 +700,10 @@
 (defn- execute-top-n-node
   "Run the streaming top-N pushdown by delegating to
    `stratum.query.top-n/execute-top-n`. The IR's `LTopN` node carries
-   the (single) order-spec, the LIMIT, and the (LProject) items it
-   absorbed (or nil for SELECT *). We assemble the synthetic query
-   map that `top-n/execute-top-n` expects from those fields plus the
-   input column context."
+   one or more `:order-specs`, the LIMIT, and the (LProject) items
+   it absorbed (or nil for SELECT *). We assemble the synthetic
+   query map that `top-n/execute-top-n` expects from those fields
+   plus the input column context."
   [node]
   (let [ctx (execute-node (:input node))
         columns (ctx-columns ctx)
@@ -717,13 +717,72 @@
         select  (when (seq items)
                   (let [refs (mapv :ref items)]
                     (when (every? keyword? refs) refs)))
-        order-spec (:order-spec node)
-        order-spec (if (vector? order-spec) order-spec [order-spec :asc])]
+        ;; `:order-specs` is the canonical multi-key form (vec of
+        ;; `[col dir]` pairs). Caller may have stored a single
+        ;; bare-keyword spec from the legacy single-key path —
+        ;; normalize back to that vector shape here.
+        order-specs (let [os (:order-specs node)]
+                      (cond
+                        (and (vector? os) (every? vector? os)) os
+                        (and (vector? os) (keyword? (first os))) [os]
+                        (keyword? os) [[os :asc]]
+                        :else (vec os)))]
     (top-n/execute-top-n
-     {:order [order-spec]
-      :limit (:limit node)
+     {:order  (vec order-specs)
+      :limit  (:limit node)
       :select select}
      columns)))
+
+(defn- execute-head-node
+  "Run the LIMIT-without-ORDER-BY pushdown — return the first N rows
+   in scan order. Each output column is materialized via
+   `cols/take-prefix-column`, which fetches only the prefix needed
+   (a single chunk for typical small limits over a multi-million-row
+   index) and never decodes the full column. Mirrors
+   `execute-top-n-node` but skips the heap.
+
+   Output is a vec of row maps (the LLimit's normal shape).
+   Dict-encoded columns flow through with their dict intact, so
+   downstream string decoding still works in the per-row reads."
+  [node]
+  (let [ctx     (execute-node (:input node))
+        columns (ctx-columns ctx)
+        length  (long (ctx-length ctx))
+        n       (Math/min (long (:limit node)) length)
+        items   (:select node)
+        all-keys (vec (keys columns))
+        out-cols (cond
+                   (nil? items) all-keys
+                   :else (let [refs (keep :ref items)]
+                           (if (every? keyword? refs) (vec refs) all-keys)))
+        ;; Materialize only the first N rows of each referenced column.
+        prefixed (into {}
+                       (map (fn [k] [k (cols/take-prefix-column (get columns k) n)]))
+                       out-cols)
+        ;; Per-key reader fn that decodes the i-th row, applying dict
+        ;; lookup for dict-encoded string columns.
+        reader  (fn [k]
+                  (let [col (get prefixed k)
+                        data (:data col)
+                        dict (:dict col)
+                        dict-string? (and dict (= :string (:dict-type col)))]
+                    (cond
+                      (and dict-string? (instance? (Class/forName "[J") data))
+                      (fn [^long i]
+                        (let [code (aget ^longs data i)]
+                          (when (>= code 0)
+                            (aget ^"[Ljava.lang.String;" dict (int code)))))
+                      (instance? (Class/forName "[J") data)
+                      (fn [^long i] (aget ^longs data i))
+                      (instance? (Class/forName "[D") data)
+                      (fn [^long i] (aget ^doubles data i))
+                      (instance? (Class/forName "[Ljava.lang.String;") data)
+                      (fn [^long i] (aget ^"[Ljava.lang.String;" data i))
+                      :else (fn [^long _i] nil))))
+        readers (into {} (map (juxt identity reader)) out-cols)]
+    (mapv (fn [^long i]
+            (into {} (map (fn [k] [k ((get readers k) i)])) out-cols))
+          (range n))))
 
 ;; --- Post-processing --------------------------------------------------------
 
@@ -877,6 +936,10 @@
      ;; Top-N pushdown — LTopN is recognized directly (no separate
      ;; physical record) and dispatched to the streaming primitive.
      (instance? LTopN node) (execute-top-n-node node)
+
+     ;; LIMIT-without-ORDER-BY pushdown — same shape as LTopN, but
+     ;; no order column: first N rows in scan order.
+     (instance? LHead node) (execute-head-node node)
 
      ;; Anomaly score materialization (post-join). Resolves at the
      ;; right point in the pipeline so the iforest sees joined

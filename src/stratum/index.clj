@@ -1362,6 +1362,41 @@
           (vreset! offset (+ off chunk-len)))))
     result))
 
+(defn idx-materialize-to-array-prefix
+  "Materialize the FIRST `n` rows of `index` into a heap array. Walks
+   chunks in order and stops once `n` values have been copied — for
+   typical 8192-row chunks an `n` of a few hundred touches a single
+   chunk, which is the difference between O(N) decode for the whole
+   index and O(chunk-size) for the prefix.
+
+   Uses the same single-copy chunk → array pattern as
+   `idx-materialize-to-array` (with `Arrays.fill` for constant
+   chunks). The returned array's length is `min(n, idx-length)`."
+  [index ^long n]
+  (let [length (long (idx-length index))
+        take-n (Math/min n length)
+        dt     (idx-datatype index)
+        result (case dt :int64 (long-array take-n) :float64 (double-array take-n))
+        tree   (idx-tree index)
+        offset (volatile! 0)]
+    (loop [es (seq (pss/slice tree nil nil))]
+      (when (and es (< (long @offset) take-n))
+        (let [^ChunkEntry entry (first es)
+              chk        (.chunk entry)
+              off        (long @offset)
+              chunk-len  (long (chunk/chunk-length chk))
+              copy-len   (Math/min chunk-len (- take-n off))]
+          (if (chunk/chunk-constant? chk)
+            (let [cv (chunk/chunk-constant-val chk)]
+              (case dt
+                :float64 (java.util.Arrays/fill ^doubles result (int off) (int (+ off copy-len)) (double cv))
+                :int64   (java.util.Arrays/fill ^longs   result (int off) (int (+ off copy-len)) (long cv))))
+            (let [chunk-arr (chunk/chunk-data chk)]
+              (System/arraycopy chunk-arr 0 result off copy-len)))
+          (vreset! offset (+ off copy-len)))
+        (recur (next es))))
+    result))
+
 (defn idx-materialize
   "Materialize index to a contiguous heap array.
 
