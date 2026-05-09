@@ -112,51 +112,212 @@
    sorted-indices: row indices in partition-sorted order.
    part-keys: partition assignment for each row.
    val-arr: source values (long[] or double[]).
-   start-bound/end-bound: frame bounds (keywords or [N :preceding/:following])."
+   start-bound/end-bound: frame bounds (keywords or [N :preceding/:following]).
+
+   The prefix array runs monotonically across the full sort order; each
+   partition's queries subtract the partition's base prefix to localize."
   [sorted-indices part-keys val-arr length start-bound end-bound]
   (let [length (long length)
         ^ints sorted-indices sorted-indices
         ^longs part-keys part-keys
         result (double-array length)
         is-double (expr/double-array? val-arr)
-        [^ints part-starts ^ints part-ends] (compute-partition-boundaries sorted-indices part-keys length)]
-    ;; Build prefix sums per partition (within sorted order)
-    (let [prefix (double-array (inc length))]
-      (dotimes [i length]
-        (let [idx (aget sorted-indices i)
-              v (if is-double (aget ^doubles val-arr idx) (double (aget ^longs val-arr idx)))
-              ps (aget part-starts i)]
-          ;; Reset prefix at partition boundary
-          (when (= i ps) (aset prefix i 0.0))
-          (aset prefix (inc i) (+ (aget prefix i) v))))
-      ;; Compute windowed sums
-      (dotimes [i length]
-        (let [idx (aget sorted-indices i)
-              ps (aget part-starts i)
-              pe (aget part-ends i)
-              ;; Resolve frame bounds to sorted positions
-              win-start (int (cond
-                               (= start-bound :unbounded-preceding) ps
-                               (= start-bound :current-row) i
-                               (vector? start-bound)
-                               (let [[n dir] start-bound]
-                                 (case dir
-                                   :preceding (max ps (- i (long n)))
-                                   :following (min pe (+ i (long n)))))
-                               :else ps))
-              win-end (int (cond
-                             (= end-bound :unbounded-following) pe
-                             (= end-bound :current-row) (inc i)
-                             (vector? end-bound)
-                             (let [[n dir] end-bound]
+        [^ints part-starts ^ints part-ends] (compute-partition-boundaries sorted-indices part-keys length)
+        prefix (double-array (inc length))]
+    ;; Single monotonic prefix across the whole sort order. We do NOT reset
+    ;; at partition boundaries — instead the query subtracts the partition's
+    ;; base prefix value so each partition's prefix sums are conceptually
+    ;; partition-local.
+    (dotimes [i length]
+      (let [idx (aget sorted-indices i)
+            v (if is-double (aget ^doubles val-arr idx) (double (aget ^longs val-arr idx)))]
+        (aset prefix (inc i) (+ (aget prefix i) v))))
+    (dotimes [i length]
+      (let [idx (aget sorted-indices i)
+            ps (aget part-starts i)
+            pe (aget part-ends i)
+            ;; Resolve frame bounds to sorted positions
+            win-start (int (cond
+                             (= start-bound :unbounded-preceding) ps
+                             (= start-bound :current-row) i
+                             (vector? start-bound)
+                             (let [[n dir] start-bound]
                                (case dir
-                                 :preceding (max ps (inc (- i (long n))))
-                                 :following (min pe (inc (+ i (long n))))))
-                             :else (inc i)))]
-          (aset result idx (if (>= win-start win-end)
-                             Double/NaN  ;; empty frame → NULL per SQL standard
-                             (- (aget prefix win-end) (aget prefix win-start)))))))
+                                 :preceding (max ps (- i (long n)))
+                                 :following (min pe (+ i (long n)))))
+                             :else ps))
+            win-end (int (cond
+                           (= end-bound :unbounded-following) pe
+                           (= end-bound :current-row) (inc i)
+                           (vector? end-bound)
+                           (let [[n dir] end-bound]
+                             (case dir
+                               :preceding (max ps (inc (- i (long n))))
+                               :following (min pe (inc (+ i (long n))))))
+                           :else (inc i)))]
+        (aset result idx (if (>= win-start win-end)
+                           Double/NaN  ;; empty frame → NULL per SQL standard
+                           (- (aget prefix win-end) (aget prefix win-start))))))
     result))
+
+;; ============================================================================
+;; RANGE-frame sliding windows (value-based bounds)
+;; ============================================================================
+
+(defn- range-bound-distance
+  "Resolve a RANGE frame bound to a numeric distance from the current row's
+   order-by value. Returns nil for :unbounded-* / :current-row, or a long for
+   [N :preceding/:following]. The bound's `N` is interpreted in the source
+   column's native units; the caller is responsible for unit conversion."
+  ^Long [bound]
+  (cond
+    (vector? bound) (let [[n _] bound] (long n))
+    :else nil))
+
+(defn- compute-sliding-window-sum-range
+  "Sliding window SUM with value-based (RANGE) bounds. Uses a two-pointer
+   sweep on the (ascending-sorted) order-by column within each partition,
+   so the algorithm is O(N) per partition.
+
+   ord-arr must be a long[] or double[] and must be sorted ascending within
+   each partition. start-bound / end-bound are [N :preceding/:following]
+   tuples or :current-row / :unbounded-*. Bounds are interpreted in the
+   units of ord-arr."
+  [sorted-indices part-keys val-arr ord-arr length start-bound end-bound]
+  (let [length (long length)
+        ^ints sorted-indices sorted-indices
+        ^longs part-keys part-keys
+        result (double-array length)
+        is-double (expr/double-array? val-arr)
+        ord-double? (expr/double-array? ord-arr)
+        [^ints part-starts ^ints part-ends] (compute-partition-boundaries sorted-indices part-keys length)
+        get-ord (fn ^double [^long sorted-pos]
+                  (let [idx (aget sorted-indices (int sorted-pos))]
+                    (if ord-double?
+                      (aget ^doubles ord-arr idx)
+                      (double (aget ^longs ord-arr idx)))))
+        ;; Monotonic prefix sums across all rows. Per-partition queries
+        ;; subtract endpoints within the partition, so no per-partition
+        ;; reset is needed (the partition base prefix cancels out).
+        prefix (double-array (inc length))]
+    (dotimes [i length]
+      (let [idx (aget sorted-indices i)
+            v (if is-double (aget ^doubles val-arr idx) (double (aget ^longs val-arr idx)))]
+        (aset prefix (inc i) (+ (aget prefix i) v))))
+    ;; Two-pointer sweep within each partition.
+    (loop [i 0]
+      (when (< i length)
+        (let [ps (aget part-starts i)
+              pe (aget part-ends i)
+              ;; bounds; nil means open on that side
+              start-d (range-bound-distance start-bound)
+              end-d   (range-bound-distance end-bound)
+              start-pre? (and (vector? start-bound) (= :preceding (second start-bound)))
+              end-fol? (and (vector? end-bound) (= :following (second end-bound)))
+              start-fol? (and (vector? start-bound) (= :following (second start-bound)))
+              end-pre? (and (vector? end-bound) (= :preceding (second end-bound)))]
+          ;; Sweep all rows in this partition. For each row p in [ps, pe):
+          ;;   lo = first row q in [ps, pe) where ord[q] >= ord[p] - start-d
+          ;;   hi = first row q in [ps, pe) where ord[q] >  ord[p] + end-d
+          ;;   (with sign flips for :following / :preceding on the other side)
+          (loop [p (long ps), lo (long ps), hi (long ps)]
+            (when (< p pe)
+              (let [ov (get-ord p)
+                    lo-target (cond
+                                (= start-bound :unbounded-preceding) Double/NEGATIVE_INFINITY
+                                (= start-bound :current-row) ov
+                                start-pre? (- ov (double start-d))
+                                start-fol? (+ ov (double start-d))
+                                :else Double/NEGATIVE_INFINITY)
+                    hi-target (cond
+                                (= end-bound :unbounded-following) Double/POSITIVE_INFINITY
+                                (= end-bound :current-row) ov
+                                end-fol? (+ ov (double end-d))
+                                end-pre? (- ov (double end-d))
+                                :else ov)
+                    ;; Advance lo while ord[lo] < lo-target  (strictly less)
+                    new-lo (loop [q (max lo ps)]
+                             (if (and (< q pe)
+                                      (< (get-ord q) lo-target))
+                               (recur (inc q))
+                               q))
+                    ;; Advance hi while ord[hi] <= hi-target  (inclusive)
+                    new-hi (loop [q (max hi new-lo)]
+                             (if (and (< q pe)
+                                      (<= (get-ord q) hi-target))
+                               (recur (inc q))
+                               q))
+                    win-start (int new-lo)
+                    win-end   (int new-hi)
+                    idx (aget sorted-indices (int p))]
+                (aset result idx
+                      (if (>= win-start win-end)
+                        Double/NaN
+                        (- (aget prefix win-end) (aget prefix win-start))))
+                (recur (inc p) (long new-lo) (long new-hi)))))
+          (recur (long pe)))))
+    result))
+
+(defn- compute-sliding-window-count-range
+  "Same as compute-sliding-window-sum-range but returns frame row count."
+  [sorted-indices part-keys ord-arr length start-bound end-bound]
+  (let [length (long length)
+        ^ints sorted-indices sorted-indices
+        ^longs part-keys part-keys
+        result (double-array length)
+        ord-double? (expr/double-array? ord-arr)
+        [^ints part-starts ^ints part-ends] (compute-partition-boundaries sorted-indices part-keys length)
+        get-ord (fn ^double [^long sorted-pos]
+                  (let [idx (aget sorted-indices (int sorted-pos))]
+                    (if ord-double?
+                      (aget ^doubles ord-arr idx)
+                      (double (aget ^longs ord-arr idx)))))]
+    (loop [i 0]
+      (when (< i length)
+        (let [ps (aget part-starts i)
+              pe (aget part-ends i)
+              start-d (range-bound-distance start-bound)
+              end-d   (range-bound-distance end-bound)
+              start-pre? (and (vector? start-bound) (= :preceding (second start-bound)))
+              end-fol? (and (vector? end-bound) (= :following (second end-bound)))
+              start-fol? (and (vector? start-bound) (= :following (second start-bound)))
+              end-pre? (and (vector? end-bound) (= :preceding (second end-bound)))]
+          (loop [p (long ps), lo (long ps), hi (long ps)]
+            (when (< p pe)
+              (let [ov (get-ord p)
+                    lo-target (cond
+                                (= start-bound :unbounded-preceding) Double/NEGATIVE_INFINITY
+                                (= start-bound :current-row) ov
+                                start-pre? (- ov (double start-d))
+                                start-fol? (+ ov (double start-d))
+                                :else Double/NEGATIVE_INFINITY)
+                    hi-target (cond
+                                (= end-bound :unbounded-following) Double/POSITIVE_INFINITY
+                                (= end-bound :current-row) ov
+                                end-fol? (+ ov (double end-d))
+                                end-pre? (- ov (double end-d))
+                                :else ov)
+                    new-lo (loop [q (max lo ps)]
+                             (if (and (< q pe) (< (get-ord q) lo-target))
+                               (recur (inc q)) q))
+                    new-hi (loop [q (max hi new-lo)]
+                             (if (and (< q pe) (<= (get-ord q) hi-target))
+                               (recur (inc q)) q))
+                    idx (aget sorted-indices (int p))]
+                (aset result idx
+                      (if (>= new-lo new-hi)
+                        Double/NaN
+                        (double (- new-hi new-lo))))
+                (recur (inc p) (long new-lo) (long new-hi)))))
+          (recur (long pe)))))
+    result))
+
+(defn- range-frame?
+  "True iff the frame uses RANGE semantics (value-based bounds)."
+  [frame]
+  (and frame (= :range (:type frame))
+       (or (vector? (:start frame))
+           (vector? (:end frame)))))
 
 (defn- compute-sliding-window-count
   "Compute sliding window COUNT."
@@ -273,6 +434,19 @@
                              p (aget ^longs part-keys idx)]
                          (aset result idx (double (.get part-totals p)))))
                      result))
+
+                 (range-frame? frame)
+                 ;; RANGE BETWEEN INTERVAL …: value-based sliding window over
+                 ;; the (single) order-by column. Partition + ascending sort
+                 ;; already done; two-pointer sweep is O(N) per partition.
+                 (let [ord-col (ffirst order-by)
+                       _ (when-not ord-col
+                           (throw (ex-info "RANGE frame requires an ORDER BY column"
+                                           {:op op :frame frame})))
+                       ord-arr (get col-arrays ord-col)]
+                   (compute-sliding-window-sum-range sorted-indices part-keys
+                                                     (get col-arrays col) ord-arr
+                                                     length (:start frame) (:end frame)))
 
                  (or sliding-frame? (non-default-running-frame? frame))
                  (compute-sliding-window-sum sorted-indices part-keys
@@ -401,6 +575,14 @@
                            p (aget ^longs part-keys idx)]
                        (aset result idx (double (.get part-counts p)))))
                    result)
+                 (range-frame? frame)
+                 (let [ord-col (ffirst order-by)
+                       _ (when-not ord-col
+                           (throw (ex-info "RANGE frame requires an ORDER BY column"
+                                           {:op op :frame frame})))
+                       ord-arr (get col-arrays ord-col)]
+                   (compute-sliding-window-count-range sorted-indices part-keys ord-arr
+                                                       length (:start frame) (:end frame)))
                  (or sliding-frame? (non-default-running-frame? frame))
                  (compute-sliding-window-count sorted-indices part-keys length
                                                (:start frame) (:end frame))
@@ -434,6 +616,24 @@
                            p (aget ^longs part-keys idx)]
                        (aset result idx (/ (double (.get part-totals p))
                                            (double (.get part-counts p))))))
+                   result)
+                 (range-frame? frame)
+                 (let [ord-col (ffirst order-by)
+                       _ (when-not ord-col
+                           (throw (ex-info "RANGE frame requires an ORDER BY column"
+                                           {:op op :frame frame})))
+                       ord-arr (get col-arrays ord-col)
+                       sums (compute-sliding-window-sum-range sorted-indices part-keys
+                                                              (get col-arrays col) ord-arr
+                                                              length (:start frame) (:end frame))
+                       cnts (compute-sliding-window-count-range sorted-indices part-keys ord-arr
+                                                                length (:start frame) (:end frame))
+                       result (double-array length)]
+                   (dotimes [i length]
+                     (let [c (aget ^doubles cnts i)]
+                       (aset result i (if (Double/isNaN c)
+                                        Double/NaN
+                                        (/ (aget ^doubles sums i) (Math/max 1.0 c))))))
                    result)
                  (or sliding-frame? (non-default-running-frame? frame))
                   ;; AVG = SUM / COUNT over the sliding window
@@ -555,6 +755,103 @@
                    (let [idx (aget ^ints sorted-indices i)
                          p (aget ^longs part-keys idx)]
                      (aset result idx (double (.get part-lasts p)))))
+                 result)
+
+               :fills
+               ;; LOCF / FORWARD FILL: replace NaN (NULL) with the previous
+               ;; non-NaN value within the partition. Leading NaNs in a
+               ;; partition stay NaN.
+               (let [result (double-array length)
+                     val-arr (get col-arrays col)
+                     is-double (expr/double-array? val-arr)
+                     is-long (expr/long-array? val-arr)]
+                 (loop [i (int 0), prev-part Long/MIN_VALUE, last-good Double/NaN]
+                   (when (< i length)
+                     (let [idx (aget ^ints sorted-indices i)
+                           p (aget ^longs part-keys idx)
+                           v (cond
+                               is-double (aget ^doubles val-arr idx)
+                               is-long (let [lv (aget ^longs val-arr idx)]
+                                         (if (= lv Long/MIN_VALUE) Double/NaN (double lv)))
+                               :else Double/NaN)
+                           new-part? (not= p prev-part)
+                           lg (if new-part? Double/NaN last-good)
+                           filled (if (Double/isNaN v) lg v)
+                           new-lg (if (Double/isNaN v) lg v)]
+                       (aset result idx (double filled))
+                       (recur (inc i) p (double new-lg)))))
+                 result)
+
+               :ema
+               ;; Exponential moving average. The smoothing factor α is
+               ;; passed via :offset (we reuse the slot — see NTH_VALUE).
+               ;; If α >= 1.0, treat as a period N and use α = 2/(N+1).
+               ;; Output starts at the first non-NaN value of the partition.
+               (let [result (double-array length)
+                     val-arr (get col-arrays col)
+                     is-double (expr/double-array? val-arr)
+                     is-long (expr/long-array? val-arr)
+                     pa (double (or offset 0.5))
+                     alpha (if (>= pa 1.0) (/ 2.0 (+ 1.0 pa)) pa)
+                     one-minus-a (- 1.0 alpha)]
+                 (loop [i (int 0), prev-part Long/MIN_VALUE, ema Double/NaN]
+                   (when (< i length)
+                     (let [idx (aget ^ints sorted-indices i)
+                           p (aget ^longs part-keys idx)
+                           v (cond
+                               is-double (aget ^doubles val-arr idx)
+                               is-long (let [lv (aget ^longs val-arr idx)]
+                                         (if (= lv Long/MIN_VALUE) Double/NaN (double lv)))
+                               :else Double/NaN)
+                           new-part? (not= p prev-part)
+                           cur-ema (cond
+                                     new-part? v
+                                     (Double/isNaN ema) v
+                                     (Double/isNaN v) ema
+                                     :else (+ (* alpha v) (* one-minus-a ema)))]
+                       (aset result idx (double cur-ema))
+                       (recur (inc i) p (double cur-ema)))))
+                 result)
+
+               :rleid
+               ;; RLEID: increment a group ID each time the value column
+               ;; changes vs. the previous row in sorted order. First row of
+               ;; each partition starts at 1. Useful for run-length-encoding
+               ;; (session detection, change-point grouping). Output is a
+               ;; long-valued group id encoded as double (per result-arr
+               ;; convention).
+               (let [result (double-array length)
+                     val-arr (get col-arrays col)
+                     is-double (expr/double-array? val-arr)
+                     is-long (expr/long-array? val-arr)
+                     is-string (expr/string-array? val-arr)
+                     ^"[Ljava.lang.String;" sa (when is-string val-arr)]
+                 (loop [i (int 0), gid (long 0), prev-part Long/MIN_VALUE,
+                        prev-double Double/NaN, prev-long Long/MIN_VALUE,
+                        prev-str (clojure.core/str " __none__")]
+                   (when (< i length)
+                     (let [idx (aget ^ints sorted-indices i)
+                           p (aget ^longs part-keys idx)
+                           same-part? (= p prev-part)
+                           [new-gid new-d new-l new-s]
+                           (cond
+                             is-double
+                             (let [v (aget ^doubles val-arr idx)
+                                   changed? (or (not same-part?) (not= v prev-double))]
+                               [(if changed? (if same-part? (inc gid) 1) gid) v prev-long prev-str])
+                             is-long
+                             (let [v (aget ^longs val-arr idx)
+                                   changed? (or (not same-part?) (not= v prev-long))]
+                               [(if changed? (if same-part? (inc gid) 1) gid) prev-double v prev-str])
+                             is-string
+                             (let [v (aget sa idx)
+                                   changed? (or (not same-part?) (not= v prev-str))]
+                               [(if changed? (if same-part? (inc gid) 1) gid) prev-double prev-long v])
+                             :else
+                             (let [changed? (not same-part?)]
+                               [(if changed? 1 gid) prev-double prev-long prev-str]))]
+                       (aset result idx (double new-gid))
+                       (recur (inc i) (long new-gid) p (double new-d) (long new-l) new-s))))
                  result)
 
                :nth-value

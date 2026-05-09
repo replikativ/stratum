@@ -194,7 +194,7 @@
 
 (def SWindowOp
   "Window function operator."
-  [:enum :row-number :rank :dense-rank :ntile :percent-rank :cume-dist :sum :count :avg :min :max :lag :lead :first-value :last-value :nth-value])
+  [:enum :row-number :rank :dense-rank :ntile :percent-rank :cume-dist :sum :count :avg :min :max :lag :lead :first-value :last-value :nth-value :rleid :fills :ema])
 
 (def SWindowSpec
   "Window function specification.
@@ -205,7 +205,7 @@
    [:col {:optional true} SExpr]
    [:partition-by {:optional true} [:vector SExpr]]
    [:order-by {:optional true} [:vector SOrderSpec]]
-   [:offset {:optional true} [:or :int :keyword]]
+   [:offset {:optional true} [:or :int :double :keyword]]
    [:default {:optional true} :any]
    [:frame {:optional true}
     [:map {:closed false}
