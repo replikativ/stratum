@@ -1,0 +1,55 @@
+# test_window_value.test
+# FIRST_VALUE / LAST_VALUE / NTH_VALUE window functions. Common time-series
+# pattern: OHLC bars per partition.
+
+statement ok
+CREATE TABLE trades (sym INTEGER, ts INTEGER, px DOUBLE)
+
+statement ok
+INSERT INTO trades VALUES
+  (1, 10, 10.0), (1, 20, 11.0), (1, 30, 9.5),
+  (2, 100, 50.0), (2, 200, 51.0)
+
+# FIRST_VALUE(px) per sym, ordered by ts → "open" price
+query IIR rowsort
+SELECT sym, ts, FIRST_VALUE(px) OVER (PARTITION BY sym ORDER BY ts) AS open
+FROM trades
+----
+1	10	10.000000
+1	20	10.000000
+1	30	10.000000
+2	100	50.000000
+2	200	50.000000
+
+# LAST_VALUE(px) over the full partition (ROWS UNBOUNDED PRECEDING TO
+# UNBOUNDED FOLLOWING) → "close" price for OHLC.
+query IIR rowsort
+SELECT sym, ts, LAST_VALUE(px) OVER (
+  PARTITION BY sym ORDER BY ts
+  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+) AS close
+FROM trades
+----
+1	10	9.500000
+1	20	9.500000
+1	30	9.500000
+2	100	51.000000
+2	200	51.000000
+
+# OHLC bars: open, close, high, low per sym
+query IRRRR rowsort
+SELECT sym,
+       FIRST_VALUE(px) OVER (PARTITION BY sym ORDER BY ts) AS o,
+       LAST_VALUE(px)  OVER (PARTITION BY sym ORDER BY ts
+                             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS c,
+       MAX(px) OVER (PARTITION BY sym
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS h,
+       MIN(px) OVER (PARTITION BY sym
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS l
+FROM trades
+----
+1	10.000000	9.500000	11.000000	9.500000
+1	10.000000	9.500000	11.000000	9.500000
+1	10.000000	9.500000	11.000000	9.500000
+2	50.000000	51.000000	51.000000	50.000000
+2	50.000000	51.000000	51.000000	50.000000

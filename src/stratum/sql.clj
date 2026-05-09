@@ -25,7 +25,7 @@
            [net.sf.jsqlparser.expression
             Alias Function LongValue DoubleValue StringValue NullValue
             Parenthesis NotExpression CaseExpression WhenClause SignedExpression
-            CastExpression AnalyticExpression IntervalExpression
+            CastExpression AnalyticExpression IntervalExpression ExtractExpression
             WindowElement WindowElement$Type WindowOffset WindowOffset$Type WindowRange]
            [net.sf.jsqlparser.statement.select
             WithItem ParenthesedSelect SetOperationList UnionOp IntersectOp ExceptOp MinusOp]
@@ -177,6 +177,19 @@
         "date" (if (string? inner)
                  (.toEpochDay (java.time.LocalDate/parse inner))
                  [:cast inner :date])
+        ;; TIMESTAMP literal — parse string to epoch-microseconds (matches the
+        ;; canonical micros-precision TIMESTAMP storage). For non-literal
+        ;; expressions, fall through to a runtime cast.
+        ("timestamp" "timestamptz" "timestamp without time zone" "timestamp with time zone")
+        (if (string? inner)
+          ;; Accept "YYYY-MM-DD HH:MM:SS[.fff[fff]]" or ISO "T" separator.
+          (let [normalized (clojure.string/replace inner #" " "T")
+                ldt (java.time.LocalDateTime/parse normalized)
+                inst (.toInstant ldt java.time.ZoneOffset/UTC)
+                secs (.getEpochSecond inst)
+                nanos (.getNano inst)]
+            (+ (* secs 1000000) (long (/ nanos 1000))))
+          [:cast inner :timestamp])
         ;; Default: pass through unmodified
         inner))
 
@@ -197,6 +210,28 @@
                              (translate-expr (.getThenExpression w))])
                           whens)]
         (into [:case] (concat clauses (when else-expr [[:else else-expr]])))))
+
+    ;; EXTRACT(field FROM col) — emit the granular op (:hour, :year, etc.).
+    ;; Recognized fields: year, month, day, hour, minute, second,
+    ;; millisecond, microsecond, day-of-week (DOW), week-of-year (WEEK).
+    (instance? ExtractExpression expr)
+    (let [^ExtractExpression ee expr
+          field (some-> (.getName ee) str/upper-case str/trim)
+          col (translate-expr (.getExpression ee))
+          op (case field
+               "YEAR" :year
+               "MONTH" :month
+               "DAY" :day
+               "HOUR" :hour
+               "MINUTE" :minute
+               "SECOND" :second
+               "MILLISECOND" :millisecond
+               "MICROSECOND" :microsecond
+               ("DOW" "ISODOW" "DAYOFWEEK") :day-of-week
+               ("WEEK" "ISOWEEK" "WEEKOFYEAR") :week-of-year
+               (throw (ex-info (str "Unsupported EXTRACT field: " field)
+                               {:field field})))]
+      [op col])
 
     ;; INTERVAL expression — convert to epoch-day count for date arithmetic
     (instance? IntervalExpression expr)
@@ -305,6 +340,19 @@
       "EPOCH_DAYS" [:epoch-days (first params)]
       "EPOCH_SECONDS" [:epoch-seconds (first params)]
 
+      ;; TIME_BUCKET(width, 'unit', col)  — DuckDB / TimescaleDB-compatible
+      ;; bucketing. Width is an integer; unit is a string ('minutes' / 'hours'
+      ;; / 'days' / 'months' / 'weeks' / etc.); col is a temporal column.
+      "TIME_BUCKET"
+      (cond
+        (= 3 n-params)
+        [:time-bucket (first params) (keyword (.toLowerCase ^String (second params))) (nth params 2)]
+        (= 4 n-params)
+        [:time-bucket (first params) (keyword (.toLowerCase ^String (second params))) (nth params 2) (nth params 3)]
+        :else
+        (throw (ex-info "TIME_BUCKET requires (width, unit, column [, origin])"
+                        {:params params})))
+
       ;; Anomaly detection — 1-arg short form uses model's feature names,
       ;; N-arg long form maps positional args to features
       "ANOMALY_SCORE"
@@ -407,6 +455,20 @@
              "FIRST_VALUE" :first-value
              "LAST_VALUE" :last-value
              "NTH_VALUE" :nth-value
+             ;; q-style sliding aggregates — a single OVER (PARTITION BY ...
+             ;; ORDER BY ...) applies the moving-window semantics. The width
+             ;; rides on the function's second positional argument, encoded
+             ;; here as :offset on the window spec.
+             "MAVG" :mavg
+             "MSUM" :msum
+             "MMIN" :mmin
+             "MMAX" :mmax
+             "MCOUNT" :mcount
+             "MDEV" :mdev
+             ;; Time-series window ops with no width parameter
+             ("FILLS" "LOCF") :fills
+             "EMA" :ema
+             "RLEID" :rleid
              (throw (ex-info (str "Unsupported window function: " name)
                              {:function name})))
         ;; Check if argument is a nested aggregate (e.g. SUM(SUM(x)))
@@ -1086,7 +1148,33 @@
         [:date-trunc (keyword (.toLowerCase ^String (first params))) (second params)]
 
         "EXTRACT"
-        [:extract (keyword (.toLowerCase ^String (first params))) (second params)]
+        ;; EXTRACT in GROUP BY can come through as a Function (params=[field, col])
+        ;; in addition to the ExtractExpression form handled in translate-expr.
+        ;; Map to the granular op so normalization recognizes it.
+        (let [field (.toUpperCase ^String (first params))
+              op (case field
+                   "YEAR" :year "MONTH" :month "DAY" :day
+                   "HOUR" :hour "MINUTE" :minute "SECOND" :second
+                   "MILLISECOND" :millisecond "MICROSECOND" :microsecond
+                   "DOW" :day-of-week "ISODOW" :day-of-week "DAYOFWEEK" :day-of-week
+                   "WEEK" :week-of-year "ISOWEEK" :week-of-year "WEEKOFYEAR" :week-of-year
+                   (throw (ex-info (str "Unsupported EXTRACT field: " field)
+                                   {:field field})))]
+          [op (second params)])
+
+        "TIME_BUCKET"
+        (cond
+          (= 3 (count params))
+          [:time-bucket (first params)
+           (keyword (.toLowerCase ^String (second params)))
+           (nth params 2)]
+          (= 4 (count params))
+          [:time-bucket (first params)
+           (keyword (.toLowerCase ^String (second params)))
+           (nth params 2) (nth params 3)]
+          :else
+          (throw (ex-info "TIME_BUCKET requires (width, unit, column [, origin])"
+                          {:params params})))
 
         ;; Other function expressions in GROUP BY
         (into [(keyword (.toLowerCase name))] params)))
@@ -1348,11 +1436,29 @@
 
           ;; Normal table reference — look up by real name, register under alias
            from-real-name
-           (let [data (get table-registry from-real-name)]
-             (when (nil? data)
-               (throw (ex-info (str "Unknown table: " from-real-name)
-                               {:table from-real-name
-                                :available (keys table-registry)})))
+           (let [raw-data (get table-registry from-real-name)
+                 _ (when (nil? raw-data)
+                     (throw (ex-info (str "Unknown table: " from-real-name)
+                                     {:table from-real-name
+                                      :available (keys table-registry)})))
+                 ;; Decorate temporal columns with their :temporal-unit so the
+                 ;; planner / expression engine can dispatch date kernels at the
+                 ;; right precision. The schema lives as Clojure metadata on
+                 ;; the table map (set by CREATE TABLE; see server.clj /
+                 ;; sqllogictest_test.clj).
+                 schema (some-> raw-data meta :column-schema)
+                 data (if (seq schema)
+                        (into {}
+                              (map (fn [[k v]]
+                                     (if-let [tu (get-in schema [k :temporal-unit])]
+                                       (cond
+                                         (map? v)        [k (assoc v :temporal-unit tu)]
+                                         (instance? (Class/forName "[J") v)
+                                         [k {:type :int64 :data v :temporal-unit tu}]
+                                         :else [k v])
+                                       [k v])))
+                              raw-data)
+                        raw-data)]
              [data (if (not= from-table-name from-real-name)
                      (assoc table-registry from-table-name data)
                      table-registry)])
@@ -2159,35 +2265,51 @@
 ;; ============================================================================
 
 (defn- sql-type->stratum-type
-  "Map SQL column type names to Stratum types."
+  "Map SQL column type names to a `{:type ... :temporal-unit ...?}` descriptor.
+   Temporal types pass back a `:temporal-unit` so columns can later track
+   day/seconds/micros precision uniformly through the expression engine."
   [^String type-str]
   (let [t (.toUpperCase type-str)]
     (cond
       (or (= t "INTEGER") (= t "INT") (= t "BIGINT") (= t "SMALLINT")
           (= t "TINYINT") (= t "INT4") (= t "INT8") (= t "SERIAL"))
-      :int64
+      {:type :int64}
 
       (or (= t "DOUBLE") (= t "FLOAT") (= t "REAL") (= t "NUMERIC")
           (= t "DECIMAL") (= t "DOUBLE PRECISION") (= t "FLOAT8") (= t "FLOAT4"))
-      :float64
+      {:type :float64}
 
       (or (= t "VARCHAR") (= t "TEXT") (= t "CHAR") (= t "STRING")
           (.startsWith t "VARCHAR(") (.startsWith t "CHAR("))
-      :string
+      {:type :string}
 
-      :else :string)))
+      ;; DATE — epoch-days
+      (= t "DATE")
+      {:type :int64 :temporal-unit :days}
+
+      ;; TIMESTAMP variants — epoch-microseconds (DuckDB convention)
+      (or (= t "TIMESTAMP") (= t "TIMESTAMPTZ")
+          (= t "TIMESTAMP WITHOUT TIME ZONE") (= t "TIMESTAMP WITH TIME ZONE"))
+      {:type :int64 :temporal-unit :micros}
+
+      :else {:type :string})))
 
 (defn- translate-create-table
-  "Translate a JSqlParser CreateTable into a DDL descriptor."
+  "Translate a JSqlParser CreateTable into a DDL descriptor.
+   For temporal SQL types (DATE, TIMESTAMP[TZ]) the column descriptor
+   carries a `:temporal-unit` so the engine routes date kernels to the
+   right scale (epoch-days for DATE, epoch-microseconds for TIMESTAMP)."
   [^CreateTable stmt]
   (let [table-name (.toString (.getTable stmt))
         col-defs (.getColumnDefinitions stmt)]
     {:ddl {:op      :create-table
            :table   table-name
            :columns (mapv (fn [^ColumnDefinition cd]
-                            {:name (.getColumnName cd)
-                             :type (sql-type->stratum-type
-                                    (str (.getColDataType cd)))})
+                            (let [type-info (sql-type->stratum-type (str (.getColDataType cd)))]
+                              (cond-> {:name (.getColumnName cd)
+                                       :type (:type type-info)}
+                                (:temporal-unit type-info)
+                                (assoc :temporal-unit (:temporal-unit type-info)))))
                           col-defs)}}))
 
 (defn- parse-insert-value

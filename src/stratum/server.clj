@@ -218,7 +218,17 @@
                                          :int64   (long-array 0)
                                          :float64 (double-array 0)
                                          :string  (make-array String 0))]))
-                               columns)]
+                               columns)
+                    ;; Side schema: column-kw → {:temporal-unit U}. Stored on
+                    ;; the table value as Clojure metadata so the existing
+                    ;; INSERT/UPSERT/UPDATE paths (which assume raw arrays)
+                    ;; keep working unchanged.
+                    schema (into {}
+                                 (keep (fn [{:keys [name temporal-unit]}]
+                                         (when temporal-unit
+                                           [(keyword name) {:temporal-unit temporal-unit}])))
+                                 columns)
+                    cols (if (seq schema) (with-meta cols {:column-schema schema}) cols)]
                 (swap! table-registry-atom assoc table cols))
               (PgWireServer$QueryResult/empty "CREATE TABLE"))
 
@@ -313,7 +323,8 @@
                                             (let [v (nth (nth rows r) ci)]
                                               (when (some? v) (str v)))))
                                     arr))]))
-                           col-keys))]
+                           col-keys))
+                    new-cols (with-meta new-cols (meta existing))]
                 (swap! table-registry-atom assoc table new-cols))
               (PgWireServer$QueryResult/empty
                (str "INSERT 0 " (count rows))))
@@ -438,7 +449,8 @@
                             {:cols existing :n-rows n-existing
                              :n-inserted 0 :n-updated 0}
                             rows)]
-                (swap! table-registry-atom assoc table (:cols result))
+                (swap! table-registry-atom assoc table
+                       (with-meta (:cols result) (meta existing)))
                 (PgWireServer$QueryResult/empty
                  (str "INSERT 0 " (:n-inserted result)))))
 
@@ -590,7 +602,8 @@
                          (assoc cols col arr)))
                      existing
                      assignments)]
-                (swap! table-registry-atom assoc table new-cols)
+                (swap! table-registry-atom assoc table
+                       (with-meta new-cols (meta existing)))
                 (PgWireServer$QueryResult/empty (str "UPDATE " n-matched))))
 
             :delete
@@ -706,7 +719,8 @@
                                                   (recur (inc i) (inc j))))))
                                         arr))]))
                                col-keys))]
-                (swap! table-registry-atom assoc table new-cols)
+                (swap! table-registry-atom assoc table
+                       (with-meta new-cols (meta existing)))
                 (PgWireServer$QueryResult/empty (str "DELETE " n-deleted))))))
 
             ;; Parse/translation error

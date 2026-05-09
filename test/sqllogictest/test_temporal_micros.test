@@ -1,0 +1,101 @@
+# test_temporal_micros.test
+# Microsecond-precision TIMESTAMP support: TIMESTAMP literals, EXTRACT
+# (HOUR/MINUTE/SECOND/MILLISECOND/MICROSECOND), and DATE_TRUNC at sub-day
+# precisions over a TIMESTAMP column.
+
+statement ok
+CREATE TABLE events (ts TIMESTAMP, label TEXT)
+
+# Three rows, all on 2024-01-15:
+#   10:30:45.123456 UTC = 1705314645123456 micros
+#   11:00:00.000000 UTC = 1705316400000000
+#   23:59:59.999999 UTC = 1705363199999999
+
+statement ok
+INSERT INTO events VALUES (1705314645123456, 'a'), (1705316400000000, 'b'), (1705363199999999, 'c')
+
+# ========================================================================
+# EXTRACT — sub-second components return correctly only because TIMESTAMP
+# columns track :temporal-unit :micros. (Without that, milli/microsecond
+# extraction is undefined.)
+# ========================================================================
+
+query R rowsort
+SELECT EXTRACT(HOUR FROM ts) FROM events
+----
+10.000000
+11.000000
+23.000000
+
+query R rowsort
+SELECT EXTRACT(MINUTE FROM ts) FROM events
+----
+0.000000
+30.000000
+59.000000
+
+query R rowsort
+SELECT EXTRACT(SECOND FROM ts) FROM events
+----
+0.000000
+45.000000
+59.000000
+
+query R rowsort
+SELECT EXTRACT(MILLISECOND FROM ts) FROM events
+----
+0.000000
+123.000000
+999.000000
+
+query R rowsort
+SELECT EXTRACT(MICROSECOND FROM ts) FROM events
+----
+0.000000
+123456.000000
+999999.000000
+
+# ========================================================================
+# DATE_TRUNC — sub-second truncation rounds to the right boundary in micros
+# ========================================================================
+
+# DATE_TRUNC('hour'):
+#   10:30:45.123456 → 10:00:00 = 1705312800000000
+#   11:00:00.000000 → 11:00:00 = 1705316400000000
+#   23:59:59.999999 → 23:00:00 = 1705359600000000
+query I rowsort
+SELECT DATE_TRUNC('hour', ts) FROM events
+----
+1705312800000000
+1705316400000000
+1705359600000000
+
+# DATE_TRUNC('millisecond'): 10:30:45.123456 → 10:30:45.123000 = 1705314645123000
+query I rowsort
+SELECT DATE_TRUNC('millisecond', ts) FROM events
+----
+1705314645123000
+1705316400000000
+1705363199999000
+
+# ========================================================================
+# TIMESTAMP literal in WHERE — must scale to micros to match the column
+# ========================================================================
+
+# 2024-01-15 11:00:00 = 1705316400000000 micros — keeps rows at >= 11:00.
+query I rowsort
+SELECT ts FROM events WHERE ts >= TIMESTAMP '2024-01-15 11:00:00'
+----
+1705316400000000
+1705363199999999
+
+# ========================================================================
+# DATE_TRUNC in GROUP BY — row count per truncated hour bucket
+# ========================================================================
+
+query II rowsort
+SELECT DATE_TRUNC('hour', ts), COUNT(*) FROM events GROUP BY DATE_TRUNC('hour', ts)
+----
+1705312800000000	1
+1705316400000000	1
+1705359600000000	1

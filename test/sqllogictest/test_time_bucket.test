@@ -1,0 +1,56 @@
+# test_time_bucket.test
+# TIME_BUCKET(width, unit, ts [, origin]) — TimescaleDB / DuckDB-compatible
+# arbitrary-width bucketing. Floor-divides the temporal column by the
+# (unit × width) and reconstitutes the bucket boundary.
+
+statement ok
+CREATE TABLE trades (ts TIMESTAMP, vol DOUBLE)
+
+# Trades over 2024-01-15:
+#   10:30:00.000000 = 1705314600000000
+#   10:32:00.000000 = 1705314720000000
+#   10:35:00.000000 = 1705314900000000
+#   10:39:05.123456 = 1705315145123456
+
+statement ok
+INSERT INTO trades VALUES
+  (1705314600000000, 1.0),
+  (1705314720000000, 2.0),
+  (1705314900000000, 4.0),
+  (1705315145123456, 8.0)
+
+# 5-minute bucket: rows split between 10:30:00 and 10:35:00
+query I rowsort
+SELECT TIME_BUCKET(5, 'minutes', ts) FROM trades
+----
+1705314600000000
+1705314600000000
+1705314900000000
+1705314900000000
+
+# Aggregation per 5-minute bucket
+query IR rowsort
+SELECT TIME_BUCKET(5, 'minutes', ts), SUM(vol) FROM trades
+GROUP BY TIME_BUCKET(5, 'minutes', ts)
+----
+1705314600000000	3.000000
+1705314900000000	12.000000
+
+# 1-hour bucket — both buckets are inside the 10:00 hour
+query I rowsort
+SELECT TIME_BUCKET(1, 'hours', ts) FROM trades
+----
+1705312800000000
+1705312800000000
+1705312800000000
+1705312800000000
+
+# 1-second bucket — preserves all rows distinct except the two on the
+# minute boundary that already have second 0.
+query I rowsort
+SELECT TIME_BUCKET(1, 'seconds', ts) FROM trades
+----
+1705314600000000
+1705314720000000
+1705314900000000
+1705315145000000

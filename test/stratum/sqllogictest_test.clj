@@ -87,7 +87,16 @@
                                :int64   (long-array 0)
                                :float64 (double-array 0)
                                :string  (make-array String 0))]))
-                     columns)]
+                     columns)
+          ;; Side schema as Clojure metadata so INSERT/UPDATE etc. stay
+          ;; array-only. Temporal columns later wear their :temporal-unit
+          ;; tag when a query actually consumes the table.
+          schema (into {}
+                       (keep (fn [{:keys [name temporal-unit]}]
+                               (when temporal-unit
+                                 [(keyword name) {:temporal-unit temporal-unit}])))
+                       columns)
+          cols (if (seq schema) (with-meta cols {:column-schema schema}) cols)]
       (swap! registry-atom assoc table cols))
 
     :drop-table
@@ -145,7 +154,7 @@
                                       (when (some? v) (str v)))))
                             arr))]))
                    col-keys))]
-        (swap! registry-atom assoc table new-cols)))
+        (swap! registry-atom assoc table (with-meta new-cols (meta existing)))))
 
     :update
     (let [existing (get @registry-atom table)]
@@ -300,7 +309,7 @@
                                         (recur (inc i) j))))
                                   arr))]))
                          col-keys))]
-          (swap! registry-atom assoc table new-cols))))
+          (swap! registry-atom assoc table (with-meta new-cols (meta existing))))))
 
     :upsert
     (let [existing (get @registry-atom table)]
@@ -412,7 +421,8 @@
                             {:cols new-cols :n-rows new-n}))))
                     {:cols existing :n-rows n-existing}
                     rows)]
-        (swap! registry-atom assoc table (:cols result))))))
+        (swap! registry-atom assoc table
+               (with-meta (:cols result) (meta existing)))))))
 
 ;; ============================================================================
 ;; Result formatting
