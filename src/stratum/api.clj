@@ -411,3 +411,64 @@
    persisted to <data-dir>/<filename>.stratum/. Mtime-based cache.
    See stratum.server/index-file!."
   server/index-file!)
+
+(defn generate-series
+  "Generate a dense sequence of values as a `:from`-compatible column map.
+   Returns {:value <column>}.
+
+   Numeric form:
+     (generate-series 1 10)            ; 1..10 step 1     → long[]
+     (generate-series 0 100 5)         ; 0,5,10,…,100      → long[]
+     (generate-series 0.0 1.0 0.1)     ; 0.0,0.1,…,1.0    → double[]
+
+   Temporal form (single :step argument with :unit):
+     (generate-series start-micros end-micros 5 :minutes :micros)
+       ; produces {:value (column with :temporal-unit :micros)}
+
+   `start` and `end` are inclusive. Useful as a left-side time spine for
+   gap-filling joins."
+  ([start end]
+   (generate-series start end 1))
+  ([start end step]
+   (cond
+     ;; Floating-point step
+     (or (double? step) (and (number? start) (not (integer? start))))
+     (let [s (double start)
+           e (double end)
+           st (double step)
+           n (max 0 (long (Math/floor (/ (- e s) st))))
+           arr (double-array (inc n))]
+       (dotimes [i (inc n)] (aset arr i (+ s (* i st))))
+       {:value {:type :float64 :data arr}})
+     :else
+     (let [s (long start)
+           e (long end)
+           st (long step)
+           n (if (zero? st) 0 (max 0 (long (quot (- e s) st))))
+           arr (long-array (inc n))]
+       (dotimes [i (inc n)] (aset arr i (+ s (* (long i) st))))
+       {:value {:type :int64 :data arr}})))
+  ([start end width unit temporal-unit]
+   ;; Temporal flavor: width-of-unit step, output column tagged with
+   ;; :temporal-unit so DATE_TRUNC/EXTRACT/TIME_BUCKET dispatch correctly.
+   (let [step-units (case [unit temporal-unit]
+                      [:microseconds :micros] width
+                      [:milliseconds :micros] (* width 1000)
+                      [:seconds :micros]      (* width 1000000)
+                      [:minutes :micros]      (* width 60000000)
+                      [:hours :micros]        (* width 3600000000)
+                      [:days :micros]         (* width 86400000000)
+                      [:days :days]           width
+                      [:weeks :days]          (* width 7)
+                      [:seconds :seconds]     width
+                      [:minutes :seconds]     (* width 60)
+                      [:hours :seconds]       (* width 3600)
+                      [:days :seconds]        (* width 86400)
+                      (throw (ex-info "Unsupported (unit, temporal-unit) combination"
+                                      {:unit unit :temporal-unit temporal-unit})))
+         s start
+         e end
+         n (max 0 (long (quot (- e s) (long step-units))))
+         arr (long-array (inc n))]
+     (dotimes [i (inc n)] (aset arr i (+ s (* (long i) (long step-units)))))
+     {:value {:type :int64 :data arr :temporal-unit temporal-unit}})))
