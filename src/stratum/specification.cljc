@@ -194,7 +194,7 @@
 
 (def SWindowOp
   "Window function operator."
-  [:enum :row-number :rank :dense-rank :ntile :percent-rank :cume-dist :sum :count :avg :min :max :lag :lead])
+  [:enum :row-number :rank :dense-rank :ntile :percent-rank :cume-dist :sum :count :avg :min :max :lag :lead :first-value :last-value :nth-value])
 
 (def SWindowSpec
   "Window function specification.

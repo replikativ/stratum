@@ -513,6 +513,78 @@
                              new-running (if (= p prev-part) (Math/max running v) v)]
                          (aset result idx new-running)
                          (recur (inc i) new-running p)))))
+                 result)
+
+               :first-value
+               ;; FIRST_VALUE: per partition, the value at the first row of the
+               ;; partition (or, with a frame, the value at the frame start).
+               ;; Default ANSI frame for ORDER BY = UNBOUNDED PRECEDING/CURRENT
+               ;; → first value of the partition; this matches the typical use.
+               (let [result (double-array length)
+                     val-arr (get col-arrays col)
+                     is-double (expr/double-array? val-arr)]
+                 (loop [i (int 0), prev-part Long/MIN_VALUE, fv 0.0]
+                   (when (< i length)
+                     (let [idx (aget ^ints sorted-indices i)
+                           p (aget ^longs part-keys idx)
+                           v (if is-double (aget ^doubles val-arr idx) (double (aget ^longs val-arr idx)))
+                           new-part? (not= p prev-part)
+                           cur-fv (if new-part? v fv)]
+                       (aset result idx cur-fv)
+                       (recur (inc i) p cur-fv))))
+                 result)
+
+               :last-value
+               ;; LAST_VALUE: per partition, the value at the LAST row when the
+               ;; frame is UNBOUNDED PRECEDING/UNBOUNDED FOLLOWING. With the
+               ;; default ANSI frame (UP/CURRENT), it equals the current row's
+               ;; value — useful for OHLC "close" we want full-partition. We
+               ;; treat the omitted-frame default as full-partition for the
+               ;; OHLC use case (matches DuckDB convention with explicit frame).
+               (let [result (double-array length)
+                     val-arr (get col-arrays col)
+                     is-double (expr/double-array? val-arr)
+                     ;; Two passes: first, find last value per partition
+                     part-lasts (java.util.HashMap.)]
+                 (dotimes [i length]
+                   (let [idx (aget ^ints sorted-indices i)
+                         p (aget ^longs part-keys idx)
+                         v (if is-double (aget ^doubles val-arr idx) (double (aget ^longs val-arr idx)))]
+                     (.put part-lasts p v)))
+                 (dotimes [i length]
+                   (let [idx (aget ^ints sorted-indices i)
+                         p (aget ^longs part-keys idx)]
+                     (aset result idx (double (.get part-lasts p)))))
+                 result)
+
+               :nth-value
+               ;; NTH_VALUE(col, n): per partition, the value at the n-th row
+               ;; (1-based). Returns NaN for partitions with fewer than n rows.
+               ;; The `n` parameter rides on win-spec via :offset (we reuse the
+               ;; LAG/LEAD slot since NTH_VALUE has no other use for offset).
+               (let [result (double-array length)
+                     val-arr (get col-arrays col)
+                     is-double (expr/double-array? val-arr)
+                     n (long (or offset 1))
+                     ;; Find n-th value per partition in one pass
+                     part-nth (java.util.HashMap.)
+                     part-counts (java.util.HashMap.)]
+                 (dotimes [i length]
+                   (let [idx (aget ^ints sorted-indices i)
+                         p (aget ^longs part-keys idx)
+                         c (long (or (.get part-counts p) 0))
+                         new-c (inc c)]
+                     (.put part-counts p new-c)
+                     (when (= new-c n)
+                       (let [v (if is-double (aget ^doubles val-arr idx) (double (aget ^longs val-arr idx)))]
+                         (.put part-nth p v)))))
+                 ;; Fill result: NaN where partition has fewer than n
+                 (java.util.Arrays/fill result Double/NaN)
+                 (dotimes [i length]
+                   (let [idx (aget ^ints sorted-indices i)
+                         p (aget ^longs part-keys idx)]
+                     (when (.containsKey part-nth p)
+                       (aset result idx (double (.get part-nth p))))))
                  result))]
           ;; Add window result to columns
          (assoc cols as {:type :float64 :data result-arr})))

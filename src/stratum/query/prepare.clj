@@ -344,7 +344,7 @@
               [(first r) (second r) nil]
               [nil columns nil])))
         string-items (into (or string-items-1 []) (or string-items-2 []))
-        columns-meta (into {} (keep (fn [[k v]] (when (:dict v) [k v]))) columns)]
+        columns-meta (into {} (keep (fn [[k v]] (when (or (:dict v) (:temporal-unit v)) [k v]))) columns)]
     {:preds preds
      :aggs aggs
      :group group

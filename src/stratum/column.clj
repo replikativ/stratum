@@ -22,12 +22,15 @@
      Sequential[String]          → converted to String[] then dict-encoded
 
    Returns: Normalized column map with keys:
-     :type       - :int64 or :float64
-     :data       - typed array (optional if :source is :index)
-     :source     - :index (optional, indicates index-backed column)
-     :index      - PersistentColumnIndex (optional, if :source is :index)
-     :dict       - String[] reverse dictionary (optional, for string columns)
-     :dict-type  - :string (required if :dict present)"
+     :type           - :int64 or :float64
+     :data           - typed array (optional if :source is :index)
+     :source         - :index (optional, indicates index-backed column)
+     :index          - PersistentColumnIndex (optional, if :source is :index)
+     :dict           - String[] reverse dictionary (optional, for string columns)
+     :dict-type      - :string (required if :dict present)
+     :temporal-unit  - :days/:seconds/:millis/:micros (optional; tags long[]
+                       columns as DATE or TIMESTAMP and selects the matching
+                       date kernels)"
   [col-val]
   (cond
     ;; Already normalized

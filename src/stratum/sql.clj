@@ -404,6 +404,9 @@
              "MAX" :max
              "LAG" :lag
              "LEAD" :lead
+             "FIRST_VALUE" :first-value
+             "LAST_VALUE" :last-value
+             "NTH_VALUE" :nth-value
              (throw (ex-info (str "Unsupported window function: " name)
                              {:function name})))
         ;; Check if argument is a nested aggregate (e.g. SUM(SUM(x)))

@@ -281,14 +281,30 @@
         :pow   (Math/pow (eval-agg-expr (nth args 0) col-arrays i)
                          (eval-agg-expr (nth args 1) col-arrays i))
         ;; Date extraction — requires reading the long value from the column
-        (:year :month :day :hour :minute :second :day-of-week :week-of-year)
+        (:year :month :day :hour :minute :second :millisecond :microsecond :day-of-week :week-of-year)
         (let [col-key (nth args 0)
               col-data (get col-arrays col-key)
-              v (if (expr/long-array? col-data)
-                  (aget ^longs col-data i)
-                  (long (aget ^doubles col-data i)))]
+              v (long (if (expr/long-array? col-data)
+                        (aget ^longs col-data i)
+                        (long (aget ^doubles col-data i))))
+              tu (or (and expr/*columns-meta* (get-in expr/*columns-meta* [col-key :temporal-unit]))
+                     (case (:op expr)
+                       (:hour :minute :second :millisecond :microsecond) :seconds
+                       (:year :month :day :day-of-week :week-of-year) :days))
+              ;; Convert the per-row scalar to canonical day/sec for the inner formula.
+              ed (long (case tu
+                         :days    v
+                         :seconds (Math/floorDiv v 86400)
+                         :millis  (Math/floorDiv v 86400000)
+                         :micros  (Math/floorDiv v 86400000000)))
+              ;; sub-day micros remainder (only used for hour/min/sec/ms/us with :micros)
+              tod-us (long (case tu
+                             :micros  (Math/floorMod v 86400000000)
+                             :millis  (* (Math/floorMod v 86400000) 1000)
+                             :seconds (* (Math/floorMod v 86400) 1000000)
+                             :days    0))]
           (case (:op expr)
-            :year   (let [z (+ v 719468)
+            :year   (let [z (+ ed 719468)
                           era (quot (if (>= z 0) z (- z 146096)) 146097)
                           doe (- z (* era 146097))
                           yoe (quot (- doe (quot doe 1460) (- (quot doe 36524)) (quot doe 146096)) 365)
@@ -297,25 +313,43 @@
                           mp (quot (+ (* 5 doy) 2) 153)
                           m (+ mp (if (< mp 10) 3 -9))]
                       (double (+ y (if (<= m 2) 1 0))))
-            :month  (let [z (+ v 719468)
+            :month  (let [z (+ ed 719468)
                           era (quot (if (>= z 0) z (- z 146096)) 146097)
                           doe (- z (* era 146097))
                           yoe (quot (- doe (quot doe 1460) (- (quot doe 36524)) (quot doe 146096)) 365)
                           doy (- doe (+ (* 365 yoe) (quot yoe 4) (- (quot yoe 100))))
                           mp (quot (+ (* 5 doy) 2) 153)]
                       (double (+ mp (if (< mp 10) 3 -9))))
-            :day    (let [z (+ v 719468)
+            :day    (let [z (+ ed 719468)
                           era (quot (if (>= z 0) z (- z 146096)) 146097)
                           doe (- z (* era 146097))
                           yoe (quot (- doe (quot doe 1460) (- (quot doe 36524)) (quot doe 146096)) 365)
                           doy (- doe (+ (* 365 yoe) (quot yoe 4) (- (quot yoe 100))))
                           mp (quot (+ (* 5 doy) 2) 153)]
                       (double (+ (- doy (quot (+ (* 153 mp) 2) 5)) 1)))
-            :hour   (double (quot (mod (+ (mod v 86400) 86400) 86400) 3600))
-            :minute (double (quot (mod (mod (+ (mod v 86400) 86400) 86400) 3600) 60))
-            :second (double (mod (mod (+ (mod v 86400) 86400) 86400) 60))
-            :day-of-week (double (mod (+ (mod v 7) 10) 7))
-            :week-of-year (double 1))) ;; simplified for scalar path
+            :hour        (case tu
+                           (:micros :millis) (double (quot tod-us 3600000000))
+                           :seconds (double (quot (mod (+ (mod v 86400) 86400) 86400) 3600))
+                           :days    (double 0))
+            :minute      (case tu
+                           (:micros :millis) (double (quot (mod tod-us 3600000000) 60000000))
+                           :seconds (double (quot (mod (mod (+ (mod v 86400) 86400) 86400) 3600) 60))
+                           :days    (double 0))
+            :second      (case tu
+                           (:micros :millis) (double (quot (mod tod-us 60000000) 1000000))
+                           :seconds (double (mod (mod (+ (mod v 86400) 86400) 86400) 60))
+                           :days    (double 0))
+            :millisecond (case tu
+                           :micros  (double (quot (mod tod-us 1000000) 1000))
+                           :millis  (double (mod (Math/floorMod v 86400000) 1000))
+                           (throw (ex-info "MILLISECOND requires :temporal-unit :micros or :millis"
+                                           {:tu tu})))
+            :microsecond (case tu
+                           :micros  (double (mod tod-us 1000000))
+                           (throw (ex-info "MICROSECOND requires :temporal-unit :micros"
+                                           {:tu tu})))
+            :day-of-week (double (mod (+ (mod ed 7) 10) 7))
+            :week-of-year (double 1)))
         ;; Date/time arithmetic (scalar path)
         :date-trunc
         (let [unit (nth args 0)
@@ -323,16 +357,28 @@
               col-data (get col-arrays col-key)
               v (long (if (expr/long-array? col-data)
                         (aget ^longs col-data i)
-                        (long (aget ^doubles col-data i))))]
-          (double (case unit
-                    :day    (long (* (Math/floorDiv v 86400) 86400))
-                    :hour   (long (* (Math/floorDiv v 3600) 3600))
-                    :minute (long (* (Math/floorDiv v 60) 60))
-                    ;; year/month need Hinnant via vectorized path
-                    :year   (let [^longs r (ColumnOps/arrayDateTruncYear (long-array [v]) 1)]
-                              (aget r 0))
-                    :month  (let [^longs r (ColumnOps/arrayDateTruncMonth (long-array [v]) 1)]
-                              (aget r 0)))))
+                        (long (aget ^doubles col-data i))))
+              tu (or (and expr/*columns-meta* (get-in expr/*columns-meta* [col-key :temporal-unit]))
+                     :seconds)]
+          (double (case tu
+                    :micros
+                    (case unit
+                      :microsecond v
+                      :millisecond (* (Math/floorDiv v 1000) 1000)
+                      :second      (* (Math/floorDiv v 1000000) 1000000)
+                      :minute      (* (Math/floorDiv v 60000000) 60000000)
+                      :hour        (* (Math/floorDiv v 3600000000) 3600000000)
+                      :day         (* (Math/floorDiv v 86400000000) 86400000000)
+                      :year        (let [^longs r (ColumnOps/arrayDateTruncYearMicros (long-array [v]) 1)] (aget r 0))
+                      :month       (let [^longs r (ColumnOps/arrayDateTruncMonthMicros (long-array [v]) 1)] (aget r 0)))
+                    :seconds
+                    (case unit
+                      :second v
+                      :minute (* (Math/floorDiv v 60) 60)
+                      :hour   (* (Math/floorDiv v 3600) 3600)
+                      :day    (* (Math/floorDiv v 86400) 86400)
+                      :year   (let [^longs r (ColumnOps/arrayDateTruncYear (long-array [v]) 1)] (aget r 0))
+                      :month  (let [^longs r (ColumnOps/arrayDateTruncMonth (long-array [v]) 1)] (aget r 0))))))
 
         :date-add
         (let [unit (nth args 0)
@@ -341,28 +387,92 @@
               col-data (get col-arrays col-key)
               v (long (if (expr/long-array? col-data)
                         (aget ^longs col-data i)
-                        (long (aget ^doubles col-data i))))]
-          (double (case unit
-                    :days    (+ v (* (long n) 86400))
-                    :hours   (+ v (* (long n) 3600))
-                    :minutes (+ v (* (long n) 60))
-                    :seconds (+ v (long n))
-                    :months  (let [^longs r (ColumnOps/arrayDateAddMonths (long-array [v]) (int n) 1)]
-                               (aget r 0))
-                    :years   (let [^longs r (ColumnOps/arrayDateAddMonths (long-array [v]) (int (* n 12)) 1)]
-                               (aget r 0)))))
+                        (long (aget ^doubles col-data i))))
+              tu (or (and expr/*columns-meta* (get-in expr/*columns-meta* [col-key :temporal-unit]))
+                     :seconds)]
+          (double (case tu
+                    :micros
+                    (case unit
+                      :microseconds (+ v (long n))
+                      :milliseconds (+ v (* (long n) 1000))
+                      :seconds      (+ v (* (long n) 1000000))
+                      :minutes      (+ v (* (long n) 60000000))
+                      :hours        (+ v (* (long n) 3600000000))
+                      :days         (+ v (* (long n) 86400000000))
+                      :months       (let [^longs r (ColumnOps/arrayDateAddMonthsMicros (long-array [v]) (int n) 1)] (aget r 0))
+                      :years        (let [^longs r (ColumnOps/arrayDateAddMonthsMicros (long-array [v]) (int (* n 12)) 1)] (aget r 0)))
+                    :seconds
+                    (case unit
+                      :days    (+ v (* (long n) 86400))
+                      :hours   (+ v (* (long n) 3600))
+                      :minutes (+ v (* (long n) 60))
+                      :seconds (+ v (long n))
+                      :months  (let [^longs r (ColumnOps/arrayDateAddMonths (long-array [v]) (int n) 1)] (aget r 0))
+                      :years   (let [^longs r (ColumnOps/arrayDateAddMonths (long-array [v]) (int (* n 12)) 1)] (aget r 0))))))
+
+        :time-bucket
+        (let [width (long (nth args 0))
+              unit (nth args 1)
+              col-key (nth args 2)
+              origin (long (if (> (count args) 3) (nth args 3) 0))
+              col-data (get col-arrays col-key)
+              v (long (if (expr/long-array? col-data)
+                        (aget ^longs col-data i)
+                        (long (aget ^doubles col-data i))))
+              tu (or (and expr/*columns-meta* (get-in expr/*columns-meta* [col-key :temporal-unit]))
+                     :seconds)]
+          (double (case tu
+                    :micros
+                    (let [w (case unit
+                              :microseconds width
+                              :milliseconds (* width 1000)
+                              :seconds      (* width 1000000)
+                              :minutes      (* width 60000000)
+                              :hours        (* width 3600000000)
+                              :days         (* width 86400000000))
+                          shifted (- v origin)]
+                      (+ (* (Math/floorDiv shifted w) w) origin))
+                    :seconds
+                    (let [w (case unit
+                              :seconds width
+                              :minutes (* width 60)
+                              :hours   (* width 3600)
+                              :days    (* width 86400))
+                          shifted (- v origin)]
+                      (+ (* (Math/floorDiv shifted w) w) origin))
+                    :days
+                    (case unit
+                      :days   (* (Math/floorDiv v width) width)
+                      :weeks  (* (Math/floorDiv v (* width 7)) (* width 7))
+                      :months (let [^longs r (ColumnOps/arrayTimeBucketMonths (long-array [v]) (int width) 1)]
+                                (aget r 0))))))
 
         :date-diff
         (let [unit (nth args 0)
-              col-data1 (get col-arrays (nth args 1))
-              col-data2 (get col-arrays (nth args 2))
+              k1 (nth args 1)
+              k2 (nth args 2)
+              col-data1 (get col-arrays k1)
+              col-data2 (get col-arrays k2)
               v1 (long (if (expr/long-array? col-data1)
                          (aget ^longs col-data1 i) (long (aget ^doubles col-data1 i))))
               v2 (long (if (expr/long-array? col-data2)
-                         (aget ^longs col-data2 i) (long (aget ^doubles col-data2 i))))]
-          (case unit
-            :days    (/ (double (- v1 v2)) 86400.0)
-            :seconds (double (- v1 v2))))
+                         (aget ^longs col-data2 i) (long (aget ^doubles col-data2 i))))
+              tu (or (and expr/*columns-meta* (get-in expr/*columns-meta* [k1 :temporal-unit]))
+                     (and expr/*columns-meta* (get-in expr/*columns-meta* [k2 :temporal-unit]))
+                     :seconds)]
+          (case tu
+            :micros
+            (case unit
+              :microseconds (double (- v1 v2))
+              :milliseconds (/ (double (- v1 v2)) 1000.0)
+              :seconds      (/ (double (- v1 v2)) 1000000.0)
+              :minutes      (/ (double (- v1 v2)) 60000000.0)
+              :hours        (/ (double (- v1 v2)) 3600000000.0)
+              :days         (/ (double (- v1 v2)) 86400000000.0))
+            :seconds
+            (case unit
+              :days    (/ (double (- v1 v2)) 86400.0)
+              :seconds (double (- v1 v2)))))
 
         :epoch-days
         (let [col-data (get col-arrays (nth args 0))

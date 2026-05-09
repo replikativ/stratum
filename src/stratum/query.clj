@@ -86,20 +86,27 @@
 (defn ^:no-doc validate-query
   "Validate query inputs. Throws ex-info with descriptive message on error.
 
-   from: StratumDataset or column map {col-name data}"
-  [from where agg group select]
+   from: StratumDataset or column map {col-name data}
+   window: optional vector of window-spec maps, used to extend the
+   `col-names` set so SELECT can reference window outputs."
+  ([from where agg group select]
+   (validate-query from where agg group select nil))
+  ([from where agg group select window]
   (when (nil? from)
     (throw (ex-info "Query :from must be a StratumDataset or non-empty map"
                     {:from from})))
 
-  ;; Extract column names from dataset or map
-  (let [col-names (if (satisfies? dataset/IDataset from)
+  ;; Extract column names from dataset or map. Window outputs are added
+  ;; so SELECT items can reference them.
+  (let [base-cols (if (satisfies? dataset/IDataset from)
                     (set (dataset/column-names from))
                     (do
                       (when (empty? from)
                         (throw (ex-info "Query :from map cannot be empty"
                                         {:from from})))
-                      (set (keys from))))]
+                      (set (keys from))))
+        win-out (set (keep :as window))
+        col-names (clojure.set/union base-cols win-out)]
     ;; Validate WHERE column references
     (doseq [pred (or where [])]
       (let [items (vec pred)
@@ -143,7 +150,7 @@
         (and (sequential? s) (= :as (first s)) (keyword? (second s)))
         (when-not (contains? col-names (norm/strip-ns (second s)))
           (throw (ex-info (str "Unknown column " (second s) " in :select. Available: " (sort col-names))
-                          {:column (second s) :available col-names})))))))
+                          {:column (second s) :available col-names}))))))))
 
 ;; ============================================================================
 ;; Anomaly detection resolution (post-join)
@@ -392,7 +399,7 @@
       (do
         (spec/validate! spec/SQuery query {:op :execute})
         (when-not (seq join)
-          (validate-query from where agg group select))
+          (validate-query from where agg group select (:window query)))
         ;; Bind column-pruning refs here too: even though the planner
         ;; has its own `column-pruning` pass, materialize-columns and
         ;; check-memory-budget! inside `exec/run-query` consult this
@@ -410,7 +417,7 @@
         (spec/validate! spec/SQuery query {:op :execute})
   ;; Semantic validation: column existence, type checks
         (when-not (seq join)
-          (validate-query from where agg group select))
+          (validate-query from where agg group select (:window query)))
 
   ;; Extract normalized columns from dataset or prepare from map
   ;; Datasets already have normalized columns (via encode-column in make-dataset)
@@ -518,7 +525,7 @@
   ;; column-reference set so materialize-columns / check-memory-budget!
   ;; can prune unreferenced columns from the budget and the decode
   ;; pass.
-              (binding [expr/*columns-meta* (into {} (keep (fn [[k v]] (when (:dict v) [k v]))) columns)
+              (binding [expr/*columns-meta* (into {} (keep (fn [[k v]] (when (or (:dict v) (:temporal-unit v)) [k v]))) columns)
                         gb/*dense-group-limit* *dense-group-limit*
                         cols/*query-column-refs* (cols/query-references query columns)]
                 ;; Streaming SELECT DISTINCT col: dedupe at the
@@ -626,7 +633,7 @@
               ;; set! updates the thread-local binding of *columns-meta* so that
               ;; subsequent expression eval within this `binding` scope sees the
               ;; newly materialized dict-encoded temp columns.
-                              (set! expr/*columns-meta* (into {} (keep (fn [[k v]] (when (:dict v) [k v]))) (nth result 3)))
+                              (set! expr/*columns-meta* (into {} (keep (fn [[k v]] (when (or (:dict v) (:temporal-unit v)) [k v]))) (nth result 3)))
                               result)
                             [group aggs select columns]))
 
