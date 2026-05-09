@@ -166,13 +166,15 @@ Every Stratum dataset is a copy-on-write value. Fork one in O(1) to create an is
 
 **ASOF JOIN**: `ASOF [LEFT] JOIN dim ON l.key = r.key AND l.ts >= r.ts` - DuckDB-style syntax. Each probe row matches the closest preceding (or following) build row per partition. Radix-partitioned, parallel, two-pointer merge.
 
-**Window functions**: ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK, CUME_DIST, LAG, LEAD, SUM/AVG/COUNT/MIN/MAX OVER - with PARTITION BY, ORDER BY, and frame clauses
+**Time-series helpers** (Clojure API): `stratum.api/window-join` (q-style `wj`: aggregate all right rows in `[t+lo, t+hi]` per left row, prefix-sum-accelerated for SUM/AVG/COUNT), `stratum.api/latest-on` (most-recent row per partition, equivalent to `DISTINCT ON`), `stratum.api/generate-series` (dense numeric or temporal spine for gap-filling joins).
+
+**Window functions**: ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK, CUME_DIST, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, SUM/AVG/COUNT/MIN/MAX OVER - with PARTITION BY, ORDER BY, and frame clauses (both `ROWS` and `RANGE BETWEEN INTERVAL ...` for value-distance sliding windows on irregular time series)
 
 **Subqueries and composition**: CTEs (WITH), uncorrelated subqueries (IN/NOT IN), derived tables in FROM
 
 **Expressions**: CASE WHEN, COALESCE, NULLIF, GREATEST, LEAST, CAST, arithmetic (+, -, \*, /, %)
 
-**Date/time**: DATE_TRUNC, DATE_ADD, DATE_DIFF, EXTRACT, EPOCH_DAYS, EPOCH_SECONDS
+**Date/time**: DATE_TRUNC, DATE_ADD, DATE_DIFF, EXTRACT (year/month/day/hour/minute/second/millisecond/microsecond/day-of-week/week-of-year), TIME_BUCKET, EPOCH_DAYS, EPOCH_SECONDS. TIMESTAMP columns track precision via `:temporal-unit` metadata (`:days` / `:seconds` / `:millis` / `:micros`); the kernels dispatch on the unit, with microseconds the DuckDB-compatible default.
 
 **String**: LIKE, ILIKE, LENGTH, UPPER, LOWER, SUBSTR (usable in SELECT, WHERE, GROUP BY, ORDER BY)
 
@@ -230,9 +232,17 @@ The DSL is intentionally flat. Every clause resolves column names by keyword loo
 ;; Supported predicates:   :< :<= :> :>= := :!= :between :in :not-in
 ;;                         :like :ilike :is-null :is-not-null :or :not
 ;; Expressions:            [:+ :a :b] [:- :a 1] [:* :price :qty] [:/ :a :b]
-;;                         [:date-trunc :day :ts] [:extract :hour :ts]
+;;                         [:date-trunc :day :ts] [:hour :ts]  ;; (or :year :month :millisecond :microsecond, etc.)
+;;                         [:time-bucket 5 :minutes :ts]       ;; arbitrary-width bucketing
 ;;                         [:coalesce :a 0] [:nullif :a 0]
 ;;                         [:greatest :a :b] [:least :a :b]
+;; Window ops:             :row-number :rank :dense-rank :ntile :percent-rank :cume-dist
+;;                         :sum :count :avg :min :max :lag :lead
+;;                         :first-value :last-value :nth-value
+;;                         :fills (LOCF) :ema :rleid
+;;                         :mavg :msum :mmin :mmax :mcount :mdev  ;; q-style sliding aggregates
+;; Window frames:          {:type :rows  :start [N :preceding]    :end :current-row}
+;;                         {:type :range :start [interval :preceding] :end :current-row}
 ```
 
 ## Ecosystem
@@ -255,6 +265,7 @@ All share copy-on-write semantics and can be branched together via Yggdrasil.
 - **Data**: CSV/Parquet import, dictionary-encoded strings, PostgreSQL NULL semantics, ad-hoc file queries
 - **Integration**: tablecloth/tech.ml.dataset interop, Datahike, Yggdrasil
 - **Analytics**: Isolation forest anomaly detection (SQL model management, scoring, online rotation)
+- **Time-series**: microsecond-precision TIMESTAMP, RANGE-BETWEEN-INTERVAL frames, TIME_BUCKET, FIRST/LAST/NTH_VALUE, FILLS/LOCF, EMA, RLEID, q-style moving aggregates (MAVG/MSUM/MMIN/MMAX/MDEV), window-join (`wj`) and LATEST ON (DISTINCT ON) helpers
 
 ## Architecture
 
