@@ -21,6 +21,7 @@
             [stratum.query.predicate :as pred]
             [stratum.query.expression :as expr]
             [stratum.query.estimate :as est]
+            [stratum.query.group-by :as gb]
             [stratum.query.execution :as x-cols]
             [stratum.dataset :as dataset])
   (:import [stratum.query.ir
@@ -160,8 +161,25 @@
                          :all? (:all? _union)}))]
     (ir/->LSetOp (:op set-op) (:queries set-op) (:all? set-op))
 
-    (let [;; Normalize group/order to strip SQL table-qualifier namespaces
-          group  (when group (mapv #(if (keyword? %) (norm/strip-ns %) %) group))
+    (let [;; Normalize group keys: strip SQL ns from plain keywords, and
+          ;; recognize the `[:as expr alias]` form (matching the existing
+          ;; `:select` / `:agg` alias convention) so a non-keyword group
+          ;; expression can be given a stable user-facing result-map key.
+          ;; Without `:as`, expressions still work but the result key is
+          ;; the planner's internal synthetic — documented as "use :as if
+          ;; you need to read it back."
+          group  (when group
+                   (mapv (fn [g]
+                           (cond
+                             (keyword? g)
+                             (norm/strip-ns g)
+
+                             (and (vector? g) (= :as (first g)) (= 3 (count g)))
+                             (let [[_ expr alias] g]
+                               {:expr expr :as alias})
+
+                             :else g))
+                         group))
           order  (when order (mapv (fn [[c dir]] [(norm/strip-ns c) dir]) order))
           window (when window
                    (mapv (fn [ws]
@@ -737,8 +755,22 @@
     (if (>= idx (count group-keys))
       [new-keys mat-nodes]
       (let [gk (nth group-keys idx)]
-        (if (keyword? gk)
+        (cond
+          (keyword? gk)
           (recur (inc idx) (conj new-keys gk) mat-nodes)
+
+          ;; `{:expr ... :as ...}` alias map (parsed at build-logical-plan
+          ;; time from `[:as expr alias]`). User-supplied alias becomes
+          ;; the column name — visible in result maps, matching the
+          ;; same convention `:select` / `:agg` use for `[:as ...]`.
+          (and (map? gk) (contains? gk :expr) (contains? gk :as))
+          (let [{:keys [expr as]} gk
+                normalized (if (map? expr) expr (norm/normalize-expr expr))]
+            (recur (inc idx)
+                   (conj new-keys as)
+                   (conj mat-nodes (ir/->PMaterializeExpr as normalized :int64 nil))))
+
+          :else
           (let [cn (keyword (str "__gk_expr_" idx))
                 normalized (if (map? gk) gk (norm/normalize-expr gk))]
             (recur (inc idx)
@@ -749,6 +781,113 @@
   "Chain PMaterializeExpr nodes on top of an input node (innermost first)."
   [mat-nodes input]
   (reduce (fn [in mat] (assoc mat :input in)) input mat-nodes))
+
+;; ============================================================================
+;; Pass: linear-agg-rewrite (F21-A)
+;; ----------------------------------------------------------------------------
+;; Algebraic rewrite for `SUM/AVG/MIN/MAX` on a linear expression of a
+;; single column: `s·x + o`. Eliminates the temp materialised column
+;; (the otherwise-mandatory `PMaterializeExpr` shim) by reducing the
+;; agg's `:expr` to `nil`, computing the agg on the bare column, and
+;; reconstructing the user-visible value at decode time from a recipe
+;; attached as agg metadata.
+;;
+;; Recipes (each agg is keyed by the user's alias):
+;;   SUM(s·x + o)         → s·SUM(x) + o·count
+;;   AVG(s·x + o)         → s·AVG(x) + o
+;;   MIN/MAX(s·x + o)     → s·MIN/MAX(x) + o      (s ≥ 0)
+;;                          s·MAX/MIN(x) + o      (s < 0; op flips)
+;;
+;; First-cut scope: `LGlobalAgg` only (single global agg). `LGroupBy`
+;; is deferred to F21-B (the per-group recipe needs threading through
+;; group-by decode).
+;; ============================================================================
+
+(defn- match-linear-expr
+  "Recognise an expression of the form `s·x + o` over a single column
+   `x` and numeric constants `s,o`. Returns `{:col k :scale s :offset o}`
+   or nil. `s,o` are returned as `double` so downstream arithmetic stays
+   in float space (the chunked SIMD agg path returns double accumulators)."
+  [expr]
+  (when (and (map? expr)
+             (vector? (:args expr))
+             (= 2 (count (:args expr))))
+    (let [op (:op expr)
+          [a b] (:args expr)
+          col-num (cond
+                    (and (keyword? a) (number? b)) [a (double b) :col-first]
+                    (and (number? a) (keyword? b)) [b (double a) :num-first]
+                    :else nil)]
+      (when col-num
+        (let [[col c order] col-num]
+          (case op
+            :add  {:col col :scale 1.0  :offset c}
+            :sub  (case order
+                    :col-first {:col col :scale 1.0  :offset (- c)}
+                    :num-first {:col col :scale -1.0 :offset c})
+            :mul  {:col col :scale c    :offset 0.0}
+            :div  (when (and (= order :col-first) (not (zero? c)))
+                    {:col col :scale (/ 1.0 c) :offset 0.0})
+            nil))))))
+
+(defn- linear-recipe
+  "Given the original agg `op` and a linear-expr match, return
+   `{:op base-op :recipe …}` describing the base agg to compute and
+   the post-arithmetic to apply. Returns nil when the rewrite is
+   not safe (e.g. `:scale 0` collapses to a constant — handled by a
+   different path)."
+  [op {:keys [scale offset] :as match}]
+  (when (and match (not (zero? (double scale))))
+    (case op
+      :sum {:base-op :sum :recipe (assoc match :reassemble :sum)}
+      :avg {:base-op :avg :recipe (assoc match :reassemble :avg)}
+      :min {:base-op (if (neg? (double scale)) :max :min)
+            :recipe  (assoc match :reassemble :min-max)}
+      :max {:base-op (if (neg? (double scale)) :min :max)
+            :recipe  (assoc match :reassemble :min-max)}
+      nil)))
+
+(defn- try-rewrite-linear-agg
+  "Attempt to rewrite a single agg map. Returns either the original
+   agg unchanged or a new agg with `:expr` cleared and the recipe
+   attached as `^:linear-recipe` metadata that downstream decoders
+   read via `(:linear-recipe (meta agg))`.
+
+   Pins `:as` to the original op (or the user's existing alias) so
+   the result key stays the user's, even though MIN/MAX with negative
+   scale internally flips the agg `:op`."
+  [agg]
+  (let [op   (:op agg)
+        expr (:expr agg)]
+    (or (when (and expr (#{:sum :avg :min :max} op))
+          (when-let [match (match-linear-expr expr)]
+            (when-let [{:keys [base-op recipe]} (linear-recipe op match)]
+              (let [as (or (:as agg) op)]
+                (with-meta
+                  (-> agg (dissoc :expr) (assoc :op base-op :col (:col match) :as as))
+                  {:linear-recipe recipe})))))
+        agg)))
+
+(defn linear-agg-rewrite
+  "Rewrite `LGlobalAgg` and `LGroupBy` aggs of the form
+   `SUM/AVG/MIN/MAX(s·x + o)` into the base agg on `x` plus a recipe
+   stored on agg metadata, eliminating the otherwise-required
+   `PMaterializeExpr` shim. The recipe is consumed at decode time:
+     - global agg paths: `format-fused-result` /
+       `rewrite-row-with-recipes`
+     - group-by paths: `apply-recipes-to-rows` on the per-group rows"
+  [plan]
+  (ir/walk-plan plan
+                (fn [node]
+                  (cond
+                    (or (instance? LGlobalAgg node)
+                        (instance? LGroupBy node))
+                    (let [orig-aggs (:aggs node)
+                          rewritten (mapv try-rewrite-linear-agg orig-aggs)]
+                      (if (= rewritten orig-aggs)
+                        node
+                        (assoc node :aggs rewritten)))
+                    :else node))))
 
 (defn expr-materialization
   "Insert PMaterializeExpr nodes for expressions in agg :expr fields
@@ -790,6 +929,62 @@
 ;; ============================================================================
 ;; Pass 4: Strategy selection (logical → physical)
 ;; ============================================================================
+
+(def ^:private long-null-sentinel
+  "The null sentinel `Long/MIN_VALUE` cast to double, the form
+   `prepare-query` produces when rewriting `IS-NULL` on `:int64` cols
+   into `:eq` for the SIMD path.  ChunkStats min/max exclude nulls so
+   zone maps can't reliably classify chunks against this sentinel."
+  (double Long/MIN_VALUE))
+
+(defn- pred-targets-null-sentinel?
+  "True if `pred` compares against the long-null sentinel (the form
+   produced by `rewrite-null-preds` when an `IS-NULL`/`IS-NOT-NULL`
+   on a long column was rewritten into `:eq`/`:neq`).  ChunkStats
+   ignore nulls, so any zone-map classification of these preds is
+   wrong: an all-null chunk has min/max set to non-null sentinels
+   and `zone-may-contain` says \"no\", but every row matches IS-NULL.
+   F20 must skip promotion in this case (cf. parquet null-column
+   tests where stats-only returned 0 instead of the null count)."
+  [pred]
+  (and (vector? pred) (>= (count pred) 3)
+       (#{:eq :neq} (second pred))
+       (let [v (nth pred 2)]
+         (and (number? v) (== (double v) long-null-sentinel)))))
+
+(defn- preds-classify-all-chunks?
+  "True iff every chunk classifies via zone maps as `:stats-only` or
+   `:skip` for the given preds — i.e. no partial-match chunks exist.
+   When this holds we can skip the SIMD path entirely and accumulate
+   the answer from `ChunkStats` alone (F20). Conservative: returns
+   false when any column is non-indexed, when no zone filters can be
+   built (e.g. preds on non-numeric cols), when any pred targets the
+   null sentinel (zone maps unreliable for nulls), or when any
+   chunk would need data inspection."
+  [preds columns]
+  (and (seq preds)
+       (every? :index (vals columns))   ; all index-backed
+       ;; Null sentinel preds bypass zone-map classification — see
+       ;; pred-targets-null-sentinel? doc.
+       (not (some pred-targets-null-sentinel? preds))
+       (let [zone-filters (gb/build-zone-filters preds)
+             ;; Reject expr-LHS preds (their `:col` is a map, not a
+             ;; keyword we can look up in `columns`) and any pred that
+             ;; build-zone-filters didn't lift.
+             pred-cols (into #{} (keep (fn [zf] (let [c (:col zf)]
+                                                  (when (keyword? c) c))))
+                             zone-filters)]
+         (and (= (count pred-cols) (count preds))
+              (let [col-entries (into {}
+                                      (keep (fn [[k info]]
+                                              (when (contains? pred-cols k)
+                                                [k (gb/collect-chunk-entries (:index info))])))
+                                      columns)
+                    n-chunks (some-> col-entries first val count)]
+                (and n-chunks
+                     (every? #(let [c (gb/classify-chunk zone-filters col-entries %)]
+                                (or (= :skip c) (= :stats-only c)))
+                             (range n-chunks))))))))
 
 (defn- select-global-agg-strategy
   "Choose physical strategy for LGlobalAgg.
@@ -836,21 +1031,28 @@
       (and (= 1 n-aggs) (= :count (:op first-agg)) no-preds?)
       (ir/->PFusedSIMDCount [] first-agg scan)
 
-      ;; 2. Stats-only (needs chunk statistics → real columns only)
+      ;; 2. Stats-only (needs chunk statistics → real columns only).
       ;; SUM and AVG read sum/sum-sq from ChunkStats. Sources whose stats
       ;; do not carry those (e.g. parquet-dataset row groups — parquet
       ;; metadata has min/max/count/null-count but not sum) advertise
       ;; :stats-sum-incomplete? on the column map; in that case SUM and
       ;; AVG must fall through to the SIMD path.
-      (and (seq aggs) no-preds? all-idx? agg-cols-in-scan?
+      ;;
+      ;; F20 extension: even with predicates, when zone maps fully
+      ;; classify every chunk as `:stats-only` or `:skip` (no partial
+      ;; chunks need data inspection), we still answer in O(chunks)
+      ;; from the surviving chunks' stats alone.
+      (and (seq aggs) all-idx? agg-cols-in-scan?
            (every? (fn [a]
                      (and (#{:sum :min :max :avg :count} (:op a))
                           (nil? (:expr a))
                           (or (not (#{:sum :avg} (:op a)))
                               (not (:stats-sum-incomplete?
                                     (get columns (:col a)))))))
-                   aggs))
-      (ir/->PStatsOnlyAgg aggs scan)
+                   aggs)
+           (or no-preds?
+               (preds-classify-all-chunks? preds columns)))
+      (ir/->PStatsOnlyAgg (if no-preds? [] preds) aggs scan)
 
       ;; 3. Chunked SIMD (single agg, index-backed → real columns only)
       ;; Cost-aware: chunked SIMD is especially good for selective preds on
@@ -1020,12 +1222,19 @@
   (ir/walk-plan plan
                 (fn [node]
                   (cond
-        ;; LScan → PScan or PChunkedScan (preserve annotations)
+        ;; LScan → PScan or PChunkedScan (preserve annotations).
+        ;; Each scan gets its own `volatile!` for `:dynamic-filters`
+        ;; so a downstream `execute-hash-join` can push a runtime
+        ;; range predicate at execute-time without mutating the IR
+        ;; node itself. The volatile defaults to `nil` (no dynamic
+        ;; preds) and the scan executor treats `nil` as "no preds".
                     (instance? LScan node)
                     (let [m (meta node)]
                       (if (::zone-map-eligible m)
-                        (with-meta (ir/->PChunkedScan (:columns node) (:length node) nil) m)
-                        (with-meta (ir/->PScan (:columns node) (:length node)) m)))
+                        (with-meta (ir/->PChunkedScan (:columns node) (:length node)
+                                                      nil [] (volatile! nil)) m)
+                        (with-meta (ir/->PScan (:columns node) (:length node)
+                                               [] (volatile! nil)) m)))
 
         ;; LGlobalAgg — peel through PMaterializeExpr to find filter/scan
                     (instance? LGlobalAgg node)
@@ -1561,6 +1770,61 @@
                       node)))))
 
 ;; ============================================================================
+;; Pass: lift-filters-to-scan
+;; ----------------------------------------------------------------------------
+;; Final-stage pass that folds `PSIMDFilter` wrappers sitting DIRECTLY
+;; above a scan into the scan's `:predicates` field.  This unifies
+;; stratum's filter representation with DuckDB's
+;; `LogicalGet::table_filters`: SIMD-eligible scan-adjacent filters
+;; have a single attachment point (the scan node), which (a) lets
+;; dynamic filters from joins target a stable spot at execute-time
+;; and (b) avoids each downstream operator needing to special-case
+;; the wrapper.
+;;
+;; **Why not `PMaskFilter`?**  `PMaskFilter` carries preds that
+;; require the `prepare-preds` pipeline (string equality on raw
+;; `String[]`, dict resolution, computed-expression preds) — they
+;; need to be rewritten into a `__mask` column before they can be
+;; evaluated.  Lifting them to the scan strips that contract: the
+;; scan's `:predicates` would surface as raw preds via ctx and
+;; downstream consumers (e.g. `execute-hash-join`'s `realize-mask`)
+;; would try to compile them as numeric → string→long cast crash.
+;; Keeping `PMaskFilter` as a wrapper preserves its
+;; prepare-preds-via-`execute-filter` semantics; F19/F20/F21 don't
+;; lose anything because they only consume numeric preds anyway
+;; (F19's join-key range is numeric by gate; F20's zone-map
+;; classification needs numeric preds; F21 operates on agg `:expr`,
+;; not filter wrappers).
+;; ============================================================================
+
+(defn lift-filters-to-scan
+  "Fold scan-adjacent `PSIMDFilter` wrappers into the scan's
+   `:predicates` field.  `PMaskFilter` wrappers are left in place
+   (see pass docstring above).
+
+   Resolves dict-encoded string equality at lift time
+   (`[col :eq \"foo\"]` → `[col :eq dict-code]`) so the lifted preds
+   are safe for downstream consumers that don't go through
+   `prepare-preds` again (e.g. `execute-hash-join`'s `realize-mask`).
+   `simd-pred?` happily classifies `:eq` with a string argument as
+   SIMD-eligible (it gates on op + column existence, not value
+   type), so without this resolution we'd crash trying to compile a
+   string into long-cast bytecode."
+  [plan]
+  (ir/walk-plan
+   plan
+   (fn [node]
+     (let [is-filter? (instance? PSIMDFilter node)
+           input      (when is-filter? (:input node))
+           scan?      (or (instance? PScan input)
+                          (instance? PChunkedScan input))]
+       (if (and is-filter? scan?)
+         (let [merged   (vec (concat (:predicates input) (:predicates node)))
+               resolved (pred/resolve-dict-equality-preds merged (:columns input))]
+           (assoc input :predicates resolved))
+         node)))))
+
+;; ============================================================================
 ;; Pass: top-N pushdown rewrite
 ;; ============================================================================
 
@@ -1797,6 +2061,12 @@
                 ;; so the rewritten `LHaving (LWindow ...)` shape is the
                 ;; one strategy-selection sees.
                 window-having-pushdown
+                ;; Algebraic rewrite of `SUM/AVG/MIN/MAX(s·col + o)` → base
+                ;; agg on `col` + decode-time recipe. Runs BEFORE
+                ;; expr-materialization so the temp-column shim is
+                ;; bypassed entirely (no extra column materialisation,
+                ;; SIMD long path stays eligible).
+                linear-agg-rewrite
                 expr-materialization
                 ;; Top-N rewrite runs BEFORE strategy-selection so it operates
                 ;; on logical IR (`LLimit (LSort scan)`) rather than physical
@@ -1814,7 +2084,16 @@
                 strategy-selection
                 operator-fusion
                 stats-propagation
-                column-pruning)]
+                column-pruning
+                ;; Final pass: any `PSIMDFilter`/`PMaskFilter` wrapper
+                ;; that didn't get absorbed by strategy-selection or
+                ;; operator-fusion (e.g. standalone `SELECT * WHERE p`
+                ;; with no agg) and that sits DIRECTLY above a scan
+                ;; gets folded into the scan's `:predicates` field.
+                ;; Provides the single attachment point F19 needs for
+                ;; runtime dynamic filters from joins. See pass for
+                ;; details.
+                lift-filters-to-scan)]
     (if (and m (instance? clojure.lang.IObj out))
       (vary-meta out merge m)
       out)))

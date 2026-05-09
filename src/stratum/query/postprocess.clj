@@ -8,16 +8,108 @@
 ;; Result Formatting
 ;; ============================================================================
 
+(defn apply-linear-recipe
+  "Reassemble the user-visible value when the planner rewrote the agg
+   from `s·x + o` form into the base agg on `x`. The recipe lives in
+   the agg's metadata under `:linear-recipe` (set by
+   `plan/linear-agg-rewrite`). Returns nil when the raw value is nil
+   (empty matching set or SQL NULL)."
+  [raw-value cnt {:keys [scale offset reassemble]}]
+  (when (some? raw-value)
+    (case reassemble
+      :sum     (+ (* (double scale) (double raw-value))
+                  (* (double offset) (double cnt)))
+      :avg     (+ (* (double scale) (double raw-value)) (double offset))
+      :min-max (+ (* (double scale) (double raw-value)) (double offset)))))
+
+(defn rewrite-row-with-recipes
+  "Walk a result row and replace each agg-keyed value with its
+   reassembled `s·x + o` form when the corresponding agg carries a
+   `:linear-recipe` metadata. Used by paths whose decoder doesn't
+   already route through `format-fused-result` (scalar agg, …).
+   Idempotent on rows whose aggs have no recipe."
+  [row aggs]
+  (reduce (fn [r agg]
+            (if-let [recipe (:linear-recipe (meta agg))]
+              (let [k (keyword (or (:as agg) (:op agg)))
+                    raw (get r k)
+                    cnt (or (:_count r) 0)]
+                (assoc r k (apply-linear-recipe raw cnt recipe)))
+              r))
+          row
+          aggs))
+
+(defn apply-recipes-to-results
+  "Apply F21 linear recipes to a group-by result. Handles both shapes:
+   - vec of row maps (default) → calls `rewrite-row-with-recipes` on each
+   - columnar map `{:col arr … :n-rows N :_count arr}` → rewrites
+     the agg's column array element-wise, threading per-row counts
+     for the SUM offset term
+
+   No-op when no agg carries a recipe (cheap fast path)."
+  [results aggs]
+  (if (some #(:linear-recipe (meta %)) aggs)
+    (cond
+      (sequential? results)
+      (mapv #(rewrite-row-with-recipes % aggs) results)
+
+      (and (map? results) (:n-rows results))
+      (let [n (long (:n-rows results))
+            ^longs cnts (let [c (:_count results)]
+                          (cond
+                            (nil? c) (let [a (long-array n)] (java.util.Arrays/fill a 1) a)
+                            :else c))]
+        (reduce
+          (fn [r agg]
+            (if-let [recipe (:linear-recipe (meta agg))]
+              (let [k    (keyword (or (:as agg) (:op agg)))
+                    src  (get r k)
+                    out  (double-array n)
+                    {:keys [scale offset reassemble]} recipe
+                    s    (double scale)
+                    o    (double offset)]
+                (cond
+                  (nil? src) r
+
+                  (= :sum reassemble)
+                  (do (dotimes [i n]
+                        (let [raw (cond
+                                    (instance? (Class/forName "[D") src) (aget ^doubles src i)
+                                    (instance? (Class/forName "[J") src) (double (aget ^longs src i))
+                                    :else                                 (double (nth src i)))
+                              c   (aget cnts i)]
+                          (aset out i (+ (* s raw) (* o (double c))))))
+                      (assoc r k out))
+
+                  :else  ; :avg / :min-max — additive offset, no count
+                  (do (dotimes [i n]
+                        (let [raw (cond
+                                    (instance? (Class/forName "[D") src) (aget ^doubles src i)
+                                    (instance? (Class/forName "[J") src) (double (aget ^longs src i))
+                                    :else                                 (double (nth src i)))]
+                          (aset out i (+ (* s raw) o))))
+                      (assoc r k out))))
+              r))
+          results
+          aggs))
+
+      :else results)
+    results))
+
 (defn format-fused-result
-  "Format fused SIMD result into standard output."
+  "Format fused SIMD result into standard output. When the agg carries
+   a `:linear-recipe` (set by the F21 rewrite pass) the raw Java
+   accumulator is post-processed back into the user's `s·x + o` value."
   [result agg]
-  (let [alias (or (:as agg) (:op agg))
-        cnt (:count result)
-        value (case (:op agg)
-                (:count :count-non-null) (long cnt)
-                (:min :max :sum :sum-product) (if (zero? cnt) nil (:result result))
-                :avg (if (zero? cnt) nil (:result result))
-                (:result result))]
+  (let [alias  (or (:as agg) (:op agg))
+        cnt    (:count result)
+        recipe (:linear-recipe (meta agg))
+        raw    (case (:op agg)
+                 (:count :count-non-null) (long cnt)
+                 (:min :max :sum :sum-product) (if (zero? cnt) nil (:result result))
+                 :avg (if (zero? cnt) nil (:result result))
+                 (:result result))
+        value  (if recipe (apply-linear-recipe raw cnt recipe) raw)]
     [{(keyword alias) value
       :_count cnt}]))
 

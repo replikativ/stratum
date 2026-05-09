@@ -2256,13 +2256,15 @@
           (println (format "  DuckDB  (NT): %s" (fmt-ms (:median rd))))
           (swap! res assoc :cb-q43 {:stratum-1t (:median r-1t) :stratum (:median r)
                                     :duckdb-1t (:median rd-1t) :duckdb (:median rd)}))
-        ;; Validate all groups (no LIMIT) to avoid tie-breaking differences
+        ;; Validate all groups (no LIMIT) to avoid tie-breaking differences.
+        ;; The `:as` alias on :group gives us a stable, named result-map
+        ;; key (`:m`) that matches the SQL alias on the DuckDB side.
         (let [v-all (q/q {:from {:et (:event-time cb)}
-                                :group [[:date-trunc :minute :et]]
+                                :group [[:as [:date-trunc :minute :et] :m]]
                                 :agg [[:count]]})]
           (validate-query "CB-Q43" conn
-            "SELECT (EventTime - EventTime % 60) AS \"__grp_0\", COUNT(*) AS count FROM hits GROUP BY \"__grp_0\""
-            v-all [:__grp_0]))))
+            "SELECT (EventTime - EventTime % 60) AS \"m\", COUNT(*) AS count FROM hits GROUP BY \"m\""
+            v-all [:m]))))
 
     (gc!)
     (when (run-q? "q3")

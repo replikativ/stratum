@@ -160,12 +160,24 @@
 
 (defrecord PScan
   ;; Materialized scan: all columns as arrays.
-           [columns length])
+  ;; predicates       — vec of normalized scan-attached preds. Folded
+  ;;                    in by `lift-filters-to-scan` from `PSIMDFilter`
+  ;;                    / `PMaskFilter` wrappers so every scan-adjacent
+  ;;                    filter has a single attachment point.
+  ;; dynamic-filters  — `volatile!` of a vec of preds attached at
+  ;;                    execution time (e.g. `execute-hash-join`
+  ;;                    derives a build-key range and pushes it onto
+  ;;                    the probe scan, mirroring DuckDB's
+  ;;                    `DynamicTableFilterSet`). Default `nil`.
+           [columns length predicates dynamic-filters])
 
 (defrecord PChunkedScan
   ;; Streaming scan: columns stay as PersistentColumnIndex, processed per-chunk.
-  ;; surviving-chunks — nil (all) or vec of chunk indices after zone-map pruning
-           [columns length surviving-chunks])
+  ;; surviving-chunks — nil (all) or vec of chunk indices after zone-map pruning.
+  ;; predicates       — same role as on `PScan`; the executor merges
+  ;;                    them into the chunk-level zone-map evaluation.
+  ;; dynamic-filters  — same as on `PScan`; `volatile!`-mutable.
+           [columns length surviving-chunks predicates dynamic-filters])
 
 ;; --- Filter strategies ------------------------------------------------------
 
@@ -184,8 +196,12 @@
 
 (defrecord PStatsOnlyAgg
   ;; O(chunks) aggregation from chunk-level statistics. No materialization.
-  ;; Requires: all columns from indices, no predicates, simple aggs.
-           [aggs input])
+  ;; Requires: all columns from indices, simple aggs.
+  ;; predicates — vec of preds. When non-empty, the strategy picker
+  ;;              has verified every chunk classifies via zone maps as
+  ;;              `:stats-only` or `:skip` (no partial chunks); the
+  ;;              executor accumulates stats only for surviving chunks.
+           [predicates aggs input])
 
 (defrecord PFusedSIMDAgg
   ;; Single fused SIMD filter+aggregate on materialized arrays.

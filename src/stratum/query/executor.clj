@@ -103,28 +103,167 @@
     {:preds preds :columns columns :length length}))
 
 ;; ============================================================================
+;; Dynamic filter pushdown (F19) — runtime build→probe range push
+;; ----------------------------------------------------------------------------
+;; Mirror of DuckDB's `DynamicTableFilterSet`. After a join's BUILD side
+;; materializes, we know the [min,max] of its join-key column. Probe-side
+;; rows whose join key falls outside that range cannot match, so we
+;; attach a `[:gte ... :lte ...]` predicate pair to the probe-side scan
+;; before executing the probe — letting zone-map pruning skip whole
+;; chunks. The scan node carries a `:dynamic-filters` `volatile!` (set
+;; up in `strategy-selection`) that the scan executor reads at run time.
+;; ============================================================================
+
+(defn- dynamic-target-scan
+  "Walk down the probe subtree to find the unique scan that owns column
+   `k`. Recurses through pass-through wrappers (project / sort / limit /
+   distinct / having / window / materialize-expr); halts at multi-input
+   nodes (joins, set ops) and at filter wrappers — those would either
+   ambiguate the source or short-circuit the lookup. Returns nil when
+   no unique target is reachable."
+  [node k]
+  (cond
+    (nil? node) nil
+
+    (or (instance? PScan node) (instance? PChunkedScan node))
+    (when (contains? (:columns node) k) node)
+
+    (or (instance? PProject node)
+        (instance? PSort node)
+        (instance? PLimit node)
+        (instance? PDistinct node)
+        (instance? PHaving node)
+        (instance? PWindow node)
+        (instance? PMaterializeExpr node)
+        (instance? PSIMDFilter node)
+        (instance? PMaskFilter node))
+    (recur (:input node) k)
+
+    :else nil))
+
+(defn- key-bounds
+  "Return `[lo hi]` as Clojure numbers for the build-side join key
+   column, or nil if it isn't a genuinely numeric heap array.
+
+   Dict-encoded string columns advertise `:type :int64` (the storage
+   type of the dict-code `long[]`) but their codes are local to the
+   build-side dictionary — probe-side strings hash into a different
+   set of codes, so a numeric range filter on those codes would be
+   incorrect. We detect dict-encoded strings via `:dict-type` and
+   skip them."
+  [build-cols build-key ^long build-length]
+  (let [info (get build-cols build-key)
+        ctype (:type info)
+        dict? (some? (:dict-type info))
+        data  (when info (:data info))]
+    (cond
+      (zero? build-length) nil
+      (nil? data) nil
+      dict? nil
+
+      (and (= :int64 ctype) (expr/long-array? data))
+      (let [^longs arr data]
+        [(ColumnOps/arrayMinLong arr (int build-length))
+         (ColumnOps/arrayMaxLong arr (int build-length))])
+
+      (and (= :float64 ctype) (expr/double-array? data))
+      (let [^doubles arr data
+            n (int build-length)]
+        (loop [i 1, mn (aget arr 0), mx (aget arr 0)]
+          (if (>= i n)
+            [mn mx]
+            (let [v (aget arr i)]
+              (recur (inc i) (Math/min mn v) (Math/max mx v))))))
+
+      :else nil)))
+
+(def ^:private ^:const PUSH_SELECTIVITY_THRESHOLD
+  "Maximum estimated selectivity at which the dynamic filter is worth
+   pushing.  Cost model: `realize-mask` is ~5× cheaper per row than a
+   hash-probe miss, so the push pays for itself only when at least
+   ~1/5 of probe rows would be filtered out — i.e. selectivity ≤ 0.8.
+
+   Lowered values push more aggressively (false-positive overhead
+   risk on FK joins), raised values miss real wins on narrow-build
+   joins.  See JOIN-Q1 / H2O-J1 trade-off discussion in F19 notes."
+  0.8)
+
+(defn- push-dynamic-filter!
+  "Best-effort: derive [min,max] from the build-side join key and push
+   `[probe-key :gte lo]` + `[probe-key :lte hi]` onto the probe-side
+   scan's `:dynamic-filters` volatile.
+
+   Gates:
+   - `:inner` join-type only — LEFT/RIGHT/FULL outer joins must
+     preserve unmatched probe rows, so a probe-side range filter
+     would silently drop them.
+   - Estimated probe-side selectivity of `[probe-key :range lo hi]`
+     must be ≤ `PUSH_SELECTIVITY_THRESHOLD`.  Uses the planner's
+     three-tier `estimate-selectivity` (zone-map → 128-sample →
+     heuristic), so the gate is cheap (microseconds) regardless of
+     probe shape.  This catches the common FK case where build's
+     range covers probe entirely — sampling sees every value
+     in-range, returns selectivity ≈ 1.0, and the push is skipped
+     (cf. JOIN-Q1: 48 ms → ~5 ms when this gate is honoured).
+
+   No-op when the probe subtree has no unique scan target, the build
+   key isn't numeric, or the target scan has no volatile."
+  [probe-side build-cols build-length on-pairs join-type]
+  (when (= :inner join-type)
+    (when-let [[probe-key build-key] (first on-pairs)]
+      (when-let [target (dynamic-target-scan probe-side probe-key)]
+        (when-let [vol (:dynamic-filters target)]
+          (when-let [[lo hi] (key-bounds build-cols build-key (long build-length))]
+            (let [sel (est/estimate-selectivity
+                        [probe-key :range lo hi]
+                        (:columns target))]
+              (when (<= (double sel) PUSH_SELECTIVITY_THRESHOLD)
+                (vreset! vol [[probe-key :gte lo] [probe-key :lte hi]])))))))))
+
+;; ============================================================================
 ;; Execute dispatch
 ;; ============================================================================
 
 (declare execute-node)
 
+(defn- scan-preds
+  "Concatenate static :predicates with the runtime contents of
+   :dynamic-filters (a `volatile!` of a vec, or nil). Returns a (possibly
+   empty) vec of raw preds — the upstream executor merges these into ctx
+   :preds, where the standard `prepare-node-preds` pipeline picks them up
+   alongside any preds carried by a downstream node."
+  [node]
+  (let [static  (:predicates node)
+        dyn-vol (:dynamic-filters node)
+        dyn     (when dyn-vol @dyn-vol)]
+    (vec (concat static dyn))))
+
 (defn- execute-scan [node]
-  {:columns (:columns node) :length (:length node)})
+  (let [preds (scan-preds node)]
+    (cond-> {:columns (:columns node) :length (:length node)}
+      (seq preds) (assoc :preds preds))))
 
 (defn- execute-chunked-scan [node]
-  ;; Zone-map pruning: compute surviving chunks and materialize only those
-  (let [columns (:columns node)
-        length  (:length node)
-        surviving (:surviving-chunks node)]
-    (if surviving
-      (let [pruned (x/materialize-columns-pruned columns surviving)
-            first-data (:data (val (first pruned)))
-            new-len (cond
-                      (expr/long-array? first-data) (alength ^longs first-data)
-                      (expr/double-array? first-data) (alength ^doubles first-data)
-                      :else length)]
-        {:columns pruned :length (long new-len)})
-      {:columns columns :length length})))
+  ;; Zone-map pruning: when the optimizer pre-computed `:surviving-chunks`,
+  ;; materialize only those chunks (already accounts for static preds).
+  ;; Dynamic preds (set at execute-time) are NOT re-applied here — they
+  ;; flow to downstream chunked operators via ctx :preds, which already
+  ;; do per-chunk zone-map skipping on the combined predicate set.
+  (let [columns   (:columns node)
+        length    (:length node)
+        surviving (:surviving-chunks node)
+        preds     (scan-preds node)
+        ctx (if surviving
+              (let [pruned (x/materialize-columns-pruned columns surviving)
+                    first-data (:data (val (first pruned)))
+                    new-len (cond
+                              (expr/long-array? first-data) (alength ^longs first-data)
+                              (expr/double-array? first-data) (alength ^doubles first-data)
+                              :else length)]
+                {:columns pruned :length (long new-len)})
+              {:columns columns :length length})]
+    (cond-> ctx
+      (seq preds) (assoc :preds preds))))
 
 (defn- count-mask-hits
   "Count how many rows pass a compiled mask (if present in preds).
@@ -137,19 +276,6 @@
           (if (>= i length)
             cnt
             (recur (inc i) (if (== 1 (aget mask i)) (inc cnt) cnt))))))))
-
-(defn- execute-filter [node]
-  ;; Filters modify the column context (potentially adding mask columns)
-  ;; but don't reduce rows — the actual filtering happens in the agg/project node.
-  ;; This matches how stratum currently works: preds are passed to the Java methods.
-  (let [ctx (execute-node (:input node))
-        {:keys [preds columns length]} (prepare-preds (:predicates node)
-                                                      (ctx-columns ctx)
-                                                      (ctx-length ctx))
-        ;; Adaptive: compute actual mask count for downstream use
-        actual-count (count-mask-hits preds columns length)]
-    (cond-> {:columns columns :length length :preds preds}
-      actual-count (assoc :actual-surviving-rows actual-count))))
 
 (defn- get-preds-and-ctx
   "Extract predicates and column context from a child node.
@@ -173,33 +299,80 @@
         [preds columns length])
       [[] (ctx-columns ctx) (ctx-length ctx)])))
 
+(defn- execute-filter [node]
+  ;; Filters modify the column context (potentially adding mask columns)
+  ;; but don't reduce rows — the actual filtering happens in the agg/project node.
+  ;; Use prepare-node-preds so any preds the scan attached to ctx (static
+  ;; lifted preds or dynamic-filter preds) are folded together with the
+  ;; filter node's own preds and run through `prepare-preds` once.
+  (let [ctx (execute-node (:input node))
+        [preds columns length] (prepare-node-preds (:predicates node) ctx)
+        actual-count (count-mask-hits preds columns length)]
+    (cond-> {:columns columns :length length :preds preds}
+      actual-count (assoc :actual-surviving-rows actual-count))))
+
 ;; --- Global aggregation strategies ------------------------------------------
 
 (defn- execute-stats-only [node columnar?]
-  (let [ctx (execute-node (:input node))
+  (let [ctx     (execute-node (:input node))
         columns (ctx-columns ctx)
-        length (ctx-length ctx)
-        aggs (:aggs node)
+        length  (ctx-length ctx)
+        aggs    (:aggs node)
+        preds   (:predicates node)
+        ;; F20: when preds are present they've been pre-validated by
+        ;; the strategy picker as fully zone-classifying — every chunk
+        ;; is :stats-only (counts wholesale) or :skip (ignored). For
+        ;; the no-preds case, surviving = all chunks.
+        zone-filters (when (seq preds) (gb/build-zone-filters preds))
+        survives?    (if zone-filters
+                       (let [pred-cols   (into #{} (map :col) zone-filters)
+                             col-entries (into {}
+                                               (keep (fn [[k info]]
+                                                       (when (contains? pred-cols k)
+                                                         [k (gb/collect-chunk-entries (:index info))])))
+                                               columns)]
+                         (fn [^long i]
+                           (= :stats-only (gb/classify-chunk zone-filters col-entries i))))
+                       (constantly true))
         result-row
         (reduce
          (fn [row agg]
            (let [alias (keyword (or (:as agg) (:op agg)))]
              (if (= :count (:op agg))
-               (assoc row alias (long length) :_count length)
-               (let [entries (gb/collect-chunk-entries (:index (get columns (:col agg))))
+               ;; COUNT: sum :count of surviving chunks (or use length
+               ;; when no preds for a cheap short-circuit).
+               (let [n (if (seq preds)
+                         (let [;; Pick any index-backed column to get
+                               ;; the chunk geometry — chunk counts
+                               ;; align across columns of the same scan.
+                               idx-col (some (fn [[_ info]] (:index info)) columns)
+                               entries (gb/collect-chunk-entries idx-col)
+                               n-chunks (count entries)]
+                           (loop [i 0 acc 0]
+                             (if (>= i n-chunks)
+                               acc
+                               (recur (inc i)
+                                      (if (survives? i)
+                                        (+ acc (long (:count (.stats ^stratum.index.ChunkEntry (nth entries i)))))
+                                        acc)))))
+                         length)]
+                 (assoc row alias (long n) :_count n))
+               (let [entries  (gb/collect-chunk-entries (:index (get columns (:col agg))))
                      n-chunks (count entries)
                      col-long? (= :int64 (:type (get columns (:col agg))))
                      [sum cnt mn mx]
                      (loop [i 0 sum 0.0 cnt (long 0) mn Double/MAX_VALUE mx (- Double/MAX_VALUE)]
                        (if (>= i n-chunks)
                          [sum cnt mn mx]
-                         (let [^stratum.index.ChunkEntry entry (nth entries i)
-                               ^stratum.stats.ChunkStats cs (.stats entry)]
-                           (recur (inc i)
-                                  (+ sum (double (:sum cs)))
-                                  (+ cnt (long (:count cs)))
-                                  (Math/min mn (double (:min-val cs)))
-                                  (Math/max mx (double (:max-val cs)))))))]
+                         (if (survives? i)
+                           (let [^stratum.index.ChunkEntry entry (nth entries i)
+                                 ^stratum.stats.ChunkStats cs (.stats entry)]
+                             (recur (inc i)
+                                    (+ sum (double (:sum cs)))
+                                    (+ cnt (long (:count cs)))
+                                    (Math/min mn (double (:min-val cs)))
+                                    (Math/max mx (double (:max-val cs)))))
+                           (recur (inc i) sum cnt mn mx))))]
                  (assoc row alias
                         (case (:op agg)
                           :sum (if (zero? cnt) nil (if col-long? (long sum) sum))
@@ -209,7 +382,8 @@
                         :_count cnt)))))
          {}
          aggs)]
-    [result-row]))
+    ;; F21: apply linear recipes if any agg carries one.
+    [(post/rewrite-row-with-recipes result-row aggs)]))
 
 (defn- execute-fused-simd-agg [node columnar?]
   (let [ctx (execute-node (:input node))
@@ -279,8 +453,10 @@
 (defn- execute-fused-multi-sum [node columnar?]
   (let [ctx (execute-node (:input node))
         [preds columns length] (prepare-node-preds (:predicates node) ctx)
-        mat-cols (cols/materialize-columns columns)]
-    (x/execute-fused-multi-sum preds (:aggs node) mat-cols length)))
+        mat-cols (cols/materialize-columns columns)
+        rows (x/execute-fused-multi-sum preds (:aggs node) mat-cols length)]
+    ;; F21: each agg may carry a `:linear-recipe` from the rewrite pass.
+    (mapv #(post/rewrite-row-with-recipes % (:aggs node)) rows)))
 
 (defn- execute-percentile-agg [node columnar?]
   (let [ctx (execute-node (:input node))
@@ -339,8 +515,11 @@
 (defn- execute-scalar-agg [node columnar?]
   (let [ctx (execute-node (:input node))
         [preds columns length] (prepare-node-preds (:predicates node) ctx)
-        mat-cols (cols/materialize-columns columns)]
-    [(gb/execute-scalar-aggs preds (:aggs node) mat-cols length)]))
+        mat-cols (cols/materialize-columns columns)
+        row (gb/execute-scalar-aggs preds (:aggs node) mat-cols length)]
+    ;; Apply F21 linear-recipe metadata if present (the rewrite pass
+    ;; may have rewritten an `:expr` agg into a base agg + recipe).
+    [(post/rewrite-row-with-recipes row (:aggs node))]))
 
 ;; --- Group-by strategies ----------------------------------------------------
 
@@ -348,28 +527,30 @@
   (let [ctx (execute-node (:input node))
         [preds columns length] (prepare-node-preds (:predicates node) ctx)
         group-keys (:group-keys node)
-        aggs (:aggs node)]
-    ;; Try chunked first (streaming, zero-copy), fall back to materialized
-    (or (gb/execute-chunked-group-by preds aggs group-keys columns length columnar?)
-        (let [mat-cols (cols/materialize-columns columns)
-              ;; Pre-compute expression aggs after materialization
-              [aggs mat-cols]
-              (if (some :expr aggs)
-                (let [col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)
-                      cache (java.util.HashMap.)]
-                  (loop [idx 0, new-aggs [], new-cols mat-cols]
-                    (if (>= idx (count aggs))
-                      [new-aggs new-cols]
-                      (let [agg (nth aggs idx)]
-                        (if-let [e (:expr agg)]
-                          (let [arr (expr/eval-expr-vectorized e col-arrays length cache)
-                                cn (keyword (str "__agg_expr_" idx))]
-                            (recur (inc idx)
-                                   (conj new-aggs (-> agg (dissoc :expr) (assoc :col cn)))
-                                   (assoc new-cols cn {:type :float64 :data arr})))
-                          (recur (inc idx) (conj new-aggs agg) new-cols))))))
-                [aggs mat-cols])]
-          (x/execute-group-by preds aggs group-keys mat-cols length columnar?)))))
+        aggs (:aggs node)
+        ;; Try chunked first (streaming, zero-copy), fall back to materialized
+        result
+        (or (gb/execute-chunked-group-by preds aggs group-keys columns length columnar?)
+            (let [mat-cols (cols/materialize-columns columns)
+                  [aggs mat-cols]
+                  (if (some :expr aggs)
+                    (let [col-arrays (into {} (map (fn [[k v]] [k (:data v)])) mat-cols)
+                          cache (java.util.HashMap.)]
+                      (loop [idx 0, new-aggs [], new-cols mat-cols]
+                        (if (>= idx (count aggs))
+                          [new-aggs new-cols]
+                          (let [agg (nth aggs idx)]
+                            (if-let [e (:expr agg)]
+                              (let [arr (expr/eval-expr-vectorized e col-arrays length cache)
+                                    cn (keyword (str "__agg_expr_" idx))]
+                                (recur (inc idx)
+                                       (conj new-aggs (-> agg (dissoc :expr) (assoc :col cn)))
+                                       (assoc new-cols cn {:type :float64 :data arr})))
+                              (recur (inc idx) (conj new-aggs agg) new-cols))))))
+                    [aggs mat-cols])]
+              (x/execute-group-by preds aggs group-keys mat-cols length columnar?)))]
+    ;; F21: per-group recipe application (no-op when no agg has a recipe).
+    (post/apply-recipes-to-results result aggs)))
 
 (defn- execute-dense-group-by [node columnar?]
   (let [ctx (execute-node (:input node))
@@ -398,11 +579,14 @@
         ;; avoids over-allocating the dense accumulator array.
         actual-rows (:actual-surviving-rows ctx)
         est-rows    (::plan/estimated-rows (meta node))]
-    (if (and actual-rows (< actual-rows 1000))
-      ;; Very few rows survive — reduce dense limit to save memory
-      (binding [gb/*dense-group-limit* (max 10000 (* 10 (long actual-rows)))]
-        (x/execute-group-by preds aggs group-keys mat-cols length columnar?))
-      (x/execute-group-by preds aggs group-keys mat-cols length columnar?))))
+    ;; F21: per-group recipe application (no-op when no agg has a recipe).
+    (post/apply-recipes-to-results
+     (if (and actual-rows (< actual-rows 1000))
+       ;; Very few rows survive — reduce dense limit to save memory
+       (binding [gb/*dense-group-limit* (max 10000 (* 10 (long actual-rows)))]
+         (x/execute-group-by preds aggs group-keys mat-cols length columnar?))
+       (x/execute-group-by preds aggs group-keys mat-cols length columnar?))
+     aggs)))
 
 (defn- execute-hash-group-by [node columnar?]
   ;; Same as dense — execute-group-by internally decides dense vs hash
@@ -504,6 +688,14 @@
 
 (defn- execute-hash-join [node]
   (let [build-ctx (execute-node (:build-side node))
+        ;; F19: derive build-key range and push it onto the probe-side
+        ;; scan's `:dynamic-filters` volatile BEFORE we execute the
+        ;; probe — gives the probe scan a chance to do zone-map skips.
+        _ (push-dynamic-filter! (:probe-side node)
+                                (ctx-columns build-ctx)
+                                (ctx-length build-ctx)
+                                (:on-pairs node)
+                                (:join-type node))
         probe-ctx (execute-node (:probe-side node))
         ;; Realize masks from pushed-down predicates
         probe-mask (realize-mask probe-ctx)
@@ -564,8 +756,14 @@
                                    [[:__semi_mask :eq 1.0]]))}))))
 
 (defn- execute-fused-join-group-agg [node columnar?]
-  (let [left-ctx  (execute-node (:left node))
-        right-ctx (execute-node (:right node))
+  (let [right-ctx (execute-node (:right node))   ;; build (dim)
+        ;; F19: push dynamic range from build (right) onto probe (left).
+        _ (push-dynamic-filter! (:left node)
+                                (ctx-columns right-ctx)
+                                (ctx-length right-ctx)
+                                (:on-pairs (:join-spec node))
+                                (:type (:join-spec node)))
+        left-ctx  (execute-node (:left node))    ;; probe (fact)
         ;; Realize masks from pushed-down predicates
         probe-mask (realize-mask left-ctx)
         build-mask (realize-mask right-ctx)
@@ -602,8 +800,14 @@
     {:columns (:columns result) :length (long (:length result))}))
 
 (defn- execute-fused-join-global-agg [node columnar?]
-  (let [left-ctx  (execute-node (:left node))
-        right-ctx (execute-node (:right node))
+  (let [right-ctx (execute-node (:right node))   ;; build (dim)
+        ;; F19: push dynamic range from build (right) onto probe (left).
+        _ (push-dynamic-filter! (:left node)
+                                (ctx-columns right-ctx)
+                                (ctx-length right-ctx)
+                                (:on-pairs (:join-spec node))
+                                (:type (:join-spec node)))
+        left-ctx  (execute-node (:left node))    ;; probe (fact)
         ;; Realize masks from pushed-down predicates
         probe-mask (realize-mask left-ctx)
         build-mask (realize-mask right-ctx)
@@ -622,11 +826,14 @@
 ;; --- Projection -------------------------------------------------------------
 
 (defn- execute-project [node columnar?]
+  ;; ctx may already carry prepared `:preds` (from a `PSIMDFilter`/`PMaskFilter`
+  ;; child that ran `prepare-preds`) or raw `:preds` (when the lifted scan
+  ;; surfaces its `:predicates` field via ctx). `prepare-node-preds [] ctx`
+  ;; normalises both: raw preds get the full prepare pipeline (string preds
+  ;; → mask, dict resolution, SIMD/mask split); already-prepared preds round-
+  ;; trip safely (the pipeline is idempotent for SIMD-eligible forms).
   (let [ctx (execute-node (:input node))
-        ;; Projection may have a filter child with prepared preds
-        [preds columns length] (if (:preds ctx)
-                                 [(:preds ctx) (:columns ctx) (:length ctx)]
-                                 [[] (ctx-columns ctx) (ctx-length ctx)])]
+        [preds columns length] (prepare-node-preds [] ctx)]
     (x/execute-projection preds (:items node) columns length columnar?)))
 
 ;; --- Window -----------------------------------------------------------------
