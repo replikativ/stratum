@@ -412,6 +412,204 @@
    See stratum.server/index-file!."
   server/index-file!)
 
+(defn window-join
+  "Window join (q `wj` semantics): for each left row at time t, aggregate
+   the right rows whose time falls within [t + lo, t + hi].
+
+   This is the bridge between ASOF (one match per left row) and a regular
+   range join (all matches, materialised) — it returns all left rows with
+   per-row aggregates over a time window of the right side.
+
+   Args:
+     left   — column map (becomes `:from`-shaped output prefix)
+     right  — column map for the source aggregated
+     opts   — {:asof-on [:left-ts-col :right-ts-col]
+              :window [lo hi]    ; numeric, in the column's storage unit
+              :agg {:result-col {:op :sum/:count/:avg/:min/:max
+                                  :col :right-col-name}}
+              :temporal-unit :micros|:seconds|...   ; for [lo hi unit] form
+              }
+
+   Window-spec convenience: if `:window` is `[lo hi unit]` and the right
+   ts column has `:temporal-unit :micros`, lo/hi are auto-converted.
+
+   Equality keys (partition) are not yet supported — do a single global
+   merge. Use a per-symbol partition explicitly via subsetting if needed.
+
+   Returns a column map: original left columns + agg result columns."
+  [left right {:keys [asof-on window agg temporal-unit]}]
+  (let [[l-key r-key] asof-on
+        [lo hi unit] (if (= 3 (count window)) window [(first window) (second window) nil])
+        ;; Convert lo/hi to the right unit if (unit, temporal-unit) given
+        scale (case [unit temporal-unit]
+                [nil nil] 1
+                [:microseconds :micros] 1
+                [:milliseconds :micros] 1000
+                [:seconds :micros] 1000000
+                [:minutes :micros] 60000000
+                [:hours :micros] 3600000000
+                [:days :micros] 86400000000
+                [:days :days] 1
+                [:weeks :days] 7
+                1)
+        lo (long (* (long lo) (long scale)))
+        hi (long (* (long hi) (long scale)))
+        ^longs left-ts (let [d (or (get-in left [l-key :data]) (get left l-key))]
+                          (if (instance? (Class/forName "[J") d) d
+                              (throw (ex-info "left ts column must be long[]"
+                                              {:col l-key :type (type d)}))))
+        ^longs right-ts (let [d (or (get-in right [r-key :data]) (get right r-key))]
+                          (if (instance? (Class/forName "[J") d) d
+                              (throw (ex-info "right ts column must be long[]"
+                                              {:col r-key :type (type d)}))))
+        n-left (alength left-ts)
+        n-right (alength right-ts)
+        ;; Build per-agg accumulators using prefix sums for sum/count/avg.
+        agg-results
+        (into {}
+              (map (fn [[as {:keys [op col]}]]
+                     [as
+                      (if (= op :count)
+                        {:op :count}
+                        (let [src
+                              (let [d (or (get-in right [col :data]) (get right col))]
+                                (cond (instance? (Class/forName "[D") d) d
+                                      (instance? (Class/forName "[J") d)
+                                      (let [da (double-array n-right)]
+                                        (dotimes [i n-right] (aset da i (double (aget ^longs d i))))
+                                        da)
+                                      :else (throw (ex-info "agg col must be numeric"
+                                                            {:col col :type (type d)}))))]
+                          (case op
+                            (:sum :avg)
+                            (let [prefix (double-array (inc n-right))]
+                              (dotimes [i n-right]
+                                (aset prefix (inc i) (+ (aget prefix i) (aget ^doubles src i))))
+                              {:op op :prefix prefix})
+                            :min {:op :min :src src}
+                            :max {:op :max :src src})))]))
+              agg)
+        ;; Two-pointer sweep over left (must be ascending by left-ts). For
+        ;; correctness we sort left by ts here and remap result indices.
+        left-order (let [arr (int-array n-left)]
+                     (dotimes [i n-left] (aset arr i i))
+                     ;; Sort by left-ts asc
+                     (let [boxed (object-array n-left)]
+                       (dotimes [i n-left] (aset boxed i (Integer/valueOf i)))
+                       (java.util.Arrays/sort boxed
+                                              (reify java.util.Comparator
+                                                (compare [_ a b]
+                                                  (Long/compare (aget left-ts (.intValue ^Integer a))
+                                                                (aget left-ts (.intValue ^Integer b))))))
+                       (dotimes [i n-left] (aset arr i (.intValue ^Integer (aget boxed i))))
+                       arr))
+        ;; Right is also sorted ascending by ts
+        right-order (let [arr (int-array n-right)
+                          _ (dotimes [i n-right] (aset arr i i))
+                          boxed (object-array n-right)]
+                      (dotimes [i n-right] (aset boxed i (Integer/valueOf i)))
+                      (java.util.Arrays/sort boxed
+                                             (reify java.util.Comparator
+                                               (compare [_ a b]
+                                                 (Long/compare (aget right-ts (.intValue ^Integer a))
+                                                               (aget right-ts (.intValue ^Integer b))))))
+                      (dotimes [i n-right] (aset arr i (.intValue ^Integer (aget boxed i))))
+                      arr)
+        ;; sorted right-ts copy for two-pointer search
+        right-sorted-ts (let [a (long-array n-right)]
+                          (dotimes [i n-right] (aset a i (aget right-ts (aget right-order i))))
+                          a)
+        ;; Build the per-agg result, in original-left-row order
+        agg-out (into {}
+                      (map (fn [[as _]]
+                             [as (double-array n-left)]))
+                      agg)]
+    ;; Two-pointer sweep: for each left row in sorted order, advance lo/hi.
+    (loop [i 0, lo-ptr 0, hi-ptr 0]
+      (when (< i n-left)
+        (let [orig-idx (aget left-order i)
+              t (aget left-ts orig-idx)
+              lo-target (+ t lo)
+              hi-target (+ t hi)
+              ;; Advance lo-ptr while right-sorted-ts < lo-target
+              new-lo (loop [p (long lo-ptr)]
+                       (if (and (< p n-right) (< (aget right-sorted-ts p) lo-target))
+                         (recur (inc p))
+                         p))
+              ;; Advance hi-ptr while right-sorted-ts <= hi-target
+              new-hi (loop [p (long (max hi-ptr new-lo))]
+                       (if (and (< p n-right) (<= (aget right-sorted-ts p) hi-target))
+                         (recur (inc p))
+                         p))]
+          ;; For each agg, compute over [new-lo, new-hi)
+          (doseq [[as info] agg-results]
+            (let [^doubles out-arr (get agg-out as)
+                  n-in-window (- new-hi new-lo)
+                  v (case (:op info)
+                      :sum (let [^doubles pf (:prefix info)]
+                             (- (aget pf new-hi) (aget pf new-lo)))
+                      :avg (if (zero? n-in-window)
+                             Double/NaN
+                             (let [^doubles pf (:prefix info)]
+                               (/ (- (aget pf new-hi) (aget pf new-lo)) (double n-in-window))))
+                      :count (double n-in-window)
+                      :min (if (zero? n-in-window)
+                             Double/NaN
+                             (let [^doubles src (:src info)]
+                               (loop [p (int new-lo), m Double/POSITIVE_INFINITY]
+                                 (if (< p new-hi)
+                                   (let [orig (aget right-order p)
+                                         x (aget src orig)]
+                                     (recur (inc p) (Math/min m x)))
+                                   m))))
+                      :max (if (zero? n-in-window)
+                             Double/NaN
+                             (let [^doubles src (:src info)]
+                               (loop [p (int new-lo), m Double/NEGATIVE_INFINITY]
+                                 (if (< p new-hi)
+                                   (let [orig (aget right-order p)
+                                         x (aget src orig)]
+                                     (recur (inc p) (Math/max m x)))
+                                   m)))))]
+              (aset out-arr orig-idx (double v))))
+          (recur (inc i) new-lo new-hi))))
+    ;; Return original left columns + agg columns (in original index order)
+    (merge (into {} (map (fn [[k v]] [k (if (map? v) v {:type :int64 :data v})])) left)
+           (into {} (map (fn [[k arr]] [k {:type :float64 :data arr}])) agg-out))))
+
+(defn latest-on
+  "Return only the latest row per partition: for each distinct combination
+   of `partition-by` columns, keep the row with the maximum value in the
+   `order-by` column.
+
+   Equivalent SQL pattern:
+     SELECT * FROM (
+       SELECT *, ROW_NUMBER() OVER (PARTITION BY p1,p2 ORDER BY ts DESC) AS rn
+       FROM t
+     ) WHERE rn = 1
+
+   Args:
+     query    — base query map (anything `q` accepts)
+     opts     — {:partition-by [:p1 :p2 ...] :order-by [[:ts :asc/:desc]]}
+
+   When :order-by direction is :asc, returns the row with the *maximum* ts
+   (so 'latest' in chronological terms); :desc returns the minimum.
+
+   Returns the result of running the augmented query."
+  [query {:keys [partition-by order-by]}]
+  (let [order-by (or order-by [[:ts :asc]])
+        ;; Flip direction so ROW_NUMBER picks the desired latest row.
+        flip (fn [d] (if (= d :desc) :asc :desc))
+        flipped (mapv (fn [[c d]] [c (flip d)]) order-by)]
+    (q (-> query
+           (update :window (fnil conj [])
+                   {:op :row-number
+                    :partition-by partition-by
+                    :order-by flipped
+                    :as :__latest_rn})
+           (update :having (fnil conj [])
+                   [:= :__latest_rn 1])))))
+
 (defn generate-series
   "Generate a dense sequence of values as a `:from`-compatible column map.
    Returns {:value <column>}.

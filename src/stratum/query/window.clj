@@ -363,8 +363,31 @@
 
    window-specs: [{:op :row-number :partition-by [:cat] :order-by [[:price :asc]] :as :rn} ...]"
   [columns length window-specs]
-  ;; Materialize only index columns referenced by window specs
-  (let [referenced-cols (into #{}
+  ;; Expand named moving aggregates (mavg/msum/mmin/mmax/mdev/mcount) into
+  ;; the underlying ROWS-frame window function. The width parameter rides
+  ;; on :offset (the sole numeric slot on the spec).
+  (let [window-specs
+        (mapv (fn [spec]
+                (let [op (:op spec)
+                      base-op (case op
+                                :mavg   :avg
+                                :msum   :sum
+                                :mmin   :min
+                                :mmax   :max
+                                :mcount :count
+                                :mdev   :mdev   ;; handled below as a dedicated op
+                                nil)]
+                  (if base-op
+                    (let [n (long (or (:offset spec) 5))]
+                      (-> spec
+                          (assoc :op base-op
+                                 :frame {:type :rows
+                                         :start [(dec n) :preceding]
+                                         :end :current-row})
+                          (dissoc :offset)))
+                    spec)))
+              window-specs)
+        referenced-cols (into #{}
                               (mapcat (fn [{:keys [col partition-by order-by]}]
                                         (concat (when col [col])
                                                 partition-by
@@ -666,8 +689,11 @@
                :min
                (let [result (double-array length)
                      val-arr (get col-arrays col)
-                     is-double (expr/double-array? val-arr)]
-                 (if full-partition-frame?
+                     is-double (expr/double-array? val-arr)
+                     [^ints part-starts ^ints part-ends] (when (or sliding-frame? (range-frame? frame))
+                                                            (compute-partition-boundaries sorted-indices part-keys length))]
+                 (cond
+                   full-partition-frame?
                    (let [part-mins (java.util.HashMap.)]
                      (dotimes [i length]
                        (let [idx (aget ^ints sorted-indices i)
@@ -679,6 +705,35 @@
                        (let [idx (aget ^ints sorted-indices i)
                              p (aget ^longs part-keys idx)]
                          (aset result idx (double (.get part-mins p))))))
+                   sliding-frame?
+                   ;; ROWS-frame sliding MIN — simple per-row scan inside the frame
+                   (let [start-bound (:start frame)
+                         end-bound (:end frame)]
+                     (dotimes [i length]
+                       (let [idx (aget ^ints sorted-indices i)
+                             ps (aget ^ints part-starts i)
+                             pe (aget ^ints part-ends i)
+                             ws (cond (= start-bound :unbounded-preceding) ps
+                                      (= start-bound :current-row) i
+                                      (vector? start-bound)
+                                      (let [[n dir] start-bound]
+                                        (case dir :preceding (max ps (- i (long n))) :following (min pe (+ i (long n)))))
+                                      :else ps)
+                             we (cond (= end-bound :unbounded-following) pe
+                                      (= end-bound :current-row) (inc i)
+                                      (vector? end-bound)
+                                      (let [[n dir] end-bound]
+                                        (case dir :preceding (max ps (inc (- i (long n)))) :following (min pe (inc (+ i (long n))))))
+                                      :else (inc i))]
+                         (if (>= ws we)
+                           (aset result idx Double/NaN)
+                           (loop [j (int ws), m Double/POSITIVE_INFINITY]
+                             (if (< j we)
+                               (let [jdx (aget ^ints sorted-indices j)
+                                     v (if is-double (aget ^doubles val-arr jdx) (double (aget ^longs val-arr jdx)))]
+                                 (recur (inc j) (Math/min m v)))
+                               (aset result idx m)))))))
+                   :else
                    (loop [i (int 0), running Double/POSITIVE_INFINITY, prev-part Long/MIN_VALUE]
                      (when (< i length)
                        (let [idx (aget ^ints sorted-indices i)
@@ -692,8 +747,11 @@
                :max
                (let [result (double-array length)
                      val-arr (get col-arrays col)
-                     is-double (expr/double-array? val-arr)]
-                 (if full-partition-frame?
+                     is-double (expr/double-array? val-arr)
+                     [^ints part-starts ^ints part-ends] (when (or sliding-frame? (range-frame? frame))
+                                                            (compute-partition-boundaries sorted-indices part-keys length))]
+                 (cond
+                   full-partition-frame?
                    (let [part-maxs (java.util.HashMap.)]
                      (dotimes [i length]
                        (let [idx (aget ^ints sorted-indices i)
@@ -705,6 +763,34 @@
                        (let [idx (aget ^ints sorted-indices i)
                              p (aget ^longs part-keys idx)]
                          (aset result idx (double (.get part-maxs p))))))
+                   sliding-frame?
+                   (let [start-bound (:start frame)
+                         end-bound (:end frame)]
+                     (dotimes [i length]
+                       (let [idx (aget ^ints sorted-indices i)
+                             ps (aget ^ints part-starts i)
+                             pe (aget ^ints part-ends i)
+                             ws (cond (= start-bound :unbounded-preceding) ps
+                                      (= start-bound :current-row) i
+                                      (vector? start-bound)
+                                      (let [[n dir] start-bound]
+                                        (case dir :preceding (max ps (- i (long n))) :following (min pe (+ i (long n)))))
+                                      :else ps)
+                             we (cond (= end-bound :unbounded-following) pe
+                                      (= end-bound :current-row) (inc i)
+                                      (vector? end-bound)
+                                      (let [[n dir] end-bound]
+                                        (case dir :preceding (max ps (inc (- i (long n)))) :following (min pe (inc (+ i (long n))))))
+                                      :else (inc i))]
+                         (if (>= ws we)
+                           (aset result idx Double/NaN)
+                           (loop [j (int ws), m Double/NEGATIVE_INFINITY]
+                             (if (< j we)
+                               (let [jdx (aget ^ints sorted-indices j)
+                                     v (if is-double (aget ^doubles val-arr jdx) (double (aget ^longs val-arr jdx)))]
+                                 (recur (inc j) (Math/max m v)))
+                               (aset result idx m)))))))
+                   :else
                    (loop [i (int 0), running Double/NEGATIVE_INFINITY, prev-part Long/MIN_VALUE]
                      (when (< i length)
                        (let [idx (aget ^ints sorted-indices i)
@@ -713,6 +799,51 @@
                              new-running (if (= p prev-part) (Math/max running v) v)]
                          (aset result idx new-running)
                          (recur (inc i) new-running p)))))
+                 result)
+
+               :mdev
+               ;; Moving population standard deviation over the ROWS frame.
+               ;; ddof=0 (population), nil-skipping. O(N*W) per row scan.
+               (let [result (double-array length)
+                     val-arr (get col-arrays col)
+                     is-double (expr/double-array? val-arr)
+                     [^ints part-starts ^ints part-ends] (compute-partition-boundaries sorted-indices part-keys length)
+                     start-bound (:start frame)
+                     end-bound (:end frame)]
+                 (dotimes [i length]
+                   (let [idx (aget ^ints sorted-indices i)
+                         ps (aget ^ints part-starts i)
+                         pe (aget ^ints part-ends i)
+                         ws (cond (= start-bound :unbounded-preceding) ps
+                                  (= start-bound :current-row) i
+                                  (vector? start-bound)
+                                  (let [[n dir] start-bound]
+                                    (case dir :preceding (max ps (- i (long n))) :following (min pe (+ i (long n)))))
+                                  :else ps)
+                         we (cond (= end-bound :unbounded-following) pe
+                                  (= end-bound :current-row) (inc i)
+                                  (vector? end-bound)
+                                  (let [[n dir] end-bound]
+                                    (case dir :preceding (max ps (inc (- i (long n)))) :following (min pe (inc (+ i (long n))))))
+                                  :else (inc i))]
+                     (if (>= ws we)
+                       (aset result idx Double/NaN)
+                       (let [;; Two-pass mean+variance avoids cancellation.
+                             n (- we ws)
+                             mean (loop [j (int ws), s 0.0]
+                                    (if (< j we)
+                                      (let [jdx (aget ^ints sorted-indices j)
+                                            v (if is-double (aget ^doubles val-arr jdx) (double (aget ^longs val-arr jdx)))]
+                                        (recur (inc j) (+ s v)))
+                                      (/ s (double n))))
+                             ssq (loop [j (int ws), ss 0.0]
+                                   (if (< j we)
+                                     (let [jdx (aget ^ints sorted-indices j)
+                                           v (if is-double (aget ^doubles val-arr jdx) (double (aget ^longs val-arr jdx)))
+                                           d (- v mean)]
+                                       (recur (inc j) (+ ss (* d d))))
+                                     ss))]
+                         (aset result idx (Math/sqrt (/ ssq (double n))))))))
                  result)
 
                :first-value
