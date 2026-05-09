@@ -691,7 +691,7 @@
                      val-arr (get col-arrays col)
                      is-double (expr/double-array? val-arr)
                      [^ints part-starts ^ints part-ends] (when (or sliding-frame? (range-frame? frame))
-                                                            (compute-partition-boundaries sorted-indices part-keys length))]
+                                                           (compute-partition-boundaries sorted-indices part-keys length))]
                  (cond
                    full-partition-frame?
                    (let [part-mins (java.util.HashMap.)]
@@ -749,7 +749,7 @@
                      val-arr (get col-arrays col)
                      is-double (expr/double-array? val-arr)
                      [^ints part-starts ^ints part-ends] (when (or sliding-frame? (range-frame? frame))
-                                                            (compute-partition-boundaries sorted-indices part-keys length))]
+                                                           (compute-partition-boundaries sorted-indices part-keys length))]
                  (cond
                    full-partition-frame?
                    (let [part-maxs (java.util.HashMap.)]

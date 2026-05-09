@@ -455,9 +455,9 @@
         lo (long (* (long lo) (long scale)))
         hi (long (* (long hi) (long scale)))
         ^longs left-ts (let [d (or (get-in left [l-key :data]) (get left l-key))]
-                          (if (instance? (Class/forName "[J") d) d
-                              (throw (ex-info "left ts column must be long[]"
-                                              {:col l-key :type (type d)}))))
+                         (if (instance? (Class/forName "[J") d) d
+                             (throw (ex-info "left ts column must be long[]"
+                                             {:col l-key :type (type d)}))))
         ^longs right-ts (let [d (or (get-in right [r-key :data]) (get right r-key))]
                           (if (instance? (Class/forName "[J") d) d
                               (throw (ex-info "right ts column must be long[]"

@@ -92,65 +92,65 @@
   ([from where agg group select]
    (validate-query from where agg group select nil))
   ([from where agg group select window]
-  (when (nil? from)
-    (throw (ex-info "Query :from must be a StratumDataset or non-empty map"
-                    {:from from})))
+   (when (nil? from)
+     (throw (ex-info "Query :from must be a StratumDataset or non-empty map"
+                     {:from from})))
 
   ;; Extract column names from dataset or map. Window outputs are added
   ;; so SELECT items can reference them.
-  (let [base-cols (if (satisfies? dataset/IDataset from)
-                    (set (dataset/column-names from))
-                    (do
-                      (when (empty? from)
-                        (throw (ex-info "Query :from map cannot be empty"
-                                        {:from from})))
-                      (set (keys from))))
-        win-out (set (keep :as window))
-        col-names (clojure.set/union base-cols win-out)]
+   (let [base-cols (if (satisfies? dataset/IDataset from)
+                     (set (dataset/column-names from))
+                     (do
+                       (when (empty? from)
+                         (throw (ex-info "Query :from map cannot be empty"
+                                         {:from from})))
+                       (set (keys from))))
+         win-out (set (keep :as window))
+         col-names (clojure.set/union base-cols win-out)]
     ;; Validate WHERE column references
-    (doseq [pred (or where [])]
-      (let [items (vec pred)
-            op-raw (first items)]
+     (doseq [pred (or where [])]
+       (let [items (vec pred)
+             op-raw (first items)]
         ;; Skip OR/NOT combinators — their sub-preds will be checked recursively
-        (when-not (or (= :or op-raw) (= 'or op-raw)
-                      (= :not op-raw) (= 'not op-raw)
-                      (= :in op-raw) (= 'in op-raw)
-                      (= :fn op-raw) (= 'fn op-raw))
-          (let [col-ref (norm/strip-ns (second items))]
-            (when (and (keyword? col-ref)
-                       (not (contains? col-names col-ref)))
-              (throw (ex-info (str "Unknown column " col-ref " in :where predicate. Available: " (sort col-names))
-                              {:column col-ref :available col-names :pred pred})))))))
+         (when-not (or (= :or op-raw) (= 'or op-raw)
+                       (= :not op-raw) (= 'not op-raw)
+                       (= :in op-raw) (= 'in op-raw)
+                       (= :fn op-raw) (= 'fn op-raw))
+           (let [col-ref (norm/strip-ns (second items))]
+             (when (and (keyword? col-ref)
+                        (not (contains? col-names col-ref)))
+               (throw (ex-info (str "Unknown column " col-ref " in :where predicate. Available: " (sort col-names))
+                               {:column col-ref :available col-names :pred pred})))))))
     ;; Validate GROUP column references (skip expressions — vectors like [:minute :et])
-    (doseq [g (or group [])]
-      (let [g (norm/strip-ns g)]
-        (when (and (keyword? g) (not (contains? col-names g)))
-          (throw (ex-info (str "Unknown column " g " in :group. Available: " (sort col-names))
-                          {:column g :available col-names})))))
+     (doseq [g (or group [])]
+       (let [g (norm/strip-ns g)]
+         (when (and (keyword? g) (not (contains? col-names g)))
+           (throw (ex-info (str "Unknown column " g " in :group. Available: " (sort col-names))
+                           {:column g :available col-names})))))
     ;; Validate aggregation column references
-    (doseq [a (or agg [])]
-      (let [items (vec a)
+     (doseq [a (or agg [])]
+       (let [items (vec a)
             ;; Unwrap [:as inner alias]
-            inner (if (= :as (first items)) (vec (second items)) items)
-            op-raw (first inner)]
-        (when-not (or (= :count op-raw) (= 'count op-raw))
-          (let [col-refs (subvec inner 1)]
-            (doseq [ref col-refs]
-              (when (and (keyword? ref) (not (contains? col-names (norm/strip-ns ref))))
-                (throw (ex-info (str "Unknown column " ref " in :agg. Available: " (sort col-names))
-                                {:column ref :available col-names :agg a}))))))))
+             inner (if (= :as (first items)) (vec (second items)) items)
+             op-raw (first inner)]
+         (when-not (or (= :count op-raw) (= 'count op-raw))
+           (let [col-refs (subvec inner 1)]
+             (doseq [ref col-refs]
+               (when (and (keyword? ref) (not (contains? col-names (norm/strip-ns ref))))
+                 (throw (ex-info (str "Unknown column " ref " in :agg. Available: " (sort col-names))
+                                 {:column ref :available col-names :agg a}))))))))
     ;; Validate SELECT column references
-    (doseq [s (or select [])]
-      (cond
-        (keyword? s)
-        (when-not (contains? col-names (norm/strip-ns s))
-          (throw (ex-info (str "Unknown column " s " in :select. Available: " (sort col-names))
-                          {:column s :available col-names})))
+     (doseq [s (or select [])]
+       (cond
+         (keyword? s)
+         (when-not (contains? col-names (norm/strip-ns s))
+           (throw (ex-info (str "Unknown column " s " in :select. Available: " (sort col-names))
+                           {:column s :available col-names})))
 
-        (and (sequential? s) (= :as (first s)) (keyword? (second s)))
-        (when-not (contains? col-names (norm/strip-ns (second s)))
-          (throw (ex-info (str "Unknown column " (second s) " in :select. Available: " (sort col-names))
-                          {:column (second s) :available col-names}))))))))
+         (and (sequential? s) (= :as (first s)) (keyword? (second s)))
+         (when-not (contains? col-names (norm/strip-ns (second s)))
+           (throw (ex-info (str "Unknown column " (second s) " in :select. Available: " (sort col-names))
+                           {:column (second s) :available col-names}))))))))
 
 ;; ============================================================================
 ;; Anomaly detection resolution (post-join)

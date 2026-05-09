@@ -215,8 +215,8 @@
         (when-let [vol (:dynamic-filters target)]
           (when-let [[lo hi] (key-bounds build-cols build-key (long build-length))]
             (let [sel (est/estimate-selectivity
-                        [probe-key :range lo hi]
-                        (:columns target))]
+                       [probe-key :range lo hi]
+                       (:columns target))]
               (when (<= (double sel) PUSH_SELECTIVITY_THRESHOLD)
                 (vreset! vol [[probe-key :gte lo] [probe-key :lte hi]])))))))))
 

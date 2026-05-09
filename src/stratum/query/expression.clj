@@ -441,11 +441,11 @@
          :micros
          (case op
            :year         (ColumnOps/arrayExtractYear  (ColumnOps/arrayDateTruncDayMicros long-data (int length))
-                                                     (int length))
+                                                      (int length))
            :month        (ColumnOps/arrayExtractMonth (ColumnOps/arrayDateTruncDayMicros long-data (int length))
-                                                     (int length))
+                                                      (int length))
            :day          (ColumnOps/arrayExtractDay   (ColumnOps/arrayDateTruncDayMicros long-data (int length))
-                                                     (int length))
+                                                      (int length))
            :hour         (ColumnOps/arrayExtractHourMicros        long-data (int length))
            :minute       (ColumnOps/arrayExtractMinuteMicros      long-data (int length))
            :second       (ColumnOps/arrayExtractSecondMicros      long-data (int length))
