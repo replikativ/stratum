@@ -60,38 +60,38 @@
                             (nil? c) (let [a (long-array n)] (java.util.Arrays/fill a 1) a)
                             :else c))]
         (reduce
-          (fn [r agg]
-            (if-let [recipe (:linear-recipe (meta agg))]
-              (let [k    (keyword (or (:as agg) (:op agg)))
-                    src  (get r k)
-                    out  (double-array n)
-                    {:keys [scale offset reassemble]} recipe
-                    s    (double scale)
-                    o    (double offset)]
-                (cond
-                  (nil? src) r
+         (fn [r agg]
+           (if-let [recipe (:linear-recipe (meta agg))]
+             (let [k    (keyword (or (:as agg) (:op agg)))
+                   src  (get r k)
+                   out  (double-array n)
+                   {:keys [scale offset reassemble]} recipe
+                   s    (double scale)
+                   o    (double offset)]
+               (cond
+                 (nil? src) r
 
-                  (= :sum reassemble)
-                  (do (dotimes [i n]
-                        (let [raw (cond
-                                    (instance? (Class/forName "[D") src) (aget ^doubles src i)
-                                    (instance? (Class/forName "[J") src) (double (aget ^longs src i))
-                                    :else                                 (double (nth src i)))
-                              c   (aget cnts i)]
-                          (aset out i (+ (* s raw) (* o (double c))))))
-                      (assoc r k out))
+                 (= :sum reassemble)
+                 (do (dotimes [i n]
+                       (let [raw (cond
+                                   (instance? (Class/forName "[D") src) (aget ^doubles src i)
+                                   (instance? (Class/forName "[J") src) (double (aget ^longs src i))
+                                   :else                                 (double (nth src i)))
+                             c   (aget cnts i)]
+                         (aset out i (+ (* s raw) (* o (double c))))))
+                     (assoc r k out))
 
-                  :else  ; :avg / :min-max — additive offset, no count
-                  (do (dotimes [i n]
-                        (let [raw (cond
-                                    (instance? (Class/forName "[D") src) (aget ^doubles src i)
-                                    (instance? (Class/forName "[J") src) (double (aget ^longs src i))
-                                    :else                                 (double (nth src i)))]
-                          (aset out i (+ (* s raw) o))))
-                      (assoc r k out))))
-              r))
-          results
-          aggs))
+                 :else  ; :avg / :min-max — additive offset, no count
+                 (do (dotimes [i n]
+                       (let [raw (cond
+                                   (instance? (Class/forName "[D") src) (aget ^doubles src i)
+                                   (instance? (Class/forName "[J") src) (double (aget ^longs src i))
+                                   :else                                 (double (nth src i)))]
+                         (aset out i (+ (* s raw) o))))
+                     (assoc r k out))))
+             r))
+         results
+         aggs))
 
       :else results)
     results))

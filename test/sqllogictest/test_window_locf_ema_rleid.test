@@ -1,0 +1,45 @@
+# test_window_locf_ema_rleid.test
+# Time-series window functions: FILLS / LOCF (forward-fill), EMA
+# (exponential moving average), RLEID (run-length-encoding group id).
+
+# ============================================================
+# RLEID — increments when value differs from previous row in
+# sorted partition order. Useful for session detection.
+# ============================================================
+
+statement ok
+CREATE TABLE runs (ts INTEGER, v INTEGER)
+
+statement ok
+INSERT INTO runs VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 1), (6, 1)
+
+# Sequence of values [1,1,2,2,1,1] → RLEID [1,1,2,2,3,3]
+query IR nosort
+SELECT v, RLEID(v) OVER (ORDER BY ts) FROM runs ORDER BY ts
+----
+1	1.000000
+1	1.000000
+2	2.000000
+2	2.000000
+1	3.000000
+1	3.000000
+
+# ============================================================
+# EMA — exponential moving average. period N → α = 2/(N+1).
+# Period 3 → α = 0.5: stepwise smoothing 0.5*new + 0.5*prev.
+# ============================================================
+
+statement ok
+CREATE TABLE prices (ts INTEGER, px DOUBLE)
+
+statement ok
+INSERT INTO prices VALUES (1, 10.0), (2, 20.0), (3, 30.0), (4, 40.0)
+
+# α = 0.5: 10, 0.5*20+0.5*10=15, 0.5*30+0.5*15=22.5, 0.5*40+0.5*22.5=31.25
+query RR nosort
+SELECT px, EMA(px, 3) OVER (ORDER BY ts) FROM prices ORDER BY ts
+----
+10.000000	10.000000
+20.000000	15.000000
+30.000000	22.500000
+40.000000	31.250000

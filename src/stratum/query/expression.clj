@@ -306,28 +306,68 @@
 ;; Date helper functions (shared by eval-expr-vectorized and eval-expr-to-long)
 ;; ============================================================================
 
+(defn- col-temporal-unit
+  "Look up the :temporal-unit of `col-key` from `*columns-meta*`, falling
+   back to `default` if no metadata is present. Stored values are
+   :days / :seconds / :millis / :micros."
+  ([col-key default]
+   (or (and *columns-meta* (get-in *columns-meta* [col-key :temporal-unit]))
+       default)))
+
 (defn- eval-date-trunc-to-long
-  "Evaluate date-trunc returning long[] directly."
-  ^longs [unit col-data ^long length]
-  (let [^longs long-data (ensure-longs col-data length)]
-    (case unit
-      :year   (ColumnOps/arrayDateTruncYear long-data (int length))
-      :month  (ColumnOps/arrayDateTruncMonth long-data (int length))
-      :day    (ColumnOps/arrayDateTruncDay long-data (int length))
-      :hour   (ColumnOps/arrayDateTruncHour long-data (int length))
-      :minute (ColumnOps/arrayDateTruncMinute long-data (int length)))))
+  "Evaluate date-trunc returning long[] directly. Dispatches on the
+   column's :temporal-unit (default :seconds, current Stratum behavior)."
+  ^longs [unit col-key col-data length]
+  (let [^longs long-data (ensure-longs col-data length)
+        tu (col-temporal-unit col-key :seconds)]
+    (case tu
+      :micros
+      (case unit
+        :year        (ColumnOps/arrayDateTruncYearMicros   long-data (int length))
+        :month       (ColumnOps/arrayDateTruncMonthMicros  long-data (int length))
+        :day         (ColumnOps/arrayDateTruncDayMicros    long-data (int length))
+        :hour        (ColumnOps/arrayDateTruncHourMicros   long-data (int length))
+        :minute      (ColumnOps/arrayDateTruncMinuteMicros long-data (int length))
+        :second      (ColumnOps/arrayDateTruncSecondMicros long-data (int length))
+        :millisecond (ColumnOps/arrayDateTruncMilliMicros  long-data (int length))
+        :microsecond long-data)
+      :seconds
+      (case unit
+        :year   (ColumnOps/arrayDateTruncYear   long-data (int length))
+        :month  (ColumnOps/arrayDateTruncMonth  long-data (int length))
+        :day    (ColumnOps/arrayDateTruncDay    long-data (int length))
+        :hour   (ColumnOps/arrayDateTruncHour   long-data (int length))
+        :minute (ColumnOps/arrayDateTruncMinute long-data (int length))
+        :second long-data
+        (:millisecond :microsecond)
+        (throw (ex-info "DATE_TRUNC sub-second unit requires :temporal-unit :micros column"
+                        {:unit unit :temporal-unit tu :col col-key}))))))
 
 (defn- eval-date-add-to-long
-  "Evaluate date-add returning long[] directly."
-  ^longs [unit n col-data ^long length]
-  (let [^longs long-data (ensure-longs col-data length)]
-    (case unit
-      :days    (ColumnOps/arrayDateAddDays long-data (long n) (int length))
-      :hours   (ColumnOps/arrayDateAddSeconds long-data (long (* n 3600)) (int length))
-      :minutes (ColumnOps/arrayDateAddSeconds long-data (long (* n 60)) (int length))
-      :seconds (ColumnOps/arrayDateAddSeconds long-data (long n) (int length))
-      :months  (ColumnOps/arrayDateAddMonths long-data (int n) (int length))
-      :years   (ColumnOps/arrayDateAddMonths long-data (int (* n 12)) (int length)))))
+  "Evaluate date-add returning long[] directly. Scales the increment to
+   the column's :temporal-unit (default :seconds, current Stratum behavior)."
+  ^longs [unit n col-key col-data length]
+  (let [^longs long-data (ensure-longs col-data length)
+        tu (col-temporal-unit col-key :seconds)]
+    (case tu
+      :micros
+      (case unit
+        :microseconds (ColumnOps/arrayDateAddMicrosMicros long-data (long n) (int length))
+        :milliseconds (ColumnOps/arrayDateAddMicrosMicros long-data (long (* n 1000)) (int length))
+        :seconds      (ColumnOps/arrayDateAddMicrosMicros long-data (long (* n 1000000)) (int length))
+        :minutes      (ColumnOps/arrayDateAddMicrosMicros long-data (long (* n 60000000)) (int length))
+        :hours        (ColumnOps/arrayDateAddMicrosMicros long-data (long (* n 3600000000)) (int length))
+        :days         (ColumnOps/arrayDateAddMicrosMicros long-data (long (* n 86400000000)) (int length))
+        :months       (ColumnOps/arrayDateAddMonthsMicros long-data (int n) (int length))
+        :years        (ColumnOps/arrayDateAddMonthsMicros long-data (int (* n 12)) (int length)))
+      :seconds
+      (case unit
+        :days    (ColumnOps/arrayDateAddDays    long-data (long n) (int length))
+        :hours   (ColumnOps/arrayDateAddSeconds long-data (long (* n 3600)) (int length))
+        :minutes (ColumnOps/arrayDateAddSeconds long-data (long (* n 60)) (int length))
+        :seconds (ColumnOps/arrayDateAddSeconds long-data (long n) (int length))
+        :months  (ColumnOps/arrayDateAddMonths  long-data (int n) (int length))
+        :years   (ColumnOps/arrayDateAddMonths  long-data (int (* n 12)) (int length))))))
 
 ;; ============================================================================
 ;; Polymorphic expression evaluation (returns long[] or double[])
@@ -380,48 +420,80 @@
              :sign  (ColumnOps/arraySign a (int length))))))
 
      ;; Date extraction functions — return double[] (extract produces small ints)
-     (and (map? expr) (#{:year :month :day :hour :minute :second :day-of-week :week-of-year} (:op expr)))
-     (let [col-key (first (:args expr))
+     (and (map? expr) (#{:year :month :day :hour :minute :second :millisecond :microsecond :day-of-week :week-of-year} (:op expr)))
+     (let [op (:op expr)
+           col-key (first (:args expr))
            col-data (if (keyword? col-key)
                       (get col-arrays col-key)
-                      (throw (ex-info "Date extraction requires column keyword" {:expr expr})))]
-       (if (long-array? col-data)
-         (case (:op expr)
-           :year         (ColumnOps/arrayExtractYear ^longs col-data (int length))
-           :month        (ColumnOps/arrayExtractMonth ^longs col-data (int length))
-           :day          (ColumnOps/arrayExtractDay ^longs col-data (int length))
-           :hour         (ColumnOps/arrayExtractHour ^longs col-data (int length))
-           :minute       (ColumnOps/arrayExtractMinute ^longs col-data (int length))
-           :second       (ColumnOps/arrayExtractSecond ^longs col-data (int length))
-           :day-of-week  (ColumnOps/arrayExtractDayOfWeek ^longs col-data (int length))
-           :week-of-year (ColumnOps/arrayExtractWeekOfYear ^longs col-data (int length)))
-         (let [long-data (long-array length)]
-           (dotimes [i length] (aset long-data i (long (aget ^doubles col-data i))))
-           (case (:op expr)
-             :year         (ColumnOps/arrayExtractYear long-data (int length))
-             :month        (ColumnOps/arrayExtractMonth long-data (int length))
-             :day          (ColumnOps/arrayExtractDay long-data (int length))
-             :hour         (ColumnOps/arrayExtractHour long-data (int length))
-             :minute       (ColumnOps/arrayExtractMinute long-data (int length))
-             :second       (ColumnOps/arrayExtractSecond long-data (int length))
-             :day-of-week  (ColumnOps/arrayExtractDayOfWeek long-data (int length))
-             :week-of-year (ColumnOps/arrayExtractWeekOfYear long-data (int length))))))
+                      (throw (ex-info "Date extraction requires column keyword" {:expr expr})))
+           ^longs long-data (if (long-array? col-data)
+                              col-data
+                              (let [la (long-array length)]
+                                (dotimes [i length] (aset la i (long (aget ^doubles col-data i))))
+                                la))
+           ;; Default: hour/minute/second/millisecond/microsecond assume seconds (legacy);
+           ;; year/month/day/dow/week assume days (legacy).
+           tu (col-temporal-unit col-key
+                                 (case op
+                                   (:hour :minute :second :millisecond :microsecond) :seconds
+                                   (:year :month :day :day-of-week :week-of-year) :days))]
+       (case tu
+         :micros
+         (case op
+           :year         (ColumnOps/arrayExtractYear  (ColumnOps/arrayDateTruncDayMicros long-data (int length))
+                                                      (int length))
+           :month        (ColumnOps/arrayExtractMonth (ColumnOps/arrayDateTruncDayMicros long-data (int length))
+                                                      (int length))
+           :day          (ColumnOps/arrayExtractDay   (ColumnOps/arrayDateTruncDayMicros long-data (int length))
+                                                      (int length))
+           :hour         (ColumnOps/arrayExtractHourMicros        long-data (int length))
+           :minute       (ColumnOps/arrayExtractMinuteMicros      long-data (int length))
+           :second       (ColumnOps/arrayExtractSecondMicros      long-data (int length))
+           :millisecond  (ColumnOps/arrayExtractMillisecondMicros long-data (int length))
+           :microsecond  (ColumnOps/arrayExtractMicrosecondMicros long-data (int length))
+           :day-of-week  (let [r (double-array length)
+                               ed-arr (ColumnOps/arrayDateTruncDayMicros long-data (int length))]
+                           (dotimes [i length]
+                             (aset r i (let [ed (quot (aget ed-arr i) 86400000000)
+                                             d (mod (+ (mod ed 7) 10) 7)]
+                                         (double d))))
+                           r)
+           :week-of-year (let [ed-arr (long-array length)]
+                           (dotimes [i length]
+                             (aset ed-arr i (quot (aget long-data i) 86400000000)))
+                           (ColumnOps/arrayExtractWeekOfYear ed-arr (int length))))
+         ;; :seconds (legacy): Y/M/D extract is wrong for seconds-based timestamps but
+         ;; current tests pass epoch-DAYS to year/month/day extraction. We honor the
+         ;; legacy contract: long-data is interpreted at face value by each kernel.
+         (case op
+           :year         (ColumnOps/arrayExtractYear         long-data (int length))
+           :month        (ColumnOps/arrayExtractMonth        long-data (int length))
+           :day          (ColumnOps/arrayExtractDay          long-data (int length))
+           :hour         (ColumnOps/arrayExtractHour         long-data (int length))
+           :minute       (ColumnOps/arrayExtractMinute       long-data (int length))
+           :second       (ColumnOps/arrayExtractSecond       long-data (int length))
+           :millisecond  (throw (ex-info "EXTRACT MILLISECOND requires :temporal-unit :micros column"
+                                         {:col col-key}))
+           :microsecond  (throw (ex-info "EXTRACT MICROSECOND requires :temporal-unit :micros column"
+                                         {:col col-key}))
+           :day-of-week  (ColumnOps/arrayExtractDayOfWeek    long-data (int length))
+           :week-of-year (ColumnOps/arrayExtractWeekOfYear   long-data (int length)))))
 
      ;; Date/time arithmetic — return long[] for date-trunc/date-add (integer epoch)
-     (and (map? expr) (#{:date-trunc :date-add :date-diff :epoch-days :epoch-seconds} (:op expr)))
+     (and (map? expr) (#{:date-trunc :date-add :date-diff :epoch-days :epoch-seconds :time-bucket} (:op expr)))
      (let [args (:args expr)]
        (case (:op expr)
          :date-trunc
          (let [col-key (second args)
                col-data (get col-arrays col-key)]
            ;; Return long[] directly — no longToDouble conversion
-           (eval-date-trunc-to-long (first args) col-data length))
+           (eval-date-trunc-to-long (first args) col-key col-data length))
 
          :date-add
          (let [col-key (nth args 2)
                col-data (get col-arrays col-key)]
            ;; Return long[] directly
-           (eval-date-add-to-long (first args) (second args) col-data length))
+           (eval-date-add-to-long (first args) (second args) col-key col-data length))
 
          :date-diff
          (let [unit (first args)
@@ -430,10 +502,38 @@
                col-data1 (get col-arrays col-key1)
                col-data2 (get col-arrays col-key2)
                ^longs l1 (ensure-longs col-data1 length)
-               ^longs l2 (ensure-longs col-data2 length)]
-           (case unit
-             :days    (ColumnOps/arrayDateDiffDays l1 l2 (int length))
-             :seconds (ColumnOps/arrayDateDiffSeconds l1 l2 (int length))))
+               ^longs l2 (ensure-longs col-data2 length)
+               tu (col-temporal-unit col-key1 (col-temporal-unit col-key2 :seconds))]
+           (case tu
+             :micros
+             (case unit
+               :microseconds (ColumnOps/arrayDateDiffMicros l1 l2 (int length))
+               :milliseconds (let [r (double-array length)
+                                   d (ColumnOps/arrayDateDiffMicros l1 l2 (int length))]
+                               (dotimes [i length] (aset r i (/ (aget ^doubles d i) 1000.0)))
+                               r)
+               :seconds      (let [r (double-array length)
+                                   d (ColumnOps/arrayDateDiffMicros l1 l2 (int length))]
+                               (dotimes [i length] (aset r i (/ (aget ^doubles d i) 1000000.0)))
+                               r)
+               :minutes      (let [r (double-array length)
+                                   d (ColumnOps/arrayDateDiffMicros l1 l2 (int length))]
+                               (dotimes [i length] (aset r i (/ (aget ^doubles d i) 60000000.0)))
+                               r)
+               :hours        (let [r (double-array length)
+                                   d (ColumnOps/arrayDateDiffMicros l1 l2 (int length))]
+                               (dotimes [i length] (aset r i (/ (aget ^doubles d i) 3600000000.0)))
+                               r)
+               :days         (let [r (double-array length)
+                                   d (ColumnOps/arrayDateDiffMicros l1 l2 (int length))]
+                               (dotimes [i length] (aset r i (/ (aget ^doubles d i) 86400000000.0)))
+                               r))
+             :seconds
+             (case unit
+               :days    (ColumnOps/arrayDateDiffDays l1 l2 (int length))
+               :seconds (ColumnOps/arrayDateDiffSeconds l1 l2 (int length))
+               (throw (ex-info "DATE_DIFF unit not supported on :seconds-precision column"
+                               {:unit unit :temporal-unit tu})))))
 
          :epoch-days
          (let [col-key (first args)
@@ -449,7 +549,44 @@
                ^longs long-data (ensure-longs col-data length)
                r (long-array length)]
            (dotimes [i length] (aset r i (* (aget long-data i) 86400)))
-           r)))
+           r)
+
+         :time-bucket
+         ;; args: [width unit col-key]   or [width unit col-key origin]
+         (let [width (long (first args))
+               unit  (second args)
+               col-key (nth args 2)
+               origin (long (if (> (count args) 3) (nth args 3) 0))
+               col-data (get col-arrays col-key)
+               ^longs long-data (ensure-longs col-data length)
+               tu (col-temporal-unit col-key :seconds)]
+           (case tu
+             :micros
+             (let [w-micros (case unit
+                              :microseconds width
+                              :milliseconds (* width 1000)
+                              :seconds      (* width 1000000)
+                              :minutes      (* width 60000000)
+                              :hours        (* width 3600000000)
+                              :days         (* width 86400000000))]
+               (if (zero? origin)
+                 (ColumnOps/arrayTimeBucketMicros long-data (long w-micros) (int length))
+                 (ColumnOps/arrayTimeBucketMicrosOrigin long-data (long w-micros) (long origin) (int length))))
+             :seconds
+             (let [w-secs (case unit
+                            :seconds width
+                            :minutes (* width 60)
+                            :hours   (* width 3600)
+                            :days    (* width 86400))]
+               ;; Re-use micros kernel with secs-as-micros — same arithmetic.
+               (if (zero? origin)
+                 (ColumnOps/arrayTimeBucketMicros long-data (long w-secs) (int length))
+                 (ColumnOps/arrayTimeBucketMicrosOrigin long-data (long w-secs) (long origin) (int length))))
+             :days
+             (case unit
+               :days   (ColumnOps/arrayTimeBucketDays   long-data (long width) (int length))
+               :weeks  (ColumnOps/arrayTimeBucketDays   long-data (long (* width 7)) (int length))
+               :months (ColumnOps/arrayTimeBucketMonths long-data (int width) (int length)))))))
 
      ;; NULL handling expressions — stay in double domain (complex sentinel logic)
      (and (map? expr) (#{:greatest :least} (:op expr)))
@@ -672,27 +809,79 @@
         :date-trunc
         (let [col-key (second args)
               col-data (get col-arrays col-key)]
-          (eval-date-trunc-to-long (first args) col-data length))
+          (eval-date-trunc-to-long (first args) col-key col-data length))
 
         :date-add
         (let [col-key (nth args 2)
               col-data (get col-arrays col-key)]
-          (eval-date-add-to-long (first args) (second args) col-data length))
+          (eval-date-add-to-long (first args) (second args) col-key col-data length))
+
+        :time-bucket
+        ;; Delegate to polymorphic path (returns long[]).
+        (let [r (eval-expr-polymorphic expr col-arrays length cache)]
+          (if (long-array? r)
+            r
+            (let [la (long-array length)]
+              (dotimes [i length] (aset la i (long (aget ^doubles r i))))
+              la)))
 
         ;; Extract operations — return long[] directly, skip double[] round-trip
-        (#{:year :month :day :hour :minute :second :day-of-week :week-of-year} (:op expr))
-        (let [col-key (first args)
+        (#{:year :month :day :hour :minute :second :millisecond :microsecond :day-of-week :week-of-year} (:op expr))
+        (let [op (:op expr)
+              col-key (first args)
               col-data (get col-arrays col-key)
-              ^longs long-data (ensure-longs col-data length)]
-          (case (:op expr)
-            :year         (ColumnOpsLong/arrayExtractYearLong long-data (int length))
-            :month        (ColumnOpsLong/arrayExtractMonthLong long-data (int length))
-            :day          (ColumnOpsLong/arrayExtractDayLong long-data (int length))
-            :hour         (ColumnOpsLong/arrayExtractHourLong long-data (int length))
-            :minute       (ColumnOpsLong/arrayExtractMinuteLong long-data (int length))
-            :second       (ColumnOpsLong/arrayExtractSecondLong long-data (int length))
-            :day-of-week  (ColumnOpsLong/arrayExtractDayOfWeekLong long-data (int length))
-            :week-of-year (ColumnOpsLong/arrayExtractWeekOfYearLong long-data (int length))))
+              ^longs long-data (ensure-longs col-data length)
+              tu (col-temporal-unit col-key
+                                    (case op
+                                      (:hour :minute :second :millisecond :microsecond) :seconds
+                                      (:year :month :day :day-of-week :week-of-year) :days))]
+          (case tu
+            :micros
+            (case op
+              :hour         (let [r (long-array length)]
+                              (dotimes [i length]
+                                (aset r i (quot (Math/floorMod (aget long-data i) 86400000000) 3600000000)))
+                              r)
+              :minute       (let [r (long-array length)]
+                              (dotimes [i length]
+                                (aset r i (quot (Math/floorMod (aget long-data i) 3600000000) 60000000)))
+                              r)
+              :second       (let [r (long-array length)]
+                              (dotimes [i length]
+                                (aset r i (quot (Math/floorMod (aget long-data i) 60000000) 1000000)))
+                              r)
+              :millisecond  (let [r (long-array length)]
+                              (dotimes [i length]
+                                (aset r i (quot (Math/floorMod (aget long-data i) 1000000) 1000)))
+                              r)
+              :microsecond  (let [r (long-array length)]
+                              (dotimes [i length]
+                                (aset r i (Math/floorMod (aget long-data i) 1000000)))
+                              r)
+              ;; Day/month/year: convert micros to days first
+              (:year :month :day :day-of-week :week-of-year)
+              (let [ed (long-array length)]
+                (dotimes [i length] (aset ed i (Math/floorDiv (aget long-data i) 86400000000)))
+                (case op
+                  :year         (ColumnOpsLong/arrayExtractYearLong ed (int length))
+                  :month        (ColumnOpsLong/arrayExtractMonthLong ed (int length))
+                  :day          (ColumnOpsLong/arrayExtractDayLong ed (int length))
+                  :day-of-week  (ColumnOpsLong/arrayExtractDayOfWeekLong ed (int length))
+                  :week-of-year (ColumnOpsLong/arrayExtractWeekOfYearLong ed (int length)))))
+            ;; :seconds / :days legacy path (unchanged behavior — extractor encodes its assumed unit)
+            (case op
+              :year         (ColumnOpsLong/arrayExtractYearLong long-data (int length))
+              :month        (ColumnOpsLong/arrayExtractMonthLong long-data (int length))
+              :day          (ColumnOpsLong/arrayExtractDayLong long-data (int length))
+              :hour         (ColumnOpsLong/arrayExtractHourLong long-data (int length))
+              :minute       (ColumnOpsLong/arrayExtractMinuteLong long-data (int length))
+              :second       (ColumnOpsLong/arrayExtractSecondLong long-data (int length))
+              :millisecond  (throw (ex-info "EXTRACT MILLISECOND requires :temporal-unit :micros column"
+                                            {:col col-key}))
+              :microsecond  (throw (ex-info "EXTRACT MICROSECOND requires :temporal-unit :micros column"
+                                            {:col col-key}))
+              :day-of-week  (ColumnOpsLong/arrayExtractDayOfWeekLong long-data (int length))
+              :week-of-year (ColumnOpsLong/arrayExtractWeekOfYearLong long-data (int length)))))
 
         ;; Fall back to eval-expr-vectorized + double→long conversion
         (let [result-arr (eval-expr-vectorized expr col-arrays length cache)

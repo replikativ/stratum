@@ -236,16 +236,16 @@
               (str "cat " c)))))
     (testing "GROUP BY cat, AVG(x+5)"
       (let [expected (expected-by-cat
-                       n n-cats
-                       #(+ 5.0 (/ (reduce + 0.0 %) (double (count %)))))]
+                      n n-cats
+                      #(+ 5.0 (/ (reduce + 0.0 %) (double (count %)))))]
         (doseq [c (range n-cats)]
           (is (= (get expected c) (get avg-by-cat c))
               (str "cat " c)))))
     (testing "GROUP BY cat, MIN(-2*x) (op flip via negative scale)"
       ;; MIN(-2x) over each group's x values = -2 * MAX(x in group)
       (let [expected (expected-by-cat
-                       n n-cats
-                       #(* -2.0 (double (apply max %))))]
+                      n n-cats
+                      #(* -2.0 (double (apply max %))))]
         (doseq [c (range n-cats)]
           (is (= (get expected c) (get min-by-cat c))
               (str "cat " c)))))))

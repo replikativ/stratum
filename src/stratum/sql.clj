@@ -25,7 +25,7 @@
            [net.sf.jsqlparser.expression
             Alias Function LongValue DoubleValue StringValue NullValue
             Parenthesis NotExpression CaseExpression WhenClause SignedExpression
-            CastExpression AnalyticExpression IntervalExpression
+            CastExpression AnalyticExpression IntervalExpression ExtractExpression
             WindowElement WindowElement$Type WindowOffset WindowOffset$Type WindowRange]
            [net.sf.jsqlparser.statement.select
             WithItem ParenthesedSelect SetOperationList UnionOp IntersectOp ExceptOp MinusOp]
@@ -177,6 +177,19 @@
         "date" (if (string? inner)
                  (.toEpochDay (java.time.LocalDate/parse inner))
                  [:cast inner :date])
+        ;; TIMESTAMP literal — parse string to epoch-microseconds (matches the
+        ;; canonical micros-precision TIMESTAMP storage). For non-literal
+        ;; expressions, fall through to a runtime cast.
+        ("timestamp" "timestamptz" "timestamp without time zone" "timestamp with time zone")
+        (if (string? inner)
+          ;; Accept "YYYY-MM-DD HH:MM:SS[.fff[fff]]" or ISO "T" separator.
+          (let [normalized (clojure.string/replace inner #" " "T")
+                ldt (java.time.LocalDateTime/parse normalized)
+                inst (.toInstant ldt java.time.ZoneOffset/UTC)
+                secs (.getEpochSecond inst)
+                nanos (.getNano inst)]
+            (+ (* secs 1000000) (long (/ nanos 1000))))
+          [:cast inner :timestamp])
         ;; Default: pass through unmodified
         inner))
 
@@ -197,6 +210,28 @@
                              (translate-expr (.getThenExpression w))])
                           whens)]
         (into [:case] (concat clauses (when else-expr [[:else else-expr]])))))
+
+    ;; EXTRACT(field FROM col) — emit the granular op (:hour, :year, etc.).
+    ;; Recognized fields: year, month, day, hour, minute, second,
+    ;; millisecond, microsecond, day-of-week (DOW), week-of-year (WEEK).
+    (instance? ExtractExpression expr)
+    (let [^ExtractExpression ee expr
+          field (some-> (.getName ee) str/upper-case str/trim)
+          col (translate-expr (.getExpression ee))
+          op (case field
+               "YEAR" :year
+               "MONTH" :month
+               "DAY" :day
+               "HOUR" :hour
+               "MINUTE" :minute
+               "SECOND" :second
+               "MILLISECOND" :millisecond
+               "MICROSECOND" :microsecond
+               ("DOW" "ISODOW" "DAYOFWEEK") :day-of-week
+               ("WEEK" "ISOWEEK" "WEEKOFYEAR") :week-of-year
+               (throw (ex-info (str "Unsupported EXTRACT field: " field)
+                               {:field field})))]
+      [op col])
 
     ;; INTERVAL expression — convert to epoch-day count for date arithmetic
     (instance? IntervalExpression expr)
@@ -305,6 +340,19 @@
       "EPOCH_DAYS" [:epoch-days (first params)]
       "EPOCH_SECONDS" [:epoch-seconds (first params)]
 
+      ;; TIME_BUCKET(width, 'unit', col)  — DuckDB / TimescaleDB-compatible
+      ;; bucketing. Width is an integer; unit is a string ('minutes' / 'hours'
+      ;; / 'days' / 'months' / 'weeks' / etc.); col is a temporal column.
+      "TIME_BUCKET"
+      (cond
+        (= 3 n-params)
+        [:time-bucket (first params) (keyword (.toLowerCase ^String (second params))) (nth params 2)]
+        (= 4 n-params)
+        [:time-bucket (first params) (keyword (.toLowerCase ^String (second params))) (nth params 2) (nth params 3)]
+        :else
+        (throw (ex-info "TIME_BUCKET requires (width, unit, column [, origin])"
+                        {:params params})))
+
       ;; Anomaly detection — 1-arg short form uses model's feature names,
       ;; N-arg long form maps positional args to features
       "ANOMALY_SCORE"
@@ -404,6 +452,23 @@
              "MAX" :max
              "LAG" :lag
              "LEAD" :lead
+             "FIRST_VALUE" :first-value
+             "LAST_VALUE" :last-value
+             "NTH_VALUE" :nth-value
+             ;; q-style sliding aggregates — a single OVER (PARTITION BY ...
+             ;; ORDER BY ...) applies the moving-window semantics. The width
+             ;; rides on the function's second positional argument, encoded
+             ;; here as :offset on the window spec.
+             "MAVG" :mavg
+             "MSUM" :msum
+             "MMIN" :mmin
+             "MMAX" :mmax
+             "MCOUNT" :mcount
+             "MDEV" :mdev
+             ;; Time-series window ops with no width parameter
+             ("FILLS" "LOCF") :fills
+             "EMA" :ema
+             "RLEID" :rleid
              (throw (ex-info (str "Unsupported window function: " name)
                              {:function name})))
         ;; Check if argument is a nested aggregate (e.g. SUM(SUM(x)))
@@ -1083,7 +1148,33 @@
         [:date-trunc (keyword (.toLowerCase ^String (first params))) (second params)]
 
         "EXTRACT"
-        [:extract (keyword (.toLowerCase ^String (first params))) (second params)]
+        ;; EXTRACT in GROUP BY can come through as a Function (params=[field, col])
+        ;; in addition to the ExtractExpression form handled in translate-expr.
+        ;; Map to the granular op so normalization recognizes it.
+        (let [field (.toUpperCase ^String (first params))
+              op (case field
+                   "YEAR" :year "MONTH" :month "DAY" :day
+                   "HOUR" :hour "MINUTE" :minute "SECOND" :second
+                   "MILLISECOND" :millisecond "MICROSECOND" :microsecond
+                   "DOW" :day-of-week "ISODOW" :day-of-week "DAYOFWEEK" :day-of-week
+                   "WEEK" :week-of-year "ISOWEEK" :week-of-year "WEEKOFYEAR" :week-of-year
+                   (throw (ex-info (str "Unsupported EXTRACT field: " field)
+                                   {:field field})))]
+          [op (second params)])
+
+        "TIME_BUCKET"
+        (cond
+          (= 3 (count params))
+          [:time-bucket (first params)
+           (keyword (.toLowerCase ^String (second params)))
+           (nth params 2)]
+          (= 4 (count params))
+          [:time-bucket (first params)
+           (keyword (.toLowerCase ^String (second params)))
+           (nth params 2) (nth params 3)]
+          :else
+          (throw (ex-info "TIME_BUCKET requires (width, unit, column [, origin])"
+                          {:params params})))
 
         ;; Other function expressions in GROUP BY
         (into [(keyword (.toLowerCase name))] params)))
@@ -1304,424 +1395,442 @@
   ([^PlainSelect select table-registry]
    (translate-select select table-registry nil))
   ([^PlainSelect select table-registry asof-markers]
-  (let [select-items (.getSelectItems select)
-        from-item (.getFromItem select)
-        where-expr (.getWhere select)
-        group-by (.getGroupBy select)
-        having-expr (.getHaving select)
-        order-by (.getOrderByElements select)
-        limit (.getLimit select)
-        offset (.getOffset select)
-        distinct? (.getDistinct select)
-        joins (.getJoins select)
+   (let [select-items (.getSelectItems select)
+         from-item (.getFromItem select)
+         where-expr (.getWhere select)
+         group-by (.getGroupBy select)
+         having-expr (.getHaving select)
+         order-by (.getOrderByElements select)
+         limit (.getLimit select)
+         offset (.getOffset select)
+         distinct? (.getDistinct select)
+         joins (.getJoins select)
 
         ;; Resolve FROM — either a table reference or a subquery
         ;; Use alias if present (e.g., FROM t1 a → "a"), otherwise real name
-        from-table-name (when (instance? Table from-item)
-                          (let [alias (.getAlias ^Table from-item)]
-                            (if alias (.getName alias) (.getName ^Table from-item))))
+         from-table-name (when (instance? Table from-item)
+                           (let [alias (.getAlias ^Table from-item)]
+                             (if alias (.getName alias) (.getName ^Table from-item))))
         ;; Real table name for registry lookup (alias may differ)
-        from-real-name (when (instance? Table from-item)
-                         (.getName ^Table from-item))
+         from-real-name (when (instance? Table from-item)
+                          (.getName ^Table from-item))
         ;; Handle FROM (SELECT ...) AS alias — subquery in FROM
-        [from-data table-registry]
-        (cond
+         [from-data table-registry]
+         (cond
           ;; Subquery in FROM
-          (instance? ParenthesedSelect from-item)
-          (let [^ParenthesedSelect ps from-item
-                inner-select (.getPlainSelect ps)
-                inner-query (translate-select inner-select table-registry)
+           (instance? ParenthesedSelect from-item)
+           (let [^ParenthesedSelect ps from-item
+                 inner-select (.getPlainSelect ps)
+                 inner-query (translate-select inner-select table-registry)
                 ;; Execute the subquery and materialize to column arrays
-                inner-result (q/q inner-query)
-                col-map (if (and (map? inner-result) (:n-rows inner-result))
-                          inner-result
+                 inner-result (q/q inner-query)
+                 col-map (if (and (map? inner-result) (:n-rows inner-result))
+                           inner-result
                           ;; Convert vector of maps to column arrays
-                          (q/results->columns inner-result))
-                alias-name (when-let [a (.getAlias ps)]
-                             (.getName a))]
-            [col-map (if alias-name
-                       (assoc table-registry alias-name col-map)
-                       table-registry)])
+                           (q/results->columns inner-result))
+                 alias-name (when-let [a (.getAlias ps)]
+                              (.getName a))]
+             [col-map (if alias-name
+                        (assoc table-registry alias-name col-map)
+                        table-registry)])
 
           ;; Normal table reference — look up by real name, register under alias
-          from-real-name
-          (let [data (get table-registry from-real-name)]
-            (when (nil? data)
-              (throw (ex-info (str "Unknown table: " from-real-name)
-                              {:table from-real-name
-                               :available (keys table-registry)})))
-            [data (if (not= from-table-name from-real-name)
-                    (assoc table-registry from-table-name data)
-                    table-registry)])
+           from-real-name
+           (let [raw-data (get table-registry from-real-name)
+                 _ (when (nil? raw-data)
+                     (throw (ex-info (str "Unknown table: " from-real-name)
+                                     {:table from-real-name
+                                      :available (keys table-registry)})))
+                 ;; Decorate temporal columns with their :temporal-unit so the
+                 ;; planner / expression engine can dispatch date kernels at the
+                 ;; right precision. The schema lives as Clojure metadata on
+                 ;; the table map (set by CREATE TABLE; see server.clj /
+                 ;; sqllogictest_test.clj).
+                 schema (some-> raw-data meta :column-schema)
+                 data (if (seq schema)
+                        (into {}
+                              (map (fn [[k v]]
+                                     (if-let [tu (get-in schema [k :temporal-unit])]
+                                       (cond
+                                         (map? v)        [k (assoc v :temporal-unit tu)]
+                                         (instance? (Class/forName "[J") v)
+                                         [k {:type :int64 :data v :temporal-unit tu}]
+                                         :else [k v])
+                                       [k v])))
+                              raw-data)
+                        raw-data)]
+             [data (if (not= from-table-name from-real-name)
+                     (assoc table-registry from-table-name data)
+                     table-registry)])
 
           ;; No FROM clause — synthesize a single-row dummy table
-          :else [{:__dummy (long-array [0])} table-registry])
+           :else [{:__dummy (long-array [0])} table-registry])
 
         ;; Classify select items into projections vs aggregates vs window functions
-        has-group? (some? group-by)
-        has-agg? (some #(select-item-is-agg? (.getExpression ^SelectItem %)) select-items)
-        has-window? (some #(window-function? (.getExpression ^SelectItem %)) select-items)
-        all-star? (and (= 1 (count select-items))
-                       (instance? AllColumns (.getExpression ^SelectItem (first select-items))))
+         has-group? (some? group-by)
+         has-agg? (some #(select-item-is-agg? (.getExpression ^SelectItem %)) select-items)
+         has-window? (some #(window-function? (.getExpression ^SelectItem %)) select-items)
+         all-star? (and (= 1 (count select-items))
+                        (instance? AllColumns (.getExpression ^SelectItem (first select-items))))
 
         ;; Extract window function specs
-        window-specs (when has-window?
-                       (->> select-items
-                            (keep (fn [^SelectItem item]
-                                    (let [expr (.getExpression item)]
-                                      (when (window-function? expr)
-                                        (translate-window-function expr (.getAliasName item))))))
-                            (vec)))
+         window-specs (when has-window?
+                        (->> select-items
+                             (keep (fn [^SelectItem item]
+                                     (let [expr (.getExpression item)]
+                                       (when (window-function? expr)
+                                         (translate-window-function expr (.getAliasName item))))))
+                             (vec)))
 
         ;; Build aggregation specs from SELECT items.
         ;; Compound expressions like MAX(v1)-MIN(v2) are decomposed into individual
         ;; aggs; a post-processing step computes the final expression.
-        agg-counter (atom 0)
-        agg-items-raw (when (or has-agg? has-group?)
-                        (->> select-items
-                             (keep (fn [^SelectItem item]
-                                     (let [expr (.getExpression item)
-                                           alias-name (.getAliasName item)]
-                                       (when (select-item-is-agg? expr)
-                                         (let [simple-agg (extract-agg-from-expr expr)]
-                                           (if simple-agg
+         agg-counter (atom 0)
+         agg-items-raw (when (or has-agg? has-group?)
+                         (->> select-items
+                              (keep (fn [^SelectItem item]
+                                      (let [expr (.getExpression item)
+                                            alias-name (.getAliasName item)]
+                                        (when (select-item-is-agg? expr)
+                                          (let [simple-agg (extract-agg-from-expr expr)]
+                                            (if simple-agg
                                              ;; Simple aggregate: SUM(x), COUNT(*), etc.
-                                             {:aggs [(if alias-name
-                                                       [:as simple-agg (keyword alias-name)]
-                                                       simple-agg)]}
+                                              {:aggs [(if alias-name
+                                                        [:as simple-agg (keyword alias-name)]
+                                                        simple-agg)]}
                                              ;; Compound: MAX(v1) - MIN(v2) AS alias, or CASE with agg
-                                             (let [collected (collect-aggs-from-expr expr agg-counter)
-                                                   agg-map (into {} (map (fn [[spec kw]] [spec kw]) collected))
-                                                   post-expr (build-post-expr expr agg-map)
-                                                   eff-alias (keyword (or alias-name
-                                                                          (str "_case_" (swap! agg-counter inc))))]
-                                               {:aggs (mapv (fn [[spec kw]] [:as spec kw]) collected)
-                                                :post-agg {:alias eff-alias
-                                                           :expr post-expr
-                                                           :sources (mapv second collected)}})))))))
-                             (vec)))
-        aggs (when (seq agg-items-raw)
-               (vec (mapcat :aggs agg-items-raw)))
-        post-aggs (vec (keep :post-agg agg-items-raw))
+                                              (let [collected (collect-aggs-from-expr expr agg-counter)
+                                                    agg-map (into {} (map (fn [[spec kw]] [spec kw]) collected))
+                                                    post-expr (build-post-expr expr agg-map)
+                                                    eff-alias (keyword (or alias-name
+                                                                           (str "_case_" (swap! agg-counter inc))))]
+                                                {:aggs (mapv (fn [[spec kw]] [:as spec kw]) collected)
+                                                 :post-agg {:alias eff-alias
+                                                            :expr post-expr
+                                                            :sources (mapv second collected)}})))))))
+                              (vec)))
+         aggs (when (seq agg-items-raw)
+                (vec (mapcat :aggs agg-items-raw)))
+         post-aggs (vec (keep :post-agg agg-items-raw))
 
         ;; Collect inner-agg specs from window functions (e.g. SUM(SUM(x)) OVER ...)
         ;; and inject them into the agg list so GROUP BY materializes them
-        inner-aggs (when (seq window-specs)
-                     (vec (keep :_inner-agg window-specs)))
-        aggs (if (seq inner-aggs)
-               (into (or aggs []) inner-aggs)
-               aggs)
+         inner-aggs (when (seq window-specs)
+                      (vec (keep :_inner-agg window-specs)))
+         aggs (if (seq inner-aggs)
+                (into (or aggs []) inner-aggs)
+                aggs)
         ;; Strip :_inner-agg from window specs (query engine doesn't need it)
-        window-specs (when (seq window-specs)
-                       (mapv #(dissoc % :_inner-agg) window-specs))
+         window-specs (when (seq window-specs)
+                        (mapv #(dissoc % :_inner-agg) window-specs))
 
         ;; Build _select-columns: describes each output column for final projection.
         ;; Used only when literals need injection into agg/group-by queries.
         ;; Agg specs use {:type :agg} without a key — the key is discovered
         ;; at apply-select-columns time by positional matching against result keys.
-        select-column-specs
-        (->> select-items
-             (map-indexed
-              (fn [idx ^SelectItem item]
-                (let [expr (.getExpression item)
-                      alias (.getAliasName item)]
-                  (cond
+         select-column-specs
+         (->> select-items
+              (map-indexed
+               (fn [idx ^SelectItem item]
+                 (let [expr (.getExpression item)
+                       alias (.getAliasName item)]
+                   (cond
                      ;; SELECT *
-                    (instance? AllColumns expr)
-                    (mapv (fn [k] {:type :ref :key k}) (keys from-data))
+                     (instance? AllColumns expr)
+                     (mapv (fn [k] {:type :ref :key k}) (keys from-data))
 
                      ;; Aggregate function
-                    (select-item-is-agg? expr)
-                    [{:type :agg :alias (when alias (keyword alias))}]
+                     (select-item-is-agg? expr)
+                     [{:type :agg :alias (when alias (keyword alias))}]
 
                      ;; Window function
-                    (window-function? expr)
-                    [{:type :ref :key (keyword (or alias (str "_win_" idx)))}]
+                     (window-function? expr)
+                     [{:type :ref :key (keyword (or alias (str "_win_" idx)))}]
 
                      ;; Column reference, literal, or expression
-                    :else
-                    (let [col-expr (translate-expr expr)]
-                      [(cond
-                         (keyword? col-expr)
-                         {:type :ref :key (if alias (keyword alias) col-expr)
-                          :source col-expr}
+                     :else
+                     (let [col-expr (translate-expr expr)]
+                       [(cond
+                          (keyword? col-expr)
+                          {:type :ref :key (if alias (keyword alias) col-expr)
+                           :source col-expr}
 
-                         (number? col-expr)
-                         {:type :literal :key (if alias (keyword alias)
-                                                  (keyword (str col-expr)))
-                          :value col-expr}
+                          (number? col-expr)
+                          {:type :literal :key (if alias (keyword alias)
+                                                   (keyword (str col-expr)))
+                           :value col-expr}
 
-                         (string? col-expr)
-                         {:type :literal :key (if alias (keyword alias)
-                                                  (keyword (str "'" col-expr "'")))
-                          :value col-expr}
+                          (string? col-expr)
+                          {:type :literal :key (if alias (keyword alias)
+                                                   (keyword (str "'" col-expr "'")))
+                           :value col-expr}
 
-                         :else ;; expression like [:* :a :b]
-                         {:type :ref :key (if alias (keyword alias)
-                                              (keyword (str "_expr_" idx)))})])))))
-             (mapcat identity)
-             (vec))
+                          :else ;; expression like [:* :a :b]
+                          {:type :ref :key (if alias (keyword alias)
+                                               (keyword (str "_expr_" idx)))})])))))
+              (mapcat identity)
+              (vec))
 
         ;; For non-aggregate SELECT without GROUP BY (pure projection)
         ;; Exclude window functions — they are handled separately
-        projection (cond
+         projection (cond
                      ;; SELECT * — project all columns from the source table
-                     (and (not has-agg?) (not has-group?) all-star?)
-                     (vec (keys from-data))
+                      (and (not has-agg?) (not has-group?) all-star?)
+                      (vec (keys from-data))
 
                      ;; Explicit SELECT columns (non-aggregate, non-group)
-                     (and (not has-agg?) (not has-group?) (not all-star?))
-                     (->> select-items
-                          (keep (fn [^SelectItem item]
-                                  (let [expr (.getExpression item)]
-                                    (when-not (window-function? expr)
-                                      (let [alias-name (.getAliasName item)
-                                            col-expr (translate-expr expr)]
-                                        (if alias-name
-                                          [:as col-expr (keyword alias-name)]
-                                          col-expr))))))
-                          (vec)))
+                      (and (not has-agg?) (not has-group?) (not all-star?))
+                      (->> select-items
+                           (keep (fn [^SelectItem item]
+                                   (let [expr (.getExpression item)]
+                                     (when-not (window-function? expr)
+                                       (let [alias-name (.getAliasName item)
+                                             col-expr (translate-expr expr)]
+                                         (if alias-name
+                                           [:as col-expr (keyword alias-name)]
+                                           col-expr))))))
+                           (vec)))
 
         ;; Build WHERE predicates
-        preds-raw (when where-expr
-                    (translate-predicate where-expr))
+         preds-raw (when where-expr
+                     (translate-predicate where-expr))
 
         ;; Resolve subqueries: IN/NOT IN, EXISTS/NOT EXISTS
-        exists-false? (atom false)
-        preds (when (seq preds-raw)
-                (into []
-                      (mapcat (fn [pred]
+         exists-false? (atom false)
+         preds (when (seq preds-raw)
+                 (into []
+                       (mapcat (fn [pred]
                             ;; Normalize [:not [:exists-subquery ...]] → [:not-exists-subquery ...]
-                                (let [pred (if (and (= :not (first pred))
-                                                    (#{:exists-subquery :not-exists-subquery} (first (second pred))))
-                                             (let [inner (second pred)
-                                                   flipped (if (= :exists-subquery (first inner))
-                                                             :not-exists-subquery :exists-subquery)]
-                                               (into [flipped] (rest inner)))
-                                             pred)]
-                                  (case (first pred)
-                                    (:in-subquery :not-in-subquery)
-                                    (let [col (second pred)
-                                          {:keys [subquery-select]} (nth pred 2)
-                                          inner-query (translate-select subquery-select table-registry)
-                                          inner-result (q/q inner-query)
-                                          vals (if (sequential? inner-result)
-                                                 (vec (distinct (map #(val (first %)) inner-result)))
-                                                 [])]
-                                      [(into [(if (= :in-subquery (first pred)) :in :not-in) col] vals)])
+                                 (let [pred (if (and (= :not (first pred))
+                                                     (#{:exists-subquery :not-exists-subquery} (first (second pred))))
+                                              (let [inner (second pred)
+                                                    flipped (if (= :exists-subquery (first inner))
+                                                              :not-exists-subquery :exists-subquery)]
+                                                (into [flipped] (rest inner)))
+                                              pred)]
+                                   (case (first pred)
+                                     (:in-subquery :not-in-subquery)
+                                     (let [col (second pred)
+                                           {:keys [subquery-select]} (nth pred 2)
+                                           inner-query (translate-select subquery-select table-registry)
+                                           inner-result (q/q inner-query)
+                                           vals (if (sequential? inner-result)
+                                                  (vec (distinct (map #(val (first %)) inner-result)))
+                                                  [])]
+                                       [(into [(if (= :in-subquery (first pred)) :in :not-in) col] vals)])
 
-                                    (:exists-subquery :not-exists-subquery)
-                                    (let [{:keys [subquery-select]} (first (rest pred))
-                                          inner-query (translate-select subquery-select table-registry)
-                                          inner-result (q/q (assoc inner-query :limit 1))
-                                          has-rows? (if (sequential? inner-result) (pos? (count inner-result)) false)
-                                          cond-met? (if (= :exists-subquery (first pred)) has-rows? (not has-rows?))]
-                                      (when-not cond-met? (reset! exists-false? true))
-                                      []) ;; EXISTS is resolved at parse time, no runtime predicate needed
+                                     (:exists-subquery :not-exists-subquery)
+                                     (let [{:keys [subquery-select]} (first (rest pred))
+                                           inner-query (translate-select subquery-select table-registry)
+                                           inner-result (q/q (assoc inner-query :limit 1))
+                                           has-rows? (if (sequential? inner-result) (pos? (count inner-result)) false)
+                                           cond-met? (if (= :exists-subquery (first pred)) has-rows? (not has-rows?))]
+                                       (when-not cond-met? (reset! exists-false? true))
+                                       []) ;; EXISTS is resolved at parse time, no runtime predicate needed
 
-                                    [pred])))
-                              preds-raw)))
+                                     [pred])))
+                               preds-raw)))
 
         ;; Build GROUP BY specs
-        groups (when group-by
-                 (let [group-exprs (.getGroupByExpressionList group-by)]
-                   (mapv #(translate-group-expr % select-items) group-exprs)))
+         groups (when group-by
+                  (let [group-exprs (.getGroupByExpressionList group-by)]
+                    (mapv #(translate-group-expr % select-items) group-exprs)))
 
         ;; Build HAVING predicates
-        having-preds (when having-expr
-                       (translate-predicate having-expr))
+         having-preds (when having-expr
+                        (translate-predicate having-expr))
 
         ;; Inject HAVING-referenced aggregates that aren't already in the agg list.
         ;; E.g., SELECT g, SUM(a) FROM t GROUP BY g HAVING AVG(a) > 4
         ;; needs AVG(a) computed even though it's not in SELECT.
-        having-agg-specs (when having-expr
-                           (collect-aggs-from-having-expr having-expr))
-        existing-bare-aggs (set (map (fn [a] (if (= :as (first a)) (second a) a))
-                                     (or aggs [])))
-        having-only-aggs (vec (distinct (remove existing-bare-aggs (or having-agg-specs []))))
+         having-agg-specs (when having-expr
+                            (collect-aggs-from-having-expr having-expr))
+         existing-bare-aggs (set (map (fn [a] (if (= :as (first a)) (second a) a))
+                                      (or aggs [])))
+         having-only-aggs (vec (distinct (remove existing-bare-aggs (or having-agg-specs []))))
         ;; Give each HAVING-only agg an explicit alias matching its HAVING reference
         ;; key (:{op}_{col}). This ensures auto-alias-aggs won't rename it, and the
         ;; key used for stripping matches the actual result key.
-        having-only-keys (when (seq having-only-aggs)
-                           (set (map (fn [spec]
-                                       (let [op-kw (first spec)
-                                             col-kw (second spec)]
-                                         (if col-kw
-                                           (keyword (str (name op-kw) "_" (name col-kw)))
-                                           op-kw)))
-                                     having-only-aggs)))
-        having-only-aliased (mapv (fn [spec]
-                                    (let [op-kw (first spec)
-                                          col-kw (second spec)
-                                          alias (if col-kw
-                                                  (keyword (str (name op-kw) "_" (name col-kw)))
-                                                  op-kw)]
-                                      [:as spec alias]))
-                                  having-only-aggs)
-        aggs (if (seq having-only-aliased)
-               (into (or aggs []) having-only-aliased)
-               aggs)
+         having-only-keys (when (seq having-only-aggs)
+                            (set (map (fn [spec]
+                                        (let [op-kw (first spec)
+                                              col-kw (second spec)]
+                                          (if col-kw
+                                            (keyword (str (name op-kw) "_" (name col-kw)))
+                                            op-kw)))
+                                      having-only-aggs)))
+         having-only-aliased (mapv (fn [spec]
+                                     (let [op-kw (first spec)
+                                           col-kw (second spec)
+                                           alias (if col-kw
+                                                   (keyword (str (name op-kw) "_" (name col-kw)))
+                                                   op-kw)]
+                                       [:as spec alias]))
+                                   having-only-aggs)
+         aggs (if (seq having-only-aliased)
+                (into (or aggs []) having-only-aliased)
+                aggs)
 
         ;; Build ORDER BY — inject aggregate expressions not already in agg list
-        order-agg-injections
-        (when (and order-by (or has-agg? has-group?))
-          (vec (keep (fn [^OrderByElement elem]
-                       (let [expr (.getExpression elem)]
-                         (when (and (instance? Function expr)
-                                    (aggregate-function? ^Function expr))
-                           (let [agg-spec (translate-aggregate ^Function expr)
+         order-agg-injections
+         (when (and order-by (or has-agg? has-group?))
+           (vec (keep (fn [^OrderByElement elem]
+                        (let [expr (.getExpression elem)]
+                          (when (and (instance? Function expr)
+                                     (aggregate-function? ^Function expr))
+                            (let [agg-spec (translate-aggregate ^Function expr)
                                  ;; Build the alias key the same way translate-expr does
-                                 ^Function f expr
-                                 agg-name-upper (-> (.getName f) (.toUpperCase))
-                                 params (when-let [p (.getParameters f)]
-                                          (mapv translate-expr p))
-                                 alias-kw (if (and (seq params) (keyword? (first params)))
-                                            (keyword (str (.toLowerCase agg-name-upper) "_" (name (first params))))
-                                            (keyword (.toLowerCase agg-name-upper)))]
-                             {:spec agg-spec :alias alias-kw}))))
-                     order-by)))
+                                  ^Function f expr
+                                  agg-name-upper (-> (.getName f) (.toUpperCase))
+                                  params (when-let [p (.getParameters f)]
+                                           (mapv translate-expr p))
+                                  alias-kw (if (and (seq params) (keyword? (first params)))
+                                             (keyword (str (.toLowerCase agg-name-upper) "_" (name (first params))))
+                                             (keyword (.toLowerCase agg-name-upper)))]
+                              {:spec agg-spec :alias alias-kw}))))
+                      order-by)))
         ;; Filter out aggs already in the list
-        order-agg-injections
-        (when (seq order-agg-injections)
-          (let [existing-aliases (set (map (fn [a]
-                                             (if (= :as (first a))
-                                               (nth a 2)
-                                               (let [spec (if (= :as (first a)) (second a) a)]
-                                                 (let [op-kw (first spec)
-                                                       col-kw (second spec)]
-                                                   (if col-kw
-                                                     (keyword (str (name op-kw) "_" (name col-kw)))
-                                                     op-kw)))))
-                                           (or aggs [])))]
-            (vec (remove #(contains? existing-aliases (:alias %)) order-agg-injections))))
-        aggs (if (seq order-agg-injections)
-               (into (or aggs [])
-                     (mapv (fn [{:keys [spec alias]}]
-                             [:as spec alias])
-                           order-agg-injections))
-               aggs)
-        orders (when order-by
-                 (mapv translate-order-element order-by))
+         order-agg-injections
+         (when (seq order-agg-injections)
+           (let [existing-aliases (set (map (fn [a]
+                                              (if (= :as (first a))
+                                                (nth a 2)
+                                                (let [spec (if (= :as (first a)) (second a) a)]
+                                                  (let [op-kw (first spec)
+                                                        col-kw (second spec)]
+                                                    (if col-kw
+                                                      (keyword (str (name op-kw) "_" (name col-kw)))
+                                                      op-kw)))))
+                                            (or aggs [])))]
+             (vec (remove #(contains? existing-aliases (:alias %)) order-agg-injections))))
+         aggs (if (seq order-agg-injections)
+                (into (or aggs [])
+                      (mapv (fn [{:keys [spec alias]}]
+                              [:as spec alias])
+                            order-agg-injections))
+                aggs)
+         orders (when order-by
+                  (mapv translate-order-element order-by))
 
         ;; Build LIMIT/OFFSET
-        limit-val (when limit
-                    (let [rc (.getRowCount limit)]
-                      (when (instance? LongValue rc)
-                        (.getValue ^LongValue rc))))
-        offset-val (when offset
-                     (let [ov (.getOffset offset)]
-                       (when (instance? LongValue ov)
-                         (.getValue ^LongValue ov))))
+         limit-val (when limit
+                     (let [rc (.getRowCount limit)]
+                       (when (instance? LongValue rc)
+                         (.getValue ^LongValue rc))))
+         offset-val (when offset
+                      (let [ov (.getOffset offset)]
+                        (when (instance? LongValue ov)
+                          (.getValue ^LongValue ov))))
 
         ;; Build JOINs
-        join-specs-raw (when (seq joins)
-                         (vec (map-indexed
-                               (fn [idx j]
-                                 (translate-join j table-registry from-table-name
-                                                 (get asof-markers idx)))
-                               joins)))
+         join-specs-raw (when (seq joins)
+                          (vec (map-indexed
+                                (fn [idx j]
+                                  (translate-join j table-registry from-table-name
+                                                  (get asof-markers idx)))
+                                joins)))
 
         ;; Qualified column resolution: detect collisions and rewrite refs
         ;; Build join table info for ref-map
-        join-table-infos (when (seq join-specs-raw)
-                           (mapv (fn [^Join j]
-                                   (when (instance? Table (.getFromItem j))
-                                     (let [t ^Table (.getFromItem j)
-                                           alias (table-name t)
-                                           real-name (.getName t)
-                                           data (get table-registry real-name)]
-                                       {:alias alias
-                                        :cols (set (keys data))})))
-                                 joins))
+         join-table-infos (when (seq join-specs-raw)
+                            (mapv (fn [^Join j]
+                                    (when (instance? Table (.getFromItem j))
+                                      (let [t ^Table (.getFromItem j)
+                                            alias (table-name t)
+                                            real-name (.getName t)
+                                            data (get table-registry real-name)]
+                                        {:alias alias
+                                         :cols (set (keys data))})))
+                                  joins))
 
         ;; Build ref-map when joins exist and there are collisions
-        [ref-map collision-set renamed-keys-by-table]
-        (if (seq join-table-infos)
-          (build-join-ref-map from-table-name
-                              (set (keys from-data))
-                              (filterv some? join-table-infos))
-          [nil nil nil])
+         [ref-map collision-set renamed-keys-by-table]
+         (if (seq join-table-infos)
+           (build-join-ref-map from-table-name
+                               (set (keys from-data))
+                               (filterv some? join-table-infos))
+           [nil nil nil])
 
         ;; has-renames? — whether any column collides across tables (drives :with rename).
         ;; has-joins? — whether the query has any JOIN at all (drives qualified-ref rewriting,
         ;; since `t.col` ends up as `:t/col` and must be stripped/resolved before execution).
-        has-renames? (and ref-map (seq renamed-keys-by-table))
-        has-joins? (boolean (seq join-table-infos))
+         has-renames? (and ref-map (seq renamed-keys-by-table))
+         has-joins? (boolean (seq join-table-infos))
 
         ;; Rename join :with data keys for colliding columns
-        join-specs (if has-renames?
-                     (mapv (fn [spec table-info]
-                             (if-let [renames (and table-info
-                                                   (get renamed-keys-by-table (:alias table-info)))]
-                               (update spec :with rename-join-data-keys renames)
-                               spec))
-                           join-specs-raw
-                           (concat join-table-infos (repeat nil)))
-                     join-specs-raw)
+         join-specs (if has-renames?
+                      (mapv (fn [spec table-info]
+                              (if-let [renames (and table-info
+                                                    (get renamed-keys-by-table (:alias table-info)))]
+                                (update spec :with rename-join-data-keys renames)
+                                spec))
+                            join-specs-raw
+                            (concat join-table-infos (repeat nil)))
+                      join-specs-raw)
 
         ;; Rewrite all refs through ref-map (resolves qualified keywords + applies renames)
-        preds (if has-joins? (rewrite-refs ref-map preds) preds)
-        projection (if (and has-joins? projection) (rewrite-refs ref-map projection) projection)
-        groups (if has-joins? (rewrite-refs ref-map groups) groups)
-        having-preds (if has-joins? (rewrite-refs ref-map having-preds) having-preds)
-        orders (if has-joins? (rewrite-refs ref-map orders) orders)
-        aggs (if has-joins? (rewrite-refs ref-map aggs) aggs)
-        window-specs (if has-joins? (rewrite-refs ref-map window-specs) window-specs)
-        join-specs (if has-joins?
-                     (mapv (fn [spec]
-                             (cond-> spec
-                               (:on spec) (update :on (partial rewrite-refs ref-map))))
-                           join-specs)
-                     join-specs)
-        select-column-specs (if has-joins?
-                              (mapv (fn [spec]
-                                      (cond-> spec
-                                        (:source spec) (update :source #(rewrite-ref ref-map %))
-                                        (:key spec) (update :key #(rewrite-ref ref-map %))))
-                                    select-column-specs)
-                              select-column-specs)
+         preds (if has-joins? (rewrite-refs ref-map preds) preds)
+         projection (if (and has-joins? projection) (rewrite-refs ref-map projection) projection)
+         groups (if has-joins? (rewrite-refs ref-map groups) groups)
+         having-preds (if has-joins? (rewrite-refs ref-map having-preds) having-preds)
+         orders (if has-joins? (rewrite-refs ref-map orders) orders)
+         aggs (if has-joins? (rewrite-refs ref-map aggs) aggs)
+         window-specs (if has-joins? (rewrite-refs ref-map window-specs) window-specs)
+         join-specs (if has-joins?
+                      (mapv (fn [spec]
+                              (cond-> spec
+                                (:on spec) (update :on (partial rewrite-refs ref-map))))
+                            join-specs)
+                      join-specs)
+         select-column-specs (if has-joins?
+                               (mapv (fn [spec]
+                                       (cond-> spec
+                                         (:source spec) (update :source #(rewrite-ref ref-map %))
+                                         (:key spec) (update :key #(rewrite-ref ref-map %))))
+                                     select-column-specs)
+                               select-column-specs)
         ;; For SELECT * with joins: expand to include renamed join columns
-        projection (if (and has-renames? all-star? (not has-agg?) (not has-group?))
-                     (let [from-keys (vec (keys from-data))
-                           join-keys (mapcat (fn [spec table-info]
-                                               (when table-info
-                                                 (let [renames (get renamed-keys-by-table (:alias table-info))
-                                                       cols (keys (:with spec))]
-                                                   (mapv (fn [k]
-                                                           (if (and renames (get renames k))
-                                                             (get renames k)
-                                                             k))
-                                                         cols))))
-                                             join-specs
-                                             (concat join-table-infos (repeat nil)))]
-                       (into from-keys join-keys))
-                     projection)
+         projection (if (and has-renames? all-star? (not has-agg?) (not has-group?))
+                      (let [from-keys (vec (keys from-data))
+                            join-keys (mapcat (fn [spec table-info]
+                                                (when table-info
+                                                  (let [renames (get renamed-keys-by-table (:alias table-info))
+                                                        cols (keys (:with spec))]
+                                                    (mapv (fn [k]
+                                                            (if (and renames (get renames k))
+                                                              (get renames k)
+                                                              k))
+                                                          cols))))
+                                              join-specs
+                                              (concat join-table-infos (repeat nil)))]
+                        (into from-keys join-keys))
+                      projection)
 
         ;; Assemble query map
-        query (cond-> {:from from-data}
-                (seq preds) (assoc :where (vec preds))
-                (seq aggs) (assoc :agg aggs)
-                (seq groups) (assoc :group groups)
-                (seq having-preds) (assoc :having (vec having-preds))
-                (seq orders) (assoc :order orders)
-                limit-val (assoc :limit limit-val)
-                @exists-false? (assoc :limit 0)
-                offset-val (assoc :offset offset-val)
-                distinct? (assoc :distinct true)
-                (seq join-specs) (assoc :join join-specs)
-                projection (assoc :select projection)
-                (seq window-specs) (assoc :window window-specs)
-                (seq post-aggs) (assoc :_post-aggs post-aggs)
-                (seq having-only-keys) (assoc :_having-only-keys having-only-keys)
-                (seq order-agg-injections) (assoc :_order-only-keys
-                                                  (set (map :alias order-agg-injections)))
+         query (cond-> {:from from-data}
+                 (seq preds) (assoc :where (vec preds))
+                 (seq aggs) (assoc :agg aggs)
+                 (seq groups) (assoc :group groups)
+                 (seq having-preds) (assoc :having (vec having-preds))
+                 (seq orders) (assoc :order orders)
+                 limit-val (assoc :limit limit-val)
+                 @exists-false? (assoc :limit 0)
+                 offset-val (assoc :offset offset-val)
+                 distinct? (assoc :distinct true)
+                 (seq join-specs) (assoc :join join-specs)
+                 projection (assoc :select projection)
+                 (seq window-specs) (assoc :window window-specs)
+                 (seq post-aggs) (assoc :_post-aggs post-aggs)
+                 (seq having-only-keys) (assoc :_having-only-keys having-only-keys)
+                 (seq order-agg-injections) (assoc :_order-only-keys
+                                                   (set (map :alias order-agg-injections)))
                 ;; Only attach _select-columns when literals need injection into
                 ;; an aggregate/group-by query (the bug: literals are dropped).
                 ;; Pure projection queries use :select; don't interfere.
-                (and (or has-agg? has-group?)
-                     (some #(= :literal (:type %)) select-column-specs))
-                (assoc :_select-columns select-column-specs))]
-    query)))
+                 (and (or has-agg? has-group?)
+                      (some #(= :literal (:type %)) select-column-specs))
+                 (assoc :_select-columns select-column-specs))]
+     query)))
 
 ;; ============================================================================
 ;; Post-aggregate expression evaluation
@@ -2156,35 +2265,51 @@
 ;; ============================================================================
 
 (defn- sql-type->stratum-type
-  "Map SQL column type names to Stratum types."
+  "Map SQL column type names to a `{:type ... :temporal-unit ...?}` descriptor.
+   Temporal types pass back a `:temporal-unit` so columns can later track
+   day/seconds/micros precision uniformly through the expression engine."
   [^String type-str]
   (let [t (.toUpperCase type-str)]
     (cond
       (or (= t "INTEGER") (= t "INT") (= t "BIGINT") (= t "SMALLINT")
           (= t "TINYINT") (= t "INT4") (= t "INT8") (= t "SERIAL"))
-      :int64
+      {:type :int64}
 
       (or (= t "DOUBLE") (= t "FLOAT") (= t "REAL") (= t "NUMERIC")
           (= t "DECIMAL") (= t "DOUBLE PRECISION") (= t "FLOAT8") (= t "FLOAT4"))
-      :float64
+      {:type :float64}
 
       (or (= t "VARCHAR") (= t "TEXT") (= t "CHAR") (= t "STRING")
           (.startsWith t "VARCHAR(") (.startsWith t "CHAR("))
-      :string
+      {:type :string}
 
-      :else :string)))
+      ;; DATE — epoch-days
+      (= t "DATE")
+      {:type :int64 :temporal-unit :days}
+
+      ;; TIMESTAMP variants — epoch-microseconds (DuckDB convention)
+      (or (= t "TIMESTAMP") (= t "TIMESTAMPTZ")
+          (= t "TIMESTAMP WITHOUT TIME ZONE") (= t "TIMESTAMP WITH TIME ZONE"))
+      {:type :int64 :temporal-unit :micros}
+
+      :else {:type :string})))
 
 (defn- translate-create-table
-  "Translate a JSqlParser CreateTable into a DDL descriptor."
+  "Translate a JSqlParser CreateTable into a DDL descriptor.
+   For temporal SQL types (DATE, TIMESTAMP[TZ]) the column descriptor
+   carries a `:temporal-unit` so the engine routes date kernels to the
+   right scale (epoch-days for DATE, epoch-microseconds for TIMESTAMP)."
   [^CreateTable stmt]
   (let [table-name (.toString (.getTable stmt))
         col-defs (.getColumnDefinitions stmt)]
     {:ddl {:op      :create-table
            :table   table-name
            :columns (mapv (fn [^ColumnDefinition cd]
-                            {:name (.getColumnName cd)
-                             :type (sql-type->stratum-type
-                                    (str (.getColDataType cd)))})
+                            (let [type-info (sql-type->stratum-type (str (.getColDataType cd)))]
+                              (cond-> {:name (.getColumnName cd)
+                                       :type (:type type-info)}
+                                (:temporal-unit type-info)
+                                (assoc :temporal-unit (:temporal-unit type-info)))))
                           col-defs)}}))
 
 (defn- parse-insert-value

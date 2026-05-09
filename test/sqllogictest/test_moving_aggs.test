@@ -1,0 +1,64 @@
+# test_moving_aggs.test
+# q-style sliding aggregates: MAVG, MSUM, MMIN, MMAX, MCOUNT, MDEV.
+# Sugar over `<op> OVER (ROWS BETWEEN N-1 PRECEDING AND CURRENT ROW)` —
+# the second positional argument is the width N.
+
+statement ok
+CREATE TABLE prices (ts INTEGER, v DOUBLE)
+
+statement ok
+INSERT INTO prices VALUES (1, 1.0), (2, 2.0), (3, 4.0), (4, 8.0), (5, 16.0)
+
+# MAVG(v, 3) — expanding window for the first 2 rows, then 3-row sliding mean
+query RR nosort
+SELECT v, MAVG(v, 3) OVER (ORDER BY ts) FROM prices ORDER BY ts
+----
+1.000000	1.000000
+2.000000	1.500000
+4.000000	2.333333
+8.000000	4.666667
+16.000000	9.333333
+
+# MSUM(v, 3)
+query RR nosort
+SELECT v, MSUM(v, 3) OVER (ORDER BY ts) FROM prices ORDER BY ts
+----
+1.000000	1.000000
+2.000000	3.000000
+4.000000	7.000000
+8.000000	14.000000
+16.000000	28.000000
+
+# MMIN, MMAX, MCOUNT all together — each over [v_{i-2}..v_i]
+query RRRRR nosort
+SELECT v,
+       MMIN(v, 3)   OVER (ORDER BY ts),
+       MMAX(v, 3)   OVER (ORDER BY ts),
+       MCOUNT(v, 3) OVER (ORDER BY ts),
+       MSUM(v, 3)   OVER (ORDER BY ts)
+FROM prices ORDER BY ts
+----
+1.000000	1.000000	1.000000	1.000000	1.000000
+2.000000	1.000000	2.000000	2.000000	3.000000
+4.000000	1.000000	4.000000	3.000000	7.000000
+8.000000	2.000000	8.000000	3.000000	14.000000
+16.000000	4.000000	16.000000	3.000000	28.000000
+
+# MDEV(v, 3) — moving population stddev (ddof=0). For evenly-spaced [10, 20, 30]
+# the variance is 200/3 → sd ≈ 8.165.
+statement ok
+CREATE TABLE seq (ts INTEGER, v DOUBLE)
+
+statement ok
+INSERT INTO seq VALUES (1, 10.0), (2, 20.0), (3, 30.0), (4, 40.0), (5, 50.0)
+
+# Position-by-position the window is identical [10,20,30] then [20,30,40] etc.
+# All produce the same population stddev ≈ 8.165.
+query RR nosort
+SELECT v, MDEV(v, 3) OVER (ORDER BY ts) FROM seq ORDER BY ts
+----
+10.000000	0.000000
+20.000000	5.000000
+30.000000	8.164966
+40.000000	8.164966
+50.000000	8.164966
