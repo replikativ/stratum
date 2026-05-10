@@ -4338,3 +4338,154 @@
           result (q/q {:from {:v vals} :select [:v] :distinct true})]
       (is (= 2 (count result)))
       (is (= #{0.0 1.0} (set (mapv :v result)))))))
+
+;; ============================================================================
+;; PSplitAgg — mixed-class aggregation split
+;; ============================================================================
+;;
+;; When the user mixes SIMD-friendly aggs (sum/min/max/avg/count) with
+;; aggs that need a separate physical operator (median/percentile), the
+;; planner emits a `PSplitAgg` that runs each class on its best operator
+;; and merges results. These tests cover correctness of the split path:
+;; matching results against single-agg references and against unsplit
+;; subsets.
+
+(deftest split-agg-global-min-avg-median-max-test
+  (testing "Mixed min/avg/median/max returns correct values"
+    (let [data {:v (double-array [1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0 10.0])}
+          result (first (q/q {:from data
+                              :agg [[:min :v] [:avg :v] [:median :v] [:max :v]]}))]
+      (is (== 1.0 (:min result)))
+      (is (== 5.5 (:avg result)))
+      (is (== 5.5 (:median result)))
+      (is (== 10.0 (:max result))))))
+
+(deftest split-agg-aliases-preserved-test
+  (testing "User aliases survive the split+merge"
+    (let [data {:v (double-array [10.0 20.0 30.0 40.0 50.0])}
+          result (first (q/q {:from data
+                              :agg [[:as [:min :v] :lo]
+                                    [:as [:median :v] :mid]
+                                    [:as [:max :v] :hi]]}))]
+      (is (== 10.0 (:lo result)))
+      (is (== 30.0 (:mid result)))
+      (is (== 50.0 (:hi result))))))
+
+(deftest split-agg-matches-unsplit-test
+  (testing "Split results equal individual queries"
+    (let [data {:v (double-array (range 1 1001))}
+          combined (first (q/q {:from data
+                                :agg [[:sum :v] [:median :v] [:max :v]]}))
+          sum-only (first (q/q {:from data :agg [[:sum :v]]}))
+          med-only (first (q/q {:from data :agg [[:median :v]]}))
+          max-only (first (q/q {:from data :agg [[:max :v]]}))]
+      (is (== (:sum sum-only) (:sum combined)))
+      (is (== (:median med-only) (:median combined)))
+      (is (== (:max max-only) (:max combined))))))
+
+(deftest split-agg-with-predicates-test
+  (testing "Split respects WHERE clause uniformly"
+    (let [data {:cat (long-array [0 0 0 0 0 1 1 1 1 1])
+                :v (double-array [1.0 2.0 3.0 4.0 5.0 100.0 200.0 300.0 400.0 500.0])}
+          result (first (q/q {:from data
+                              :where [[:< :cat 1]]
+                              :agg [[:min :v] [:median :v] [:max :v]]}))]
+      (is (== 1.0 (:min result)))
+      (is (== 3.0 (:median result)))
+      (is (== 5.0 (:max result))))))
+
+(deftest split-agg-no-split-when-single-class-test
+  (testing "All-fast aggs do NOT trigger split (no PSplitAgg in plan)"
+    ;; min/max/avg all in :fast class — should use multi-agg path directly,
+    ;; not wrap in PSplitAgg.
+    (let [data {:v (double-array [1.0 2.0 3.0])}
+          plan-str (-> (q/explain {:from data :agg [[:min :v] [:max :v] [:avg :v]]})
+                       :plan-tree)]
+      (is (not (clojure.string/includes? plan-str "PSplitAgg"))))))
+
+(deftest split-agg-all-percentile-no-split-test
+  (testing "All-percentile aggs do NOT trigger split"
+    (let [data {:v (double-array [1.0 2.0 3.0 4.0 5.0])}
+          plan-str (-> (q/explain {:from data
+                                   :agg [[:median :v] [:percentile :v 0.25]
+                                         [:percentile :v 0.75]]})
+                       :plan-tree)]
+      (is (not (clojure.string/includes? plan-str "PSplitAgg")))
+      (is (clojure.string/includes? plan-str "PPercentileAgg")))))
+
+(deftest split-agg-emits-when-mixed-test
+  (testing "Mixed fast + percentile emits PSplitAgg"
+    (let [data {:v (double-array [1.0 2.0 3.0 4.0 5.0])}
+          plan-str (-> (q/explain {:from data :agg [[:sum :v] [:median :v]]})
+                       :plan-tree)]
+      (is (clojure.string/includes? plan-str "PSplitAgg")))))
+
+(deftest split-agg-group-by-test
+  (testing "GROUP BY with mixed aggs returns correct per-group results"
+    (let [data {:cat (long-array [0 0 0 0 0 1 1 1 1])
+                :v (double-array [1.0 2.0 3.0 4.0 5.0 10.0 20.0 30.0 40.0])}
+          rows (q/q {:from data
+                     :group [:cat]
+                     :agg [[:min :v] [:median :v] [:max :v]]
+                     :order [[:cat :asc]]})]
+      (is (= 2 (count rows)))
+      ;; cat 0: [1,2,3,4,5]  → min=1, median=3, max=5
+      (let [r0 (first rows)]
+        (is (== 0 (:cat r0)))
+        (is (== 1.0 (:min r0)))
+        (is (== 3.0 (:median r0)))
+        (is (== 5.0 (:max r0))))
+      ;; cat 1: [10,20,30,40] → min=10, median=25 (interpolated), max=40
+      (let [r1 (second rows)]
+        (is (== 1 (:cat r1)))
+        (is (== 10.0 (:min r1)))
+        (is (== 25.0 (:median r1)))
+        (is (== 40.0 (:max r1)))))))
+
+(deftest split-agg-group-by-aliases-test
+  (testing "GROUP BY split preserves user aliases on agg columns"
+    (let [data {:cat (long-array [0 0 1 1])
+                :v (double-array [10.0 20.0 100.0 200.0])}
+          rows (q/q {:from data
+                     :group [:cat]
+                     :agg [[:as [:min :v] :lo]
+                           [:as [:median :v] :mid]
+                           [:as [:max :v] :hi]]
+                     :order [[:cat :asc]]})]
+      (is (== 10.0 (:lo (first rows))))
+      (is (== 15.0 (:mid (first rows))))
+      (is (== 20.0 (:hi (first rows))))
+      (is (== 100.0 (:lo (second rows))))
+      (is (== 150.0 (:mid (second rows))))
+      (is (== 200.0 (:hi (second rows)))))))
+
+(deftest split-agg-group-by-matches-unsplit-test
+  (testing "GROUP BY split: combined query matches individual queries per group"
+    (let [data {:cat (long-array (mapcat #(repeat 100 %) (range 10)))
+                :v (double-array (mapcat #(map double (range (* % 10) (+ (* % 10) 100)))
+                                         (range 10)))}
+          combined (q/q {:from data
+                         :group [:cat]
+                         :agg [[:min :v] [:median :v] [:max :v]]
+                         :order [[:cat :asc]]})
+          mn-only (q/q {:from data :group [:cat]
+                        :agg [[:min :v]] :order [[:cat :asc]]})
+          med-only (q/q {:from data :group [:cat]
+                         :agg [[:median :v]] :order [[:cat :asc]]})]
+      (is (= 10 (count combined)))
+      (doseq [i (range 10)]
+        (is (== (:min (nth mn-only i)) (:min (nth combined i))))
+        (is (== (:median (nth med-only i)) (:median (nth combined i))))))))
+
+(deftest split-agg-sql-mixed-test
+  (testing "SQL mixed agg goes through split path"
+    (let [data {:price (double-array (range 1.0 101.0))}
+          result (first (q/q {:from data
+                              :agg [[:as [:min :price] :mn]
+                                    [:as [:avg :price] :av]
+                                    [:as [:median :price] :md]
+                                    [:as [:max :price] :mx]]}))]
+      (is (== 1.0 (:mn result)))
+      (is (== 50.5 (:av result)))
+      (is (== 50.5 (:md result)))
+      (is (== 100.0 (:mx result))))))
