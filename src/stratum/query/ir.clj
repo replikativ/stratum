@@ -248,6 +248,17 @@
   ;; Clojure scalar loop for complex/unsupported agg combinations.
            [predicates aggs input])
 
+(defrecord PSplitAgg
+  ;; Mixed-strategy aggregation: partitions aggregates by physical class
+  ;; (fast SIMD / percentile / variance / scalar) and runs each class on
+  ;; its optimal sub-plan, then merges results.
+  ;;
+  ;; children   — vec of physical sub-plan nodes (one per class)
+  ;; agg-order  — original aggs in declared order (for column projection
+  ;;              and to preserve user-facing field order)
+  ;; group-keys — nil for global agg; vec of group keys for GROUP BY merge
+           [children agg-order group-keys])
+
 ;; --- Group-by strategies ----------------------------------------------------
 
 (defrecord PChunkedDenseGroupBy
@@ -391,6 +402,9 @@
     (-> node
         (update :input f)
         (update-in [:join-spec :build-side] f))
+
+    (instance? PSplitAgg node)
+    (update node :children (fn [cs] (mapv f cs)))
 
     (:input node)
     (update node :input f)

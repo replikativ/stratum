@@ -29,7 +29,7 @@
             PScan PChunkedScan PSIMDFilter PMaskFilter
             PStatsOnlyAgg PFusedSIMDAgg PFusedSIMDCount
             PChunkedSIMDAgg PChunkedSIMDCount PBlockSkipCount
-            PFusedMultiSum PPercentileAgg PScalarAgg
+            PFusedMultiSum PPercentileAgg PScalarAgg PSplitAgg
             PChunkedDenseGroupBy PDenseGroupBy PHashGroupBy
             PFusedExtractCount PBitmapSemiJoin PHashJoin
             PPerfectHashJoin PAsofJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
@@ -520,6 +520,83 @@
     ;; Apply F21 linear-recipe metadata if present (the rewrite pass
     ;; may have rewritten an `:expr` agg into a base agg + recipe).
     [(post/rewrite-row-with-recipes row (:aggs node))]))
+
+;; --- Mixed-class split aggregation (PSplitAgg) ------------------------------
+;;
+;; The planner emits PSplitAgg when LGlobalAgg / LGroupBy contain aggs whose
+;; physical strategies disagree (e.g. `min(x)` runs on SIMD, `median(x)` on
+;; quickselect). Each child sub-plan computes its own subset on its best
+;; operator; this executor runs them and merges results.
+
+(defn- merge-global-rows
+  "Merge single-row results from each child into one row, preserving
+   the user-facing agg order from `agg-order`. The `:_count` field is
+   identical across children (same predicates + scan), so any one is fine."
+  [child-results agg-order]
+  (let [merged (reduce merge {} (map first child-results))
+        ;; Project user-aliased fields in agg-order, plus :_count if present.
+        ordered (cond-> (reduce (fn [m a]
+                                  (let [alias (or (:as a) (:op a))]
+                                    (if (contains? merged alias)
+                                      (assoc m alias (get merged alias))
+                                      m)))
+                                {}
+                                agg-order)
+                  (contains? merged :_count) (assoc :_count (get merged :_count)))]
+    [ordered]))
+
+(defn- row-group-key
+  "Extract the group-key tuple from a result row."
+  [row group-keys]
+  (mapv #(get row %) group-keys))
+
+(defn- merge-group-rows
+  "Merge per-group rows from each child by group-key tuple. Each child
+   returns the same set of groups (same predicates + scan + keys); the
+   merge unions their agg fields."
+  [child-results agg-order group-keys]
+  (let [;; Index child 0 by group key to preserve its row order.
+        first-child (first child-results)
+        key-index   (mapv #(row-group-key % group-keys) first-child)
+        ;; For each remaining child, build a key→row map.
+        other-maps  (mapv (fn [rows]
+                            (persistent!
+                             (reduce (fn [m r]
+                                       (assoc! m (row-group-key r group-keys) r))
+                                     (transient {})
+                                     rows)))
+                          (rest child-results))]
+    (mapv (fn [base-row k]
+            (let [merged (reduce (fn [acc child-map]
+                                   (let [r (get child-map k)]
+                                     (if r (merge acc r) acc)))
+                                 base-row
+                                 other-maps)]
+              ;; Project group keys + aggs in declared order.
+              (cond-> (reduce (fn [m gk] (assoc m gk (get merged gk)))
+                              {}
+                              group-keys)
+                true (into (keep (fn [a]
+                                   (let [alias (or (:as a) (:op a))]
+                                     (when (contains? merged alias)
+                                       [alias (get merged alias)])))
+                                 agg-order))
+                (contains? merged :_count) (assoc :_count (get merged :_count)))))
+          first-child
+          key-index)))
+
+(defn- execute-split-agg [node columnar?]
+  ;; Each child is a complete physical sub-plan. We always run them
+  ;; in row mode (columnar? = false) and merge maps; the outer projection
+  ;; layer handles the columnar conversion if requested. Children share
+  ;; the same upstream scan, so the OS page cache / L3 keeps the column
+  ;; data hot across the K passes.
+  (let [child-results (mapv #(execute-node % false) (:children node))
+        agg-order     (:agg-order node)
+        group-keys    (:group-keys node)]
+    (if (nil? group-keys)
+      (merge-global-rows child-results agg-order)
+      (merge-group-rows child-results agg-order group-keys))))
 
 ;; --- Group-by strategies ----------------------------------------------------
 
@@ -1122,6 +1199,7 @@
      (instance? PFusedMultiSum node)   (execute-fused-multi-sum node columnar?)
      (instance? PPercentileAgg node)   (execute-percentile-agg node columnar?)
      (instance? PScalarAgg node)       (execute-scalar-agg node columnar?)
+     (instance? PSplitAgg node)        (execute-split-agg node columnar?)
 
      ;; Group-by
      (instance? PChunkedDenseGroupBy node) (execute-chunked-dense-group-by node columnar?)

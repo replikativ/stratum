@@ -30,7 +30,7 @@
             PScan PChunkedScan PSIMDFilter PMaskFilter
             PStatsOnlyAgg PFusedSIMDAgg PFusedSIMDCount
             PChunkedSIMDAgg PChunkedSIMDCount PBlockSkipCount
-            PFusedMultiSum PPercentileAgg PScalarAgg
+            PFusedMultiSum PPercentileAgg PScalarAgg PSplitAgg
             PChunkedDenseGroupBy PDenseGroupBy PHashGroupBy
             PFusedExtractCount PBitmapSemiJoin PHashJoin
             PPerfectHashJoin PAsofJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
@@ -986,6 +986,48 @@
                                 (or (= :skip c) (= :stats-only c)))
                              (range n-chunks))))))))
 
+;; ----------------------------------------------------------------------------
+;; Mixed-agg partitioning (PSplitAgg)
+;; ----------------------------------------------------------------------------
+;;
+;; Several aggregate ops need a fundamentally different physical operator
+;; (e.g. `median` needs a sort/quickselect pass, `count-distinct` needs a
+;; HashSet, `variance` needs Welford). When the user mixes these with
+;; SIMD-friendly aggs (`sum/min/max/avg/count`) on a single LGlobalAgg or
+;; LGroupBy, the legacy planner picks one operator for the whole list and
+;; falls all the way down to `PScalarAgg` — a per-row Clojure reduce that
+;; is 6–10× slower than running each agg on its best operator. The split
+;; pass partitions the aggregate list by physical-strategy class, plans
+;; each subset with the regular strategy chooser, and emits a `PSplitAgg`
+;; that the executor runs and merges. See DuckDB / ClickHouse for the
+;; analogous design: each aggregate function declares its own state and
+;; update routine; the engine dispatches per-agg over the same column data.
+
+(defn- agg-class
+  "Classify an aggregate by its physical-strategy compatibility.
+   Aggs in the same class share a single physical sub-plan; aggs in
+   different classes must run on separate sub-plans."
+  [agg]
+  (case (:op agg)
+    (:median :percentile :approx-quantile) :percentile
+    (:sum :min :max :avg :count :sum-product :count-non-null) :fast
+    :scalar))
+
+(defn- partition-aggs-by-class
+  "Group aggs by class, preserving in-class declared order.
+   Returns a vec of [class agg-subset] pairs (stable across runs)."
+  [aggs]
+  ;; Use an ordered traversal so result order is stable.
+  (let [grouped (reduce (fn [acc a]
+                          (let [c (agg-class a)]
+                            (update acc c (fnil conj []) a)))
+                        {}
+                        aggs)]
+    ;; Stable ordering: :fast first (cheapest), then :percentile, then :scalar
+    (->> [:fast :percentile :scalar]
+         (keep (fn [c] (when-let [as (get grouped c)] [c as])))
+         vec)))
+
 (defn- select-global-agg-strategy
   "Choose physical strategy for LGlobalAgg.
 
@@ -995,6 +1037,7 @@
    - Otherwise follows capability-based priority cascade.
 
    Priority (capability gated, cost-informed):
+   0. Mixed-class aggs → split into per-class sub-plans (PSplitAgg)
    1. Unfiltered COUNT → short-circuit to length
    2. Stats-only → O(chunks) from chunk statistics
    3. Chunked SIMD → stream index chunks (favored for selective preds)
@@ -1025,8 +1068,22 @@
                       (est/estimate-combined-selectivity preds columns))
         est-rows    (when selectivity
                       (est/estimate-output-rows preds columns length))
-        very-selective? (and selectivity (< (double selectivity) 0.05))]
+        very-selective? (and selectivity (< (double selectivity) 0.05))
+        ;; 0. Mixed-class split detection.
+        ;; If aggs span >1 class, each class would force a different
+        ;; physical plan. Without splitting, the cascade below collapses
+        ;; the whole list to PScalarAgg (the slowest fallback). Splitting
+        ;; runs each class on its best operator and merges single rows.
+        partitions (partition-aggs-by-class aggs)]
     (cond
+      ;; 0. Mixed classes — split into per-class sub-plans
+      (> (count partitions) 1)
+      (let [child-plans (mapv (fn [[_cls agg-subset]]
+                                (select-global-agg-strategy
+                                 (assoc node :aggs agg-subset) scan preds))
+                              partitions)]
+        (ir/->PSplitAgg child-plans aggs nil))
+
       ;; 1. Unfiltered COUNT
       (and (= 1 n-aggs) (= :count (:op first-agg)) no-preds?)
       (ir/->PFusedSIMDCount [] first-agg scan)
@@ -1106,7 +1163,12 @@
    - Estimated output rows inform dense-vs-hash: if predicates are very
      selective, fewer rows enter the group-by → dense array more likely viable.
    - For index-backed columns, chunked dense is preferred (zero-copy streaming)
-     with fallback to materialized dense/hash at execution time."
+     with fallback to materialized dense/hash at execution time.
+
+   Mixed-class aggs are split into per-class sub-plans (PSplitAgg) — same
+   principle as the global-agg path. This keeps median/percentile out of
+   the slow Clojure fallback in `execute-group-by` when mixed with
+   SIMD-friendly aggs."
   [node scan preds]
   (let [{:keys [group-keys aggs]} node
         columns  (:columns scan)
@@ -1117,13 +1179,28 @@
                       (est/estimate-combined-selectivity preds columns))
         est-rows    (if selectivity
                       (est/estimate-output-rows preds columns length)
-                      length)]
-    (if all-idx?
+                      length)
+        partitions  (partition-aggs-by-class aggs)]
+    (cond
+      ;; Mixed classes — split into per-class group-by sub-plans
+      (> (count partitions) 1)
+      (let [child-plans (mapv (fn [[_cls agg-subset]]
+                                (select-group-by-strategy
+                                 (assoc node :aggs agg-subset) scan preds))
+                              partitions)]
+        (vary-meta
+         (ir/->PSplitAgg child-plans aggs group-keys)
+         assoc ::estimated-rows est-rows
+         ::selectivity (or selectivity 1.0)))
+
+      all-idx?
       (vary-meta
        (ir/->PChunkedDenseGroupBy preds group-keys aggs 0 scan)
        assoc ::fallback :dense-or-hash
        ::estimated-rows est-rows
        ::selectivity (or selectivity 1.0))
+
+      :else
       (vary-meta
        (ir/->PDenseGroupBy preds group-keys aggs 0 scan)
        assoc ::estimated-rows est-rows
@@ -1581,6 +1658,14 @@
         (instance? PPercentileAgg node) (instance? PScalarAgg node)
         (instance? PFusedJoinGlobalAgg node))
     1
+
+    ;; PSplitAgg: 1 row when no group keys (global); otherwise inherit
+    ;; from a child plan (all children produce the same group cardinality).
+    (instance? PSplitAgg node)
+    (if (nil? (:group-keys node))
+      1
+      (long (or (::estimated-rows (meta (first (:children node))))
+                1000000)))
 
     ;; Fused join+group: use metadata if present
     (instance? PFusedJoinGroupAgg node)
@@ -2157,6 +2242,11 @@
                 (instance? PMaterializeExpr node)
                 (str "col=" (:col-name node) " expr=" (:expr node))
 
+                (instance? PSplitAgg node)
+                (str "aggs=" (mapv :op (:agg-order node))
+                     " classes=" (count (:children node))
+                     (when-let [gks (:group-keys node)] (str " groups=" gks)))
+
                 :else "")))
 
 (defn explain
@@ -2198,6 +2288,9 @@
                     (let [bs (get-in plan [:join-spec :build-side])]
                       (cond-> [(explain (:input plan) (inc depth))]
                         bs (conj (str indent "  dim:\n" (explain bs (+ depth 2))))))
+
+                    (instance? PSplitAgg plan)
+                    (mapv (fn [c] (explain c (inc depth))) (:children plan))
 
                     (ir/input-node plan)
                     [(explain (ir/input-node plan) (inc depth))]
