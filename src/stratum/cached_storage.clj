@@ -264,6 +264,26 @@
    is querying it."
   16)
 
+(defn attach-pss-handlers
+  "Return `store` with stratum's PSS Fressian read/write handlers
+   attached to its :FressianSerializer. Useful for code paths (e.g.
+   audit) that need to deserialize PSS nodes (Leaf/Branch/ChunkEntry)
+   from konserve directly without creating a full CachedStorage."
+  [store]
+  (let [storage-atom (atom nil)
+        handlers (create-fressian-handlers storage-atom)
+        chunk-entry-cls @chunk-entry-class
+        all-write-handlers (assoc (:write-handlers handlers)
+                                  chunk-entry-cls
+                                  {"stratum.ChunkEntry" (chunk-entry-write-handler)}
+                                  ChunkStats
+                                  {"stratum.ChunkStats" (chunk-stats-write-handler)})]
+    (assoc store
+           :serializers {:FressianSerializer
+                         (fressian-serializer
+                          (:read-handlers handlers)
+                          all-write-handlers)})))
+
 (defn create-storage
   "Create CachedStorage backed by a konserve store.
 
