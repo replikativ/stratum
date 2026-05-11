@@ -1176,69 +1176,110 @@
 ;; Main dispatch
 ;; ============================================================================
 
+(def ^:dynamic *explain-collector*
+  "When bound (to an atom holding a map), `execute-node` records per-node
+   wall-clock time and output cardinality keyed by `(System/identityHashCode
+   node)`. Bound by `explain-analyze-query`; nil at runtime in non-EXPLAIN
+   paths so the overhead is a single nil check per node call."
+  nil)
+
+(defn- count-output
+  "Best-effort row count for whatever `execute-node` returned.
+   Column context → :length. Columnar result → :n-rows. Seq → count.
+   Other shapes (rare) → 1."
+  ^long [result]
+  (cond
+    (nil? result)                                              0
+    (and (map? result) (contains? result :length))             (long (:length result))
+    (and (map? result) (contains? result :n-rows))             (long (:n-rows result))
+    (sequential? result)                                       (count result)
+    :else                                                      1))
+
+(declare execute-node-impl)
+
 (defn execute-node
-  "Execute a physical plan node, returning either a column context or result rows."
+  "Execute a physical plan node, returning either a column context or result rows.
+
+   When `*explain-collector*` is bound, records wall-clock duration and
+   output row count per invocation. Sub-executors call back through this
+   public arity, so every recursive call also gets timed. A parent's
+   recorded time naturally includes its children's — matching Postgres /
+   DuckDB EXPLAIN ANALYZE semantics (inclusive timing)."
   ([node] (execute-node node false))
   ([node columnar?]
-   (cond
+   (if-let [coll *explain-collector*]
+     (let [start  (System/nanoTime)
+           result (execute-node-impl node columnar?)
+           end    (System/nanoTime)]
+       (swap! coll assoc (System/identityHashCode node)
+              {:time-ns (- end start)
+               :rows    (count-output result)})
+       result)
+     (execute-node-impl node columnar?))))
+
+(defn- execute-node-impl
+  "Inner dispatch. Sub-execute-* fns call back through `execute-node`
+   for their children, so each child goes through the timing wrap."
+  [node columnar?]
+  (cond
      ;; Scan
-     (instance? PScan node)         (execute-scan node)
-     (instance? PChunkedScan node)  (execute-chunked-scan node)
+    (instance? PScan node)         (execute-scan node)
+    (instance? PChunkedScan node)  (execute-chunked-scan node)
 
      ;; Filter
-     (instance? PSIMDFilter node)   (execute-filter node)
-     (instance? PMaskFilter node)   (execute-filter node)
+    (instance? PSIMDFilter node)   (execute-filter node)
+    (instance? PMaskFilter node)   (execute-filter node)
 
      ;; Global aggregation
-     (instance? PStatsOnlyAgg node)    (execute-stats-only node columnar?)
-     (instance? PFusedSIMDAgg node)    (execute-fused-simd-agg node columnar?)
-     (instance? PFusedSIMDCount node)  (execute-fused-simd-count node columnar?)
-     (instance? PChunkedSIMDAgg node)  (execute-chunked-simd-agg node columnar?)
-     (instance? PChunkedSIMDCount node) (execute-chunked-simd-count node columnar?)
-     (instance? PBlockSkipCount node)  (execute-block-skip-count node columnar?)
-     (instance? PFusedMultiSum node)   (execute-fused-multi-sum node columnar?)
-     (instance? PPercentileAgg node)   (execute-percentile-agg node columnar?)
-     (instance? PScalarAgg node)       (execute-scalar-agg node columnar?)
-     (instance? PSplitAgg node)        (execute-split-agg node columnar?)
+    (instance? PStatsOnlyAgg node)    (execute-stats-only node columnar?)
+    (instance? PFusedSIMDAgg node)    (execute-fused-simd-agg node columnar?)
+    (instance? PFusedSIMDCount node)  (execute-fused-simd-count node columnar?)
+    (instance? PChunkedSIMDAgg node)  (execute-chunked-simd-agg node columnar?)
+    (instance? PChunkedSIMDCount node) (execute-chunked-simd-count node columnar?)
+    (instance? PBlockSkipCount node)  (execute-block-skip-count node columnar?)
+    (instance? PFusedMultiSum node)   (execute-fused-multi-sum node columnar?)
+    (instance? PPercentileAgg node)   (execute-percentile-agg node columnar?)
+    (instance? PScalarAgg node)       (execute-scalar-agg node columnar?)
+    (instance? PSplitAgg node)        (execute-split-agg node columnar?)
 
      ;; Group-by
-     (instance? PChunkedDenseGroupBy node) (execute-chunked-dense-group-by node columnar?)
-     (instance? PDenseGroupBy node)        (execute-dense-group-by node columnar?)
-     (instance? PHashGroupBy node)         (execute-hash-group-by node columnar?)
-     (instance? PFusedExtractCount node)   (execute-fused-extract-count node columnar?)
+    (instance? PChunkedDenseGroupBy node) (execute-chunked-dense-group-by node columnar?)
+    (instance? PDenseGroupBy node)        (execute-dense-group-by node columnar?)
+    (instance? PHashGroupBy node)         (execute-hash-group-by node columnar?)
+    (instance? PFusedExtractCount node)   (execute-fused-extract-count node columnar?)
 
      ;; Join
-     (instance? PHashJoin node)             (execute-hash-join node)
-     (instance? PPerfectHashJoin node)      (execute-hash-join node) ;; same API, perfect hash is internal
-     (instance? PBitmapSemiJoin node)       (execute-bitmap-semi-join-node node)
-     (instance? PAsofJoin node)             (execute-asof-join node)
-     (instance? PFusedJoinGroupAgg node)    (execute-fused-join-group-agg node columnar?)
-     (instance? PFusedJoinGlobalAgg node)   (execute-fused-join-global-agg node columnar?)
+    (instance? PHashJoin node)             (execute-hash-join node)
+    (instance? PPerfectHashJoin node)      (execute-hash-join node) ;; same API, perfect hash is internal
+    (instance? PBitmapSemiJoin node)       (execute-bitmap-semi-join-node node)
+    (instance? PAsofJoin node)             (execute-asof-join node)
+    (instance? PFusedJoinGroupAgg node)    (execute-fused-join-group-agg node columnar?)
+    (instance? PFusedJoinGlobalAgg node)   (execute-fused-join-global-agg node columnar?)
 
      ;; Expression materialization
-     (instance? PMaterializeExpr node) (execute-materialize-expr node)
+    (instance? PMaterializeExpr node) (execute-materialize-expr node)
 
      ;; Top-N pushdown — LTopN is recognized directly (no separate
      ;; physical record) and dispatched to the streaming primitive.
-     (instance? LTopN node) (execute-top-n-node node)
+    (instance? LTopN node) (execute-top-n-node node)
 
      ;; LIMIT-without-ORDER-BY pushdown — same shape as LTopN, but
      ;; no order column: first N rows in scan order.
-     (instance? LHead node) (execute-head-node node)
+    (instance? LHead node) (execute-head-node node)
 
      ;; Anomaly score materialization (post-join). Resolves at the
      ;; right point in the pipeline so the iforest sees joined
      ;; columns. The plan's frontend has already rewritten the
      ;; surrounding query to reference the synthetic columns
      ;; produced here. Pure column-ctx → column-ctx — no row decode.
-     (instance? LAnomaly node)
-     (let [ctx       (execute-node (:input node))
-           columns   (:columns ctx)
-           length    (long (:length ctx))
-           new-cols  (prep/materialize-anomaly (:expr->col node)
-                                               columns length
-                                               (:models node))]
-       (assoc ctx :columns new-cols))
+    (instance? LAnomaly node)
+    (let [ctx       (execute-node (:input node))
+          columns   (:columns ctx)
+          length    (long (:length ctx))
+          new-cols  (prep/materialize-anomaly (:expr->col node)
+                                              columns length
+                                              (:models node))]
+      (assoc ctx :columns new-cols))
 
      ;; Post-join string-expression materialization. The frontend
      ;; has rewritten `:group` / aggs / `:select` to reference the
@@ -1246,18 +1287,18 @@
      ;; runs `expr/eval-string-expr` against the post-join
      ;; (materialized) column ctx, so dict-encoded results are
      ;; sized to the joined row count.
-     (instance? LStringMaterialize node)
-     (let [ctx       (execute-node (:input node))
-           columns   (:columns ctx)
-           length    (long (:length ctx))
-           mat-cols  (cols/materialize-columns columns)
-           new-cols  (reduce
-                      (fn [cs {:keys [col-name expr]}]
-                        (let [entry (expr/eval-string-expr expr cs length)]
-                          (assoc cs col-name entry)))
-                      mat-cols
-                      (:items node))]
-       (assoc ctx :columns new-cols))
+    (instance? LStringMaterialize node)
+    (let [ctx       (execute-node (:input node))
+          columns   (:columns ctx)
+          length    (long (:length ctx))
+          mat-cols  (cols/materialize-columns columns)
+          new-cols  (reduce
+                     (fn [cs {:keys [col-name expr]}]
+                       (let [entry (expr/eval-string-expr expr cs length)]
+                         (assoc cs col-name entry)))
+                     mat-cols
+                     (:items node))]
+      (assoc ctx :columns new-cols))
 
      ;; Set ops — UNION/INTERSECT/EXCEPT. The runtime path in
      ;; `stratum.query/q` short-circuits these before the planner
@@ -1265,35 +1306,35 @@
      ;; still hand us an `LSetOp`. Recurse via `q` so each
      ;; sub-query goes through its own planner pass and the result
      ;; combination matches the legacy semantics in `q.clj:372–386`.
-     (instance? LSetOp node)
-     (let [q-fn @(requiring-resolve 'stratum.query/q)
-           sub-results (mapv q-fn (:queries node))]
-       (case (:op node)
-         :union
-         (let [combined (vec (apply concat sub-results))]
-           (if (:all? node)
-             combined
-             (vec (clojure.core/distinct combined))))
-         :intersect
-         (let [first-r (set (first sub-results))]
-           (vec (reduce #(clojure.set/intersection %1 (set %2))
-                        first-r (rest sub-results))))
-         :except
-         (let [first-r (first sub-results)
-               to-remove (reduce (fn [acc r] (into acc r)) #{} (rest sub-results))]
-           (vec (remove to-remove first-r)))))
+    (instance? LSetOp node)
+    (let [q-fn @(requiring-resolve 'stratum.query/q)
+          sub-results (mapv q-fn (:queries node))]
+      (case (:op node)
+        :union
+        (let [combined (vec (apply concat sub-results))]
+          (if (:all? node)
+            combined
+            (vec (clojure.core/distinct combined))))
+        :intersect
+        (let [first-r (set (first sub-results))]
+          (vec (reduce #(clojure.set/intersection %1 (set %2))
+                       first-r (rest sub-results))))
+        :except
+        (let [first-r (first sub-results)
+              to-remove (reduce (fn [acc r] (into acc r)) #{} (rest sub-results))]
+          (vec (remove to-remove first-r)))))
 
      ;; Projection
-     (instance? PProject node)  (execute-project node columnar?)
+    (instance? PProject node)  (execute-project node columnar?)
 
      ;; Post-processing
-     (instance? PWindow node)   (execute-window node columnar? nil)
-     (instance? PHaving node)   (execute-having node nil)
-     (instance? PSort node)     (execute-sort node nil)
-     (instance? PDistinct node) (execute-distinct node nil)
-     (instance? PLimit node)    (execute-limit node nil)
+    (instance? PWindow node)   (execute-window node columnar? nil)
+    (instance? PHaving node)   (execute-having node nil)
+    (instance? PSort node)     (execute-sort node nil)
+    (instance? PDistinct node) (execute-distinct node nil)
+    (instance? PLimit node)    (execute-limit node nil)
 
-     :else (throw (ex-info (str "Unknown physical node: " (type node)) {:node node})))))
+    :else (throw (ex-info (str "Unknown physical node: " (type node)) {:node node}))))
 
 ;; ============================================================================
 ;; Entry point
@@ -1448,14 +1489,48 @@
 
 (defn explain-query
   "Build and explain a physical plan. Returns a map with both the
-   planner-native keys (`:plan-tree`, `:strategy`) and legacy-shape
-   keys (`:n-rows`, `:columns`) so existing callers don't break."
+   planner-native keys (`:plan-tree`, `:strategy`, `:plan-data`) and
+   legacy-shape keys (`:n-rows`, `:columns`) so existing callers don't
+   break.
+
+   `:plan-data` is the structured data tree from `plan/plan->data`;
+   render with `plan/render-text` or `plan/render-json` for alternate
+   output formats."
   [query]
   (let [logical  (plan/build-logical-plan query)
         physical (plan/optimize logical)
+        data     (plan/plan->data physical)
         [n-rows n-cols] (scan-summary physical)]
-    {:plan-tree (plan/explain physical)
+    {:plan-data data
+     :plan-tree (plan/render-text data)
      :strategy  (keyword (.getSimpleName (class physical)))
      :n-rows    n-rows
      :columns   n-cols
+     :query     (dissoc query :from)}))
+
+(defn explain-analyze-query
+  "Same as `explain-query`, but runs the query under instrumentation
+   and merges per-node `actual-rows` + `time-ms` into the plan data.
+
+   `:execution-time-ms` is the wall-clock time for the root execute call.
+   Result map adds `:plan-data` (with timings) + `:plan-tree` (rendered
+   with timings + footer)."
+  [query]
+  (let [logical   (plan/build-logical-plan query)
+        physical  (plan/optimize logical)
+        collector (atom {})
+        start     (System/nanoTime)
+        _         (binding [*explain-collector* collector]
+                    (execute-node physical false))
+        elapsed   (/ (double (- (System/nanoTime) start)) 1.0e6)
+        [n-rows n-cols] (scan-summary physical)
+        data      (-> (plan/plan->data physical)
+                      (plan/merge-analyze-timings @collector)
+                      (assoc :execution-time-ms elapsed))]
+    {:plan-data data
+     :plan-tree (plan/render-text data)
+     :strategy  (keyword (.getSimpleName (class physical)))
+     :n-rows    n-rows
+     :columns   n-cols
+     :execution-time-ms elapsed
      :query     (dissoc query :from)}))

@@ -46,6 +46,7 @@
             [stratum.query.window :as win]
             [stratum.query.execution :as x]
             [stratum.query.executor :as exec]
+            [stratum.query.plan :as plan]
             [stratum.index :as index]
             [stratum.chunk :as chunk]
             [stratum.specification :as spec]
@@ -1244,16 +1245,30 @@
 (defn explain
   "Show execution plan without running the query.
 
-   When *use-planner* is true, returns a map with:
-     :plan-tree   — human-readable physical plan tree string
+   When *use-planner* is true (the default), returns a map with:
+     :plan-data   — structured data tree (see `stratum.query.plan/plan->data`)
+     :plan-tree   — Postgres-style human-readable plan tree string
      :strategy    — top-level physical node type
-   Otherwise returns the original strategy map.
+     :n-rows      — base-scan length
+     :columns     — base-scan column count
+   When `:analyze?` is true, the query is executed under instrumentation
+   and `:execution-time-ms` plus per-node `:actual-rows`/`:time-ms`
+   appear on the plan-data tree.
+   When `:format` is `:json`, also returns `:plan-json` — a Clojure data
+   structure matching DuckDB's JSON EXPLAIN shape.
 
    Options:
-     :tree? true  — force planner tree output even when *use-planner* is false"
-  [{:keys [from join where select agg group] :as query} & {:keys [tree?]}]
+     :analyze?  — run the query and collect per-node timing (default false)
+     :format    — :text (default) | :json
+     :tree?     — force planner output when *use-planner* is false"
+  [{:keys [from join where select agg group] :as query} & {:keys [tree? analyze? format]
+                                                           :or   {format :text}}]
   (if (or *use-planner* tree?)
-    (exec/explain-query query)
+    (let [base (if analyze?
+                 (exec/explain-analyze-query query)
+                 (exec/explain-query query))]
+      (cond-> base
+        (= :json format) (assoc :plan-json (plan/render-json (:plan-data base)))))
     (let [columns (x/prepare-columns from)
           preds (mapv norm/normalize-pred (or where []))
           aggs (norm/auto-alias-aggs (mapv norm/normalize-agg (or agg [])))

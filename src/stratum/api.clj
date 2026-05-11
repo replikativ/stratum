@@ -170,29 +170,55 @@
 (defn explain
   "Show execution plan without running the query.
 
-   Accepts the same arguments as `q`. Returns a map describing
-   the execution strategy that would be used."
+   Returns a map with `:plan-tree` (Postgres-style text), `:plan-data`
+   (structured data tree), `:strategy`, `:n-rows`, `:columns`. With
+   `:analyze? true`, the query is executed and per-node timings appear
+   on `:plan-data` plus `:execution-time-ms` at the root. With
+   `:format :json`, also returns `:plan-json` (DuckDB-shape Clojure data).
+
+   Arities:
+     (explain query-map)             — Clojure query map
+     (explain query-map opts)        — opts: {:analyze? :format}
+     (explain sql tables)            — SQL + table registry
+     (explain sql tables opts)       — opts: {:analyze? :format}
+
+   When the SQL itself contains `EXPLAIN [ANALYZE] [(FORMAT JSON)]`,
+   those options are honored; opts passed here override them."
   ([query-or-sql]
    (if (string? query-or-sql)
      (throw (ex-info "SQL queries require a table map as second argument"
                      {:sql query-or-sql}))
      (query/explain query-or-sql)))
-  ([sql tables]
+  ([query-or-sql opts-or-tables]
+   (if (string? query-or-sql)
+     (explain query-or-sql opts-or-tables nil)
+     (query/explain query-or-sql opts-or-tables)))
+  ([sql tables opts]
    (let [registry (into {}
                         (map (fn [[k v]]
                                [(if (keyword? k) (clojure.core/name k) (str k))
                                 (encode-table v)]))
                         tables)
-         parsed (sql/parse-sql sql registry)]
+         parsed (sql/parse-sql sql registry)
+         from-sql (when (:explain parsed) (:options (:explain parsed)))
+         merged-opts (merge from-sql opts)]
      (cond
        (:error parsed)
        {:error (:error parsed) :sql sql}
+
+       ;; SQL prefixed with EXPLAIN — peel one level, explain the inner
+       (:explain parsed)
+       (let [inner (:inner (:explain parsed))]
+         (cond
+           (:system inner) {:strategy :system :tag (:tag inner)}
+           (:query inner)  (query/explain (:query inner) merged-opts)
+           :else           {:error "Unexpected EXPLAIN inner result"}))
 
        (:system parsed)
        {:strategy :system :tag (:tag parsed)}
 
        (:query parsed)
-       (query/explain (:query parsed))
+       (query/explain (:query parsed) merged-opts)
 
        :else
        {:error "Unexpected parse result"}))))

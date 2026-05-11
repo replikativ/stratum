@@ -71,27 +71,105 @@
 ;; Query Handler
 ;; ============================================================================
 
-(defn- format-explain-result
-  "Format an EXPLAIN result as a text table for pgwire."
-  [plan]
-  (let [lines [(str "Strategy: " (name (:strategy plan)))
-               (str "Data source: " (name (or (:data-source plan) :unknown)))
-               (str "Rows: " (:n-rows plan))
-               (str "Columns: " (:columns plan))
-               (str "Predicates: " (:count (:predicates plan)) " total")
-               (when (seq (:aggregates plan))
-                 (str "Aggregates: " (pr-str (:aggregates plan))))
-               (when (seq (:group-by plan))
-                 (str "Group by: " (pr-str (:group-by plan))))
-               (when (:join plan)
-                 (str "Joins: " (:count (:join plan))))]
-        lines (remove nil? lines)
-        rows (mapv (fn [l] (into-array String [l])) lines)]
+(defn- json-write-str
+  "Minimal JSON writer for explain output. Handles maps, vectors, strings,
+   numbers, booleans, nil. Indented pretty-print."
+  ([x] (json-write-str x 0))
+  ([x ^long depth]
+   (let [ind (apply str (repeat (* 2 depth) \space))
+         ind1 (apply str (repeat (* 2 (inc depth)) \space))
+         escape (fn [^String s]
+                  (-> s
+                      (.replace "\\" "\\\\")
+                      (.replace "\"" "\\\"")
+                      (.replace "\n" "\\n")
+                      (.replace "\r" "\\r")
+                      (.replace "\t" "\\t")))]
+     (cond
+       (nil? x)     "null"
+       (true? x)    "true"
+       (false? x)   "false"
+       (string? x)  (str "\"" (escape x) "\"")
+       (number? x)  (str x)
+       (keyword? x) (str "\"" (escape (name x)) "\"")
+       (map? x)
+       (if (empty? x)
+         "{}"
+         (str "{\n"
+              (str/join ",\n"
+                        (mapv (fn [[k v]]
+                                (str ind1 (json-write-str (cond
+                                                            (keyword? k) (name k)
+                                                            :else (str k))
+                                                          0)
+                                     ": "
+                                     (json-write-str v (inc depth))))
+                              x))
+              "\n" ind "}"))
+       (sequential? x)
+       (if (empty? x)
+         "[]"
+         (str "[\n"
+              (str/join ",\n"
+                        (mapv (fn [item] (str ind1 (json-write-str item (inc depth))))
+                              x))
+              "\n" ind "]"))
+       :else (str "\"" (escape (str x)) "\"")))))
+
+(defn- explain-rows
+  "Build pgwire `QueryResult` rows for an EXPLAIN result.
+
+   `plan-result` is what `q/explain` returns; `format` is :text or :json.
+   For :text, each line of `:plan-tree` is its own row (matches Postgres'
+   per-line `QUERY PLAN` column). For :json, a single row with the
+   pretty-printed JSON document."
+  [plan-result format]
+  (let [lines (case format
+                :json [(json-write-str (:plan-json plan-result))]
+                :text (str/split-lines (str (:plan-tree plan-result))))
+        rows  (mapv (fn [l] (into-array String [l])) lines)]
     (PgWireServer$QueryResult.
      (into-array String ["QUERY PLAN"])
      (int-array [25])
      (into-array (Class/forName "[Ljava.lang.String;") rows)
      (str "EXPLAIN"))))
+
+(defn- format-explain-result
+  "Pgwire formatter for an EXPLAIN parsed result.
+
+   `parsed-explain` is the `:explain` value from `sql/parse-sql`:
+     {:options {:analyze? bool :format :text/:json}
+      :inner   {:query <map>} | {:system true :tag <str>}}"
+  [parsed-explain table-registry]
+  (let [{:keys [options inner]} parsed-explain
+        {:keys [analyze? format] :or {format :text}} options]
+    (cond
+      ;; System query — show its tag in a single QUERY PLAN row
+      (:system inner)
+      (let [tag (or (:tag inner) "SYSTEM")
+            row (into-array String [(str "System query: " tag)])]
+        (PgWireServer$QueryResult.
+         (into-array String ["QUERY PLAN"])
+         (int-array [25])
+         (into-array (Class/forName "[Ljava.lang.String;") [row])
+         (str "EXPLAIN")))
+
+      (:query inner)
+      (let [query   (:query inner)
+            ;; Resolve any string-keyed table references in the query
+            ;; against the live registry, matching the path the
+            ;; non-EXPLAIN dispatch takes.
+            opts    {:analyze? (boolean analyze?)
+                     :format   (or format :text)}
+            result  (q/explain query opts)]
+        (explain-rows (cond-> result
+                        (and (= :json format) (not (:plan-json result)))
+                        (assoc :plan-json (stratum.query.plan/render-json
+                                           (:plan-data result))))
+                      format))
+
+      :else
+      (PgWireServer$QueryResult. "EXPLAIN: malformed parsed result"))))
 
 (def ^:private model-type-map
   "Extensible registry of model types for CREATE MODEL.
@@ -185,20 +263,9 @@
           registry     (merge registry extra)
           parsed       (sql/parse-sql sql registry)]
       (cond
-            ;; EXPLAIN query — show execution plan
+            ;; EXPLAIN [(ANALYZE)] [(FORMAT JSON)] query
         (:explain parsed)
-        (let [explain-data (:explain parsed)]
-          (if (map? explain-data)
-            (if (:strategy explain-data)
-                  ;; Already a plan (system query)
-              (format-explain-result explain-data)
-                  ;; It's a query map — run explain on it
-              (format-explain-result (q/explain {:from (:from explain-data)
-                                                 :where (:where explain-data)
-                                                 :agg (:agg explain-data)
-                                                 :group (:group explain-data)
-                                                 :select (:select explain-data)})))
-            (PgWireServer$QueryResult. "EXPLAIN: unexpected result")))
+        (format-explain-result (:explain parsed) @table-registry-atom)
 
             ;; System query (SET, SHOW, VERSION, etc.)
         (:system parsed)
