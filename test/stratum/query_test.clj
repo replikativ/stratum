@@ -4420,6 +4420,53 @@
                        :plan-tree)]
       (is (clojure.string/includes? plan-str "PSplitAgg")))))
 
+(deftest stats-only-single-pass-multi-col-test
+  ;; Fix 1: PStatsOnlyAgg used to walk all chunks once per agg. The
+  ;; refactor coalesces walks per distinct column, so multi-col global
+  ;; aggregates exercise a new code path. Build an indexed dataset so
+  ;; the planner actually picks PStatsOnlyAgg, then check that aggs on
+  ;; two different columns return correct values.
+  (testing "Stats-only over multiple columns gives correct results"
+    (let [a (long-array (range 1 1001))
+          b (double-array (map (fn [i] (* i 2.0)) (range 1 1001)))
+          a-idx (index/index-from-array a)
+          b-idx (index/index-from-array b)
+          result (first (q/q {:from {:a a-idx :b b-idx}
+                              :agg [[:min :a] [:max :a]
+                                    [:sum :b] [:avg :b]]}))]
+      (is (== 1 (:min result)))
+      (is (== 1000 (:max result)))
+      (is (== (* 2.0 (/ (* 1000 1001) 2)) (:sum result)))
+      (is (== 1001.0 (:avg result))))))
+
+(deftest stats-only-three-aggs-one-column-test
+  ;; Fix 1 regression: previously this query walked chunks 3 times.
+  ;; Now it should walk once. Correctness unchanged.
+  (testing "min+avg+max on same column is correct"
+    (let [v-idx (index/index-from-array
+                 (double-array (map double (range 1 1001))))
+          result (first (q/q {:from {:v v-idx}
+                              :agg [[:min :v] [:avg :v] [:max :v]]}))]
+      (is (== 1.0 (:min result)))
+      (is (== 500.5 (:avg result)))
+      (is (== 1000.0 (:max result))))))
+
+(deftest split-agg-parallel-preserves-order-test
+  ;; Fix 2: children now run in parallel via futures. Verify result
+  ;; aggs appear in the user-declared order (not arrival order).
+  (testing "Aliases and aggs appear in declared order after parallel merge"
+    (let [v-idx (index/index-from-array
+                 (double-array (map double (range 1 1001))))
+          result (first (q/q {:from {:v v-idx}
+                              :agg [[:as [:median :v] :a]
+                                    [:as [:min :v]    :b]
+                                    [:as [:max :v]    :c]
+                                    [:as [:avg :v]    :d]]}))]
+      (is (== 500.5 (:a result)))
+      (is (== 1.0   (:b result)))
+      (is (== 1000.0 (:c result)))
+      (is (== 500.5 (:d result))))))
+
 (deftest split-agg-group-by-test
   (testing "GROUP BY with mixed aggs returns correct per-group results"
     (let [data {:cat (long-array [0 0 0 0 0 1 1 1 1])

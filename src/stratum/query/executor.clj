@@ -39,6 +39,10 @@
 
 (set! *warn-on-reflection* true)
 
+;; Forward-declared because `execute-split-agg` (defined far above the
+;; dispatch table) propagates the ANALYZE collector across futures.
+(declare ^:dynamic *explain-collector*)
+
 ;; ============================================================================
 ;; Column context helpers
 ;; ============================================================================
@@ -313,6 +317,25 @@
 
 ;; --- Global aggregation strategies ------------------------------------------
 
+(defn- walk-chunk-stats
+  "Walk all chunk entries for one column once, accumulating sum/count/
+   min/max in a single pass. Predicate-aware via `survives?`. Returns
+   `[sum count min-val max-val]` as a typed tuple."
+  [entries ^long n-chunks survives?]
+  (loop [i (long 0) sum 0.0 cnt (long 0)
+         mn Double/MAX_VALUE mx (- Double/MAX_VALUE)]
+    (if (>= i n-chunks)
+      [sum cnt mn mx]
+      (if (survives? i)
+        (let [^stratum.index.ChunkEntry entry (nth entries i)
+              ^stratum.stats.ChunkStats cs (.stats entry)]
+          (recur (inc i)
+                 (+ sum (double (:sum cs)))
+                 (+ cnt (long (:count cs)))
+                 (Math/min mn (double (:min-val cs)))
+                 (Math/max mx (double (:max-val cs)))))
+        (recur (inc i) sum cnt mn mx)))))
+
 (defn- execute-stats-only [node columnar?]
   (let [ctx     (execute-node (:input node))
         columns (ctx-columns ctx)
@@ -334,52 +357,51 @@
                          (fn [^long i]
                            (= :stats-only (gb/classify-chunk zone-filters col-entries i))))
                        (constantly true))
+        ;; One chunk-walk per distinct column. Previously the code walked
+        ;; chunks once per agg — fine for one-agg queries, but for
+        ;; e.g. MIN(price)+AVG(price)+MAX(price) that's three identical
+        ;; passes over the same chunk-entry vector. Materialize the
+        ;; per-column accumulator once and project aggs from it.
+        ref-cols   (into #{} (keep :col) aggs)
+        col-stats  (into {}
+                         (map (fn [col]
+                                (let [entries  (gb/collect-chunk-entries
+                                                (:index (get columns col)))
+                                      n-chunks (count entries)
+                                      [sum cnt mn mx] (walk-chunk-stats
+                                                       entries n-chunks survives?)]
+                                  [col {:sum    (double sum)
+                                        :count  (long cnt)
+                                        :min    (double mn)
+                                        :max    (double mx)
+                                        :long?  (= :int64 (:type (get columns col)))}])))
+                         ref-cols)
+        ;; COUNT(*) under preds: derive from any one column's accumulated
+        ;; count. Without preds, it's just `length`. Without preds AND
+        ;; without ref-cols (count-only with no col agg), we still need
+        ;; a count from chunk entries — pick any indexed column.
+        count-all  (if (seq preds)
+                     (or (some-> (first ref-cols) col-stats :count)
+                         (let [idx-col  (some (fn [[_ info]] (:index info)) columns)
+                               entries  (gb/collect-chunk-entries idx-col)
+                               n-chunks (count entries)
+                               [_ cnt _ _] (walk-chunk-stats entries n-chunks survives?)]
+                           cnt))
+                     length)
         result-row
         (reduce
          (fn [row agg]
            (let [alias (keyword (or (:as agg) (:op agg)))]
              (if (= :count (:op agg))
-               ;; COUNT: sum :count of surviving chunks (or use length
-               ;; when no preds for a cheap short-circuit).
-               (let [n (if (seq preds)
-                         (let [;; Pick any index-backed column to get
-                               ;; the chunk geometry — chunk counts
-                               ;; align across columns of the same scan.
-                               idx-col (some (fn [[_ info]] (:index info)) columns)
-                               entries (gb/collect-chunk-entries idx-col)
-                               n-chunks (count entries)]
-                           (loop [i 0 acc 0]
-                             (if (>= i n-chunks)
-                               acc
-                               (recur (inc i)
-                                      (if (survives? i)
-                                        (+ acc (long (:count (.stats ^stratum.index.ChunkEntry (nth entries i)))))
-                                        acc)))))
-                         length)]
-                 (assoc row alias (long n) :_count n))
-               (let [entries  (gb/collect-chunk-entries (:index (get columns (:col agg))))
-                     n-chunks (count entries)
-                     col-long? (= :int64 (:type (get columns (:col agg))))
-                     [sum cnt mn mx]
-                     (loop [i 0 sum 0.0 cnt (long 0) mn Double/MAX_VALUE mx (- Double/MAX_VALUE)]
-                       (if (>= i n-chunks)
-                         [sum cnt mn mx]
-                         (if (survives? i)
-                           (let [^stratum.index.ChunkEntry entry (nth entries i)
-                                 ^stratum.stats.ChunkStats cs (.stats entry)]
-                             (recur (inc i)
-                                    (+ sum (double (:sum cs)))
-                                    (+ cnt (long (:count cs)))
-                                    (Math/min mn (double (:min-val cs)))
-                                    (Math/max mx (double (:max-val cs)))))
-                           (recur (inc i) sum cnt mn mx))))]
+               (assoc row alias (long count-all) :_count count-all)
+               (let [{:keys [sum count min max long?]} (col-stats (:col agg))]
                  (assoc row alias
                         (case (:op agg)
-                          :sum (if (zero? cnt) nil (if col-long? (long sum) sum))
-                          :min (if (zero? cnt) nil (if col-long? (long mn) mn))
-                          :max (if (zero? cnt) nil (if col-long? (long mx) mx))
-                          :avg (if (zero? cnt) nil (/ sum (double cnt))))
-                        :_count cnt)))))
+                          :sum (if (zero? count) nil (if long? (long sum) sum))
+                          :min (if (zero? count) nil (if long? (long min) min))
+                          :max (if (zero? count) nil (if long? (long max) max))
+                          :avg (if (zero? count) nil (/ sum (double count))))
+                        :_count count)))))
          {}
          aggs)]
     ;; F21: apply linear recipes if any agg carries one.
@@ -588,12 +610,32 @@
 (defn- execute-split-agg [node columnar?]
   ;; Each child is a complete physical sub-plan. We always run them
   ;; in row mode (columnar? = false) and merge maps; the outer projection
-  ;; layer handles the columnar conversion if requested. Children share
-  ;; the same upstream scan, so the OS page cache / L3 keeps the column
-  ;; data hot across the K passes.
-  (let [child-results (mapv #(execute-node % false) (:children node))
-        agg-order     (:agg-order node)
-        group-keys    (:group-keys node)]
+  ;; layer handles the columnar conversion if requested.
+  ;;
+  ;; Children execute IN PARALLEL: the original serial design assumed
+  ;; sub-plans shared L3-cached input across passes, but mixed-class
+  ;; workloads can have wildly different per-branch costs (e.g.
+  ;; percentile O(N log N) sort vs stats-only O(chunks)). Sequential
+  ;; execution then bills wall-time = Σ branches; parallel bills
+  ;; max(branches), saving the cheap-branch cost in the common case and
+  ;; cleanly protecting against per-branch first-touch pessimism (page
+  ;; faults, JIT warmup) that would otherwise serialize. Branches read
+  ;; the same scan input — only OS-page-cache / L3 bandwidth is shared.
+  (let [children   (:children node)
+        agg-order  (:agg-order node)
+        group-keys (:group-keys node)
+        child-results
+        (if (= 1 (count children))
+          [(execute-node (first children) false)]
+          ;; Propagate *explain-collector* across the worker threads so
+          ;; ANALYZE per-node timings continue to be recorded.
+          (let [coll *explain-collector*
+                fs   (mapv (fn [c]
+                             (future
+                               (binding [*explain-collector* coll]
+                                 (execute-node c false))))
+                           children)]
+            (mapv deref fs)))]
     (if (nil? group-keys)
       (merge-global-rows child-results agg-order)
       (merge-group-rows child-results agg-order group-keys))))
