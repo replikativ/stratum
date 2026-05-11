@@ -2439,6 +2439,54 @@
 ;; Public API
 ;; ============================================================================
 
+(defn- parse-explain-option
+  "Parse one comma-separated EXPLAIN option string. Returns a map fragment."
+  [part]
+  (let [p (str/trim part)]
+    (cond
+      (re-matches #"(?i)ANALYZE"        p) {:analyze? true}
+      (re-matches #"(?i)FORMAT\s+JSON"  p) {:format :json}
+      (re-matches #"(?i)FORMAT\s+TEXT"  p) {:format :text}
+      (re-matches #"(?i)VERBOSE"        p) {} ; accepted for compatibility, no-op
+      :else (throw (ex-info (str "Unknown EXPLAIN option: " p)
+                            {:option p})))))
+
+(defn- parse-explain-prefix
+  "If `sql` starts with `EXPLAIN`, parse modifiers and return
+   `[options inner-sql]`. Otherwise return nil. Recognized syntaxes:
+
+     EXPLAIN <sql>
+     EXPLAIN ANALYZE <sql>
+     EXPLAIN (ANALYZE) <sql>
+     EXPLAIN (FORMAT JSON) <sql>
+     EXPLAIN (ANALYZE, FORMAT JSON) <sql>"
+  [sql]
+  (when-let [[_ rest-sql] (re-matches #"(?is)\s*EXPLAIN\s+(.*)" sql)]
+    (let [rest-sql (str/triml rest-sql)
+          default {:analyze? false :format :text}]
+      (cond
+        ;; Parenthesized options list
+        (str/starts-with? rest-sql "(")
+        (if-let [[_ opts-str inner] (re-matches #"(?s)\(([^)]*)\)\s*(.*)" rest-sql)]
+          (let [opts (->> (str/split opts-str #",")
+                          (map parse-explain-option)
+                          (reduce merge default))]
+            [opts (str/triml inner)])
+          (throw (ex-info "Malformed EXPLAIN (...) options" {:sql sql})))
+
+        ;; Bare ANALYZE keyword
+        (re-matches #"(?is)ANALYZE\s+.*" rest-sql)
+        (let [[_ inner] (re-matches #"(?is)ANALYZE\s+(.*)" rest-sql)]
+          [(assoc default :analyze? true) (str/triml inner)])
+
+        ;; VERBOSE keyword (Postgres) — accepted, no semantic effect
+        (re-matches #"(?is)VERBOSE\s+.*" rest-sql)
+        (let [[_ inner] (re-matches #"(?is)VERBOSE\s+(.*)" rest-sql)]
+          [default (str/triml inner)])
+
+        :else
+        [default rest-sql]))))
+
 (defn parse-sql
   "Parse a SQL string and translate to a Stratum query map.
 
@@ -2446,18 +2494,23 @@
      {:query {...}}       — translated query map for q/execute
      {:ddl {:op ...}}     — DDL/DML statement (create-table, insert, update, delete, upsert)
      {:system true ...}   — system query result (SET, SHOW, VERSION, etc.)
-     {:explain {...}}     — EXPLAIN result (execution plan)
-     {:error \"message\"} — parse or translation error"
+     {:explain {...}}     — EXPLAIN result (see below)
+     {:error \"message\"} — parse or translation error
+
+   The `:explain` value is a map:
+     {:options {:analyze? bool :format :text | :json}
+      :inner   {:query <map>} | {:system true :tag <str>}}"
   [sql table-registry]
   (try
     ;; Check for EXPLAIN prefix
-    (if-let [[_ inner-sql] (re-matches #"(?is)\s*EXPLAIN\s+(.*)" sql)]
-      ;; Parse the inner SQL, return as :explain
+    (if-let [[opts inner-sql] (parse-explain-prefix sql)]
       (let [result (parse-sql inner-sql table-registry)]
         (cond
-          (:error result) result
-          (:system result) {:explain {:strategy :system :tag (:tag result)}}
-          (:query result) {:explain (:query result)}
+          (:error result)  result
+          (:system result) {:explain {:options opts
+                                      :inner   {:system true :tag (:tag result)}}}
+          (:query result)  {:explain {:options opts
+                                      :inner   {:query (:query result)}}}
           :else result))
 
       ;; Normal parsing

@@ -96,7 +96,7 @@
                           :on [:>= :ts :ts]}]}))
           s (plan/explain phys)]
       (is (re-find #"PAsofJoin" s))
-      (is (re-find #"match=" s)))))
+      (is (re-find #"Match Cond:" s)))))
 
 ;; ============================================================================
 ;; End-to-end execution — INNER, >=, no equality keys

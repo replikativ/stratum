@@ -2185,115 +2185,473 @@
 
 ;; ============================================================================
 ;; Plan explanation (for debugging and EXPLAIN output)
+;;
+;; The pipeline is:
+;;
+;;   physical-plan  --plan->data-->  data tree  --render-text-->  Postgres-style string
+;;                                                --render-json-->  DuckDB-shape JSON data
+;;
+;; The data tree is a recursive map keyed by:
+;;   :op           — operator class simple name (string)
+;;   :est-rows     — estimated cardinality (long or nil)
+;;   :sel          — selectivity (double or nil)
+;;   :actual-rows  — actual row count (long or nil; ANALYZE only)
+;;   :time-ms      — wall-clock millis (double or nil; ANALYZE only)
+;;   :details      — vec of [label string-value] pairs (in display order)
+;;   :children     — vec of child data nodes
+;;   :child-tags   — vec of role labels parallel to :children (e.g. ["build" "probe"])
+;;                   nil for unary nodes / parallel branches.
 ;; ============================================================================
 
-(defn- node-name [node]
-  (let [cls (.getSimpleName (class node))]
-    cls))
+(defn- format-val
+  "Format a literal predicate value for display."
+  [v]
+  (cond
+    (nil? v)     "NULL"
+    (string? v)  (str "'" v "'")
+    (keyword? v) (name v)
+    (set? v)     (str "(" (clojure.string/join ", "
+                                               (mapv format-val
+                                                     (sort-by str v)))
+                      ")")
+    :else        (str v)))
 
-(defn- est-detail
-  "Append selectivity/estimated-rows from node metadata if present."
-  [node base]
-  (let [m (meta node)
-        sel (::selectivity m)
-        est (::estimated-rows m)]
-    (cond-> base
-      sel (str " sel=" (format "%.3f" (double sel)))
-      est (str " est-rows=" est))))
+(declare format-col-or-expr)
 
-(defn- node-detail [node]
-  (est-detail node
-              (cond
-                (instance? PStatsOnlyAgg node)
-                (str "aggs=" (mapv :op (:aggs node)))
+(defn- format-col-or-expr
+  "Format an LHS that may be a keyword column or a normalized expr map."
+  [x]
+  (cond
+    (keyword? x) (name x)
+    (map? x)
+    (let [{:keys [op args]} x
+          arity-2-infix {:add "+" :sub "-" :mul "*" :div "/" :mod "%"}]
+      (cond
+        (contains? arity-2-infix op)
+        (str "(" (clojure.string/join (str " " (arity-2-infix op) " ")
+                                      (mapv format-col-or-expr args))
+             ")")
+        :else
+        (str (name (or op :expr))
+             "("
+             (clojure.string/join ", " (mapv format-col-or-expr args))
+             ")")))
+    :else (pr-str x)))
 
-                (instance? PFusedSIMDAgg node)
-                (str "agg=" (:op (:agg node)) " preds=" (count (:predicates node)))
+(defn- format-pred
+  "Format a normalized predicate vector to a SQL-like string."
+  [pred]
+  (let [op (second pred)]
+    (case op
+      :or         (str "("
+                       (clojure.string/join " OR "
+                                            (mapv format-pred (subvec (vec pred) 2)))
+                       ")")
+      :lt         (str "(" (format-col-or-expr (first pred)) " < "  (format-val (nth pred 2)) ")")
+      :gt         (str "(" (format-col-or-expr (first pred)) " > "  (format-val (nth pred 2)) ")")
+      :lte        (str "(" (format-col-or-expr (first pred)) " <= " (format-val (nth pred 2)) ")")
+      :gte        (str "(" (format-col-or-expr (first pred)) " >= " (format-val (nth pred 2)) ")")
+      :eq         (str "(" (format-col-or-expr (first pred)) " = "  (format-val (nth pred 2)) ")")
+      :neq        (str "(" (format-col-or-expr (first pred)) " != " (format-val (nth pred 2)) ")")
+      :range      (str "(" (format-col-or-expr (first pred))
+                       " BETWEEN " (format-val (nth pred 2))
+                       " AND "     (format-val (nth pred 3)) ")")
+      :not-range  (str "(" (format-col-or-expr (first pred))
+                       " NOT BETWEEN " (format-val (nth pred 2))
+                       " AND "         (format-val (nth pred 3)) ")")
+      :in         (str "(" (format-col-or-expr (first pred))
+                       " IN " (format-val (nth pred 2)) ")")
+      :not-in     (str "(" (format-col-or-expr (first pred))
+                       " NOT IN " (format-val (nth pred 2)) ")")
+      :like       (str "(" (format-col-or-expr (first pred)) " LIKE "       (format-val (nth pred 2)) ")")
+      :not-like   (str "(" (format-col-or-expr (first pred)) " NOT LIKE "   (format-val (nth pred 2)) ")")
+      :ilike      (str "(" (format-col-or-expr (first pred)) " ILIKE "      (format-val (nth pred 2)) ")")
+      :not-ilike  (str "(" (format-col-or-expr (first pred)) " NOT ILIKE "  (format-val (nth pred 2)) ")")
+      :is-null      (str "(" (format-col-or-expr (first pred)) " IS NULL)")
+      :is-not-null  (str "(" (format-col-or-expr (first pred)) " IS NOT NULL)")
+      :contains     (str "(" (format-col-or-expr (first pred)) " CONTAINS "    (format-val (nth pred 2)) ")")
+      :starts-with  (str "(" (format-col-or-expr (first pred)) " STARTS WITH " (format-val (nth pred 2)) ")")
+      :ends-with    (str "(" (format-col-or-expr (first pred)) " ENDS WITH "   (format-val (nth pred 2)) ")")
+      :fn           (str "(" (format-col-or-expr (first pred)) " <fn>)")
+      (pr-str pred))))
 
-                (instance? PChunkedDenseGroupBy node)
-                (str "groups=" (:group-keys node) " aggs=" (mapv :op (:aggs node)))
+(defn- format-preds
+  "Format a vector of predicates as a single SQL-like AND-conjunction."
+  [preds]
+  (if (= 1 (count preds))
+    (format-pred (first preds))
+    (str "("
+         (clojure.string/join " AND " (mapv format-pred preds))
+         ")")))
 
-                (instance? PDenseGroupBy node)
-                (str "groups=" (:group-keys node) " aggs=" (mapv :op (:aggs node))
-                     " max-key=" (:max-key node))
+(defn- format-agg
+  "Format a normalized aggregate map. Recognizes :as alias."
+  [agg]
+  (let [{:keys [op col cols p as expr]} agg
+        body (cond
+               expr             (str (name (or op :agg)) "(" (pr-str expr) ")")
+               cols             (str (name op) "("
+                                     (clojure.string/join ", "
+                                                          (mapv format-col-or-expr cols))
+                                     ")")
+               (and p col)      (str (name op) "(" (format-col-or-expr col)
+                                     ", " p ")")
+               col              (str (name op) "(" (format-col-or-expr col) ")")
+               (= :count op)    "count(*)"
+               :else            (str (name op) "()"))]
+    (if as (str body " AS " (name as)) body)))
 
-                (instance? PHashGroupBy node)
-                (str "groups=" (:group-keys node) " aggs=" (mapv :op (:aggs node)))
+(defn- format-aggs [aggs]
+  (str "[" (clojure.string/join ", " (mapv format-agg aggs)) "]"))
 
-                (instance? PScan node)
-                (str "cols=" (vec (keys (:columns node))) " len=" (:length node))
+(defn- format-on-pairs
+  "Format `[[l r] ...]` join keys as `(l = r AND ...)`."
+  [on-pairs]
+  (clojure.string/join " AND "
+                       (mapv (fn [[l r]] (str (format-col-or-expr l)
+                                              " = "
+                                              (format-col-or-expr r)))
+                             on-pairs)))
 
-                (instance? PChunkedScan node)
-                (str "cols=" (vec (keys (:columns node))) " len=" (:length node)
-                     " zone-pruned=" (some? (:surviving-chunks node)))
+(defn- format-match-cond
+  "Format an asof match condition [op l r] as `l <op> r`."
+  [[op l r]]
+  (let [sym (case op
+              :lt "<" :gt ">" :lte "<=" :gte ">="
+              :eq "=" (name op))]
+    (str (format-col-or-expr l) " " sym " " (format-col-or-expr r))))
 
-                (instance? PFusedJoinGroupAgg node)
-                (str "groups=" (:group-keys node) " aggs=" (mapv :op (:aggs node))
-                     " join=" (:join-spec node))
+;; ---- Detail-entry helpers (each returns [label value] or nil) -------------
 
-                (instance? PFusedJoinGlobalAgg node)
-                (str "aggs=" (mapv :op (:aggs node)) " join=" (:join-spec node))
+(defn- d-filter [preds] (when (seq preds) ["Filter" (format-preds preds)]))
+(defn- d-group-keys [ks] (when (seq ks) ["Group Keys" (pr-str (vec ks))]))
+(defn- d-aggs [aggs] (when (seq aggs) ["Aggregates" (format-aggs aggs)]))
+(defn- d-agg  [agg]  (when agg ["Aggregate" (format-agg agg)]))
+(defn- d-columns [cols] (when (seq cols) ["Columns" (pr-str (vec (keys cols)))]))
+(defn- d-length  [len]  (when len ["Length" (str len)]))
+(defn- d-zone-pruned [n]
+  (when (instance? PChunkedScan n)
+    ["Zone Pruned" (if (:surviving-chunks n) "yes" "no")]))
 
-                (instance? PAsofJoin node)
-                (str "type=" (:join-type node)
-                     " on=" (:on-pairs node)
-                     " match=" (:match-condition node))
+(defn- node-details
+  "Return a vec of [label value] entries for a physical node's labeled
+   sub-info lines, in display order. Nils are dropped."
+  [node]
+  (->>
+   (cond
+     (instance? PScan node)
+     [(d-columns (:columns node))
+      (d-length  (:length node))
+      (d-filter  (:predicates node))]
 
-                (instance? PMaterializeExpr node)
-                (str "col=" (:col-name node) " expr=" (:expr node))
+     (instance? PChunkedScan node)
+     [(d-columns (:columns node))
+      (d-length  (:length node))
+      (d-zone-pruned node)
+      (d-filter  (:predicates node))]
 
-                (instance? PSplitAgg node)
-                (str "aggs=" (mapv :op (:agg-order node))
-                     " classes=" (count (:children node))
-                     (when-let [gks (:group-keys node)] (str " groups=" gks)))
+     (or (instance? PSIMDFilter node) (instance? PMaskFilter node))
+     [(d-filter (:predicates node))]
 
-                :else "")))
+     (instance? PStatsOnlyAgg node)
+     [(d-aggs (:aggs node))
+      (d-filter (:predicates node))]
+
+     (or (instance? PFusedSIMDAgg node)
+         (instance? PFusedSIMDCount node)
+         (instance? PChunkedSIMDAgg node)
+         (instance? PChunkedSIMDCount node)
+         (instance? PBlockSkipCount node))
+     [(d-agg (:agg node))
+      (d-filter (:predicates node))]
+
+     (instance? PFusedMultiSum node)
+     [(d-aggs (:aggs node))
+      (d-filter (:predicates node))]
+
+     (instance? PPercentileAgg node)
+     [(d-aggs (:aggs node))
+      (d-filter (:predicates node))]
+
+     (instance? PScalarAgg node)
+     [(d-aggs (:aggs node))
+      (d-filter (:predicates node))]
+
+     (instance? PSplitAgg node)
+     [(d-aggs (:agg-order node))
+      (d-group-keys (:group-keys node))
+      ["Strategies" (str (count (:children node)))]]
+
+     (instance? PChunkedDenseGroupBy node)
+     [(d-group-keys (:group-keys node))
+      (d-aggs (:aggs node))
+      ["Max Key" (str (:max-key node))]
+      (d-filter (:predicates node))]
+
+     (instance? PDenseGroupBy node)
+     [(d-group-keys (:group-keys node))
+      (d-aggs (:aggs node))
+      ["Max Key" (str (:max-key node))]
+      (d-filter (:predicates node))]
+
+     (instance? PHashGroupBy node)
+     [(d-group-keys (:group-keys node))
+      (d-aggs (:aggs node))
+      (d-filter (:predicates node))]
+
+     (instance? PFusedExtractCount node)
+     [["Extract" (str (name (:extract-op node))
+                      "(" (format-col-or-expr (:extract-col node)) ")")]
+      (d-aggs (:aggs node))]
+
+     (instance? PHashJoin node)
+     [["Join Type" (name (:join-type node))]
+      ["Hash Cond" (format-on-pairs (:on-pairs node))]]
+
+     (instance? PPerfectHashJoin node)
+     [["Join Type" (name (:join-type node))]
+      ["Hash Cond" (format-on-pairs (:on-pairs node))]
+      ["Min Key" (str (:min-key node))]
+      ["Key Range" (str (:key-range node))]]
+
+     (instance? PAsofJoin node)
+     [["Join Type" (name (:join-type node))]
+      ["Equi Keys" (if (seq (:on-pairs node))
+                     (format-on-pairs (:on-pairs node))
+                     "(none)")]
+      ["Match Cond" (format-match-cond (:match-condition node))]]
+
+     (instance? PBitmapSemiJoin node)
+     (let [js (:join-spec node)]
+       [["Probe Key" (format-col-or-expr (:probe-key js))]
+        ["Build Key" (format-col-or-expr (:build-key js))]])
+
+     (instance? PFusedJoinGroupAgg node)
+     [["Join" (pr-str (dissoc (:join-spec node) :build-side))]
+      (d-group-keys (:group-keys node))
+      (d-aggs (:aggs node))]
+
+     (instance? PFusedJoinGlobalAgg node)
+     [["Join" (pr-str (dissoc (:join-spec node) :build-side))]
+      (d-aggs (:aggs node))]
+
+     (instance? PProject node)
+     [["Output" (pr-str (mapv (fn [i] (or (:as i) (:expr i) i)) (:items node)))]]
+
+     (instance? PWindow node)
+     [["Specs" (pr-str (mapv #(select-keys % [:fn :partition-by :order-by :as])
+                             (:specs node)))]]
+
+     (instance? PHaving node)
+     [(d-filter (:predicates node))]
+
+     (instance? PSort node)
+     (let [{:keys [order-specs limit offset]} node]
+       [["Order" (pr-str order-specs)]
+        (when limit ["Limit" (str limit)])
+        (when offset ["Offset" (str offset)])])
+
+     (instance? PLimit node)
+     [(when (:limit node) ["Limit" (str (:limit node))])
+      (when (:offset node) ["Offset" (str (:offset node))])]
+
+     (instance? PMaterializeExpr node)
+     [["Column" (name (:col-name node))]
+      ["Expr"   (format-col-or-expr (:expr node))]
+      (when (:target node) ["Target" (name (:target node))])]
+
+     (instance? LScan node)
+     [(d-columns (:columns node))
+      (d-length  (:length node))
+      (d-filter  (:predicates node))]
+
+     (instance? LFilter node)
+     [(d-filter (:predicates node))]
+
+     (instance? LJoin node)
+     [["Join Type" (name (:join-type node))]
+      (when (seq (:on-pairs node))
+        ["Cond" (format-on-pairs (:on-pairs node))])]
+
+     (instance? LAsofJoin node)
+     [["Join Type" (name (:join-type node))]
+      (when (seq (:on-pairs node))
+        ["Equi Keys" (format-on-pairs (:on-pairs node))])
+      (when (:match-condition node)
+        ["Match Cond" (format-match-cond (:match-condition node))])]
+
+     (instance? LGroupBy node)
+     [(d-group-keys (:group-keys node))
+      (d-aggs (:aggs node))]
+
+     (instance? LGlobalAgg node)
+     [(d-aggs (:aggs node))]
+
+     :else
+     [])
+   (filterv some?)))
+
+(defn- node-children
+  "Return a [children-vec child-tags-vec] pair for a plan node.
+   child-tags-vec is nil for plain unary nodes."
+  [node]
+  (cond
+    (instance? LJoin node)
+    [[(:left node) (:right node)] ["left" "right"]]
+
+    (instance? LAsofJoin node)
+    [[(:left node) (:right node)] ["left" "right"]]
+
+    (instance? PAsofJoin node)
+    [[(:left node) (:right node)] ["probe" "build"]]
+
+    (instance? PHashJoin node)
+    [[(:build-side node) (:probe-side node)] ["build" "probe"]]
+
+    (instance? PPerfectHashJoin node)
+    [[(:build-side node) (:probe-side node)] ["build" "probe"]]
+
+    (instance? PFusedJoinGroupAgg node)
+    [[(:left node) (:right node)] ["fact" "dim"]]
+
+    (instance? PFusedJoinGlobalAgg node)
+    [[(:left node) (:right node)] ["fact" "dim"]]
+
+    (instance? PBitmapSemiJoin node)
+    (let [bs (get-in node [:join-spec :build-side])]
+      (if bs
+        [[(:input node) bs] ["input" "dim"]]
+        [[(:input node)] nil]))
+
+    (instance? PSplitAgg node)
+    [(vec (:children node)) nil]
+
+    :else
+    (if-let [c (ir/input-node node)]
+      [[c] nil]
+      [[] nil])))
+
+(defn plan->data
+  "Convert a physical (or logical) plan tree into a serializable data
+   tree of `node-info` maps. See namespace doc above for shape.
+
+   `:node-id` is the System/identityHashCode of the physical node — used
+   by `merge-analyze-timings` to look up per-node ANALYZE measurements.
+   It is not rendered in text or JSON output."
+  [plan]
+  (let [m (meta plan)
+        [kids tags] (node-children plan)]
+    {:op          (.getSimpleName (class plan))
+     :node-id     (System/identityHashCode plan)
+     :est-rows    (::estimated-rows m)
+     :sel         (::selectivity m)
+     :details     (node-details plan)
+     :children    (mapv plan->data kids)
+     :child-tags  tags}))
+
+(defn merge-analyze-timings
+  "Given a plan data tree and a `{node-identity-hash -> {:time-ns N :rows N}}`
+   collector map, return the data tree with `:actual-rows` and `:time-ms`
+   attached on every node where a measurement was recorded."
+  [data timings]
+  (let [m (get timings (:node-id data))
+        merged-kids (mapv #(merge-analyze-timings % timings) (:children data))]
+    (cond-> (assoc data :children merged-kids)
+      m (assoc :actual-rows (:rows m)
+               :time-ms (/ (double (:time-ns m)) 1.0e6)))))
+
+;; ---- Text renderer (Postgres style) ---------------------------------------
+
+(defn- pad ^String [^long n]
+  (apply str (repeat n \space)))
+
+(defn- cost-suffix
+  "Render `(est-rows=N sel=S.SSS actual-rows=M time=T.TTms)` Postgres-style.
+   Returns empty string when there's nothing to show."
+  [{:keys [est-rows sel actual-rows time-ms]}]
+  (let [parts (cond-> []
+                est-rows    (conj (str "est-rows=" est-rows))
+                sel         (conj (format "sel=%.3f" (double sel)))
+                actual-rows (conj (str "actual-rows=" actual-rows))
+                time-ms     (conj (format "time=%.3fms" (double time-ms))))]
+    (if (seq parts)
+      (str "  (" (clojure.string/join " " parts) ")")
+      "")))
+
+(defn- render-data-lines
+  "Returns a vec of strings for a data tree at the given depth.
+   `tag` is an optional role label (e.g. \"build\") for branching parents."
+  [data depth tag]
+  (let [op-col   (+ 2 (* 6 (long depth)))
+        sub-col  (+ op-col 2)
+        head-sym (cond
+                   (zero? depth)        (pad 1)
+                   (some? tag)          (str (pad (- op-col 4)) "->  ")
+                   :else                (str (pad (- op-col 4)) "->  "))
+        head-tag (if tag (str "[" tag "] ") "")
+        head     (str head-sym head-tag (:op data) (cost-suffix data))
+        details  (mapv (fn [[label value]]
+                         (str (pad sub-col) label ": " value))
+                       (:details data))
+        kids     (:children data)
+        ktags    (:child-tags data)
+        child-lines
+        (vec
+         (mapcat (fn [i child]
+                   (render-data-lines child
+                                      (inc depth)
+                                      (when ktags (nth ktags i))))
+                 (range) kids))]
+    (into [head] (into details child-lines))))
+
+(defn render-text
+  "Render a plan data tree to a Postgres-style indented multi-line string.
+
+   If `data` contains `:execution-time-ms` at the root (set by the
+   ANALYZE entry point), appends a Postgres-style `Execution Time:` line."
+  [data]
+  (let [body (clojure.string/join "\n" (render-data-lines data 0 nil))
+        et   (:execution-time-ms data)]
+    (if et
+      (str body "\n Execution Time: " (format "%.3f ms" (double et)))
+      body)))
+
+;; ---- JSON renderer (DuckDB-compatible shape) ------------------------------
+
+(defn- data->json-node
+  "Convert a plan data node to a DuckDB-shape map:
+     {\"name\" op, \"children\" [...], \"extra_info\" {...}}
+   Internal numeric keys use the `__...__` convention DuckDB uses."
+  [{:keys [op est-rows sel actual-rows time-ms details children child-tags] :as data}]
+  (let [extra (cond-> (reduce (fn [m [k v]] (assoc m k v)) {} details)
+                est-rows    (assoc "__estimated_cardinality__" est-rows)
+                sel         (assoc "__selectivity__" sel)
+                actual-rows (assoc "__cardinality__" actual-rows)
+                time-ms     (assoc "__timing__" time-ms))
+        kids (mapv (fn [i child]
+                     (let [json-child (data->json-node child)]
+                       (if child-tags
+                         (assoc json-child "role" (nth child-tags i))
+                         json-child)))
+                   (range) children)]
+    {"name" op
+     "children" kids
+     "extra_info" extra}))
+
+(defn render-json
+  "Render a plan data tree as a Clojure data structure matching
+   DuckDB's JSON EXPLAIN shape: a one-element vector wrapping the root."
+  [data]
+  [(data->json-node data)])
+
+;; ---- Public entry point ---------------------------------------------------
 
 (defn explain
-  "Return a human-readable string describing the physical plan tree.
+  "Return a Postgres-style human-readable string describing the plan tree.
 
-   (println (explain (optimize (build-logical-plan query))))"
-  ([plan] (explain plan 0))
-  ([plan depth]
-   (let [indent (apply str (repeat (* 2 depth) \space))
-         line   (str indent (node-name plan)
-                     (let [d (node-detail plan)]
-                       (when (seq d) (str "  " d))))
-         children (cond
-                    (instance? LJoin plan)
-                    [(str indent "  left:\n" (explain (:left plan) (+ depth 2)))
-                     (str indent "  right:\n" (explain (:right plan) (+ depth 2)))]
+   (println (explain (optimize (build-logical-plan query))))
 
-                    (instance? LAsofJoin plan)
-                    [(str indent "  left:\n" (explain (:left plan) (+ depth 2)))
-                     (str indent "  right:\n" (explain (:right plan) (+ depth 2)))]
-
-                    (instance? PAsofJoin plan)
-                    [(str indent "  probe:\n" (explain (:left plan) (+ depth 2)))
-                     (str indent "  build:\n" (explain (:right plan) (+ depth 2)))]
-
-                    (instance? PHashJoin plan)
-                    [(str indent "  build:\n" (explain (:build-side plan) (+ depth 2)))
-                     (str indent "  probe:\n" (explain (:probe-side plan) (+ depth 2)))]
-
-                    (instance? PFusedJoinGroupAgg plan)
-                    [(str indent "  fact:\n" (explain (:left plan) (+ depth 2)))
-                     (str indent "  dim:\n" (explain (:right plan) (+ depth 2)))]
-
-                    (instance? PFusedJoinGlobalAgg plan)
-                    [(str indent "  fact:\n" (explain (:left plan) (+ depth 2)))
-                     (str indent "  dim:\n" (explain (:right plan) (+ depth 2)))]
-
-                    (instance? PBitmapSemiJoin plan)
-                    (let [bs (get-in plan [:join-spec :build-side])]
-                      (cond-> [(explain (:input plan) (inc depth))]
-                        bs (conj (str indent "  dim:\n" (explain bs (+ depth 2))))))
-
-                    (instance? PSplitAgg plan)
-                    (mapv (fn [c] (explain c (inc depth))) (:children plan))
-
-                    (ir/input-node plan)
-                    [(explain (ir/input-node plan) (inc depth))]
-
-                    :else [])]
-     (clojure.string/join "\n" (cons line children)))))
+   For structured access, use `plan->data` + `render-text`/`render-json`
+   directly."
+  [plan]
+  (render-text (plan->data plan)))
