@@ -1,0 +1,1056 @@
+WARNING: Using incubator modules: jdk.incubator.vector
+
+================================================================
+  Stratum vs DuckDB — OLAP Benchmark Suite
+  Date: 2026-05-15T16:33:09.136326892
+  Git: 0118da5
+  CPU: Intel(R) Core(TM) Ultra 7 258V (8 cores)
+  OS: Linux/amd64, JVM: 25.0.1 (Java HotSpot(TM) 64-Bit Server VM)
+  SIMD lanes: 4 long, 4 double
+  10,000,000 rows, input modes: arrays, idx
+  Stratum warmup: 5, bench: 10 iters
+  DuckDB warmup: 1, bench: 10 iters (JDBC in-process)
+  DuckDB: v1.4.4
+================================================================
+
+JIT warmup: 0.9s
+
+=== Tier 1: TPC-H / SSB ===
+  Counting rows in data/tpch/lineitem.csv...
+  Loaded TPC-H data from CSV (6001215 rows)
+  Creating DuckDB lineitem table (JDBC)...
+  DuckDB: 6001215 rows loaded
+
+  --- Input mode: arrays ---
+
+B1: TPC-H Q6 — Filter + Sum-Product
+    SUM(price * discount) WHERE shipdate BETWEEN 8766..9131
+                            AND discount BETWEEN 0.05..0.07
+                            AND quantity < 24
+  Stratum (1 thread):                  29.6ms  (rev=123499783, cnt=114490)
+  Stratum (all threads):               17.0ms
+  DuckDB (1 thread):                   54.5ms
+  DuckDB (all threads):                13.2ms
+  ✓ B1: PASS (1 rows match)
+
+B2: TPC-H Q1 — Group-By + Multiple Aggregates
+    GROUP BY returnflag, linestatus with sum, avg, count
+  Stratum (1 thread):                 231.3ms  (4 groups)
+  Stratum (all threads):              167.9ms
+  DuckDB (1 thread):                  174.4ms
+  DuckDB (all threads):                38.0ms
+  ✓ B2: PASS (4 rows match)
+
+B3: SSB Q1.1 — Filter + Sum-Product (different params)
+    SUM(price * discount) WHERE shipdate BETWEEN 8766..9131
+                            AND discount BETWEEN 0.01..0.03
+                            AND quantity < 25
+  Stratum (1 thread):                  28.6ms  (rev=44792139, cnt=119265)
+  Stratum (all threads):               13.4ms
+  DuckDB (1 thread):                   59.6ms
+  DuckDB (all threads):                24.9ms
+  ✓ B3: PASS (1 rows match)
+
+B4: COUNT(*) — No Filter (metadata)
+  Stratum:                              1.0ms  (count=6001215)
+  DuckDB (1 thread):                    1.1ms
+  DuckDB (all threads):                 1.3ms
+  →  Stratum 1.1x FASTER (vs 1T)
+  ✓ B4: PASS (1 rows match)
+
+B5: Filtered Count — NEQ + COUNT
+    COUNT(*) WHERE discount <> 0
+  Stratum (1 thread):                   5.6ms  (count=5456329)
+  Stratum (all threads):                7.0ms
+  DuckDB (1 thread):                   24.9ms
+  DuckDB (all threads):                 9.8ms
+  ✓ B5: PASS (1 rows match)
+
+B6: Low-Cardinality Group-By — Filter + Group + Count
+    GROUP BY returnflag WHERE shipdate >= 9131
+  Stratum (1 thread):                  32.4ms  (3 groups)
+  Stratum (all threads):               16.1ms
+  DuckDB (1 thread):                   49.5ms
+  DuckDB (all threads):                17.8ms
+  ✓ B6: PASS (3 rows match)
+
+SSB-Q1.2: Tighter Filter + Sum-Product
+    SUM(price*discount) WHERE shipdate BETWEEN, disc 0.04..0.06, qty 26..35
+  Stratum (1T):    29.1ms
+  Stratum (NT):    24.6ms
+  DuckDB  (1T):    47.8ms
+  DuckDB  (NT):    25.0ms
+  ✓ SSB-Q12: PASS (1 rows match)
+
+  --- Input mode: idx ---
+  Building Stratum indices...
+  Indices built in 2.5s
+
+B1: TPC-H Q6 — Filter + Sum-Product
+    SUM(price * discount) WHERE shipdate BETWEEN 8766..9131
+                            AND discount BETWEEN 0.05..0.07
+                            AND quantity < 24
+  Stratum (1 thread):                 245.2ms  (rev=123499783, cnt=114490)
+  Stratum (all threads):              212.2ms
+  DuckDB (1 thread):                   54.3ms
+  DuckDB (all threads):                14.6ms
+  ✓ B1: PASS (1 rows match)
+
+B2: TPC-H Q1 — Group-By + Multiple Aggregates
+    GROUP BY returnflag, linestatus with sum, avg, count
+  Stratum (1 thread):                 139.4ms  (4 groups)
+  Stratum (all threads):              297.9ms
+  DuckDB (1 thread):                  117.1ms
+  DuckDB (all threads):                21.1ms
+  ✓ B2: PASS (4 rows match)
+
+B3: SSB Q1.1 — Filter + Sum-Product (different params)
+    SUM(price * discount) WHERE shipdate BETWEEN 8766..9131
+                            AND discount BETWEEN 0.01..0.03
+                            AND quantity < 25
+  Stratum (1 thread):                 110.8ms  (rev=44792139, cnt=119265)
+  Stratum (all threads):              104.5ms
+  DuckDB (1 thread):                   39.3ms
+  DuckDB (all threads):                 8.7ms
+  ✓ B3: PASS (1 rows match)
+
+B4: COUNT(*) — No Filter (metadata)
+  Stratum:                              0.2ms  (count=6001215)
+  DuckDB (1 thread):                    0.6ms
+  DuckDB (all threads):                 0.5ms
+  →  Stratum 2.2x FASTER (vs 1T)
+  ✓ B4: PASS (1 rows match)
+
+B5: Filtered Count — NEQ + COUNT
+    COUNT(*) WHERE discount <> 0
+  Stratum (1 thread):                   4.1ms  (count=5456329)
+  Stratum (all threads):                4.0ms
+  DuckDB (1 thread):                   16.9ms
+  DuckDB (all threads):                 4.2ms
+  ✓ B5: PASS (1 rows match)
+
+B6: Low-Cardinality Group-By — Filter + Group + Count
+    GROUP BY returnflag WHERE shipdate >= 9131
+  Stratum (1 thread):                  38.8ms  (3 groups)
+  Stratum (all threads):               13.5ms
+  DuckDB (1 thread):                   37.4ms
+  DuckDB (all threads):                 6.7ms
+  ✓ B6: PASS (3 rows match)
+
+SSB-Q1.2: Tighter Filter + Sum-Product
+    SUM(price*discount) WHERE shipdate BETWEEN, disc 0.04..0.06, qty 26..35
+  Stratum (1T):   108.1ms
+  Stratum (NT):   106.9ms
+  DuckDB  (1T):    28.1ms
+  DuckDB  (NT):     8.1ms
+  ✓ SSB-Q12: PASS (1 rows match)
+
+
+=== Tier 2: H2O.ai db-benchmark ===
+  Generating H2O db-benchmark data...
+  Exporting H2O data to DuckDB (shared CSV)...
+
+  --- Input mode: arrays ---
+
+H2O-Q1: GROUP BY id1 (string), SUM(v1)
+  Stratum (1T):    48.0ms (100 groups)
+  Stratum (NT):    25.6ms
+  DuckDB  (1T):    63.3ms
+  DuckDB  (NT):    15.3ms
+  ✓ H2O-Q1: PASS (100 rows match)
+
+H2O-Q2: GROUP BY id1, id2 (string), SUM(v1)
+  Stratum (1T):    67.9ms (10000 groups)
+  Stratum (NT):    38.5ms
+  DuckDB  (1T):   165.4ms
+  DuckDB  (NT):    66.5ms
+  ✓ H2O-Q2: PASS (10000 rows match)
+
+H2O-Q3: GROUP BY id3 (high-card string), SUM(v1)+AVG(v3)
+  Stratum (1T):   158.6ms (100000 groups)
+  Stratum (NT):   155.3ms
+  DuckDB  (1T):   510.4ms
+  DuckDB  (NT):   238.9ms
+  ✓ H2O-Q3: PASS (100000 rows match)
+
+H2O-Q4: GROUP BY id4 (int 100), AVG(v1)+AVG(v2)+AVG(v3)
+  Stratum (1T):   172.0ms (100 groups)
+  Stratum (NT):   172.3ms
+  DuckDB  (1T):    55.1ms
+  DuckDB  (NT):    11.1ms
+  ✓ H2O-Q4: PASS (100 rows match)
+
+H2O-Q5: GROUP BY id6 (high-card int), SUM(v1)+SUM(v2)+SUM(v3)
+  Stratum (1T):   145.8ms (100000 groups)
+  Stratum (NT):   153.8ms
+  DuckDB  (1T):   169.3ms
+  DuckDB  (NT):   133.1ms
+  ✓ H2O-Q5: PASS (100000 rows match)
+
+H2O-Q7: GROUP BY id3 (string), MAX(v1)-MIN(v2)
+  Stratum (1T):   124.4ms (100000 groups)
+  Stratum (NT):   114.2ms
+  DuckDB  (1T):   414.2ms
+  DuckDB  (NT):   224.6ms
+  ✓ H2O-Q7: PASS (100000 rows match)
+
+H2O-Q10: GROUP BY id1..id6 (6 cols), SUM(v3)+COUNT(*)
+  Stratum (1T):  1152.9ms (10000000 groups)
+  Stratum (NT):   770.3ms
+  DuckDB  (1T):  9615.4ms
+  DuckDB  (NT):  8863.3ms
+  ✓ H2O-Q10: PASS (row count 10000000 matches)
+
+INT-Q1: GROUP BY id4 (int 100), SUM(v1)+SUM(v2)+COUNT (all-integer)
+  Stratum (1T):    90.9ms (100 groups)
+  Stratum (NT):    46.5ms
+  DuckDB  (1T):    44.3ms
+  DuckDB  (NT):     7.0ms
+  ✓ INT-Q1: PASS (100 rows match)
+
+INT-Q2: GROUP BY id4 (int 100), SUM+MIN+MAX+COUNT (all-integer)
+  Stratum (1T):    85.3ms (100 groups)
+  Stratum (NT):    35.9ms
+  DuckDB  (1T):    48.6ms
+  DuckDB  (NT):     9.6ms
+  ✓ INT-Q2: PASS (100 rows match)
+
+INT-Q3: SUM(v1)+SUM(v2)+COUNT (global integer multi-sum)
+  Stratum (1T):    27.5ms  (sum_v1=30003271, sum_v2=79992624)
+  Stratum (NT):    23.5ms
+  DuckDB  (1T):    18.0ms
+  DuckDB  (NT):     3.1ms
+  ✓ INT-Q3: PASS
+
+H2O-Q6: GROUP BY id4,id5, STDDEV(v3) (compound agg)
+  Stratum (1T):    72.8ms (10000 groups)
+  Stratum (NT):    49.2ms
+  DuckDB  (1T):   102.3ms
+  DuckDB  (NT):    47.8ms
+  ✓ H2O-Q6: PASS (10000 rows match)
+
+H2O-Q9: GROUP BY id2,id4, CORR(v1,v2) (compound agg)
+  Stratum (1T):   129.6ms (10000 groups)
+  Stratum (NT):    78.9ms
+  DuckDB  (1T):   174.5ms
+  DuckDB  (NT):    66.9ms
+  ✓ H2O-Q9: PASS (10000 rows match)
+
+H2O-Q8: Top-2 v3 per id6 (ROW_NUMBER window)
+  Stratum (1T):  1699.1ms (200000 rows)
+  Stratum (NT):  1299.3ms
+  DuckDB  (1T):  1774.1ms
+  DuckDB  (NT):   544.0ms
+  Ratio 1T:   Stratum 1.0x FASTER
+  ✓ H2O-Q8: PASS (200000 rows match)
+
+  --- Input mode: idx ---
+  Building Stratum indices...
+  Indices built in 2.8s
+
+H2O-Q1: GROUP BY id1 (string), SUM(v1)
+  Stratum (1T):    31.9ms (100 groups)
+  Stratum (NT):    11.2ms
+  DuckDB  (1T):    62.2ms
+  DuckDB  (NT):    14.5ms
+  ✓ H2O-Q1: PASS (100 rows match)
+
+H2O-Q2: GROUP BY id1, id2 (string), SUM(v1)
+  Stratum (1T):    43.2ms (10000 groups)
+  Stratum (NT):    17.1ms
+  DuckDB  (1T):   164.4ms
+  DuckDB  (NT):    81.7ms
+  ✓ H2O-Q2: PASS (10000 rows match)
+
+H2O-Q3: GROUP BY id3 (high-card string), SUM(v1)+AVG(v3)
+  Stratum (1T):   133.4ms (100000 groups)
+  Stratum (NT):   139.5ms
+  DuckDB  (1T):   816.9ms
+  DuckDB  (NT):   432.7ms
+  ✓ H2O-Q3: PASS (100000 rows match)
+
+H2O-Q4: GROUP BY id4 (int 100), AVG(v1)+AVG(v2)+AVG(v3)
+  Stratum (1T):    78.2ms (100 groups)
+  Stratum (NT):    19.1ms
+  DuckDB  (1T):    76.9ms
+  DuckDB  (NT):    20.9ms
+  ✓ H2O-Q4: PASS (100 rows match)
+
+H2O-Q5: GROUP BY id6 (high-card int), SUM(v1)+SUM(v2)+SUM(v3)
+  Stratum (1T):   169.8ms (100000 groups)
+  Stratum (NT):   176.5ms
+  DuckDB  (1T):   306.0ms
+  DuckDB  (NT):   307.6ms
+  ✓ H2O-Q5: PASS (100000 rows match)
+
+H2O-Q7: GROUP BY id3 (string), MAX(v1)-MIN(v2)
+  Stratum (1T):   115.2ms (100000 groups)
+  Stratum (NT):   144.2ms
+  DuckDB  (1T):   443.0ms
+  DuckDB  (NT):   211.2ms
+  ✓ H2O-Q7: PASS (100000 rows match)
+
+H2O-Q10: GROUP BY id1..id6 (6 cols), SUM(v3)+COUNT(*)
+  Stratum (1T):  1113.7ms (10000000 groups)
+  Stratum (NT):  1040.1ms
+  DuckDB  (1T):  8703.3ms
+  DuckDB  (NT):  7216.9ms
+  ✓ H2O-Q10: PASS (row count 10000000 matches)
+
+INT-Q1: GROUP BY id4 (int 100), SUM(v1)+SUM(v2)+COUNT (all-integer)
+  Stratum (1T):    51.0ms (100 groups)
+  Stratum (NT):    12.9ms
+  DuckDB  (1T):    40.7ms
+  DuckDB  (NT):     6.6ms
+  ✓ INT-Q1: PASS (100 rows match)
+
+INT-Q2: GROUP BY id4 (int 100), SUM+MIN+MAX+COUNT (all-integer)
+  Stratum (1T):    80.2ms (100 groups)
+  Stratum (NT):    19.3ms
+  DuckDB  (1T):    44.2ms
+  DuckDB  (NT):     8.6ms
+  ✓ INT-Q2: PASS (100 rows match)
+
+INT-Q3: SUM(v1)+SUM(v2)+COUNT (global integer multi-sum)
+  Stratum (1T):     0.7ms  (sum_v1=30003271, sum_v2=79992624)
+  Stratum (NT):     0.7ms
+  DuckDB  (1T):    16.7ms
+  DuckDB  (NT):     3.3ms
+  ✓ INT-Q3: PASS
+
+H2O-Q6: GROUP BY id4,id5, STDDEV(v3) (compound agg)
+  Stratum (1T):    40.8ms (10000 groups)
+  Stratum (NT):    18.2ms
+  DuckDB  (1T):   107.1ms
+  DuckDB  (NT):    58.5ms
+  ✓ H2O-Q6: PASS (10000 rows match)
+
+H2O-Q9: GROUP BY id2,id4, CORR(v1,v2) (compound agg)
+  Stratum (1T):    81.0ms (10000 groups)
+  Stratum (NT):    31.3ms
+  DuckDB  (1T):   161.0ms
+  DuckDB  (NT):    65.3ms
+  ✓ H2O-Q9: PASS (10000 rows match)
+
+H2O-Q8: Top-2 v3 per id6 (ROW_NUMBER window)
+  Stratum (1T):  1636.6ms (200000 rows)
+  Stratum (NT):  1083.2ms
+  DuckDB  (1T):  1464.0ms
+  DuckDB  (NT):   516.6ms
+  Ratio 1T:   DuckDB 1.1x faster
+  ✓ H2O-Q8: PASS (200000 rows match)
+
+  --- H2O Join Queries ---
+  Generating H2O join dimension tables...
+
+H2O-J1: x JOIN small ON id4=id1, SUM(v1), SUM(v2)
+  Stratum (1T):    69.1ms
+  Stratum (NT):    17.6ms
+  DuckDB  (1T):    39.3ms
+  DuckDB  (NT):     6.9ms
+  Ratio 1T:   DuckDB 1.8x faster
+  ✓ H2O-J1: PASS (1 rows match)
+
+H2O-J2: x JOIN medium ON id4=mid4, id5=mid5, SUM(v1), SUM(v2)
+  Stratum (1T):    93.1ms
+  Stratum (NT):    37.0ms
+  DuckDB  (1T):    88.1ms
+  DuckDB  (NT):    55.5ms
+  Ratio 1T:   DuckDB 1.1x faster
+  ✓ H2O-J2: PASS (1 rows match)
+
+H2O-J3: x LEFT JOIN medium ON id4=mid4, id5=mid5, SUM(v1), SUM(v2)
+  Stratum (1T):    92.0ms
+  Stratum (NT):    39.9ms
+  DuckDB  (1T):   102.8ms
+  DuckDB  (NT):    43.4ms
+  Ratio 1T:   Stratum 1.1x FASTER
+  ✓ H2O-J3: PASS (1 rows match)
+
+  --- Bitmap Semi-Join Queries ---
+  Generating semi-join dimension data...
+
+SEMI-Q1: SUM(v1) WHERE EXISTS customer(nation=5) — bitmap semi-join
+  Stratum (1T):    31.2ms  (sum=1213996, cnt=404752)
+  Stratum (NT):     8.1ms
+  DuckDB  (1T):   302.7ms
+  DuckDB  (NT):   118.9ms
+  Ratio 1T:   Stratum 9.7x FASTER
+  ✓ SEMI-Q1: PASS
+
+SEMI-Q2: SUM(v1) GROUP BY id4 WHERE EXISTS customer(nation=5)
+  Stratum (1T):    98.2ms (100 groups)
+  Stratum (NT):    83.0ms
+  DuckDB  (1T):   351.0ms
+  DuckDB  (NT):   144.6ms
+  Ratio 1T:   Stratum 3.6x FASTER
+  ✓ SEMI-Q2: PASS (100 rows match)
+
+SEMI-Q3: COUNT(*) WHERE EXISTS customer(nation=5)
+  Stratum (1T):    68.4ms  (cnt=404752)
+  Stratum (NT):    24.8ms
+  DuckDB  (1T):   300.1ms
+  DuckDB  (NT):   146.6ms
+  Ratio 1T:   Stratum 4.4x FASTER
+  ✓ SEMI-Q3: PASS
+
+
+=== Tier 3: ClickBench ===
+  Counting rows in data/cb/hits.csv...
+  Loaded ClickBench data from CSV (6000000 rows)
+  Creating DuckDB ClickBench table (JDBC)...
+
+  --- Input mode: arrays ---
+
+--- ClickBench Numeric Subset ---
+
+CB-Q0: COUNT(*)
+  Stratum (1T):     0.2ms
+  Stratum (NT):     0.2ms
+
+CB-Q1: COUNT(*) WHERE AdvEngineID != 0
+  Stratum (1T):    45.5ms
+  Stratum (NT):    18.1ms
+  DuckDB  (1T):     9.3ms
+  DuckDB  (NT):     3.0ms
+  ✓ CB-Q1: PASS (1 rows match)
+
+CB-Q2: SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth)
+  Stratum (1T):    20.4ms
+  Stratum (NT):    18.0ms
+  DuckDB  (1T):    14.9ms
+  DuckDB  (NT):     5.9ms
+  ✓ CB-Q2: PASS (1 rows match)
+
+CB-Q7: COUNT(*) WHERE IsRefresh=1 AND ResolutionWidth>1000
+  Stratum (1T):    75.1ms
+  Stratum (NT):    23.8ms
+  DuckDB  (1T):    16.0ms
+  DuckDB  (NT):     3.7ms
+  ✓ CB-Q7: PASS (1 rows match)
+
+CB-GRP-SE: GROUP BY SearchEngineID, COUNT(*)
+  Stratum (1T):    21.0ms (65 groups)
+  Stratum (NT):    10.8ms
+  DuckDB  (1T):    27.0ms
+  DuckDB  (NT):     4.1ms
+  ✓ CB-GRP-SE: PASS (65 rows match)
+
+CB-GRP-REG: GROUP BY RegionID, SUM(AdvEngineID)+COUNT(*)
+  Stratum (1T):    50.7ms (3274 groups)
+  Stratum (NT):    35.0ms
+  DuckDB  (1T):    50.0ms
+  DuckDB  (NT):    29.7ms
+  ✓ CB-GRP-REG: PASS (3274 rows match)
+
+CB-Q15: GROUP BY UserID, COUNT(*) (high-card)
+  Stratum (1T):   159.8ms (1132807 groups)
+  Stratum (NT):    84.6ms
+  DuckDB  (1T):   113.6ms
+  DuckDB  (NT):    49.3ms
+  ✓ CB-Q15: PASS (row count 1132807 matches)
+
+CB-Q5: COUNT(DISTINCT UserID)
+  Stratum (1T):   153.2ms  (distinct=1132807)
+  Stratum (NT):   166.3ms
+  DuckDB  (1T):    85.0ms
+  DuckDB  (NT):    37.7ms
+  ✓ CB-Q5: PASS (1 rows match)
+
+CB-CD-GRP: COUNT(DISTINCT AdvEngineID) GROUP BY RegionID
+  Stratum (1T):    41.2ms  (top-cd=7, groups=10)
+  Stratum (NT):    22.9ms
+  DuckDB  (1T):    40.5ms
+  DuckDB  (NT):    29.8ms
+  ✓ CB-CD-GRP: PASS (3274 rows match)
+
+CB-Q19: GROUP BY EXTRACT(minute FROM EventTime), COUNT(*)
+  Stratum (1T):    13.2ms (10 groups)
+  Stratum (NT):     3.8ms
+  DuckDB  (1T):  1288.1ms
+  DuckDB  (NT):   358.1ms
+  ✓ CB-Q19: PASS (60 rows match)
+
+CB-LIKE1: COUNT(*) WHERE URL LIKE '%example.com/page%'
+  Stratum (1T):    31.0ms  (count=0)
+  Stratum (NT):    30.6ms
+  DuckDB  (1T):   431.3ms
+  DuckDB  (NT):    77.8ms
+  ✓ CB-LIKE1: PASS (1 rows match)
+
+CB-LIKE2: COUNT(*) WHERE URL LIKE '%search%'
+  Stratum (1T):    79.2ms  (count=956814)
+  Stratum (NT):    40.9ms
+  DuckDB  (1T):   494.0ms
+  DuckDB  (NT):   123.6ms
+  ✓ CB-LIKE2: PASS (1 rows match)
+
+CB-LIKE3: GROUP BY SearchEngineID WHERE URL LIKE '%shop%', COUNT(*)
+  Stratum (1T):    48.8ms (33 groups)
+  Stratum (NT):    44.7ms
+  DuckDB  (1T):   406.5ms
+  DuckDB  (NT):    89.7ms
+  ✓ CB-LIKE3: PASS (33 rows match)
+
+CB-Q28: AVG(LENGTH(URL))
+  Stratum (1T):    59.7ms  (avg_len=85.1)
+  Stratum (NT):    33.3ms
+  DuckDB  (1T):   260.3ms
+  DuckDB  (NT):    54.6ms
+  ✓ CB-Q28: PASS (1 rows match)
+
+CB-Q43: GROUP BY DATE_TRUNC(minute, EventTime), COUNT(*)
+  Stratum (1T):   113.3ms (10 groups)
+  Stratum (NT):    60.2ms
+  DuckDB  (1T):    78.0ms
+  DuckDB  (NT):    35.2ms
+  ✓ CB-Q43: PASS (11195 rows match)
+
+CB-Q3: AVG(UserID)
+  Stratum (1T):    51.2ms
+  Stratum (NT):    31.4ms
+  DuckDB  (1T):    12.8ms
+  DuckDB  (NT):     2.3ms
+  ✓ CB-Q3: PASS (1 rows match)
+
+CB-Q6: MIN(EventTime), MAX(EventTime)
+  Stratum (1T):    25.4ms
+  Stratum (NT):     6.3ms
+  DuckDB  (1T):    10.4ms
+  DuckDB  (NT):     2.3ms
+  ✓ CB-Q6: PASS (1 rows match)
+
+CB-Q8: GROUP BY RegionID, COUNT(DISTINCT UserID) ORDER BY u DESC LIMIT 10
+  Stratum (1T):   105.7ms (10 groups)
+  Stratum (NT):   115.0ms
+  DuckDB  (1T):   108.2ms
+  DuckDB  (NT):    44.6ms
+  ✓ CB-Q8: PASS (10 rows match)
+
+CB-Q9: GROUP BY RegionID, SUM+COUNT+AVG+COUNT-DISTINCT
+  Stratum (1T):   114.7ms (10 groups)
+  Stratum (NT):   126.3ms
+  DuckDB  (1T):   173.2ms
+  DuckDB  (NT):   105.6ms
+  ✓ CB-Q9: PASS (10 rows match)
+
+CB-Q20: COUNT(*) WHERE URL LIKE '%google%'
+  Stratum (1T):    50.7ms  (count=459)
+  Stratum (NT):    56.3ms
+  DuckDB  (1T):   315.1ms
+  DuckDB  (NT):    54.0ms
+  ✓ CB-Q20: PASS (1 rows match)
+
+CB-Q12: GROUP BY SearchPhrase WHERE SearchPhrase<>'', COUNT(*) LIMIT 10
+  Stratum (1T):   502.3ms (10 groups)
+  Stratum (NT):   432.5ms
+  DuckDB  (1T):   134.0ms
+  DuckDB  (NT):    33.4ms
+  ✓ CB-Q12: PASS (10 rows match)
+
+CB-Q27: GROUP BY CounterID, AVG(LENGTH(URL)) HAVING COUNT>100000
+  Stratum (1T):    55.7ms (11 groups)
+  Stratum (NT):    31.9ms
+  DuckDB  (1T):   236.2ms
+  DuckDB  (NT):    52.2ms
+  ✓ CB-Q27: PASS (11 rows match)
+
+CB-Q33: GROUP BY URL, COUNT(*) ORDER BY c DESC LIMIT 10
+  Stratum (1T):  1429.9ms (0 groups)
+  Stratum (NT):  1636.6ms
+  DuckDB  (1T):   502.8ms
+  DuckDB  (NT):   142.1ms
+  ✓ CB-Q33: PASS (10 rows match)
+
+  --- Input mode: idx ---
+  Building Stratum indices...
+  Indices built in 1.9s
+
+--- ClickBench Numeric Subset ---
+
+CB-Q0: COUNT(*)
+  Stratum (1T):     0.3ms
+  Stratum (NT):     0.3ms
+
+CB-Q1: COUNT(*) WHERE AdvEngineID != 0
+  Stratum (1T):    20.1ms
+  Stratum (NT):     8.1ms
+  DuckDB  (1T):     5.2ms
+  DuckDB  (NT):     1.1ms
+  ✓ CB-Q1: PASS (1 rows match)
+
+CB-Q2: SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth)
+  Stratum (1T):     0.6ms
+  Stratum (NT):     0.3ms
+  DuckDB  (1T):     9.8ms
+  DuckDB  (NT):     2.0ms
+  ✓ CB-Q2: PASS (1 rows match)
+
+CB-Q7: COUNT(*) WHERE IsRefresh=1 AND ResolutionWidth>1000
+  Stratum (1T):    42.7ms
+  Stratum (NT):    14.8ms
+  DuckDB  (1T):    10.5ms
+  DuckDB  (NT):     2.1ms
+  ✓ CB-Q7: PASS (1 rows match)
+
+CB-GRP-SE: GROUP BY SearchEngineID, COUNT(*)
+  Stratum (1T):    19.7ms (65 groups)
+  Stratum (NT):     4.4ms
+  DuckDB  (1T):    17.9ms
+  DuckDB  (NT):     3.0ms
+  ✓ CB-GRP-SE: PASS (65 rows match)
+
+CB-GRP-REG: GROUP BY RegionID, SUM(AdvEngineID)+COUNT(*)
+  Stratum (1T):    31.4ms (3274 groups)
+  Stratum (NT):    29.4ms
+  DuckDB  (1T):    32.2ms
+  DuckDB  (NT):    22.3ms
+  ✓ CB-GRP-REG: PASS (3274 rows match)
+
+CB-Q15: GROUP BY UserID, COUNT(*) (high-card)
+  Stratum (1T):   126.5ms (1132807 groups)
+  Stratum (NT):    68.0ms
+  DuckDB  (1T):    94.2ms
+  DuckDB  (NT):    44.3ms
+  ✓ CB-Q15: PASS (row count 1132807 matches)
+
+CB-Q5: COUNT(DISTINCT UserID)
+  Stratum (1T):   149.2ms  (distinct=1132807)
+  Stratum (NT):   139.8ms
+  DuckDB  (1T):    73.5ms
+  DuckDB  (NT):    29.0ms
+  ✓ CB-Q5: PASS (1 rows match)
+
+CB-CD-GRP: COUNT(DISTINCT AdvEngineID) GROUP BY RegionID
+  Stratum (1T):    41.3ms  (top-cd=7, groups=10)
+  Stratum (NT):    24.3ms
+  DuckDB  (1T):    38.1ms
+  DuckDB  (NT):    29.8ms
+  ✓ CB-CD-GRP: PASS (3274 rows match)
+
+CB-Q19: GROUP BY EXTRACT(minute FROM EventTime), COUNT(*)
+  Stratum (1T):    18.6ms (10 groups)
+  Stratum (NT):     8.9ms
+  DuckDB  (1T):  1050.3ms
+  DuckDB  (NT):   201.1ms
+  ✓ CB-Q19: PASS (60 rows match)
+
+CB-LIKE1: COUNT(*) WHERE URL LIKE '%example.com/page%'
+  Stratum (1T):    31.8ms  (count=0)
+  Stratum (NT):    32.3ms
+  DuckDB  (1T):   320.1ms
+  DuckDB  (NT):    53.4ms
+  ✓ CB-LIKE1: PASS (1 rows match)
+
+CB-LIKE2: COUNT(*) WHERE URL LIKE '%search%'
+  Stratum (1T):    60.3ms  (count=956814)
+  Stratum (NT):    45.4ms
+  DuckDB  (1T):   296.2ms
+  DuckDB  (NT):    52.1ms
+  ✓ CB-LIKE2: PASS (1 rows match)
+
+CB-LIKE3: GROUP BY SearchEngineID WHERE URL LIKE '%shop%', COUNT(*)
+  Stratum (1T):    49.8ms (33 groups)
+  Stratum (NT):    99.0ms
+  DuckDB  (1T):   312.4ms
+  DuckDB  (NT):    51.2ms
+  ✓ CB-LIKE3: PASS (33 rows match)
+
+CB-Q28: AVG(LENGTH(URL))
+  Stratum (1T):    51.0ms  (avg_len=85.1)
+  Stratum (NT):    32.4ms
+  DuckDB  (1T):   213.6ms
+  DuckDB  (NT):    34.0ms
+  ✓ CB-Q28: PASS (1 rows match)
+
+CB-Q43: GROUP BY DATE_TRUNC(minute, EventTime), COUNT(*)
+  Stratum (1T):    86.1ms (10 groups)
+  Stratum (NT):    51.0ms
+  DuckDB  (1T):    62.6ms
+  DuckDB  (NT):    26.4ms
+  ✓ CB-Q43: PASS (11195 rows match)
+
+CB-Q3: AVG(UserID)
+  Stratum (1T):     0.5ms
+  Stratum (NT):     0.3ms
+  DuckDB  (1T):     8.9ms
+  DuckDB  (NT):     1.8ms
+  ✓ CB-Q3: PASS (1 rows match)
+
+CB-Q6: MIN(EventTime), MAX(EventTime)
+  Stratum (1T):     0.2ms
+  Stratum (NT):     0.2ms
+  DuckDB  (1T):     8.0ms
+  DuckDB  (NT):     1.6ms
+  ✓ CB-Q6: PASS (1 rows match)
+
+CB-Q8: GROUP BY RegionID, COUNT(DISTINCT UserID) ORDER BY u DESC LIMIT 10
+  Stratum (1T):    87.0ms (10 groups)
+  Stratum (NT):    95.7ms
+  DuckDB  (1T):    86.6ms
+  DuckDB  (NT):    35.7ms
+  ✓ CB-Q8: PASS (10 rows match)
+
+CB-Q9: GROUP BY RegionID, SUM+COUNT+AVG+COUNT-DISTINCT
+  Stratum (1T):   111.6ms (10 groups)
+  Stratum (NT):   119.0ms
+  DuckDB  (1T):   147.9ms
+  DuckDB  (NT):    62.1ms
+  ✓ CB-Q9: PASS (10 rows match)
+
+CB-Q20: COUNT(*) WHERE URL LIKE '%google%'
+  Stratum (1T):    39.9ms  (count=459)
+  Stratum (NT):    46.9ms
+  DuckDB  (1T):   220.6ms
+  DuckDB  (NT):    37.1ms
+  ✓ CB-Q20: PASS (1 rows match)
+
+CB-Q12: GROUP BY SearchPhrase WHERE SearchPhrase<>'', COUNT(*) LIMIT 10
+  Stratum (1T):   356.5ms (10 groups)
+  Stratum (NT):   343.4ms
+  DuckDB  (1T):   124.9ms
+  DuckDB  (NT):    28.9ms
+  ✓ CB-Q12: PASS (10 rows match)
+
+CB-Q27: GROUP BY CounterID, AVG(LENGTH(URL)) HAVING COUNT>100000
+  Stratum (1T):    58.0ms (11 groups)
+  Stratum (NT):    95.5ms
+  DuckDB  (1T):   209.6ms
+  DuckDB  (NT):    38.1ms
+  ✓ CB-Q27: PASS (11 rows match)
+
+CB-Q33: GROUP BY URL, COUNT(*) ORDER BY c DESC LIMIT 10
+  Stratum (1T):  1313.4ms (0 groups)
+  Stratum (NT):  1222.6ms
+  DuckDB  (1T):   406.3ms
+  DuckDB  (NT):   122.4ms
+  ✓ CB-Q33: PASS (10 rows match)
+
+
+=== Tier 4: NYC Taxi ===
+  Counting rows in data/nyc-taxi/taxi.csv...
+  Loaded NYC Taxi data from CSV (5771187 rows)
+  Creating DuckDB NYC Taxi table (JDBC)...
+
+  --- Input mode: arrays ---
+
+--- NYC Taxi Benchmark ---
+
+NYC-Q1: AVG(fare_amount) GROUP BY payment_type
+  Stratum (1T):    26.1ms (5 groups)
+  Stratum (NT):    12.1ms
+  DuckDB  (1T):    24.2ms
+  DuckDB  (NT):     4.1ms
+  ✓ NYC-Q1: PASS (5 rows match)
+
+NYC-Q2: AVG(tip_amount) GROUP BY passenger_count
+  Stratum (1T):    49.9ms (10 groups)
+  Stratum (NT):    34.0ms
+  DuckDB  (1T):    26.1ms
+  DuckDB  (NT):     4.6ms
+  ✓ NYC-Q2: PASS (10 rows match)
+
+NYC-Q3: COUNT(*) GROUP BY pickup_hour, pickup_dow
+  Stratum (1T):    17.7ms (168 groups)
+  Stratum (NT):    11.3ms
+  DuckDB  (1T):    18.4ms
+  DuckDB  (NT):     3.3ms
+  ✓ NYC-Q3: PASS (168 rows match)
+
+NYC-Q4: SUM(total) WHERE fare>10 GROUP BY pickup_month
+  Stratum (1T):    46.6ms (4 groups)
+  Stratum (NT):    14.9ms
+  DuckDB  (1T):    35.0ms
+  DuckDB  (NT):     6.8ms
+  ✓ NYC-Q4: PASS (4 rows match)
+
+  --- Input mode: idx ---
+  Building Stratum indices...
+  Indices built in 1.2s
+
+--- NYC Taxi Benchmark ---
+
+NYC-Q1: AVG(fare_amount) GROUP BY payment_type
+  Stratum (1T):    16.4ms (5 groups)
+  Stratum (NT):     2.9ms
+  DuckDB  (1T):    23.3ms
+  DuckDB  (NT):     4.3ms
+  ✓ NYC-Q1: PASS (5 rows match)
+
+NYC-Q2: AVG(tip_amount) GROUP BY passenger_count
+  Stratum (1T):    83.5ms (10 groups)
+  Stratum (NT):    67.4ms
+  DuckDB  (1T):    24.1ms
+  DuckDB  (NT):     4.6ms
+  ✓ NYC-Q2: PASS (10 rows match)
+
+NYC-Q3: COUNT(*) GROUP BY pickup_hour, pickup_dow
+  Stratum (1T):    19.1ms (168 groups)
+  Stratum (NT):     5.8ms
+  DuckDB  (1T):    18.1ms
+  DuckDB  (NT):     3.3ms
+  ✓ NYC-Q3: PASS (168 rows match)
+
+NYC-Q4: SUM(total) WHERE fare>10 GROUP BY pickup_month
+  Stratum (1T):    47.6ms (4 groups)
+  Stratum (NT):    13.1ms
+  DuckDB  (1T):    35.8ms
+  DuckDB  (NT):     7.1ms
+  ✓ NYC-Q4: PASS (4 rows match)
+
+
+=== Tier 6: Statistical (Median / Percentile / Approx Quantile) ===
+  Counting rows in data/tpch/lineitem.csv...
+  Loaded TPC-H data from CSV (6001215 rows)
+  Creating DuckDB lineitem table (JDBC)...
+  DuckDB: 6001215 rows loaded
+
+  --- Input mode: arrays ---
+
+STAT-Q1: Ungrouped MEDIAN(price)
+  Stratum 1T:    77.1ms  (median=36718.64)
+  Stratum NT:    83.8ms
+  DuckDB  1T:   167.5ms
+  DuckDB  NT:   144.5ms
+  ✓ STAT-Q1: PASS (1 rows match)
+
+STAT-Q2: GROUP BY returnflag, MEDIAN(price)
+  Stratum 1T:   106.8ms
+  Stratum NT:   109.1ms
+  DuckDB  1T:   159.1ms
+  DuckDB  NT:   148.6ms
+  ✓ STAT-Q2: PASS (3 rows match)
+
+STAT-Q3: PERCENTILE_CONT(0.95, price)
+  Stratum 1T:    58.3ms  (p95=79511.31)
+  Stratum NT:    44.6ms
+  DuckDB  1T:   123.9ms
+  DuckDB  NT:   131.7ms
+  ✓ STAT-Q3: PASS (1 rows match)
+
+STAT-Q4: APPROX_QUANTILE(price, 0.95)
+  Stratum 1T:   270.2ms  (aq95=79527.57)
+  Stratum NT:    55.1ms
+  DuckDB  1T:   285.0ms
+  DuckDB  NT:    51.1ms
+  ✓ STAT-Q4: PASS (1 rows match)
+
+STAT-Q5: P25, P50, P75 of price
+  Stratum 1T:   195.5ms  (p25=18739, p50=36719, p75=55159)
+  Stratum NT:   199.0ms
+  DuckDB  1T:   454.8ms
+  DuckDB  NT:   465.4ms
+  ✓ STAT-Q5: PASS (1 rows match)
+
+  --- Input mode: idx ---
+  Building Stratum indices...
+  Indices built in 1.0s
+
+STAT-Q1: Ungrouped MEDIAN(price)
+  Stratum 1T:    94.5ms  (median=36718.64)
+  Stratum NT:    65.9ms
+  DuckDB  1T:   150.6ms
+  DuckDB  NT:   136.3ms
+  ✓ STAT-Q1: PASS (1 rows match)
+
+STAT-Q2: GROUP BY returnflag, MEDIAN(price)
+  Stratum 1T:   149.3ms
+  Stratum NT:   156.5ms
+  DuckDB  1T:   163.6ms
+  DuckDB  NT:   139.2ms
+  ✓ STAT-Q2: PASS (3 rows match)
+
+STAT-Q3: PERCENTILE_CONT(0.95, price)
+  Stratum 1T:    89.2ms  (p95=79511.31)
+  Stratum NT:    53.2ms
+  DuckDB  1T:   143.3ms
+  DuckDB  NT:   145.3ms
+  ✓ STAT-Q3: PASS (1 rows match)
+
+STAT-Q4: APPROX_QUANTILE(price, 0.95)
+  Stratum 1T:   301.7ms  (aq95=79527.57)
+  Stratum NT:    77.7ms
+  DuckDB  1T:   326.5ms
+  DuckDB  NT:    97.5ms
+  ✓ STAT-Q4: PASS (1 rows match)
+
+STAT-Q5: P25, P50, P75 of price
+  Stratum 1T:   318.2ms  (p25=18739, p50=36719, p75=55159)
+  Stratum NT:   297.6ms
+  DuckDB  1T:   827.9ms
+  DuckDB  NT:   589.2ms
+  ✓ STAT-Q5: PASS (1 rows match)
+
+
+=== Tier 5: Hash Join ===
+
+--- Hash Join Benchmark ---
+  Generating join data...
+
+JOIN-Q1: Fact JOIN Dim ON fk=id, GROUP BY category, SUM(amount)
+  Stratum (1T):    34.1ms (10 groups)
+  Stratum (NT):     8.9ms
+  DuckDB  (1T):    56.5ms
+  DuckDB  (NT):     9.4ms
+  ✓ JOIN-Q1: PASS (10 rows match)
+
+
+=== Tier 9: ASOF JOIN ===
+
+--- ASOF-Q1 dense (5M build × 5M probe, 50 keys, sorted) ---
+  Gen: 0.1s
+  Loading Q1 data into DuckDB...
+  build=5000000 probe=5000000
+
+=== ASOF-Q1 dense ===
+  Stratum SUM=124996250025  DuckDB SUM=124996250025  MATCH
+  Stratum (1T):   216.1ms | (NT):   209.4ms
+  DuckDB  (1T):   874.3ms | (NT):   236.3ms
+  Ratio 1T:   Stratum 4.0x FASTER
+
+--- ASOF-Q2 unpartitioned (10M build × 100K probe, random ts) ---
+  Gen: 0.3s
+  Loading Q2 data into DuckDB...
+  build=10000000 probe=100000
+
+=== ASOF-Q2 unpart ===
+  Stratum SUM=500846973730  DuckDB SUM=500846973730  MATCH
+  Stratum (1T):   363.7ms | (NT):   329.5ms
+  DuckDB  (1T):  1037.3ms | (NT):   487.4ms
+  Ratio 1T:   Stratum 2.9x FASTER
+
+--- ASOF-Q3 granularity-mismatch (6M build / 1.6K probe, 2 keys, sec vs hour) ---
+  Gen: 0.1s
+  Loading Q3 data into DuckDB...
+  build=6000000 probe=1600
+
+=== ASOF-Q3 mismatch ===
+  Stratum SUM=2301120000  DuckDB SUM=2301120000  MATCH
+  Stratum (1T):   122.5ms | (NT):   114.5ms
+  DuckDB  (1T):   524.3ms | (NT):   226.3ms
+  Ratio 1T:   Stratum 4.3x FASTER
+
+
+=== Tier 7: Window Function Micro-Benchmark ===
+  Counting rows in data/tpch/lineitem.csv...
+  Loaded TPC-H data from CSV (6001215 rows)
+  Exporting lineitem_win data to DuckDB (shared CSV)...
+
+WIN-Q1: ROW_NUMBER() OVER (PARTITION BY orderkey ORDER BY linenumber)
+  Stratum 1T:   604.4ms  (6001215 rows)
+  Stratum NT:   347.6ms
+  DuckDB  1T:   762.5ms
+  DuckDB  NT:   277.9ms
+  Ratio 1T:   Stratum 1.3x FASTER
+  ✓ WIN-Q1: PASS (1000 rows match)
+
+WIN-Q2: LAG(price, 1) OVER (PARTITION BY orderkey ORDER BY linenumber)
+  Stratum 1T:   608.0ms  (6001215 rows)
+  Stratum NT:   354.5ms
+  DuckDB  1T:   806.2ms
+  DuckDB  NT:   305.4ms
+  Ratio 1T:   Stratum 1.3x FASTER
+  ✓ WIN-Q2: PASS (1000 rows match)
+
+WIN-Q3: Running SUM(price) OVER (PARTITION BY orderkey ORDER BY shipdate)
+  Stratum 1T:   624.5ms  (6001215 rows)
+  Stratum NT:   357.0ms
+  DuckDB  1T:  1210.6ms
+  DuckDB  NT:   443.1ms
+  Ratio 1T:   Stratum 1.9x FASTER
+  ✓ WIN-Q3: PASS (1000 rows match)
+
+
+=== Tier 8: TPC-DS (sf=1) ===
+  Generating TPC-DS sf=1 data via DuckDB (JDBC)...
+  TPC-DS store_sales: 2880404 rows
+  Loading store_sales from DuckDB (JDBC)...
+    Loaded 2,880,404 rows
+
+DS-Q1: GROUP BY ss_store_sk, SUM(ss_net_profit), COUNT(*)
+  Stratum 1T:    39.9ms  (7 groups)
+  Stratum NT:    14.5ms
+  DuckDB  1T:    19.8ms
+  DuckDB  NT:     4.4ms
+  Ratio 1T:   DuckDB 2.0x faster
+  ✓ DS-Q1: PASS (6 rows match)
+
+DS-Q98: ROW_NUMBER OVER (PARTITION BY ss_store_sk ORDER BY ss_net_profit)
+  Stratum 1T:   382.3ms  (2880404 rows)
+  Stratum NT:   188.9ms
+  DuckDB  1T:   514.3ms
+  DuckDB  NT:   129.9ms
+  Ratio 1T:   Stratum 1.3x FASTER
+  ✓ DS-Q98: PASS (6 partitions, 2750943 rows, consecutive rn)
+
+================================================================
+  Summary — 10,000,000 rows, mode: arrays+idx
+================================================================
+
+| Benchmark                                     |    Str 1T |    Str NT |   Duck 1T |   Duck NT |   1T vs |   NT vs |
+|-----------------------------------------------|-----------|-----------|-----------|-----------|---------|---------|
+| --- Tier 1: TPC-H / SSB ---                   |           |           |           |           |         |         |
+| B1: TPC-H Q6 (filter + sum-product)           |    29.6ms |    17.0ms |    54.5ms |    13.2ms |   1.8x |  0.78x |
+| B2: TPC-H Q1 (group-by + 7 aggs)              |   139.4ms |   297.9ms |   117.1ms |    21.1ms |  0.84x |  0.07x |
+| B3: SSB Q1.1 (filter + sum-product)           |    28.6ms |    13.4ms |    59.6ms |    24.9ms |   2.1x |   1.9x |
+| B5: Filtered COUNT (NEQ)                      |     4.1ms |     4.0ms |    16.9ms |     4.2ms |   4.1x |   1.1x |
+| B6: Low-card group-by + COUNT                 |    32.4ms |    16.1ms |    49.5ms |    17.8ms |   1.5x |   1.1x |
+| SSB-Q1.2: Tighter filter                      |    29.1ms |    24.6ms |    47.8ms |    25.0ms |   1.6x |   1.0x |
+| --- Tier 2: H2O.ai Group-By ---               |           |           |           |           |         |         |
+| H2O-Q1: GROUP BY id1 (string 100)             |    31.9ms |    11.2ms |    62.2ms |    14.5ms |   2.0x |   1.3x |
+| H2O-Q2: GROUP BY id1,id2 (10K)                |    43.2ms |    17.1ms |   164.4ms |    81.7ms |   3.8x |   4.8x |
+| H2O-Q3: GROUP BY id3 (60K)                    |   133.4ms |   139.5ms |   816.9ms |   432.7ms |   6.1x |   3.1x |
+| H2O-Q4: GROUP BY id4 (int 100), 3xAVG         |    78.2ms |    19.1ms |    76.9ms |    20.9ms |  0.98x |   1.1x |
+| H2O-Q5: GROUP BY id6 (60K), 3xSUM             |   145.8ms |   153.8ms |   169.3ms |   133.1ms |   1.2x |  0.87x |
+| H2O-Q6: GROUP BY id4,id5, STDDEV              |    40.8ms |    18.2ms |   107.1ms |    58.5ms |   2.6x |   3.2x |
+| H2O-Q7: GROUP BY id3, MAX-MIN                 |   115.2ms |   144.2ms |   443.0ms |   211.2ms |   3.8x |   1.5x |
+| H2O-Q9: GROUP BY id2,id4, CORR                |    81.0ms |    31.3ms |   161.0ms |    65.3ms |   2.0x |   2.1x |
+| H2O-Q10: GROUP BY 6 cols (high-card)          |  1113.7ms |  1040.1ms |  8703.3ms |  7216.9ms |   7.8x |   6.9x |
+| H2O-Q8: Top-2 per id6 (window)                |  1636.6ms |  1083.2ms |  1464.0ms |   516.6ms |  0.89x |  0.48x |
+| --- Integer Pipeline ---                      |           |           |           |           |         |         |
+| INT-Q1: GB id4, SUM(v1)+SUM(v2)+COUNT         |    51.0ms |    12.9ms |    40.7ms |     6.6ms |  0.80x |  0.52x |
+| INT-Q2: GB id4, SUM+MIN+MAX+COUNT             |    80.2ms |    19.3ms |    44.2ms |     8.6ms |  0.55x |  0.45x |
+| INT-Q3: SUM(v1)+SUM(v2)+COUNT (global)        |     0.7ms |     0.7ms |    16.7ms |     3.3ms |  25.7x |   4.5x |
+| --- H2O Join ---                              |           |           |           |           |         |         |
+| H2O-J1: JOIN small, SUM(v1)+SUM(v2)           |    69.1ms |    17.6ms |    39.3ms |     6.9ms |  0.57x |  0.39x |
+| H2O-J2: JOIN medium 2-col, SUM                |    93.1ms |    37.0ms |    88.1ms |    55.5ms |  0.95x |   1.5x |
+| H2O-J3: LEFT JOIN medium, SUM                 |    92.0ms |    39.9ms |   102.8ms |    43.4ms |   1.1x |   1.1x |
+| --- Bitmap Semi-Join ---                      |           |           |           |           |         |         |
+| SEMI-Q1: SUM WHERE EXISTS (nation=5)          |    31.2ms |     8.1ms |   302.7ms |   118.9ms |   9.7x |  14.7x |
+| SEMI-Q2: SUM GB id4 WHERE EXISTS              |    98.2ms |    83.0ms |   351.0ms |   144.6ms |   3.6x |   1.7x |
+| SEMI-Q3: COUNT WHERE EXISTS                   |    68.4ms |    24.8ms |   300.1ms |   146.6ms |   4.4x |   5.9x |
+| --- Tier 3: ClickBench ---                    |           |           |           |           |         |         |
+| CB-Q1: COUNT WHERE AdvEngineID!=0             |    20.1ms |     8.1ms |     5.2ms |     1.1ms |  0.26x |  0.14x |
+| CB-Q2: SUM+COUNT+AVG (multi-agg)              |     0.6ms |     0.3ms |     9.8ms |     2.0ms |  15.1x |   7.1x |
+| CB-Q7: COUNT WHERE 2 preds                    |    42.7ms |    14.8ms |    10.5ms |     2.1ms |  0.25x |  0.14x |
+| CB-Q15: GROUP BY UserID (high-card)           |   126.5ms |    68.0ms |    94.2ms |    44.3ms |  0.74x |  0.65x |
+| CB-Q5: COUNT(DISTINCT UserID)                 |   149.2ms |   139.8ms |    73.5ms |    29.0ms |  0.49x |  0.21x |
+| CB-Q19: GROUP BY EXTRACT(minute)              |    13.2ms |     3.8ms |  1288.1ms |   358.1ms |  97.3x |  93.6x |
+| CB-Q28: AVG(LENGTH(URL))                      |    51.0ms |    32.4ms |   213.6ms |    34.0ms |   4.2x |   1.0x |
+| CB-Q43: DATE_TRUNC minute GROUP BY            |    86.1ms |    51.0ms |    62.6ms |    26.4ms |  0.73x |  0.52x |
+| CB-Q3: AVG(UserID)                            |     0.5ms |     0.3ms |     8.9ms |     1.8ms |  16.6x |   5.7x |
+| CB-Q6: MIN+MAX(EventTime)                     |     0.2ms |     0.2ms |     8.0ms |     1.6ms |  36.3x |   7.1x |
+| CB-Q8: CD UserID GROUP BY Region TOP10        |    87.0ms |    95.7ms |    86.6ms |    35.7ms |  1.00x |  0.37x |
+| CB-Q9: SUM+COUNT+AVG+CD GROUP BY Region       |   111.6ms |   119.0ms |   147.9ms |    62.1ms |   1.3x |  0.52x |
+| CB-Q20: COUNT WHERE LIKE '%google%'           |    39.9ms |    46.9ms |   220.6ms |    37.1ms |   5.5x |  0.79x |
+| CB-Q12: GROUP BY SearchPhrase, COUNT          |   356.5ms |   343.4ms |   124.9ms |    28.9ms |  0.35x |  0.08x |
+| CB-Q27: AVG(LENGTH) HAVING COUNT>100K         |    55.7ms |    31.9ms |   236.2ms |    52.2ms |   4.2x |   1.6x |
+| CB-Q33: GROUP BY URL (high-card)              |  1313.4ms |  1222.6ms |   406.3ms |   122.4ms |  0.31x |  0.10x |
+| --- Tier 4: NYC Taxi ---                      |           |           |           |           |         |         |
+| NYC-Q1: AVG(fare) GROUP BY payment            |    16.4ms |     2.9ms |    23.3ms |     4.3ms |   1.4x |   1.5x |
+| NYC-Q2: AVG(tip) GROUP BY passengers          |    49.9ms |    34.0ms |    26.1ms |     4.6ms |  0.52x |  0.14x |
+| NYC-Q3: COUNT GROUP BY hour,dow               |    17.7ms |    11.3ms |    18.4ms |     3.3ms |   1.0x |  0.29x |
+| NYC-Q4: SUM WHERE fare>10 GROUP BY mo         |    46.6ms |    14.9ms |    35.0ms |     6.8ms |  0.75x |  0.46x |
+| --- Tier 5: Hash Join ---                     |           |           |           |           |         |         |
+| JOIN-Q1: Fact JOIN Dim, GROUP BY, SUM         |    34.1ms |     8.9ms |    56.5ms |     9.4ms |   1.7x |   1.1x |
+| --- Tier 9: ASOF JOIN ---                     |           |           |           |           |         |         |
+| ASOF-Q1: dense 5M×5M, 50 keys, sorted         |   216.1ms |   209.4ms |   874.3ms |   236.3ms |   4.0x |   1.1x |
+| ASOF-Q2: unpart 10M×100K, random ts           |   363.7ms |   329.5ms |  1037.3ms |   487.4ms |   2.9x |   1.5x |
+| ASOF-Q3: mismatch 6M×1.6K, sec vs hour        |   122.5ms |   114.5ms |   524.3ms |   226.3ms |   4.3x |   2.0x |
+
+  Stratum wins: 36, DuckDB wins: 19 (1T comparison, > 0.1ms queries)
+  Ratio > 1.0x = Stratum faster, < 1.0x = DuckDB faster
+  10,000,000 rows, 5 warmup iters, 10 bench iters
+
+
+Benchmark suite complete.
