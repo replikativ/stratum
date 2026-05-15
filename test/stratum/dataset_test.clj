@@ -648,3 +648,99 @@
       ;; Round-trip:
       (let [loaded (dataset/load store "main")]
         (is (= 3 (dataset/row-count loaded)))))))
+
+;; ============================================================================
+;; Valid-Time Metadata Config
+;; ============================================================================
+
+(deftest vt-config-stamps-temporal-unit-on-construction
+  (testing ":valid-time metadata tags the two named cols with :temporal-unit"
+    (let [ds (dataset/make-dataset
+              {:e (long-array [1 2])
+               :_valid_from (long-array [1700000000000000 1710000000000000])
+               :_valid_to   (long-array [1710000000000000 Long/MAX_VALUE])}
+              {:name "vt"
+               :metadata {:valid-time {:from-col :_valid_from
+                                       :to-col   :_valid_to}}})]
+      (is (= :micros (:temporal-unit (dataset/column ds :_valid_from))))
+      (is (= :micros (:temporal-unit (dataset/column ds :_valid_to))))
+      (testing "non-vt columns are unaffected"
+        (is (nil? (:temporal-unit (dataset/column ds :e)))))
+      (testing "vt-config helper returns the config with :unit defaulted"
+        (is (= {:from-col :_valid_from :to-col :_valid_to :unit :micros}
+               (dataset/vt-config ds)))))))
+
+(deftest vt-config-honours-explicit-unit
+  (testing "explicit :unit overrides the :micros default"
+    (let [ds (dataset/make-dataset
+              {:_valid_from (long-array [19000 19365])
+               :_valid_to   (long-array [19365 Long/MAX_VALUE])}
+              {:metadata {:valid-time {:from-col :_valid_from
+                                       :to-col   :_valid_to
+                                       :unit     :days}}})]
+      (is (= :days (:temporal-unit (dataset/column ds :_valid_from))))
+      (is (= :days (:temporal-unit (dataset/column ds :_valid_to))))
+      (is (= :days (:unit (dataset/vt-config ds)))))))
+
+(deftest vt-config-rejects-missing-column
+  (testing "make-dataset throws if :valid-time names a column that does not exist"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"valid-time config references missing column"
+         (dataset/make-dataset
+          {:_valid_from (long-array [1 2])}
+          {:metadata {:valid-time {:from-col :_valid_from
+                                   :to-col   :_valid_to}}})))))
+
+(deftest vt-config-rejects-wrong-type
+  (testing "make-dataset throws if a vt column is not :int64"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"valid-time column must be :int64"
+         (dataset/make-dataset
+          {:_valid_from (double-array [1.0 2.0])
+           :_valid_to   (long-array   [3 4])}
+          {:metadata {:valid-time {:from-col :_valid_from
+                                   :to-col   :_valid_to}}})))))
+
+(deftest vt-config-rejects-conflicting-temporal-unit
+  (testing "make-dataset throws if a vt column already carries a different :temporal-unit"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"valid-time unit conflicts"
+         (dataset/make-dataset
+          {:_valid_from {:type :int64
+                         :data (long-array [1 2])
+                         :temporal-unit :millis}
+           :_valid_to   (long-array [3 4])}
+          {:metadata {:valid-time {:from-col :_valid_from
+                                   :to-col   :_valid_to}}})))))
+
+(deftest vt-config-survives-sync-load-round-trip
+  (testing "after sync!/load, the :valid-time tag is restamped on the restored columns"
+    (let [store (make-store)
+          ds (dataset/make-dataset
+              {:e (index/index-from-seq :int64 [1 2 3])
+               :_valid_from (index/index-from-seq
+                             :int64 [1700000000000000
+                                     1710000000000000
+                                     1720000000000000])
+               :_valid_to   (index/index-from-seq
+                             :int64 [1710000000000000
+                                     1720000000000000
+                                     Long/MAX_VALUE])}
+              {:name "vt"
+               :metadata {:valid-time {:from-col :_valid_from
+                                       :to-col   :_valid_to}}})]
+      (dataset/sync! ds store "main")
+      (let [loaded (dataset/load store "main")]
+        (testing "metadata round-trips intact"
+          (is (= {:from-col :_valid_from :to-col :_valid_to :unit :micros}
+                 (dataset/vt-config loaded))))
+        (testing "columns carry :temporal-unit after load"
+          (is (= :micros (:temporal-unit (dataset/column loaded :_valid_from))))
+          (is (= :micros (:temporal-unit (dataset/column loaded :_valid_to)))))
+        (testing "non-vt column is unaffected"
+          (is (nil? (:temporal-unit (dataset/column loaded :e)))))))))
+
+(deftest vt-config-nil-on-non-vt-dataset
+  (testing "vt-config returns nil for a dataset with no :valid-time metadata"
+    (let [ds (dataset/make-dataset {:x (long-array [1 2 3])})]
+      (is (nil? (dataset/vt-config ds))))))
