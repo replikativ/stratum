@@ -160,8 +160,7 @@ are three reasonable behaviors:
    plain insert if no `:close-safe` rows matched). `retract!` runs
    the same reshape with no append step. SQL:2011
    "application-time-period tables" allow this surgical behavior
-   under the *non-sequenced UPDATE* mode; XTDB v2 implements a
-   similar without-overlaps invariant at write time.
+   under the *non-sequenced UPDATE* mode.
 3. **Accept** (silent). Not exposed — backdated overlaps that aren't
    handled by the writer become a correctness problem at read time.
 
@@ -177,11 +176,10 @@ If two pre-existing rows already overlap each other within the
 target slice (a data-quality issue), bounded UPDATE produces two
 overlapping output slices — both with fresh `_system_from`. Reads
 at the new system-time will see both. Stratum does not enforce
-WITHOUT OVERLAPS at write time. (XTDB v2 takes the same approach:
-its `upsert-rel-indexer` calls `logPut` per matched row without an
-overlap check; the read-time trie merge resolves which event
-"wins" at each (vt-time, system-time) point. We don't have a trie
-merge, so the responsibility lands on the writer.)
+WITHOUT OVERLAPS at write time. Event-sourced bitemporal stores
+can defer this to a read-time merge step that resolves which
+event "wins" at each (vt-time, system-time) point; stratum's
+mutate-in-place storage leaves the responsibility on the writer.
 
 To get surgical replacement (drop the slice + assert one new row),
 compose `DELETE FOR PORTION OF VALID_TIME …` and `INSERT FOR
@@ -288,8 +286,7 @@ Plain `DELETE WHERE` / `INSERT VALUES` / `UPDATE WHERE` (without
 `SELECT … FROM t FOR VALID_TIME (AS OF x | BETWEEN x AND y |
 FROM x TO y | ALL)` is rewritten by the same preprocessor into
 equivalent `WHERE` predicates over the table's `_valid_from` /
-`_valid_to` columns. Convention is SQL:2011 + XTDB v2 default
-naming; tables that opt into a custom axis via `:bitemporal
+`_valid_to` columns. Convention is the SQL:2011 default naming; tables that opt into a custom axis via `:bitemporal
 {:valid {:from-col …}}` would need a view to expose the canonical
 names for SELECT-side use (or extend the preprocessor to consult
 the registry — deferred).
@@ -407,8 +404,9 @@ pg-datahike's `feature/valid-time` (PR #7).
 
 - **Allen interval rules** (the full set: `overlaps`, `meets`,
   `during`, `starts`, `finishes`, `equals` with `STRICTLY` /
-  `IMMEDIATELY` variants). Phase H or later — XTDB v2 has 7+; we have
-  only `period-overlaps?`. Datalog-only addition, no schema change.
+  `IMMEDIATELY` variants). Phase H or later — the SQL:2011 stdlib
+  defines 7+; we have only `period-overlaps?`. Datalog-only
+  addition, no schema change.
 - **Per-pattern `{:valid-at t}` annotation** in `:where` so a single
   query can join two relations at different vt instants. Useful for
   reconciliation queries. Open API design call.
@@ -425,13 +423,12 @@ pg-datahike's `feature/valid-time` (PR #7).
 - Snodgrass, R. T. *Developing Time-Oriented Database Applications in
   SQL*. Morgan Kaufmann (2000).
 - SQL:2011 §4.15 "Application-time period tables" + §4.16
-  "System-versioned tables".
-- XTDB v2 docs https://v2-docs.xtdb.com/ for the auto-split / WITHOUT
-  OVERLAPS invariant and the `_valid_from`/`_system_from` column
-  naming we mirror.
-- `doc/research/58-stratum-vt-followup.md` (kontor) — write-path gap
-  audit that motivated this PR's expansion.
-- `doc/research/59-bitemporality-terminology-and-landscape.md`
-  (kontor) — terminology survey.
-- `doc/research/60-xtdb-vt-feature-comparison.md` (kontor) —
-  feature-by-feature gap list against XTDB v1/v2.
+  "System-versioned tables" for the WITHOUT OVERLAPS invariant and
+  the `_valid_from` / `_system_from` column naming convention.
+- Public surveys of bitemporal database designs (Allen interval
+  algebra, the Snodgrass-style temporal database literature) informed
+  the high-level shape; the implementation here is derived from the
+  SQL:2011 specification, not from any specific reference codebase.
+- Internal kontor research notes (not shipped with stratum)
+  enumerated point-in-time gap analyses and terminology surveys
+  that motivated this PR's expansion.

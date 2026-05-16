@@ -265,7 +265,7 @@
                 (merge-axis-defaults row-map bt-cfg tx-meta)
                 row-map)]
       ;; Reject zero-width / reverse windows BEFORE we touch any column.
-      ;; XTDB v2 enforces vf < vt at every entry point; we do the same.
+      ;; SQL:2011 requires vf < vt; we enforce it at every entry point.
       (when-let [{:keys [from-col to-col]} (:valid bt-cfg)]
         (validate-period! (long (get row from-col)) (long (get row to-col)) :valid))
       (when-let [{:keys [from-col to-col]} (:system bt-cfg)]
@@ -310,8 +310,8 @@
             ;; rejecting overlapping writes (the conservative default
             ;; we ship) or surgically splitting historical rows so the
             ;; new write slots in (the `:auto-split?` opt-in, staged
-            ;; for a follow-up). Auto-split mirrors XTDB v2's
-            ;; without-overlaps invariant in concept; the precise
+            ;; for a follow-up). Auto-split implements the SQL:2011
+            ;; WITHOUT OVERLAPS invariant; the precise
             ;; semantics here are determined by the predicate language
             ;; and the SCD2 row layout chosen by the dataset config.
             ;; A matching row falls into one of three classes vs the
@@ -1017,8 +1017,8 @@
                       {:value v :type (type v) :unit unit})))))
 
 (defn- validate-period!
-  "Reject zero-width and reverse temporal windows. SQL:2011 + XTDB v2
-   require `from < to`; stratum's bounded surgery silently degenerates
+  "Reject zero-width and reverse temporal windows. SQL:2011 requires
+   `from < to`; stratum's bounded surgery silently degenerates
    to a no-op when `to <= from` (overlap test collapses), so any
    downstream `bounded-update!`/`retract!`/`bounded-INSERT` on an
    invalid window silently swallows the user's intent.
@@ -1173,8 +1173,9 @@
 ;; configured), an SCD2 mutation of an existing row's valid window
 ;; must ALSO advance the system axis — otherwise a query `FOR
 ;; SYSTEM_TIME AS OF <past-instant>` would return post-correction
-;; data, which collapses the audit story. XTDB v2 achieves this by
-;; being event-sourced; we achieve it by closing the old row's
+;; data, which collapses the audit story. Event-sourced
+;; bitemporal stores get this for free; stratum's mutate-in-place
+;; storage achieves it by closing the old row's
 ;; `_system_to` in place and appending one or more "replacement"
 ;; rows carrying the new valid window AND a fresh `_system_from`.
 ;;

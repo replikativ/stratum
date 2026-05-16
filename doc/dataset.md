@@ -228,7 +228,7 @@ Either axis is optional — a dataset can opt into only `:valid` (most common), 
 - both are `:int64`,
 - no conflicting pre-existing `:temporal-unit` is set,
 
-and `make-dataset` stamps each pair with `:temporal-unit :micros` (the default — overridable to `:days`, `:seconds`, `:millis`). The columns are queryable like any other temporal column, including `DATE_TRUNC` / `EXTRACT` and zone-map range pruning. The `:micros` default matches the DuckDB `TIMESTAMP` convention used by the SQL surface and XTDB v2's per-row temporal columns.
+and `make-dataset` stamps each pair with `:temporal-unit :micros` (the default — overridable to `:days`, `:seconds`, `:millis`). The columns are queryable like any other temporal column, including `DATE_TRUNC` / `EXTRACT` and zone-map range pruning. The `:micros` default matches the DuckDB `TIMESTAMP` convention used by the SQL surface and the SQL:2011 application-time-period table convention.
 
 Read the config back via `stratum.dataset/bitemporal-config`:
 

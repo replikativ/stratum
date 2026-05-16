@@ -322,10 +322,11 @@
 
 (def ^:private dml-tail-keywords
   "Keywords that terminate a `FOR PORTION OF VALID_TIME` clause when
-   walking forward through the SQL. Matches the keyword set XTDB v2
-   uses in its `Sql.g4:828-829` grammar and adds the SQL DML tail
-   tokens we want to preserve (WHERE, SET, VALUES, RETURNING, etc.).
-   `to` is included so the FROM scan stops at the optional TO keyword."
+   walking forward through the SQL. Matches the keyword set the
+   SQL:2011 DML grammar uses for FOR PORTION OF VALID_TIME and adds
+   the SQL DML tail tokens we want to preserve (WHERE, SET, VALUES,
+   RETURNING, etc.). `to` is included so the FROM scan stops at the
+   optional TO keyword."
   #{"to" "where" "set" "values" "returning" "from" "using" "select"})
 
 (def ^:private dml-tail-keywords-no-to
@@ -341,8 +342,8 @@
    server attaches `:period` back when lowering to stratum primitives.
 
    The `TO` clause is optional — when absent, the period extends to
-   `Long/MAX_VALUE` (XTDB v2 calls this `xtdb/end-of-time`,
-   `Sql.g4:828-829`). The open-ended form is useful for retracting
+   `Long/MAX_VALUE` (the conventional 'end of time' sentinel for the
+   valid-time axis). The open-ended form is useful for retracting
    from a point forward.
 
    Only one occurrence is recognized per statement (DML applies to a
@@ -350,8 +351,8 @@
    currently only `VALID_TIME` is honored by the server."
   [^String sql]
   ;; `FOR ALL VALID_TIME` / `FOR VALID_TIME ALL` (and the same for
-  ;; SYSTEM_TIME) — XTDB v2 grammar `Sql.g4:830`. Strip first and
-  ;; emit `:period {:axis ... :from MIN :to MAX}` so the lowering
+  ;; SYSTEM_TIME) — SQL:2011 temporal DML scope clause. Strip first
+  ;; and emit `:period {:axis ... :from MIN :to MAX}` so the lowering
   ;; treats it as a window spanning all time.
   (if-let [all-m (re-find #"(?is)\bFOR\s+(?:ALL\s+(VALID_TIME|SYSTEM_TIME)|(VALID_TIME|SYSTEM_TIME)\s+ALL)\b" sql)]
     (let [axis (or (nth all-m 1) (nth all-m 2))
@@ -402,12 +403,12 @@
 ;; Rewrites `… FROM t [alias?] FOR VALID_TIME <spec> …` by stripping
 ;; the temporal clause and injecting an equivalent WHERE predicate
 ;; over the table's `_valid_from` / `_valid_to` columns. The
-;; convention is the SQL:2011 + XTDB v2 column naming; tables that
+;; convention is the SQL:2011 column naming; tables that
 ;; use custom axis column names (via `:bitemporal {:valid {:from-col
 ;; …}}`) need to expose them under those names for the SELECT
 ;; surface (or use a view).
 ;;
-;; Supported specs (matching XTDB v2 `Sql.g4:578-593`):
+;; Supported specs (SQL:2011 application-time-period table grammar):
 ;;   FOR VALID_TIME AS OF <expr>
 ;;   FOR VALID_TIME BETWEEN <expr> AND <expr>
 ;;   FOR VALID_TIME FROM <expr> TO <expr>

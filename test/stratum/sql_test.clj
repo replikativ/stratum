@@ -1764,7 +1764,7 @@
       (is (> (:sum_price (first results)) 50.0)))))
 
 ;; ============================================================================
-;; SQL Projection Tests (Postgres/xtdb-inspired)
+;; SQL Projection Tests (Postgres-inspired)
 ;; ============================================================================
 
 (deftest sql-select-star-test
@@ -2654,7 +2654,7 @@
 ;;
 ;; Preprocessor rewrites the temporal clause into equivalent WHERE
 ;; predicates over the table's _valid_from / _valid_to columns. Uses
-;; the SQL:2011 + XTDB v2 convention column names.
+;; the SQL:2011 convention column names.
 ;; ============================================================================
 
 (deftest preprocess-select-temporal-as-of-injects-where

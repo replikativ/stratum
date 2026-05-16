@@ -734,7 +734,7 @@
     (instance? Parenthesis expr)
     (translate-predicate (.getExpression ^Parenthesis expr))
 
-    ;; Allen interval predicates (SQL:2011 + XTDB v2 stdlib).
+    ;; Allen interval predicates (SQL:2011 temporal stdlib).
     ;; Each takes 4 args — `(a_from, a_to, b_from, b_to)` —
     ;; representing two half-open intervals `[a_from, a_to)` and
     ;; `[b_from, b_to)`. Generic over any orderable int64 columns
