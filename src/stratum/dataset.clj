@@ -396,7 +396,8 @@
     (when-not edit
       (throw (IllegalStateException. "Cannot mutate persistent dataset. Call transient first.")))
     (let [bt (:bitemporal ds-metadata-field)
-          valid-cfg (when (:valid bt) (merge {:unit :micros} (:valid bt)))]
+          valid-cfg (when (:valid bt) (merge {:unit :micros} (:valid bt)))
+          system-cfg (when (:system bt) (merge {:unit :micros} (:system bt)))]
       (when-not valid-cfg
         (throw (ex-info "retract! requires a :valid axis on the dataset's :bitemporal config"
                         {:metadata ds-metadata-field})))
@@ -405,61 +406,131 @@
       (let [{vf-col :from-col vt-col :to-col vt-unit :unit} valid-cfg
             close-vt-val (or (coerce-temporal-value (:valid-from tx-meta) vt-unit)
                              (now-in-unit vt-unit))
-            n (long row-count-val)
-            ;; Same classification as upsert!: a matching row is
-            ;; :close-safe iff currently open AND its vf < retract
-            ;; instant. Closed rows entirely before the retract instant
-            ;; are :no-conflict; everything else overlaps the slice.
-            {:keys [close-safe overlaps]}
-            (loop [i 0 acc {:close-safe (transient [])
-                            :overlaps (transient [])}]
-              (if (>= i n)
-                {:close-safe (persistent! (:close-safe acc))
-                 :overlaps   (persistent! (:overlaps acc))}
-                (let [row (materialize-row columns-field i)]
-                  (if (eval-pred where row)
-                    (let [row-vf (long (get row vf-col))
-                          row-vt (long (get row vt-col))
-                          open?  (= row-vt Long/MAX_VALUE)
-                          klass (cond
-                                  (and open? (< row-vf close-vt-val)) :close-safe
-                                  (and (not open?) (<= row-vt close-vt-val)) :no-conflict
-                                  :else :overlaps)]
-                      (recur (inc i)
-                             (if (= :no-conflict klass)
-                               acc
-                               (update acc klass conj! [i row]))))
-                    (recur (inc i) acc)))))
-        ;; Same partition as upsert!: TRUNCATE when row's vf is before
-        ;; the retract instant (keep the historical prefix); DROP when
-        ;; the row is entirely inside [new-vf, MAX) (the retract erases
-        ;; it). retract! has no append step — once the rows are closed
-        ;; or removed, we're done.
-        {auto-truncate :truncate auto-drop :drop}
-        (if (and (seq overlaps) auto-split?)
-          (group-by (fn [[_i r]]
-                      (if (< (long (get r vf-col)) close-vt-val)
-                        :truncate
-                        :drop))
-                    overlaps)
-          {:truncate [] :drop []})
+            close-vt-end (or (coerce-temporal-value (:valid-to tx-meta) vt-unit)
+                             Long/MAX_VALUE)
+            ;; Bounded retract — SQL:2011 `FOR PORTION OF VALID_TIME
+            ;; FROM x TO y DELETE` semantic. For each matching row's
+            ;; window [row-vf, row-vt), apply surgery against
+            ;; [new-vf, new-vt):
+            ;;   row fully inside  → drop
+            ;;   partial left      → truncate vt to new-vf
+            ;;   partial right     → shift vf forward to new-vt
+            ;;   straddles both    → split (truncate + append right tail)
+            ;; Bounded retract is unconditional — no `:auto-split?` flag,
+            ;; the bounded form IS the surgical semantic.
+            bounded? (not= close-vt-end Long/MAX_VALUE)
+            n (long row-count-val)]
+        (if bounded?
+          ;; ----- Bounded retract (SQL:2011 FOR PORTION OF VALID_TIME) -----
+          ;; Surgery is unconditional — no `:auto-split?` flag.
+          (let [{:keys [drops trunc-vt trunc-vf splits]}
+                (loop [i 0 acc {:drops (transient [])
+                                :trunc-vt (transient [])
+                                :trunc-vf (transient [])
+                                :splits (transient [])}]
+                  (if (>= i n)
+                    {:drops    (persistent! (:drops acc))
+                     :trunc-vt (persistent! (:trunc-vt acc))
+                     :trunc-vf (persistent! (:trunc-vf acc))
+                     :splits   (persistent! (:splits acc))}
+                    (let [row (materialize-row columns-field i)]
+                      (if (eval-pred where row)
+                        (let [row-vf (long (get row vf-col))
+                              row-vt (long (get row vt-col))
+                              klass (cond
+                                      (or (<= row-vt close-vt-val)
+                                          (>= row-vf close-vt-end))
+                                      :no-conflict
 
-        _ (when (and (seq overlaps) (not auto-split?))
-            (throw (ex-info "retract! would touch rows whose vt-window doesn't cover the retract instant"
-                            {:where where
-                             :retract-at close-vt-val
-                             :overlaps (mapv (fn [[i r]]
-                                               (assoc (select-keys r [vf-col vt-col]) :row-idx i))
-                                             overlaps)
-                             :hint "pass :auto-split? true to split overlapping rows, or restructure the write"})))]
-        ;; close-safe + truncate first (no index shift), then drops.
-        (doseq [[i _row] close-safe]
-          (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
-        (doseq [[i _r] auto-truncate]
-          (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
-        (when (seq auto-drop)
-          (ds-delete-rows! this (mapv first auto-drop)))
-        this)))
+                                      (and (>= row-vf close-vt-val)
+                                           (<= row-vt close-vt-end))
+                                      :drops
+
+                                      (and (<  row-vf close-vt-val)
+                                           (<= row-vt close-vt-end))
+                                      :trunc-vt
+
+                                      (and (>= row-vf close-vt-val)
+                                           (>  row-vt close-vt-end))
+                                      :trunc-vf
+
+                                      :else :splits)]
+                          (recur (inc i)
+                                 (if (= :no-conflict klass)
+                                   acc
+                                   (update acc klass conj! [i row]))))
+                        (recur (inc i) acc)))))]
+            ;; 1. Truncate vt-col on partial-left + split rows (set-at!
+            ;;    on vt → new-vf).
+            (doseq [[i _r] trunc-vt]
+              (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+            ;; 2. Truncate vf-col on partial-right rows (set-at! on vf
+            ;;    → new-vt).
+            (doseq [[i _r] trunc-vf]
+              (idx/idx-set! (:index (get columns-field vf-col)) i close-vt-end))
+            ;; 3. For each split row, truncate its vt now (set-at!), and
+            ;;    remember the right-tail to append after drops.
+            (let [tails (mapv (fn [[i r]]
+                                (idx/idx-set! (:index (get columns-field vt-col))
+                                              i close-vt-val)
+                                (-> r
+                                    (assoc vf-col close-vt-end)
+                                    (dissoc (:from-col system-cfg)
+                                            (:to-col system-cfg))))
+                              splits)]
+              ;; 4. Drop fully-superseded rows (index shift — must come
+              ;;    after all set-at! ops on captured indices).
+              (when (seq drops)
+                (ds-delete-rows! this (mapv first drops)))
+              ;; 5. Append the split right-tails. append! auto-stamps
+              ;;    the system axis from tx-meta / now().
+              (doseq [tail tails]
+                (append! this tail tx-meta)))
+            this)
+          ;; ----- Open-window retract (existing behavior) -----
+          (let [{:keys [close-safe overlaps]}
+                (loop [i 0 acc {:close-safe (transient [])
+                                :overlaps (transient [])}]
+                  (if (>= i n)
+                    {:close-safe (persistent! (:close-safe acc))
+                     :overlaps   (persistent! (:overlaps acc))}
+                    (let [row (materialize-row columns-field i)]
+                      (if (eval-pred where row)
+                        (let [row-vf (long (get row vf-col))
+                              row-vt (long (get row vt-col))
+                              open?  (= row-vt Long/MAX_VALUE)
+                              klass (cond
+                                      (and open? (< row-vf close-vt-val)) :close-safe
+                                      (and (not open?) (<= row-vt close-vt-val)) :no-conflict
+                                      :else :overlaps)]
+                          (recur (inc i)
+                                 (if (= :no-conflict klass)
+                                   acc
+                                   (update acc klass conj! [i row]))))
+                        (recur (inc i) acc)))))
+                {auto-truncate :truncate auto-drop :drop}
+                (if (and (seq overlaps) auto-split?)
+                  (group-by (fn [[_i r]]
+                              (if (< (long (get r vf-col)) close-vt-val)
+                                :truncate
+                                :drop))
+                            overlaps)
+                  {:truncate [] :drop []})]
+            (when (and (seq overlaps) (not auto-split?))
+              (throw (ex-info "retract! would touch rows whose vt-window doesn't cover the retract instant"
+                              {:where where
+                               :retract-at close-vt-val
+                               :overlaps (mapv (fn [[i r]]
+                                                 (assoc (select-keys r [vf-col vt-col]) :row-idx i))
+                                               overlaps)
+                               :hint "pass :auto-split? true to split overlapping rows, or restructure the write"})))
+            (doseq [[i _row] close-safe]
+              (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+            (doseq [[i _r] auto-truncate]
+              (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+            (when (seq auto-drop)
+              (ds-delete-rows! this (mapv first auto-drop)))
+            this)))))
 
   (ds-delete-rows! [this row-idxs]
     (when-not edit

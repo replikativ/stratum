@@ -2524,10 +2524,17 @@
 
         ;; Pre-parse rewrite for non-standard syntax (ASOF JOIN, ...) and
         ;; parse with JSqlParser.
-       (let [{rewritten-sql :sql asof-markers :asof-markers}
+       (let [{rewritten-sql :sql asof-markers :asof-markers period :period}
              (rewrite/preprocess-sql sql)
              sql rewritten-sql  ;; shadow: downstream uses rewritten form
-             stmt (CCJSqlParserUtil/parse ^String sql)]
+             stmt (CCJSqlParserUtil/parse ^String sql)
+             ;; FOR PORTION OF VALID_TIME (SQL:2011) lowers to a temporal
+             ;; slice attached to the DDL map; INSERT/UPDATE/DELETE
+             ;; translators below pick it up via `assoc-period`.
+             assoc-period (fn [result]
+                            (cond-> result
+                              (and period (:ddl result))
+                              (assoc-in [:ddl :period] period)))]
          (cond
            (instance? PlainSelect stmt)
            (let [^PlainSelect select stmt
@@ -2608,15 +2615,15 @@
 
            ;; INSERT INTO
            (instance? Insert stmt)
-           (translate-insert stmt)
+           (assoc-period (translate-insert stmt))
 
            ;; UPDATE
            (instance? Update stmt)
-           (translate-update stmt)
+           (assoc-period (translate-update stmt))
 
            ;; DELETE
            (instance? Delete stmt)
-           (translate-delete stmt)
+           (assoc-period (translate-delete stmt))
 
            ;; DROP TABLE
            (instance? Drop stmt)

@@ -232,9 +232,19 @@ DELETE FROM employees FOR PORTION OF VALID_TIME FROM '2024-09-01' TO '2024-10-01
 ```
 
 JSqlParser 5.2 doesn't grok these tokens, so the path is a pre-tokenise
-rewriter in pg-datahike: strip the temporal clauses to a side-channel
-map before parsing, lower to `vt-update!` / `vt-delete!` in the
-translator.
+rewriter in `stratum.sql.rewrite/preprocess-sql`: strip
+`FOR PORTION OF VALID_TIME FROM x TO y` to a side-channel `:period`
+map before JSqlParser sees the SQL, then attach `:period` to the
+parsed `:ddl` for the translator. As of Phase D the `DELETE` form
+lowers to `dataset/retract!` with `:valid-from` + `:valid-to` in
+tx-meta on a fully-index-backed table; `retract!` performs the
+bounded surgery (truncate / shift / split / drop) per overlapping
+row. `UPDATE` and `INSERT` flavors are staged for a follow-up
+commit — the preprocessor already accepts the clause, the server
+DDL branch just needs the lowering. Plain `DELETE WHERE` (without
+`FOR PORTION OF`) on an index-backed table routes through
+`ds-delete-rows!` and behaves identically to the array-backed
+CREATE TABLE path.
 
 ## Four-axis composability
 
@@ -277,7 +287,8 @@ After this PR:
 | B | Write primitives: `vt-append!` / `vt-update!` / `vt-delete!` | 2 |
 | C | Overlap detection: reject by default | 1 |
 | C+ | Auto-split: truncate partial-left + drop fully-superseded (via `ds-delete-rows!`) | 1 |
-| D | SQL grammar: `FOR PORTION OF VALID_TIME` + `FOR SYSTEM_TIME` | 2 |
+| D | SQL grammar `FOR PORTION OF VALID_TIME` (DELETE) + bounded retract! + index-backed SQL DELETE | 1 |
+| D+ | `FOR PORTION OF VALID_TIME` on UPDATE / INSERT / UPSERT (deferred) | future |
 | E | Datahike adapter refactor: use new primitives | 1 |
 | F | Datahike `d/system-at` wrapper | 1 |
 | G | pg-datahike `datahike.system_at` session vars + SQL passthrough | 1 |

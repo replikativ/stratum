@@ -5,7 +5,9 @@
             [stratum.query :as q]
             [stratum.server :as server]
             [stratum.specification :as spec])
-  (:import [stratum.internal PgWireServer$QueryResult]))
+  (:import [stratum.internal PgWireServer$QueryResult
+                              PgWireServer$QueryHandler
+                              PgWireServer$QueryHandlerFactory]))
 
 (set! *warn-on-reflection* true)
 
@@ -2034,7 +2036,8 @@
                                      :humidity    (double-array [50.0 52.0 48.0 55.0 51.0
                                                                  5.0 53.0 47.0 50.5 52.5])})
           make-factory @(resolve 'stratum.server/make-handler-factory)
-          handler (.create (make-factory (:registry srv) (atom nil)))]
+          ^PgWireServer$QueryHandler handler
+          (.create ^PgWireServer$QueryHandlerFactory (make-factory (:registry srv) (atom nil)))]
       (try
         ;; CREATE MODEL via handler
         (let [^PgWireServer$QueryResult qr
@@ -2157,3 +2160,151 @@
       ;; The 200.0 and 300.0 readings should have highest scores
       (is (contains? #{200.0 300.0} (:reading (first result)))
           "Highest anomaly score should be for extreme readings"))))
+
+;; ============================================================================
+;; SQL DELETE on index-backed tables (Phase D)
+;;
+;; Tables registered with `idx/index-from-seq` columns route DELETE
+;; through `dataset/ds-delete-rows!` instead of the array-rebuild path.
+;; The end-to-end behavior must be identical from a SQL perspective.
+;; ============================================================================
+
+(deftest sql-delete-on-index-backed-table
+  (testing "DELETE FROM ... WHERE on a stratum-index-backed table"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "salaries"
+          {:eid    (stratum.index/index-from-seq :int64 [1 2 3 4 5])
+           :salary (stratum.index/index-from-seq :int64 [100 200 300 400 500])})
+        ;; Sanity check — confirm the registry stored it as an index-backed
+        ;; encoded map (else this test isn't really exercising the new path).
+        (let [cols (get @(:registry srv) "salaries")]
+          (is (every? (fn [[_ v]] (= :index (:source v))) cols)
+              "table must be index-backed for this test to be meaningful"))
+        ;; Run DELETE via the SQL path.
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec "DELETE FROM salaries WHERE eid = 3"
+                    (:registry srv) (:data-dir srv))]
+          (is (= "DELETE 1" (.commandTag qr))))
+        ;; The remaining four rows should still be queryable as index-backed.
+        (let [cols (get @(:registry srv) "salaries")]
+          (is (= 4 (stratum.index/idx-length (:index (:eid cols)))))
+          (is (= [1 2 4 5]
+                 (mapv #(stratum.index/idx-get-long (:index (:eid cols)) %)
+                       (range 4)))))
+        (finally (server/stop srv))))))
+
+(deftest sql-delete-all-on-index-backed-table
+  (testing "DELETE FROM ... (no WHERE) drops every row, transient still valid"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "t"
+          {:a (stratum.index/index-from-seq :int64 [1 2 3])
+           :b (stratum.index/index-from-seq :int64 [10 20 30])})
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec "DELETE FROM t" (:registry srv) (:data-dir srv))]
+          (is (= "DELETE 3" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "t")]
+          (is (zero? (stratum.index/idx-length (:index (:a cols))))))
+        (finally (server/stop srv))))))
+
+(deftest sql-delete-no-match-on-index-backed-table
+  (testing "DELETE with predicate that matches no rows leaves the table intact"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "t"
+          {:a (stratum.index/index-from-seq :int64 [1 2 3])})
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec "DELETE FROM t WHERE a = 99" (:registry srv) (:data-dir srv))]
+          (is (= "DELETE 0" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "t")]
+          (is (= 3 (stratum.index/idx-length (:index (:a cols))))))
+        (finally (server/stop srv))))))
+
+;; ============================================================================
+;; SQL:2011 FOR PORTION OF VALID_TIME (Phase D)
+;;
+;; The pre-parser in `stratum.sql.rewrite/preprocess-sql` strips the
+;; clause and attaches `:period` to the DDL map; the server's DELETE
+;; branch lowers a fully-index-backed bitemporal table's bounded
+;; DELETE to `dataset/retract!` with `:valid-from` + `:valid-to`.
+;; ============================================================================
+
+(deftest preprocess-for-portion-of-valid-time-strips-clause
+  (testing "preprocess-sql extracts FOR PORTION OF VALID_TIME and rewrites the SQL"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "DELETE FROM t FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-07-01' WHERE eid = 1")]
+      (is (= "DELETE FROM t WHERE eid = 1" (.trim ^String (:sql r))))
+      (is (= :valid_time (:axis (:period r))))
+      ;; 2024-04-01T00:00Z → 1711929600 sec → 1711929600000000 micros
+      (is (= 1711929600000000 (:from (:period r))))
+      (is (= 1719792000000000 (:to (:period r)))))))
+
+(deftest preprocess-without-portion-is-identity
+  (testing "SQL without FOR PORTION OF passes through unchanged"
+    (let [sql "DELETE FROM t WHERE eid = 1"
+          r (stratum.sql.rewrite/preprocess-sql sql)]
+      (is (= sql (:sql r)))
+      (is (nil? (:period r))))))
+
+(deftest parse-sql-attaches-period-to-delete-ddl
+  (testing "parse-sql carries :period through to the :ddl map for DELETE"
+    (let [r (sql/parse-sql
+              "DELETE FROM t FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-07-01' WHERE eid = 1"
+              {"t" {:eid (long-array [1])}})]
+      (is (= :delete (get-in r [:ddl :op])))
+      (is (= :valid_time (get-in r [:ddl :period :axis])))
+      (is (= 1711929600000000 (get-in r [:ddl :period :from])))
+      (is (= 1719792000000000 (get-in r [:ddl :period :to]))))))
+
+(deftest sql-delete-for-portion-of-valid-time-bounded-on-index-backed-table
+  (testing "DELETE … FOR PORTION OF VALID_TIME applies bounded retract on a bitemporal index-backed table"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "salaries"
+          (with-meta
+            {:eid         (stratum.index/index-from-seq :int64 [1 1])
+             :salary      (stratum.index/index-from-seq :int64 [100 200])
+             ;; [Jan-2024, Jul-2024) closed, [Jul-2024, MAX) open
+             :_valid_from (stratum.index/index-from-seq :int64
+                            [1704067200000000 1719792000000000])
+             :_valid_to   (stratum.index/index-from-seq :int64
+                            [1719792000000000 Long/MAX_VALUE])}
+            {:bitemporal {:valid {:from-col :_valid_from
+                                  :to-col   :_valid_to
+                                  :unit     :micros}}}))
+        ;; DELETE FOR PORTION OF [Apr-2024, May-2024) WHERE eid=1
+        ;; Closed row [Jan, Jul) straddles the cut: SPLIT into [Jan, Apr) + [May, Jul).
+        ;; Open row [Jul, MAX) doesn't overlap.
+        ;; Result: 3 rows (split produces 2 surviving from 1, open untouched).
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec (str "DELETE FROM salaries "
+                         "FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-05-01' "
+                         "WHERE eid = 1")
+                    (:registry srv) (:data-dir srv))]
+          (is (re-find #"^DELETE" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                        (:index (get cols k)) %)
+                                     (range n)))]
+          (is (= 3 n))
+          ;; Three surviving rows after the split of row 0:
+          ;;   :_valid_from 2024-01-01 (left piece of the split)
+          ;;   :_valid_from 2024-05-01 (right piece, appended)
+          ;;   :_valid_from 2024-07-01 (open row, unchanged)
+          (is (= #{1704067200000000 1714521600000000 1719792000000000}
+                 (set (read-col :_valid_from))))
+          ;; :_valid_to mirrors the split — Apr-01 (left piece's new vt),
+          ;; Jul-01 (right piece's original vt), MAX (open row).
+          (is (= #{1711929600000000 1719792000000000 Long/MAX_VALUE}
+                 (set (read-col :_valid_to)))))
+        (finally (server/stop srv))))))

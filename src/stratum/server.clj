@@ -22,6 +22,7 @@
   (:require [stratum.query :as q]
             [stratum.sql :as sql]
             [stratum.dataset :as dataset]
+            [stratum.index :as idx]
             [stratum.files :as files]
             [stratum.iforest :as iforest]
             [clojure.string :as str])
@@ -66,6 +67,211 @@
                      encoded (q/encode-column col-data)]
                  [k encoded])))
         columns))
+
+;; ----------------------------------------------------------------------------
+;; Row-level helpers — uniform across raw-array tables (CREATE TABLE) and
+;; encoded index-backed tables (register-table! with stratum indexes).
+;; ----------------------------------------------------------------------------
+
+(defn- col-row-count
+  "Length of a single column entry in the table-registry. Handles raw
+   `[J` / `[D` / `[Ljava.lang.String;` arrays AND encoded
+   `{:source :index :index PSI ...}` / `{:type ... :data <arr>}` maps."
+  ^long [col]
+  (cond
+    (nil? col) 0
+    (instance? (Class/forName "[J") col) (alength ^longs col)
+    (instance? (Class/forName "[D") col) (alength ^doubles col)
+    (instance? (Class/forName "[Ljava.lang.String;") col)
+    (alength ^"[Ljava.lang.String;" col)
+    (and (map? col) (= :index (:source col))) (idx/idx-length (:index col))
+    (and (map? col) (:data col))
+    (let [arr (:data col)]
+      (cond
+        (instance? (Class/forName "[J") arr) (alength ^longs arr)
+        (instance? (Class/forName "[D") arr) (alength ^doubles arr)
+        :else 0))
+    :else 0))
+
+(defn- index-backed-cols?
+  "True when every column entry is encoded with `:source :index` —
+   i.e. the table was registered through stratum's columnar engine
+   and DML must route through `idx-*!` primitives instead of array
+   rebuilds."
+  [cols]
+  (and (seq cols)
+       (every? (fn [[_k v]] (and (map? v) (= :index (:source v))))
+               cols)))
+
+(defn- read-cell
+  "Read the value of `col-name` at row `i` from a table-registry entry.
+   Returns nil for NULL sentinels (Long/MIN_VALUE / NaN / nil String).
+   Mirrors the per-column dispatch used by DML predicate evaluation but
+   covers both raw arrays AND encoded index columns."
+  [existing col-name ^long i]
+  (let [col (get existing col-name)]
+    (cond
+      (instance? (Class/forName "[J") col)
+      (let [v (aget ^longs col i)]
+        (when-not (= v Long/MIN_VALUE) v))
+
+      (instance? (Class/forName "[D") col)
+      (let [v (aget ^doubles col i)]
+        (when-not (Double/isNaN v) v))
+
+      (instance? (Class/forName "[Ljava.lang.String;") col)
+      (aget ^"[Ljava.lang.String;" col i)
+
+      (and (map? col) (= :index (:source col)))
+      (let [index (:index col)
+            datatype (:type col)
+            dict (:dict col)]
+        (cond
+          dict
+          (let [code (idx/idx-get-long index i)]
+            (when-not (= code Long/MIN_VALUE)
+              (aget ^"[Ljava.lang.String;" dict (int code))))
+
+          (= :int64 datatype)
+          (let [v (idx/idx-get-long index i)]
+            (when-not (= v Long/MIN_VALUE) v))
+
+          (= :float64 datatype)
+          (let [v (idx/idx-get-double index i)]
+            (when-not (Double/isNaN v) v))
+
+          :else nil))
+
+      :else nil)))
+
+(defn- eval-dml-predicate
+  "Evaluate the DML-style predicate list (each pred is `[op col val]`)
+   against row `i` of a column-map. Returns truthy/falsy. Reusable
+   across UPDATE / DELETE / UPSERT branches; works on both raw-array
+   and index-backed columns via `read-cell`."
+  [existing where ^long i]
+  (every? (fn [pred]
+            (let [eval-val (fn eval-val [e]
+                             (cond
+                               (keyword? e) (read-cell existing e i)
+                               (number? e)  e
+                               (string? e)  e
+                               (nil? e)     nil
+                               (vector? e)
+                               (case (first e)
+                                 :+ (+ (double (eval-val (nth e 1)))
+                                       (double (eval-val (nth e 2))))
+                                 :- (- (double (eval-val (nth e 1)))
+                                       (double (eval-val (nth e 2))))
+                                 :* (* (double (eval-val (nth e 1)))
+                                       (double (eval-val (nth e 2))))
+                                 :/ (/ (double (eval-val (nth e 1)))
+                                       (double (eval-val (nth e 2))))
+                                 nil)))]
+              (case (first pred)
+                :=   (let [l (eval-val (nth pred 1))
+                           r (eval-val (nth pred 2))]
+                       (and (some? l) (some? r) (= l r)))
+                (:!= :<>) (let [l (eval-val (nth pred 1))
+                                r (eval-val (nth pred 2))]
+                            (and (some? l) (some? r) (not= l r)))
+                :>   (let [l (eval-val (nth pred 1))
+                           r (eval-val (nth pred 2))]
+                       (and (some? l) (some? r) (> (double l) (double r))))
+                :<   (let [l (eval-val (nth pred 1))
+                           r (eval-val (nth pred 2))]
+                       (and (some? l) (some? r) (< (double l) (double r))))
+                :>=  (let [l (eval-val (nth pred 1))
+                           r (eval-val (nth pred 2))]
+                       (and (some? l) (some? r) (>= (double l) (double r))))
+                :<=  (let [l (eval-val (nth pred 1))
+                           r (eval-val (nth pred 2))]
+                       (and (some? l) (some? r) (<= (double l) (double r))))
+                :is-null     (nil? (eval-val (nth pred 1)))
+                :is-not-null (some? (eval-val (nth pred 1)))
+                false)))
+          where))
+
+(defn- delete-via-index-backend
+  "Apply a DELETE to a fully-index-backed table. Builds a sorted-desc
+   list of row indices to delete, then fans `dataset/ds-delete-rows!`
+   across a transient wrapper. Returns the new column map + delete
+   count.
+
+   `existing` — the registry's column map for `table` (must be
+                fully index-backed; callers gate on `index-backed-cols?`).
+   `where`    — predicate list, or nil to delete all rows.
+   `meta`     — original metadata to re-attach on the result map."
+  [^String table existing where meta]
+  (let [first-col (val (first existing))
+        n-rows    (col-row-count first-col)
+        ;; Phase 1: scan once, collect row indices matching `where`.
+        delete-idxs
+        (if (nil? where)
+          (vec (range n-rows))
+          (vec (filter #(eval-dml-predicate existing where %)
+                       (range n-rows))))]
+    (if (empty? delete-idxs)
+      {:new-cols existing :n-deleted 0}
+      ;; Phase 2: wrap as dataset, drop rows via the transient primitive.
+      (let [ds (dataset/make-dataset existing {:name table})
+            mutated (-> ds
+                        transient
+                        (dataset/ds-delete-rows! delete-idxs)
+                        persistent!)
+            new-cols (dataset/columns mutated)
+            new-cols (if meta (with-meta new-cols meta) new-cols)]
+        {:new-cols new-cols :n-deleted (count delete-idxs)}))))
+
+(defn- delete-portion-via-index-backend
+  "Apply a SQL:2011 `DELETE … FOR PORTION OF VALID_TIME FROM x TO y`
+   to an index-backed table. Lowers to `retract!` on a transient
+   stratum dataset with `:valid-from` + `:valid-to` in tx-meta —
+   `retract!` then performs the bounded surgery (truncate / shift /
+   split / drop) per overlapping row.
+
+   The bitemporal axis config is inferred from the column-map's
+   metadata; if the user registered a table without bitemporal
+   metadata, we infer reasonable defaults from the column names
+   (`_valid_from` + `_valid_to`). Throws if neither convention is
+   discoverable."
+  [^String table existing where period meta]
+  (let [{vf-val :from vt-val :to} period
+        ;; Try to read bitemporal config from the table-meta first
+        ;; (set by the user at register time). Otherwise fall back to
+        ;; the SQL:2011 convention column names.
+        bt-meta (:bitemporal meta)
+        valid (or (:valid bt-meta)
+                  (when (and (contains? existing :_valid_from)
+                             (contains? existing :_valid_to))
+                    {:from-col :_valid_from :to-col :_valid_to :unit :micros}))
+        _ (when-not valid
+            (throw (ex-info (str "DELETE FOR PORTION OF VALID_TIME requires a "
+                                 ":valid axis on the table — either set "
+                                 ":bitemporal {:valid {...}} on the registered "
+                                 "metadata, or use _valid_from / _valid_to columns")
+                            {:table table
+                             :existing-cols (vec (keys existing))})))
+        ds-meta (merge (or bt-meta {}) {:bitemporal {:valid valid}})
+        before-count (col-row-count (val (first existing)))
+        ds (dataset/make-dataset existing {:name table :metadata ds-meta})
+        mutated (-> ds
+                    transient
+                    (dataset/retract! {:where (or where [])}
+                                      {:valid-from vf-val :valid-to vt-val})
+                    persistent!)
+        new-cols (dataset/columns mutated)
+        new-cols (if meta (with-meta new-cols meta) new-cols)
+        after-count (dataset/row-count mutated)]
+    ;; "DELETE N" tag reports rows physically removed. With bounded
+    ;; retract, splits ADD rows (one tail per split), which doesn't
+    ;; map cleanly to a "DELETE n" count. We report
+    ;; max(0, before-after) so a pure-shift or pure-truncate reports
+    ;; 0, a drop reports the count, and a split reports a smaller
+    ;; number than reality. Refinement deferred until a real SQL
+    ;; client cares about the exact semantics here.
+    {:new-cols new-cols
+     :n-deleted (max 0 (- before-count after-count))}))
 
 ;; ============================================================================
 ;; Query Handler
@@ -677,6 +883,22 @@
             (let [existing (get @table-registry-atom table)]
               (when-not existing
                 (throw (ex-info (str "Table not found: " table) {:table table})))
+              ;; Index-backed tables (registered via stratum's columnar
+              ;; engine — `register-table!` with `idx/index-from-seq`
+              ;; columns) route through `ds-delete-rows!` (no period)
+              ;; or `retract!` (with FOR PORTION OF VALID_TIME period)
+              ;; instead of the array rebuild path below. The arrays
+              ;; path is preserved unchanged for CREATE TABLE statements.
+              (if (index-backed-cols? existing)
+                (let [period (:period ddl)
+                      {:keys [new-cols n-deleted]}
+                      (if (and period (= :valid_time (:axis period)))
+                        (delete-portion-via-index-backend
+                          table existing where period (meta existing))
+                        (delete-via-index-backend
+                          table existing where (meta existing)))]
+                  (swap! table-registry-atom assoc table new-cols)
+                  (PgWireServer$QueryResult/empty (str "DELETE " n-deleted)))
               (let [col-keys (vec (keys existing))
                     n-rows (let [first-col (get existing (first col-keys))]
                              (cond
@@ -788,7 +1010,7 @@
                                col-keys))]
                 (swap! table-registry-atom assoc table
                        (with-meta new-cols (meta existing)))
-                (PgWireServer$QueryResult/empty (str "DELETE " n-deleted))))))
+                (PgWireServer$QueryResult/empty (str "DELETE " n-deleted)))))))
 
             ;; Parse/translation error
         (:error parsed)

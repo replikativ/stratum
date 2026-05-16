@@ -18,6 +18,11 @@
 
 (set! *warn-on-reflection* true)
 
+;; Forward declaration: preprocess-sql calls this, but the implementation
+;; (and its helpers parse-temporal-literal / find-balanced-end) live further
+;; down to keep the ASOF preprocessor near the top of the file.
+(declare preprocess-for-portion-of-valid-time)
+
 ;; ============================================================================
 ;; Low-level scanner — skips strings, comments, identifiers correctly
 ;; ============================================================================
@@ -107,24 +112,35 @@
 
 (defn preprocess-sql
   "Strip 'ASOF' before 'JOIN' (or 'ASOF LEFT JOIN' / 'ASOF INNER JOIN').
+   Also strip `FOR PORTION OF VALID_TIME FROM x TO y` from DML statements.
 
-   Returns {:sql rewritten-sql :asof-markers [marker-or-nil ...]}.
+   Returns {:sql rewritten-sql
+            :asof-markers [marker-or-nil ...]
+            :period {:axis :valid_time :from <micros> :to <micros>} | nil}.
 
    The :asof-markers vector is indexed by top-level join ordinal (0-based);
    each entry is :asof, :asof-left, or nil for non-ASOF joins. The downstream
    translator looks up the marker for each Join in JSqlParser's getJoins()
    list by position.
 
+   :period is attached when the SQL carries a SQL:2011 `FOR PORTION OF
+   VALID_TIME` clause; the downstream DML translator picks it up and
+   passes it as a temporal slice to the stratum dataset's retract! /
+   upsert! primitives.
+
    Joins inside subqueries (paren-depth > 0) are not counted at the top level
    and are not eligible for ASOF rewriting in this pass."
   [^String sql]
-  (let [n (.length sql)
+  (let [{:keys [sql period]} (preprocess-for-portion-of-valid-time sql)
+        ^String sql sql
+        n (.length sql)
         sb (StringBuilder. n)
         markers (java.util.ArrayList.)]
     (loop [i (long 0) paren-depth (long 0)]
       (if (>= i n)
         {:sql (.toString sb)
-         :asof-markers (vec markers)}
+         :asof-markers (vec markers)
+         :period period}
         (let [c (.charAt sql i)]
           (cond
             ;; String literal — copy unchanged
@@ -203,3 +219,99 @@
 
             :else
             (do (.append sb c) (recur (inc i) paren-depth))))))))
+
+;; ============================================================================
+;; Public: SQL:2011 FOR PORTION OF VALID_TIME preprocessor
+;; ============================================================================
+
+(defn- parse-temporal-literal
+  "Parse a stratum-temporal literal expression into a `long` in `:micros`.
+   Accepts (case-insensitive prefix optional):
+     'YYYY-MM-DD'                — start-of-day UTC
+     DATE 'YYYY-MM-DD'           — same
+     TIMESTAMP 'YYYY-MM-DD...'   — full ISO instant
+     <number>                    — passthrough (already in :micros)
+   Throws ex-info on unparseable input."
+  [^String s]
+  (let [trimmed (.trim s)]
+    (cond
+      (re-matches #"-?\d+" trimmed) (Long/parseLong trimmed)
+
+      :else
+      (let [body (or (second (re-find #"(?is)^(?:DATE|TIMESTAMP)?\s*'([^']+)'$" trimmed))
+                     (throw (ex-info "Unparseable temporal literal in FOR PORTION OF VALID_TIME"
+                                     {:input s})))]
+        (cond
+          (re-matches #"\d{4}-\d{2}-\d{2}" body)
+          (-> (java.time.LocalDate/parse body)
+              (.atStartOfDay java.time.ZoneOffset/UTC)
+              .toInstant
+              .toEpochMilli
+              (* 1000))
+
+          :else
+          (-> (java.time.Instant/parse body)
+              .toEpochMilli
+              (* 1000)))))))
+
+(defn- find-balanced-end
+  "Starting at position `i` just past `keyword`, scan forward for the next
+   keyword from `terminators` at paren-depth 0. Returns the index of the
+   terminator. Used to find where the expr after FROM or TO ends."
+  ^long [^String sql ^long i terminators]
+  (let [n (.length sql)]
+    (loop [j i, paren 0]
+      (cond
+        (>= j n) j
+
+        (= \' (.charAt sql j))
+        (recur (skip-string sql j \') paren)
+
+        (= \" (.charAt sql j))
+        (recur (skip-string sql j \") paren)
+
+        (= \( (.charAt sql j)) (recur (inc j) (inc paren))
+        (= \) (.charAt sql j)) (recur (inc j) (dec paren))
+
+        (and (zero? paren)
+             (or (Character/isLetter (.charAt sql j)) (= \_ (.charAt sql j))))
+        (let [[wend* w] (read-word sql j)]
+          (if (and (zero? paren) (contains? terminators w))
+            j
+            (recur (long wend*) paren)))
+
+        :else (recur (inc j) paren)))))
+
+(defn preprocess-for-portion-of-valid-time
+  "Strip SQL:2011 `FOR PORTION OF VALID_TIME FROM <x> TO <y>` from a DML
+   statement. Returns `{:sql rewritten :period [vf-micros vt-micros]}` if
+   the clause is present, otherwise `{:sql sql :period nil}`. The
+   downstream parser then sees a plain INSERT / UPDATE / DELETE and the
+   server attaches `:period` back when lowering to stratum primitives.
+
+   Only one occurrence is recognized per statement (DML applies to a
+   single target). Recognizes `VALID_TIME` and `SYSTEM_TIME` axes;
+   currently only `VALID_TIME` is honored by the server."
+  [^String sql]
+  (let [m (re-find #"(?is)\bFOR\s+PORTION\s+OF\s+(VALID_TIME|SYSTEM_TIME)\s+FROM\s+" sql)]
+    (if-not m
+      {:sql sql :period nil}
+      (let [[full-prefix axis] m
+            start (.indexOf sql ^String full-prefix)
+            after-from (+ start (.length ^String full-prefix))
+            to-pos (long (find-balanced-end sql after-from #{"to"}))
+            from-expr (subs sql after-from to-pos)
+            ;; skip "TO"
+            [after-to-kw _] (read-word sql (long (skip-ws-and-comments sql to-pos)))
+            after-to (long after-to-kw)
+            tail-pos (long (find-balanced-end sql after-to #{"where" "set" "values" "returning"
+                                                              "from" "using" "select"}))
+            ;; If the terminator is the end of statement (semicolon, EOL), tail-pos = n.
+            to-expr (subs sql after-to tail-pos)
+            vf-val (parse-temporal-literal from-expr)
+            vt-val (parse-temporal-literal to-expr)
+            rewritten (str (subs sql 0 start) (subs sql tail-pos))]
+        {:sql rewritten
+         :period {:axis (keyword (.toLowerCase ^String axis))
+                  :from vf-val
+                  :to vt-val}}))))
