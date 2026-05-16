@@ -138,6 +138,18 @@
         ;; would be claimed by both preprocessors.
         [_ leading] (read-word sql (long (skip-ws-and-comments sql 0)))
         select-stmt? (= "select" leading)
+        erase-stmt? (= "erase" leading)
+        ;; `ERASE FROM <t> [WHERE <p>]` — physical purge across
+        ;; both temporal axes. Rewrite to `DELETE FROM …` and tag
+        ;; with `:erase? true` so the server bypasses any
+        ;; logical-retract path and routes directly to
+        ;; `ds-delete-rows!`. (XTDB v2 has the same DML verb for
+        ;; GDPR-style right-to-be-forgotten purges; we expose it
+        ;; with the same SQL surface but our own implementation
+        ;; via the existing `ds-delete-rows!` primitive.)
+        sql (if erase-stmt?
+              (.replaceFirst ^String sql "(?i)\\s*ERASE\\s+FROM" "DELETE FROM")
+              sql)
         sql (if select-stmt? (preprocess-select-temporal sql) sql)
         {:keys [sql period]} (if select-stmt?
                                {:sql sql :period nil}
@@ -150,7 +162,8 @@
       (if (>= i n)
         {:sql (.toString sb)
          :asof-markers (vec markers)
-         :period period}
+         :period period
+         :erase? erase-stmt?}
         (let [c (.charAt sql i)]
           (cond
             ;; String literal — copy unchanged
@@ -234,7 +247,7 @@
 ;; Public: SQL:2011 FOR PORTION OF VALID_TIME preprocessor
 ;; ============================================================================
 
-(defn- parse-temporal-literal
+(defn parse-temporal-literal
   "Parse a stratum-temporal *constant-foldable expression* into a
    `long` in `:micros`. Accepts (case-insensitive):
 

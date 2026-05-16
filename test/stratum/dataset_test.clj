@@ -1403,3 +1403,34 @@
         rows (ds-rows result)]
     (is (= 2 (count rows))
         "valid-only mode: original closed in place + new merged row = 2")))
+
+;; ============================================================================
+;; P2-3: *clock-time-millis* dynamic var for repeatable test runs
+;; ============================================================================
+
+(deftest now-in-unit-honors-clock-time-millis-binding
+  (testing "Binding *clock-time-millis* pins the time source"
+    (let [ds (vt-only-ds [])
+          pinned 1704067200000]   ;; Jan-01-2024 millis
+      ;; append! without :valid-from defaults to now → should be the pinned value
+      ;; in micros (×1000).
+      (let [result (binding [dataset/*clock-time-millis* pinned]
+                     (-> ds transient
+                         (dataset/append! {:eid 1 :salary 100})
+                         persistent!))
+            row (first (ds-rows result))]
+        (is (= (* 1000 pinned) (:_valid_from row))
+            "valid-from must equal the pinned clock-time × 1000 (millis → micros)")))))
+
+(deftest now-in-unit-without-binding-uses-system-clock
+  (testing "When *clock-time-millis* is nil, falls back to wall-clock"
+    (let [ds (vt-only-ds [])
+          before-millis (System/currentTimeMillis)
+          result (-> ds transient
+                     (dataset/append! {:eid 1 :salary 100})
+                     persistent!)
+          after-millis (System/currentTimeMillis)
+          row (first (ds-rows result))
+          vf-millis (quot (:_valid_from row) 1000)]
+      (is (<= before-millis vf-millis after-millis)
+          "valid-from millis should fall in [before, after] window"))))

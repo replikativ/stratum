@@ -540,14 +540,37 @@
       [@result @extra-reg])))
 
 (defn- execute-sql
-  "Execute a SQL statement against the registry and return a QueryResult."
+  "Execute a SQL statement against the registry and return a QueryResult.
+
+   `SET datahike.clock_time = …` is honored as a session-scoped
+   binding by writing the parsed millis to
+   `(get @table-registry-atom \"__settings__\" :clock-time-millis)`;
+   every subsequent execute-sql call runs inside a `binding` form
+   that pins `dataset/*clock-time-millis*` to that value, so DML
+   defaults (`:valid-from` / `:system-from` when omitted) become
+   repeatable. `SET datahike.clock_time = DEFAULT` clears the
+   binding."
   [sql table-registry-atom data-dir-atom]
   (try
     (let [raw-registry @table-registry-atom
           registry     (resolve-live-tables raw-registry)
           [sql extra]  (resolve-file-refs sql @data-dir-atom)
           registry     (merge registry extra)
-          parsed       (sql/parse-sql sql registry)]
+          parsed       (sql/parse-sql sql registry)
+          ;; If parse surfaced a SET datahike.clock_time setting,
+          ;; merge it into the registry's `__settings__` map.
+          settings (:settings parsed)]
+      (when settings
+        (cond
+          (= :clear (:clock-time-millis settings))
+          (swap! table-registry-atom update "__settings__" dissoc :clock-time-millis)
+          (number? (:clock-time-millis settings))
+          (swap! table-registry-atom assoc-in
+                 ["__settings__" :clock-time-millis]
+                 (:clock-time-millis settings))))
+      (binding [dataset/*clock-time-millis*
+                (or (get-in @table-registry-atom ["__settings__" :clock-time-millis])
+                    dataset/*clock-time-millis*)]
       (cond
             ;; EXPLAIN [(ANALYZE)] [(FORMAT JSON)] query
         (:explain parsed)
@@ -1049,15 +1072,30 @@
               ;; instead of the array rebuild path below. The arrays
               ;; path is preserved unchanged for CREATE TABLE statements.
               (if (index-backed-cols? existing)
+                ;; `ERASE FROM …` (P2-1, kontor doc/research/61) bypasses
+                ;; the bounded-retract path and always physically purges
+                ;; via `ds-delete-rows!` — the distinct verb makes the
+                ;; "destroys across both axes" intent explicit. Plain
+                ;; DELETE today also routes to ds-delete-rows! on
+                ;; index-backed tables; ERASE just hardens the contract.
                 (let [period (:period ddl)
+                      erase? (:erase? ddl)
                       {:keys [new-cols n-deleted]}
-                      (if (and period (= :valid_time (:axis period)))
+                      (cond
+                        erase?
+                        (delete-via-index-backend
+                          table existing where (meta existing))
+
+                        (and period (= :valid_time (:axis period)))
                         (delete-portion-via-index-backend
                           table existing where period (meta existing))
+
+                        :else
                         (delete-via-index-backend
-                          table existing where (meta existing)))]
+                          table existing where (meta existing)))
+                      tag (if erase? "ERASE" "DELETE")]
                   (swap! table-registry-atom assoc table new-cols)
-                  (PgWireServer$QueryResult/empty (str "DELETE " n-deleted)))
+                  (PgWireServer$QueryResult/empty (str tag " " n-deleted)))
               (let [col-keys (vec (keys existing))
                     n-rows (let [first-col (get existing (first col-keys))]
                              (cond
@@ -1190,7 +1228,7 @@
           (sql/format-results result))
 
         :else
-        (PgWireServer$QueryResult. "Internal error: unexpected parse result")))
+        (PgWireServer$QueryResult. "Internal error: unexpected parse result"))))
     (catch Exception e
       (PgWireServer$QueryResult. (str (.getMessage e))))))
 

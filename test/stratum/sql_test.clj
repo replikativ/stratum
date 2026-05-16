@@ -2740,3 +2740,144 @@
               rows (q/results->columns result)]
           (is (= [110] (vec (:salary rows)))))
         (finally (server/stop srv))))))
+
+;; ============================================================================
+;; P2-3: SQL session SET datahike.clock_time
+;; ============================================================================
+
+(deftest sql-set-clock-time-pins-defaults
+  (testing "SET datahike.clock_time pins the time source for subsequent DML defaults"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)
+          pinned-millis 1704067200000]   ;; Jan-01-2024
+      (try
+        (server/register-table!
+          srv "salaries"
+          (with-meta
+            {:eid (stratum.index/index-from-seq :int64 [])
+             :salary (stratum.index/index-from-seq :int64 [])
+             :_valid_from (stratum.index/index-from-seq :int64 [])
+             :_valid_to (stratum.index/index-from-seq :int64 [])}
+            {:bitemporal {:valid {:from-col :_valid_from
+                                  :to-col   :_valid_to
+                                  :unit     :micros}}}))
+        ;; Pin clock_time to Jan-01-2024.
+        (exec (str "SET datahike.clock_time = '2024-01-01'")
+              (:registry srv) (:data-dir srv))
+        ;; INSERT without specifying _valid_from → default should be the pinned value.
+        (exec "INSERT INTO salaries (eid, salary) VALUES (1, 100)"
+              (:registry srv) (:data-dir srv))
+        (let [cols (get @(:registry srv) "salaries")
+              vf (stratum.index/idx-get-long (:index (:_valid_from cols)) 0)]
+          (is (= (* 1000 pinned-millis) vf)
+              "valid-from should match pinned clock_time in micros"))
+        ;; Clear with DEFAULT.
+        (exec "SET datahike.clock_time = DEFAULT" (:registry srv) (:data-dir srv))
+        (is (nil? (get-in @(:registry srv) ["__settings__" :clock-time-millis]))
+            "DEFAULT clears the binding")
+        (finally (server/stop srv))))))
+
+;; ============================================================================
+;; P2-1: ERASE DML — GDPR-style physical purge
+;; ============================================================================
+
+(deftest sql-erase-from-physically-purges-rows
+  (testing "ERASE FROM … WHERE physically removes matching rows"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        (server/register-table!
+          srv "salaries"
+          {:eid    (stratum.index/index-from-seq :int64 [1 2 3])
+           :salary (stratum.index/index-from-seq :int64 [100 200 300])})
+        (let [^PgWireServer$QueryResult qr
+              (exec "ERASE FROM salaries WHERE eid = 2"
+                    (:registry srv) (:data-dir srv))]
+          (is (= "ERASE 1" (.commandTag qr))
+              "tag should distinguish ERASE from DELETE"))
+        (let [cols (get @(:registry srv) "salaries")
+              n (stratum.index/idx-length (:index (:eid cols)))
+              eids (mapv #(stratum.index/idx-get-long (:index (:eid cols)) %)
+                         (range n))]
+          (is (= [1 3] eids)))
+        (finally (server/stop srv))))))
+
+(deftest sql-erase-from-without-where-purges-all
+  (testing "ERASE FROM <t> with no WHERE wipes the entire table"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        (server/register-table!
+          srv "t"
+          {:a (stratum.index/index-from-seq :int64 [1 2 3])})
+        (let [^PgWireServer$QueryResult qr
+              (exec "ERASE FROM t" (:registry srv) (:data-dir srv))]
+          (is (= "ERASE 3" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "t")]
+          (is (zero? (stratum.index/idx-length (:index (:a cols))))))
+        (finally (server/stop srv))))))
+
+(deftest sql-erase-on-bitemporal-bypasses-temporal-semantics
+  (testing "ERASE on a bitemporal table ignores FOR PORTION OF and just purges"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        (server/register-table!
+          srv "salaries"
+          (with-meta
+            {:eid (stratum.index/index-from-seq :int64 [1 1])
+             :salary (stratum.index/index-from-seq :int64 [100 110])
+             :_valid_from (stratum.index/index-from-seq :int64 [1000 2000])
+             :_valid_to (stratum.index/index-from-seq :int64 [2000 Long/MAX_VALUE])}
+            {:bitemporal {:valid {:from-col :_valid_from
+                                  :to-col   :_valid_to
+                                  :unit     :micros}}}))
+        (let [^PgWireServer$QueryResult qr
+              (exec "ERASE FROM salaries WHERE eid = 1"
+                    (:registry srv) (:data-dir srv))]
+          (is (re-find #"^ERASE" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "salaries")]
+          (is (zero? (stratum.index/idx-length (:index (:eid cols))))
+              "all vt-slices for eid=1 should be physically gone"))
+        (finally (server/stop srv))))))
+
+;; ============================================================================
+;; Col-vs-col SELECT predicates (P2-followup from kontor doc/research/61)
+;;
+;; SELECT WHERE <col1> OP <col2> now evaluates correctly. Unlocks
+;; SELECT-side Allen predicates (P1-3 worked in DML only without this).
+;; ============================================================================
+
+(deftest sql-select-col-vs-col-comparison
+  (testing "WHERE col1 < col2 evaluates row-by-row"
+    (let [reg {"t" {:a (long-array [1 5 3 7])
+                    :b (long-array [2 4 8 6])}}
+          parsed (sql/parse-sql "SELECT a, b FROM t WHERE a < b" reg)
+          result (q/q (:query parsed))
+          rows (q/results->columns result)]
+      ;; Row 0: 1<2 ✓, Row 1: 5<4 ✗, Row 2: 3<8 ✓, Row 3: 7<6 ✗
+      (is (= [1 3] (vec (:a rows))))
+      (is (= [2 8] (vec (:b rows)))))))
+
+(deftest sql-select-overlaps-allen-predicate-with-projected-cols
+  (testing "OVERLAPS Allen predicate works in SELECT WHERE when all 4 cols are also projected"
+    ;; Caveat: stratum's executor extracts LHS columns from
+    ;; normalized predicates but skips RHS keyword refs when picking
+    ;; which columns to materialize. So Allen predicates need their
+    ;; 4 column args projected too (or otherwise referenced).
+    ;; Extending the executor's column-pruner to consider predicate
+    ;; RHS keywords is a P2 follow-up.
+    (let [reg {"intervals"
+               {:eid    (long-array [1 2 3])
+                :a_from (long-array [100 200 300])
+                :a_to   (long-array [200 300 400])
+                :b_from (long-array [150 350 250])
+                :b_to   (long-array [250 450 350])}}
+          parsed (sql/parse-sql
+                   (str "SELECT eid, a_from, a_to, b_from, b_to FROM intervals "
+                        "WHERE OVERLAPS(a_from, a_to, b_from, b_to)")
+                   reg)
+          result (q/q (:query parsed))
+          rows (q/results->columns result)
+          eids (vec (:eid rows))]
+      (is (= [1 3] (sort eids))))))

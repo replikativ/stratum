@@ -965,14 +965,25 @@
 ;; Temporal write helpers
 ;; ============================================================================
 
+(def ^:dynamic *clock-time-millis*
+  "Pin the wall-clock-time source for `now-in-unit` (epoch millis).
+   When non-nil, all `:valid-from` / `:system-from` defaults derive
+   from this value instead of `(System/currentTimeMillis)`.
+
+   Bind for repeatable test runs and regulator/replay scenarios:
+     `(binding [*clock-time-millis* 1704067200000] (append! ...))`
+   The SQL surface exposes it as the session variable
+   `datahike.clock_time`."
+  nil)
+
 (defn- now-in-unit
   "Current wall-clock time as a long in the requested `:temporal-unit`.
    Used to default `:valid-from` / `:system-from` when the caller
-   doesn't supply one. `(System/currentTimeMillis)` returns millis;
-   multiplying by 1000 gives micros, dividing by 1000 gives seconds,
-   etc."
+   doesn't supply one. Honors `*clock-time-millis*` for repeatable
+   test runs and regulator replays; otherwise falls back to
+   `(System/currentTimeMillis)`."
   ^long [unit]
-  (let [ms (System/currentTimeMillis)]
+  (let [ms (long (or *clock-time-millis* (System/currentTimeMillis)))]
     (case unit
       :micros  (* 1000 ms)
       :millis  ms

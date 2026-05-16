@@ -633,24 +633,38 @@
                 (let [sub-col (first sub-pred)]
                   (eval-pred-scalar col-arrays i sub-pred)))
               sub-preds))
-      ;; Standard predicate — all arguments are numeric (dict args pre-encoded)
+      ;; Standard predicate. The LHS is either a column ref (keyword
+      ;; or pre-resolved column-data) or an expression result; each
+      ;; RHS arg is either a numeric literal, a string, a set (for
+      ;; `:in`), or — when the predicate compares two columns —
+      ;; another keyword to be resolved per-row. The arg-resolver
+      ;; handles the col-vs-col case (P2-followup); column predicates
+      ;; like `[:_valid_from :lt :_valid_to]` then evaluate correctly
+      ;; in SELECT WHERE clauses, not just DML.
       (let [col-data (if (keyword? col-ref) (get col-arrays col-ref) col-ref)
             v (if (expr/long-array? col-data)
                 (aget ^longs col-data i)
                 (aget ^doubles col-data i))
-            args (subvec pred 2)]
+            args (subvec pred 2)
+            resolve-arg (fn [a]
+                          (if (keyword? a)
+                            (let [other (get col-arrays a)]
+                              (if (expr/long-array? other)
+                                (aget ^longs other i)
+                                (aget ^doubles other i)))
+                            a))]
         (case op
-          :lt    (< (double v) (double (first args)))
-          :gt    (> (double v) (double (first args)))
-          :lte   (<= (double v) (double (first args)))
-          :gte   (>= (double v) (double (first args)))
-          :eq    (== (double v) (double (first args)))
-          :neq   (not (== (double v) (double (first args))))
-          :range (let [lo (double (first args))
-                       hi (double (second args))]
+          :lt    (< (double v) (double (resolve-arg (first args))))
+          :gt    (> (double v) (double (resolve-arg (first args))))
+          :lte   (<= (double v) (double (resolve-arg (first args))))
+          :gte   (>= (double v) (double (resolve-arg (first args))))
+          :eq    (== (double v) (double (resolve-arg (first args))))
+          :neq   (not (== (double v) (double (resolve-arg (first args)))))
+          :range (let [lo (double (resolve-arg (first args)))
+                       hi (double (resolve-arg (second args)))]
                    (and (>= (double v) lo) (<= (double v) hi)))
-          :not-range (let [lo (double (first args))
-                           hi (double (second args))]
+          :not-range (let [lo (double (resolve-arg (first args)))
+                           hi (double (resolve-arg (second args)))]
                        (or (< (double v) lo) (> (double v) hi)))
           :in    (let [s (first args)]
                    (if (every? number? s)

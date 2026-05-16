@@ -2069,6 +2069,35 @@
                    {:error (str "Model not found: " model-name)})))}
 
    ;; --- Standard system queries ---
+   ;; `SET datahike.clock_time = <expr>` pins the wall-clock-time
+   ;; source for downstream DML / append! defaults. Returns the
+   ;; parsed millis as a side-channel so the server can update its
+   ;; session-settings atom. `SET datahike.clock_time = DEFAULT`
+   ;; clears the binding. Other SET statements are accepted as
+   ;; no-ops (Postgres compatibility).
+   {:pattern #"(?i)^\s*SET\s+datahike\.clock_time\s*(?:=|TO)\s+(.+?)\s*;?\s*$"
+    :handler (fn [sql _reg]
+               (let [[_ value-str]
+                     (re-find #"(?is)^\s*SET\s+datahike\.clock_time\s*(?:=|TO)\s+(.+?)\s*;?\s*$"
+                              sql)
+                     trimmed (when value-str (.trim ^String value-str))
+                     clear? (and trimmed
+                                 (or (.equalsIgnoreCase ^String trimmed "DEFAULT")
+                                     (.equalsIgnoreCase ^String trimmed "NULL")))
+                     millis (when-not clear?
+                              (try
+                                ;; Reuse rewrite/parse-temporal-literal —
+                                ;; it returns micros so divide by 1000 to
+                                ;; get the millis we store.
+                                (quot ^long (rewrite/parse-temporal-literal trimmed) 1000)
+                                (catch Exception _ nil)))]
+                 {:system true
+                  :tag "SET"
+                  :settings (cond
+                              clear?  {:clock-time-millis :clear}
+                              millis  {:clock-time-millis millis}
+                              :else   nil)}))}
+
    {:pattern #"(?i)^\s*SET\s+"
     :handler (fn [_sql _reg] {:system true :tag "SET"})}
    {:pattern #"(?i)^\s*SHOW\s+"
@@ -2582,17 +2611,22 @@
 
         ;; Pre-parse rewrite for non-standard syntax (ASOF JOIN, ...) and
         ;; parse with JSqlParser.
-       (let [{rewritten-sql :sql asof-markers :asof-markers period :period}
+       (let [{rewritten-sql :sql asof-markers :asof-markers
+              period :period erase? :erase?}
              (rewrite/preprocess-sql sql)
              sql rewritten-sql  ;; shadow: downstream uses rewritten form
              stmt (CCJSqlParserUtil/parse ^String sql)
              ;; FOR PORTION OF VALID_TIME (SQL:2011) lowers to a temporal
              ;; slice attached to the DDL map; INSERT/UPDATE/DELETE
-             ;; translators below pick it up via `assoc-period`.
+             ;; translators below pick it up via `assoc-period`. ERASE
+             ;; flag is attached to DELETE so server.clj routes it as a
+             ;; physical purge regardless of bitemporal status.
              assoc-period (fn [result]
                             (cond-> result
                               (and period (:ddl result))
-                              (assoc-in [:ddl :period] period)))]
+                              (assoc-in [:ddl :period] period)
+                              (and erase? (:ddl result))
+                              (assoc-in [:ddl :erase?] true)))]
          (cond
            (instance? PlainSelect stmt)
            (let [^PlainSelect select stmt
