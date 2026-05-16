@@ -146,15 +146,22 @@ are three reasonable behaviors:
 
 1. **Reject** (default, implemented). Throw with an error citing the
    overlapping rows. Caller must split the write themselves.
-2. **Auto-split** (`:auto-split? true`). Split the existing window
-   into the pre-overlap and post-overlap pieces, re-assert each, and
-   insert the new write in the middle. SQL:2011 "application-time
-   period tables" allow this surgical behavior under the
-   *non-sequenced UPDATE* mode; XTDB v2 implements a similar
-   without-overlaps invariant at write time. **Currently raises
-   `not yet implemented`** — the flag is reserved for the follow-up.
-   The reject path covers the safety invariant; the surgical-split
-   implementation is staged for a later commit.
+2. **Auto-split** (`:auto-split? true`, implemented). Reshape the
+   matching rows so the new write slots in without violating the
+   without-overlaps invariant. Per row, the action depends on its
+   position relative to the new write's `[new-vf, MAX)`:
+     - `row-vf < new-vf < row-vt` — partial left overlap; *truncate*
+       the row's `vt` down to `new-vf`. The historical prefix
+       `[row-vf, new-vf)` is preserved.
+     - `row-vf >= new-vf` — row is entirely inside the new write's
+       range; *drop* it physically via `ds-delete-rows!` (fans
+       `idx-delete!` across every column).
+   Then `upsert!` appends the new merged row (or degenerates to a
+   plain insert if no `:close-safe` rows matched). `retract!` runs
+   the same reshape with no append step. SQL:2011
+   "application-time-period tables" allow this surgical behavior
+   under the *non-sequenced UPDATE* mode; XTDB v2 implements a
+   similar without-overlaps invariant at write time.
 3. **Accept** (silent). Not exposed — backdated overlaps that aren't
    handled by the writer become a correctness problem at read time.
 
@@ -173,10 +180,17 @@ window (implemented in `upsert!` / `retract!`):
 - **`:no-conflict`** — closed row entirely before the new write
   (`vt <= new-vf`). Ignored; no overlap.
 - **`:overlaps`** — any other matching row. Reject (default) or
-  auto-split (deferred). Includes:
-    - open row with `vf >= new-vf` (would create a backwards window)
+  auto-split (`:auto-split? true`). Includes:
+    - open row with `vf >= new-vf` (would create a backwards window) —
+      auto-split drops it.
     - closed row with `vt > new-vf` (the new write would land inside
-      an already-closed historical period)
+      an already-closed historical period) — auto-split truncates if
+      `row-vf < new-vf`, drops otherwise.
+
+Right-partial and middle-overlap classes don't appear in the current
+API because the new write's `vt` is always `MAX` in `upsert!` /
+`retract!`. They become reachable once SQL `FOR PORTION OF VALID_TIME
+FROM x TO y` lowers to bounded windows in Phase D.
 
 Cost: one extra full scan over matching rows per write (predicate eval
 in pure Clojure). Future Phase C+ work can push the predicate through
@@ -261,7 +275,8 @@ After this PR:
 |---|---|---|
 | A | Schema redesign: `:bitemporal {:valid :system}` | 1 |
 | B | Write primitives: `vt-append!` / `vt-update!` / `vt-delete!` | 2 |
-| C | Overlap detection: reject + opt-in auto-split | 1 |
+| C | Overlap detection: reject by default | 1 |
+| C+ | Auto-split: truncate partial-left + drop fully-superseded (via `ds-delete-rows!`) | 1 |
 | D | SQL grammar: `FOR PORTION OF VALID_TIME` + `FOR SYSTEM_TIME` | 2 |
 | E | Datahike adapter refactor: use new primitives | 1 |
 | F | Datahike `d/system-at` wrapper | 1 |

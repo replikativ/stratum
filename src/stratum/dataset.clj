@@ -143,6 +143,17 @@
 
      Throws when the dataset is not bitemporal.")
 
+  (ds-delete-rows! [this row-idxs]
+    "Physically remove the rows at the given indices from a transient
+     dataset. Fans `idx-delete!` across every column. Indices are
+     sorted descending internally so the unsorted input is fine.
+     Decrements row-count. Returns the same transient.
+
+     This bypasses temporal semantics — a posted/sealed dataset
+     should not call this directly; prefer `upsert!`/`retract!` with
+     `:auto-split? true`. Exposed because the SQL `DELETE` lowering
+     and the auto-split overlap handler both need it.")
+
   ;; Persistence
   (sync! [this store branch]
     "Atomically persist dataset + all indices to storage.
@@ -322,27 +333,50 @@
                              (if (= :no-conflict klass)
                                acc
                                (update acc klass conj! [i row]))))
-                    (recur (inc i) acc)))))]
-        (when (seq overlaps)
-          (cond
-            auto-split?
-            (throw (ex-info ":auto-split? not yet implemented; reject is the only policy"
-                            {:overlaps (mapv second overlaps)
-                             :new-window [close-vt-val Long/MAX_VALUE]
-                             :hint "split / truncate / drop overlaps manually for now"}))
+                    (recur (inc i) acc)))))
+        ;; Auto-split partitions overlaps by row-vf vs new-vf:
+        ;;   row-vf <  new-vf → partial left overlap → TRUNCATE
+        ;;                       (set row-vt = new-vf, keep the
+        ;;                        historical prefix)
+        ;;   row-vf >= new-vf → row entirely inside [new-vf, MAX) →
+        ;;                       DROP (physical removal via
+        ;;                        ds-delete-rows!).
+        ;; (Right-partial and middle-overlap don't occur here because
+        ;; new-vt is always MAX in upsert!/retract!. They become
+        ;; reachable once Phase D wires SQL `FOR PORTION OF
+        ;; VALID_TIME FROM x TO y`.)
+        {auto-truncate :truncate auto-drop :drop}
+        (if (and (seq overlaps) auto-split?)
+          (group-by (fn [[_i r]]
+                      (if (< (long (get r vf-col)) close-vt-val)
+                        :truncate
+                        :drop))
+                    overlaps)
+          {:truncate [] :drop []})
 
-            :else
+        _ (when (and (seq overlaps) (not auto-split?))
             (throw (ex-info "upsert! would overlap existing rows' vt-windows"
                             {:where where
                              :new-window [close-vt-val Long/MAX_VALUE]
                              :overlaps (mapv (fn [[i r]]
                                                (assoc (select-keys r [vf-col vt-col]) :row-idx i))
                                              overlaps)
-                             :hint "pass :auto-split? true to split overlapping rows (Phase C+ — not yet implemented), or restructure the write"}))))
-        ;; Pass 2: close each safe row's :valid-to and append a merged
-        ;; new row with the new vt-window.
-        (doseq [[i prev-row] close-safe]
-          (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val)
+                             :hint "pass :auto-split? true to split overlapping rows, or restructure the write"})))]
+        ;; Mutation order is load-bearing:
+        ;;   1. set-at! everything (close-safe + truncate) — indices stay
+        ;;      stable across set-at!.
+        ;;   2. ds-delete-rows! for drops — this shifts indices, so any
+        ;;      later references to the captured indices (close-safe,
+        ;;      truncate) would point at the wrong row.
+        ;;   3. append! the new rows (close-safe merged-row, or degenerate
+        ;;      insert).
+        (doseq [[i _prev-row] close-safe]
+          (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+        (doseq [[i _r] auto-truncate]
+          (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+        (when (seq auto-drop)
+          (ds-delete-rows! this (mapv first auto-drop)))
+        (doseq [[_i prev-row] close-safe]
           (let [merged-row (merge (dissoc prev-row vf-col vt-col
                                           (:from-col system-cfg) (:to-col system-cfg))
                                   set)]
@@ -395,25 +429,56 @@
                              (if (= :no-conflict klass)
                                acc
                                (update acc klass conj! [i row]))))
-                    (recur (inc i) acc)))))]
-        (when (seq overlaps)
-          (cond
-            auto-split?
-            (throw (ex-info ":auto-split? not yet implemented; reject is the only policy"
-                            {:overlaps (mapv second overlaps)
-                             :retract-at close-vt-val}))
+                    (recur (inc i) acc)))))
+        ;; Same partition as upsert!: TRUNCATE when row's vf is before
+        ;; the retract instant (keep the historical prefix); DROP when
+        ;; the row is entirely inside [new-vf, MAX) (the retract erases
+        ;; it). retract! has no append step — once the rows are closed
+        ;; or removed, we're done.
+        {auto-truncate :truncate auto-drop :drop}
+        (if (and (seq overlaps) auto-split?)
+          (group-by (fn [[_i r]]
+                      (if (< (long (get r vf-col)) close-vt-val)
+                        :truncate
+                        :drop))
+                    overlaps)
+          {:truncate [] :drop []})
 
-            :else
+        _ (when (and (seq overlaps) (not auto-split?))
             (throw (ex-info "retract! would touch rows whose vt-window doesn't cover the retract instant"
                             {:where where
                              :retract-at close-vt-val
                              :overlaps (mapv (fn [[i r]]
                                                (assoc (select-keys r [vf-col vt-col]) :row-idx i))
                                              overlaps)
-                             :hint "pass :auto-split? true (Phase C+ — not yet implemented), or restructure the write"}))))
+                             :hint "pass :auto-split? true to split overlapping rows, or restructure the write"})))]
+        ;; close-safe + truncate first (no index shift), then drops.
         (doseq [[i _row] close-safe]
           (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+        (doseq [[i _r] auto-truncate]
+          (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+        (when (seq auto-drop)
+          (ds-delete-rows! this (mapv first auto-drop)))
         this)))
+
+  (ds-delete-rows! [this row-idxs]
+    (when-not edit
+      (throw (IllegalStateException. "Cannot mutate persistent dataset. Call transient first.")))
+    (let [n (long row-count-val)
+          ;; Distinct + descending: descending so each delete doesn't
+          ;; shift the still-pending indices above it. Distinct so a
+          ;; duplicated index doesn't double-delete (which would target
+          ;; the row that just shifted into its place).
+          sorted (vec (sort > (distinct row-idxs)))]
+      (doseq [i sorted]
+        (when (or (neg? (long i)) (>= (long i) n))
+          (throw (IndexOutOfBoundsException.
+                  (str "ds-delete-rows!: index " i " out of bounds [0, " n ")")))))
+      (doseq [i sorted]
+        (doseq [[_col-name col-data] columns-field]
+          (idx/idx-delete! (:index col-data) (long i))))
+      (set! row-count-val (- n (count sorted)))
+      this))
 
   ;; ========================================================================
   ;; Persistence

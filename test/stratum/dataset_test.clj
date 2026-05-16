@@ -1050,16 +1050,77 @@
              (dataset/upsert! {:where [[:= :eid 1]] :set {:salary 95000}}
                               {:valid-from 1714521600000000}))))))
 
-(deftest upsert!-auto-split-is-deferred
+(deftest upsert!-auto-split-truncates-open-row-when-new-vf-is-inside-it
+  ;; Single open row [Jul-2024, MAX). Backdated upsert at Apr-2024 with
+  ;; :auto-split? true: row's open vt is in the future, so close-safe
+  ;; doesn't apply (row-vf=Jul > new-vf=Apr); instead auto-split must
+  ;; DROP the row (it's entirely inside [Apr, MAX)) and append the new
+  ;; row from `:set`.
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1719792000000000  ;; Jul-2024
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]] :set {:eid 1 :salary 110000}
+                                     :auto-split? true}
+                                    {:valid-from 1714521600000000}) ;; Apr-2024
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "exactly one row survives — the original was dropped, new appended"
+      (is (= 1 (count rows)))
+      (is (= 110000 (:salary (first rows))))
+      (is (= 1714521600000000 (:_valid_from (first rows))))
+      (is (= Long/MAX_VALUE (:_valid_to (first rows)))))))
+
+(deftest upsert!-auto-split-truncates-closed-historical-with-partial-left-overlap
+  ;; Closed row [Jan, Jul). Backdated upsert at Apr (inside the row).
+  ;; row-vf=Jan < new-vf=Apr < row-vt=Jul → TRUNCATE row to [Jan, Apr),
+  ;; then append new [Apr, MAX).
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000  ;; Jan-2024
+                         :_valid_to   1719792000000000} ;; Jul-2024
+                        {:eid 1 :salary 110000
+                         :_valid_from 1719792000000000  ;; Jul-2024
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]] :set {:eid 1 :salary 95000}
+                                     :auto-split? true}
+                                    {:valid-from 1714521600000000}) ;; Apr-2024
+                   persistent!)
+        rows (sort-by :_valid_from (ds-rows result))]
+    (testing "two rows after split: truncated historical + new write"
+      (is (= 2 (count rows))))
+    (testing "historical row truncated to [Jan, Apr)"
+      (is (= 100000 (:salary (first rows))))
+      (is (= 1704067200000000 (:_valid_from (first rows))))
+      (is (= 1714521600000000 (:_valid_to (first rows)))))
+    (testing "new row covers [Apr, MAX)"
+      (is (= 95000 (:salary (second rows))))
+      (is (= 1714521600000000 (:_valid_from (second rows))))
+      (is (= Long/MAX_VALUE (:_valid_to (second rows)))))
+    (testing "the future open row [Jul, MAX) was dropped (row-vf >= new-vf)"
+      (is (not-any? #(= 110000 (:salary %)) rows)))))
+
+(deftest upsert!-auto-split-leaves-other-entities-alone
+  ;; eid=2 has an open row but doesn't match :where [:= :eid 1].
+  ;; Auto-split on eid=1 must not touch eid=2.
   (let [ds (vt-only-ds [{:eid 1 :salary 100000
                          :_valid_from 1719792000000000
-                         :_valid_to   Long/MAX_VALUE}])]
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #":auto-split\? not yet implemented"
-         (-> ds transient
-             (dataset/upsert! {:where [[:= :eid 1]] :set {:salary 110000}
-                               :auto-split? true}
-                              {:valid-from 1714521600000000}))))))
+                         :_valid_to   Long/MAX_VALUE}
+                        {:eid 2 :salary 80000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]] :set {:eid 1 :salary 999}
+                                     :auto-split? true}
+                                    {:valid-from 1714521600000000})
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "eid=2 untouched"
+      (let [r2 (first (filter #(= 2 (:eid %)) rows))]
+        (is (some? r2))
+        (is (= 80000 (:salary r2)))
+        (is (= 1704067200000000 (:_valid_from r2)))
+        (is (= Long/MAX_VALUE (:_valid_to r2)))))))
 
 (deftest upsert!-tolerates-historical-rows-strictly-before-new-vf
   ;; Closed row entirely in the past (Nov-Jan), open row Jan-MAX,
@@ -1118,15 +1179,52 @@
              (dataset/retract! {:where [[:= :eid 1]]}
                                {:valid-from 1714521600000000}))))))
 
-(deftest retract!-auto-split-is-deferred
+(deftest retract!-auto-split-truncates-historical-and-drops-future
+  ;; Closed [Jan, Jul) + open [Jul, MAX). Backdated retract at Apr:
+  ;; closed row spans Apr → TRUNCATE to [Jan, Apr); open row's
+  ;; vf=Jul >= Apr → DROP.
   (let [ds (vt-only-ds [{:eid 1 :salary 100000
                          :_valid_from 1704067200000000
                          :_valid_to   1719792000000000}
                         {:eid 1 :salary 110000
                          :_valid_from 1719792000000000
-                         :_valid_to   Long/MAX_VALUE}])]
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #":auto-split\? not yet implemented"
-         (-> ds transient
-             (dataset/retract! {:where [[:= :eid 1]] :auto-split? true}
-                               {:valid-from 1714521600000000}))))))
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/retract! {:where [[:= :eid 1]] :auto-split? true}
+                                     {:valid-from 1714521600000000})
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "only the truncated historical row survives"
+      (is (= 1 (count rows)))
+      (is (= 100000 (:salary (first rows))))
+      (is (= 1704067200000000 (:_valid_from (first rows))))
+      (is (= 1714521600000000 (:_valid_to (first rows)))))))
+
+(deftest ds-delete-rows!-shifts-correctly
+  ;; Delete two rows from a 5-row dataset; verify the remaining rows
+  ;; keep their column-aligned values.
+  (let [ds (vt-only-ds (for [i (range 5)]
+                         {:eid i :salary (* 100 (inc i))
+                          :_valid_from i :_valid_to Long/MAX_VALUE}))
+        out (-> ds transient
+                (dataset/ds-delete-rows! [1 3])
+                persistent!)
+        rows (ds-rows out)]
+    (testing "row count is reduced"
+      (is (= 3 (count rows)))
+      (is (= 3 (dataset/row-count out))))
+    (testing "surviving rows keep column alignment"
+      (is (= [0 2 4] (mapv :eid rows)))
+      (is (= [100 300 500] (mapv :salary rows))))))
+
+(deftest ds-delete-rows!-requires-transient
+  (let [ds (vt-only-ds [{:eid 1 :salary 100
+                         :_valid_from 1 :_valid_to Long/MAX_VALUE}])]
+    (is (thrown? IllegalStateException
+                 (dataset/ds-delete-rows! ds [0])))))
+
+(deftest ds-delete-rows!-rejects-out-of-bounds
+  (let [ds (vt-only-ds [{:eid 1 :salary 100
+                         :_valid_from 1 :_valid_to Long/MAX_VALUE}])]
+    (is (thrown? IndexOutOfBoundsException
+                 (-> ds transient (dataset/ds-delete-rows! [5]))))))
