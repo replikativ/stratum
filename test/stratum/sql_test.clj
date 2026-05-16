@@ -2308,3 +2308,118 @@
           (is (= #{1711929600000000 1719792000000000 Long/MAX_VALUE}
                  (set (read-col :_valid_to)))))
         (finally (server/stop srv))))))
+
+(deftest sql-insert-for-portion-of-valid-time-stamps-vf-vt-from-period
+  (testing "INSERT … FOR PORTION OF VALID_TIME fills _valid_from / _valid_to from the period"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "salaries"
+          (with-meta
+            ;; Start with an empty bitemporal table.
+            {:eid         (stratum.index/index-from-seq :int64 [])
+             :salary      (stratum.index/index-from-seq :int64 [])
+             :_valid_from (stratum.index/index-from-seq :int64 [])
+             :_valid_to   (stratum.index/index-from-seq :int64 [])}
+            {:bitemporal {:valid {:from-col :_valid_from
+                                  :to-col   :_valid_to
+                                  :unit     :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec (str "INSERT INTO salaries (eid, salary) VALUES (1, 100) "
+                         "FOR PORTION OF VALID_TIME FROM '2024-01-01' TO '2024-07-01'")
+                    (:registry srv) (:data-dir srv))]
+          (is (= "INSERT 0 1" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                        (:index (get cols k)) %)
+                                     (range n)))]
+          (is (= 1 n))
+          (is (= [1] (read-col :eid)))
+          (is (= [100] (read-col :salary)))
+          (is (= [1704067200000000] (read-col :_valid_from)))
+          (is (= [1719792000000000] (read-col :_valid_to))))
+        (finally (server/stop srv))))))
+
+(deftest sql-update-for-portion-of-valid-time-splits-correctly
+  (testing "UPDATE … FOR PORTION OF VALID_TIME applies bounded-update! 3-way split"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "salaries"
+          (with-meta
+            ;; Single row [Jan, Jul) with salary=100.
+            {:eid         (stratum.index/index-from-seq :int64 [1])
+             :salary      (stratum.index/index-from-seq :int64 [100])
+             :_valid_from (stratum.index/index-from-seq :int64 [1704067200000000])
+             :_valid_to   (stratum.index/index-from-seq :int64 [1719792000000000])}
+            {:bitemporal {:valid {:from-col :_valid_from
+                                  :to-col   :_valid_to
+                                  :unit     :micros}}}))
+        ;; UPDATE … FOR PORTION OF [Apr, May) SET salary=999 WHERE eid=1
+        ;; Row [Jan, Jul) straddles [Apr, May): 3-way split.
+        ;;   [Jan, Apr) keeps salary=100
+        ;;   [Apr, May) gets salary=999
+        ;;   [May, Jul) keeps salary=100
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec (str "UPDATE salaries SET salary = 999 "
+                         "FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-05-01' "
+                         "WHERE eid = 1")
+                    (:registry srv) (:data-dir srv))]
+          (is (re-find #"^UPDATE" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                        (:index (get cols k)) %)
+                                     (range n)))]
+          (is (= 3 n))
+          ;; Find the [Apr, May) slice (the updated one) by its
+          ;; _valid_from value.
+          (let [rows (mapv (fn [i]
+                             {:eid (nth (read-col :eid) i)
+                              :salary (nth (read-col :salary) i)
+                              :vf (nth (read-col :_valid_from) i)
+                              :vt (nth (read-col :_valid_to) i)})
+                           (range n))
+                by-vf (group-by :vf rows)]
+            ;; Three slices, all eid=1.
+            (is (every? #(= 1 (:eid %)) rows))
+            ;; [Jan, Apr) keeps old salary=100
+            (let [r (first (by-vf 1704067200000000))]
+              (is (some? r))
+              (is (= 100 (:salary r)))
+              (is (= 1711929600000000 (:vt r))))
+            ;; [Apr, May) gets new salary=999
+            (let [r (first (by-vf 1711929600000000))]
+              (is (some? r))
+              (is (= 999 (:salary r)))
+              (is (= 1714521600000000 (:vt r))))
+            ;; [May, Jul) keeps old salary=100
+            (let [r (first (by-vf 1714521600000000))]
+              (is (some? r))
+              (is (= 100 (:salary r)))
+              (is (= 1719792000000000 (:vt r))))))
+        (finally (server/stop srv))))))
+
+(deftest sql-upsert-for-portion-of-valid-time-rejected
+  (testing "INSERT … ON CONFLICT … FOR PORTION OF VALID_TIME throws a clear error"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "t"
+          (with-meta
+            {:eid (stratum.index/index-from-seq :int64 [])
+             :_valid_from (stratum.index/index-from-seq :int64 [])
+             :_valid_to (stratum.index/index-from-seq :int64 [])}
+            {:bitemporal {:valid {:from-col :_valid_from :to-col :_valid_to :unit :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec (str "INSERT INTO t (eid) VALUES (1) "
+                         "ON CONFLICT (eid) DO UPDATE SET eid = 2 "
+                         "FOR PORTION OF VALID_TIME FROM '2024-01-01' TO '2024-07-01'")
+                    (:registry srv) (:data-dir srv))]
+          (is (some? (.error qr)))
+          (is (re-find #"not supported" (.error qr))))
+        (finally (server/stop srv))))))

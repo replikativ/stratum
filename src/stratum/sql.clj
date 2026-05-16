@@ -2355,6 +2355,12 @@
    Supports INSERT ... ON CONFLICT (UPSERT)."
   [^Insert stmt]
   (let [table-name (.toString (.getTable stmt))
+        ;; Explicit column list `INSERT INTO t (a, b) VALUES (…)` is
+        ;; optional in SQL but required for FOR PORTION OF VALID_TIME
+        ;; on bitemporal tables (so we know which user values go
+        ;; where). Nil when omitted.
+        col-list (when-let [cols (.getColumns stmt)]
+                   (mapv (fn [^Column c] (keyword (.getColumnName c))) cols))
         ^Values vals (.getValues stmt)
         exprs (.getExpressions vals)
         ;; Single-row inserts have flat expressions, multi-row have PELs
@@ -2374,15 +2380,17 @@
                                         expr (translate-expr (first (.getValues us)))]
                                     {:col col :expr expr}))
                                 (.getUpdateSets ^InsertConflictAction conflict-action)))]
-        {:ddl {:op            :upsert
-               :table         table-name
-               :rows          rows
-               :conflict-cols conflict-cols
-               :action        (if is-update? :do-update :do-nothing)
-               :assignments   (or update-sets [])}})
-      {:ddl {:op     :insert
-             :table  table-name
-             :rows   rows}})))
+        {:ddl (cond-> {:op            :upsert
+                       :table         table-name
+                       :rows          rows
+                       :conflict-cols conflict-cols
+                       :action        (if is-update? :do-update :do-nothing)
+                       :assignments   (or update-sets [])}
+                col-list (assoc :columns col-list))})
+      {:ddl (cond-> {:op     :insert
+                     :table  table-name
+                     :rows   rows}
+              col-list (assoc :columns col-list))})))
 
 (defn- translate-update
   "Translate a JSqlParser Update into a DDL descriptor.

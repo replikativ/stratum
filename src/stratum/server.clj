@@ -223,6 +223,86 @@
             new-cols (if meta (with-meta new-cols meta) new-cols)]
         {:new-cols new-cols :n-deleted (count delete-idxs)}))))
 
+(defn- bitemporal-valid-cfg
+  "Infer the `:valid` axis config for a table-registry column map.
+   Prefers metadata (`:bitemporal {:valid {...}}` on the column map),
+   falls back to the SQL:2011 convention column names. Returns nil if
+   neither is discoverable."
+  [existing meta]
+  (let [bt-meta (:bitemporal meta)]
+    (or (:valid bt-meta)
+        (when (and (contains? existing :_valid_from)
+                   (contains? existing :_valid_to))
+          {:from-col :_valid_from :to-col :_valid_to :unit :micros}))))
+
+(defn- insert-portion-via-index-backend
+  "Apply a SQL:2011 `INSERT … FOR PORTION OF VALID_TIME FROM x TO y`
+   on an index-backed bitemporal table. Each row in `rows` (positional
+   per `col-list`, which must be supplied since the period fills in
+   the temporal cols) is `append!`'d with `:valid-from` / `:valid-to`
+   in tx-meta so `append!`'s axis auto-stamping picks them up.
+
+   The user MUST supply an explicit column list naming all the
+   non-temporal columns; the temporal cols are filled from the
+   period. If `col-list` is nil (positional VALUES with no column
+   names) we throw — the temporal columns are positionally ambiguous."
+  [^String table existing col-list rows period meta]
+  (let [valid (bitemporal-valid-cfg existing meta)
+        _ (when-not valid
+            (throw (ex-info "INSERT FOR PORTION OF VALID_TIME requires a :valid axis on the table"
+                            {:table table :existing-cols (vec (keys existing))})))
+        _ (when-not col-list
+            (throw (ex-info (str "INSERT FOR PORTION OF VALID_TIME requires an explicit "
+                                 "column list: `INSERT INTO t (col1, col2) VALUES (...)` — "
+                                 "the period fills in " (:from-col valid) " / " (:to-col valid))
+                            {:table table})))
+        ds-meta (merge (or (:bitemporal meta) {}) {:bitemporal {:valid valid}})
+        ds (dataset/make-dataset existing {:name table :metadata ds-meta})
+        mutated (reduce (fn [tds row-vals]
+                          (let [row-map (zipmap col-list row-vals)]
+                            (dataset/append! tds row-map
+                                             {:valid-from (:from period)
+                                              :valid-to   (:to period)})))
+                        (transient ds)
+                        rows)
+        sealed (persistent! mutated)
+        new-cols (dataset/columns sealed)
+        new-cols (if meta (with-meta new-cols meta) new-cols)]
+    {:new-cols new-cols :n-inserted (count rows)}))
+
+(defn- update-portion-via-index-backend
+  "Apply a SQL:2011 `UPDATE … FOR PORTION OF VALID_TIME FROM x TO y
+   SET col=val WHERE p` on an index-backed bitemporal table by
+   lowering to `dataset/bounded-update!`. The :set assignments are
+   evaluated as literal values (no expressions — sub-expressions in
+   SET are a P2 future addition)."
+  [^String table existing where assignments period meta]
+  (let [valid (bitemporal-valid-cfg existing meta)
+        _ (when-not valid
+            (throw (ex-info "UPDATE FOR PORTION OF VALID_TIME requires a :valid axis on the table"
+                            {:table table :existing-cols (vec (keys existing))})))
+        set-map (reduce (fn [m {:keys [col expr]}]
+                          (when-not (or (number? expr) (string? expr) (nil? expr))
+                            (throw (ex-info "UPDATE FOR PORTION OF VALID_TIME only supports literal SET values"
+                                            {:assignment {:col col :expr expr}
+                                             :hint "expression evaluation in SET is deferred"})))
+                          (assoc m col expr))
+                        {}
+                        assignments)
+        ds-meta (merge (or (:bitemporal meta) {}) {:bitemporal {:valid valid}})
+        ds (dataset/make-dataset existing {:name table :metadata ds-meta})
+        mutated (-> ds
+                    transient
+                    (dataset/bounded-update! {:where (or where []) :set set-map}
+                                             {:valid-from (:from period)
+                                              :valid-to   (:to period)})
+                    persistent!)
+        new-cols (dataset/columns mutated)
+        new-cols (if meta (with-meta new-cols meta) new-cols)]
+    {:new-cols new-cols
+     :n-updated (count (filter #(eval-dml-predicate existing where %)
+                                (range (col-row-count (val (first existing))))))}))
+
 (defn- delete-portion-via-index-backend
   "Apply a SQL:2011 `DELETE … FOR PORTION OF VALID_TIME FROM x TO y`
    to an index-backed table. Lowers to `retract!` on a transient
@@ -549,6 +629,51 @@
             (let [existing (get @table-registry-atom table)]
               (when-not existing
                 (throw (ex-info (str "Table not found: " table) {:table table})))
+              (cond
+                ;; INSERT … FOR PORTION OF VALID_TIME on a fully
+                ;; index-backed bitemporal table lowers to append!
+                ;; with vf/vt stamped from the period.
+                (and (:period ddl)
+                     (= :valid_time (:axis (:period ddl)))
+                     (index-backed-cols? existing))
+                (let [{:keys [new-cols n-inserted]}
+                      (insert-portion-via-index-backend
+                        table existing (:columns ddl) rows (:period ddl) (meta existing))]
+                  (swap! table-registry-atom assoc table new-cols)
+                  (PgWireServer$QueryResult/empty (str "INSERT 0 " n-inserted)))
+
+                ;; Plain INSERT on an index-backed bitemporal table
+                ;; with explicit column list lowers to append! so
+                ;; the user can supply vf/vt directly.
+                (and (index-backed-cols? existing) (:columns ddl))
+                (let [valid (bitemporal-valid-cfg existing (meta existing))
+                      ds-meta (merge (or (:bitemporal (meta existing)) {})
+                                     (when valid {:bitemporal {:valid valid}}))
+                      ds (dataset/make-dataset existing
+                                               (cond-> {:name table}
+                                                 (seq ds-meta) (assoc :metadata ds-meta)))
+                      mutated (reduce (fn [tds row-vals]
+                                        (dataset/append! tds (zipmap (:columns ddl) row-vals)))
+                                      (transient ds)
+                                      rows)
+                      sealed (persistent! mutated)
+                      new-cols (dataset/columns sealed)
+                      new-cols (if-let [m (meta existing)] (with-meta new-cols m) new-cols)]
+                  (swap! table-registry-atom assoc table new-cols)
+                  (PgWireServer$QueryResult/empty (str "INSERT 0 " (count rows))))
+
+                ;; Index-backed table without explicit column list — reject
+                ;; rather than silently mismatch positions against an
+                ;; encoded column map (whose iteration order isn't guaranteed
+                ;; to match a SQL `CREATE TABLE` order).
+                (index-backed-cols? existing)
+                (throw (ex-info
+                         (str "INSERT on a stratum-index-backed table requires an explicit "
+                              "column list: `INSERT INTO " table " (col1, col2, ...) VALUES (...)`")
+                         {:table table}))
+
+                :else
+                (do
               (let [col-keys (vec (keys existing))
                     n-existing (if-let [first-col (get existing (first col-keys))]
                                  (cond
@@ -600,12 +725,30 @@
                     new-cols (with-meta new-cols (meta existing))]
                 (swap! table-registry-atom assoc table new-cols))
               (PgWireServer$QueryResult/empty
-               (str "INSERT 0 " (count rows))))
+               (str "INSERT 0 " (count rows))))))
 
             :upsert
             (let [existing (get @table-registry-atom table)]
               (when-not existing
                 (throw (ex-info (str "Table not found: " table) {:table table})))
+              ;; UPSERT (INSERT … ON CONFLICT) combined with FOR
+              ;; PORTION OF VALID_TIME has subtle semantics — the
+              ;; conflict target needs to be evaluated *per slice*,
+              ;; not per (positional) row. Reject explicitly rather
+              ;; than silently doing the wrong thing.
+              (when (:period ddl)
+                (throw (ex-info
+                         (str "INSERT … ON CONFLICT … FOR PORTION OF VALID_TIME "
+                              "is not supported. Use INSERT FOR PORTION OF + "
+                              "UPDATE FOR PORTION OF as separate statements, "
+                              "or DELETE FOR PORTION OF + INSERT FOR PORTION OF.")
+                         {:table table
+                          :period (:period ddl)})))
+              (when (and (index-backed-cols? existing) (nil? (:period ddl)))
+                (throw (ex-info
+                         (str "INSERT … ON CONFLICT on stratum-index-backed tables "
+                              "is not yet supported. Use plain INSERT + UPDATE separately.")
+                         {:table table})))
               (let [col-keys (vec (keys existing))
                     n-existing (let [first-col (get existing (first col-keys))]
                                  (cond
@@ -731,6 +874,22 @@
             (let [existing (get @table-registry-atom table)]
               (when-not existing
                 (throw (ex-info (str "Table not found: " table) {:table table})))
+              (cond
+                ;; UPDATE … FOR PORTION OF VALID_TIME on a fully
+                ;; index-backed bitemporal table lowers to
+                ;; dataset/bounded-update! (SQL:2011 non-sequenced UPDATE).
+                (and (:period ddl)
+                     (= :valid_time (:axis (:period ddl)))
+                     (index-backed-cols? existing))
+                (let [{:keys [new-cols n-updated]}
+                      (update-portion-via-index-backend
+                        table existing where assignments
+                        (:period ddl) (meta existing))]
+                  (swap! table-registry-atom assoc table new-cols)
+                  (PgWireServer$QueryResult/empty (str "UPDATE " n-updated)))
+
+                :else
+                (do
               (let [;; FROM table for UPDATE FROM (joined updates)
                     from-existing (when from
                                     (let [ft (get @table-registry-atom (:table from))]
@@ -877,7 +1036,7 @@
                      assignments)]
                 (swap! table-registry-atom assoc table
                        (with-meta new-cols (meta existing)))
-                (PgWireServer$QueryResult/empty (str "UPDATE " n-matched))))
+                (PgWireServer$QueryResult/empty (str "UPDATE " n-matched))))))
 
             :delete
             (let [existing (get @table-registry-atom table)]

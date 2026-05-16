@@ -1047,6 +1047,82 @@
     cols)))
 
 ;; ============================================================================
+;; SQL:2011 bounded-window UPDATE: `UPDATE … FOR PORTION OF VALID_TIME
+;; FROM x TO y SET col=val WHERE p`. Decomposes into:
+;;   1. capture matching rows that overlap [x, y) (including their
+;;      original values and per-row overlap window);
+;;   2. retract! over [x, y) — the bounded retract handles the
+;;      temporal surgery for both matched and untouched portions;
+;;   3. append a new slice per captured row, merging :set into the
+;;      original row values and stamping the per-row overlap window.
+;; Top-level function (rather than protocol method) since it composes
+;; existing primitives — keeps the IDataset surface small.
+;; ============================================================================
+
+(defn bounded-update!
+  "SQL:2011 non-sequenced UPDATE on a transient bitemporal dataset.
+
+   opts: {:where <predicate> :set {col-kw value ...}}
+   tx-meta: must include `:valid-from` AND `:valid-to`; the bounded
+            surgery applies over [`valid-from`, `valid-to`).
+
+   For every matching row whose vt-window overlaps the bounded slice,
+   the slice's overlap portion gets the merged `:set` values and the
+   non-overlap parts retain the original values. This is the
+   surgical equivalent of `DELETE FOR PORTION OF VALID_TIME` followed
+   by inserting the per-row updated slice.
+
+   Open-window UPDATE (no `:valid-to`) is not the SQL:2011 semantic
+   and is intentionally not supported here — use `upsert!` for that
+   shape."
+  [ds {:keys [where set] :as _opts} tx-meta]
+  (let [cfg (bitemporal-config ds)
+        valid (:valid cfg)
+        _ (when-not valid
+            (throw (ex-info "bounded-update! requires a :valid axis on the dataset"
+                            {:bitemporal-config cfg})))
+        _ (when (nil? where)
+            (throw (ex-info "bounded-update! requires :where" {})))
+        _ (when (nil? (:valid-to tx-meta))
+            (throw (ex-info "bounded-update! requires tx-meta :valid-to (bounded-window only)"
+                            {:tx-meta tx-meta})))
+        {vf-col :from-col vt-col :to-col vt-unit :unit} valid
+        new-vf (coerce-temporal-value (:valid-from tx-meta) vt-unit)
+        new-vt (coerce-temporal-value (:valid-to tx-meta) vt-unit)
+        cols-snap (columns ds)
+        n (row-count ds)
+        ;; Step 1: capture matching rows that overlap [new-vf, new-vt).
+        ;; We materialize each row so we have its values AFTER retract!
+        ;; shifts indices in step 2.
+        overlapping
+        (vec
+          (for [i (range n)
+                :let [row (materialize-row cols-snap i)]
+                :when (let [pred-ok? (eval-pred where row)
+                            row-vf  (long (get row vf-col))
+                            row-vt  (long (get row vt-col))]
+                        (and pred-ok?
+                             (not (or (<= row-vt new-vf) (>= row-vf new-vt)))))]
+            (let [row-vf (long (get row vf-col))
+                  row-vt (long (get row vt-col))]
+              {:row row
+               :slice-vf (max row-vf new-vf)
+               :slice-vt (min row-vt new-vt)})))]
+    ;; Step 2: retract over [new-vf, new-vt). The bounded retract
+    ;; handles every overlap class — drop / truncate-vt / truncate-vf
+    ;; / split — preserving the non-overlap parts of each matched row.
+    (retract! ds {:where where} tx-meta)
+    ;; Step 3: assert the updated slice per captured row.
+    (doseq [{:keys [row slice-vf slice-vt]} overlapping]
+      (let [merged (-> row
+                       (merge set)
+                       (assoc vf-col slice-vf vt-col slice-vt)
+                       (dissoc (get-in cfg [:system :from-col])
+                               (get-in cfg [:system :to-col])))]
+        (append! ds merged tx-meta)))
+    ds))
+
+;; ============================================================================
 ;; Constructor
 ;; ============================================================================
 

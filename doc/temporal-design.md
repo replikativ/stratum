@@ -235,16 +235,31 @@ JSqlParser 5.2 doesn't grok these tokens, so the path is a pre-tokenise
 rewriter in `stratum.sql.rewrite/preprocess-sql`: strip
 `FOR PORTION OF VALID_TIME FROM x TO y` to a side-channel `:period`
 map before JSqlParser sees the SQL, then attach `:period` to the
-parsed `:ddl` for the translator. As of Phase D the `DELETE` form
-lowers to `dataset/retract!` with `:valid-from` + `:valid-to` in
-tx-meta on a fully-index-backed table; `retract!` performs the
-bounded surgery (truncate / shift / split / drop) per overlapping
-row. `UPDATE` and `INSERT` flavors are staged for a follow-up
-commit — the preprocessor already accepts the clause, the server
-DDL branch just needs the lowering. Plain `DELETE WHERE` (without
-`FOR PORTION OF`) on an index-backed table routes through
-`ds-delete-rows!` and behaves identically to the array-backed
-CREATE TABLE path.
+parsed `:ddl` for the translator.
+
+- `DELETE FOR PORTION OF VALID_TIME` lowers to `dataset/retract!`
+  with `:valid-from` + `:valid-to` in tx-meta. `retract!` performs
+  the bounded surgery (truncate / shift / split / drop) per
+  overlapping row.
+- `INSERT FOR PORTION OF VALID_TIME` lowers to `dataset/append!` with
+  the period values stamping the configured `_valid_from` /
+  `_valid_to` columns. The SQL must provide an explicit column list
+  (`INSERT INTO t (a, b) VALUES (...)`) — the period fills in the
+  temporal columns.
+- `UPDATE FOR PORTION OF VALID_TIME` lowers to `dataset/bounded-update!`
+  (SQL:2011 non-sequenced UPDATE): per row, the overlap portion gets
+  the merged `:set` values, the non-overlap parts retain the
+  original values. Internally decomposes into `retract!` over the
+  slice + an `append!` per captured overlap.
+- `INSERT … ON CONFLICT … FOR PORTION OF VALID_TIME` is explicitly
+  rejected — the conflict target's semantics under non-sequenced
+  semantics are not well-defined; users can compose `DELETE FOR
+  PORTION OF` + `INSERT FOR PORTION OF` (or `INSERT FOR PORTION OF`
+  + `UPDATE FOR PORTION OF`) instead.
+
+Plain `DELETE WHERE` / `INSERT VALUES` / `UPDATE WHERE` (without
+`FOR PORTION OF`) on an index-backed table also route through
+`ds-delete-rows!` / `append!` / array-rebuild appropriately.
 
 ## Four-axis composability
 
@@ -288,7 +303,7 @@ After this PR:
 | C | Overlap detection: reject by default | 1 |
 | C+ | Auto-split: truncate partial-left + drop fully-superseded (via `ds-delete-rows!`) | 1 |
 | D | SQL grammar `FOR PORTION OF VALID_TIME` (DELETE) + bounded retract! + index-backed SQL DELETE | 1 |
-| D+ | `FOR PORTION OF VALID_TIME` on UPDATE / INSERT / UPSERT (deferred) | future |
+| D+ | `FOR PORTION OF VALID_TIME` on UPDATE + INSERT (via `bounded-update!`); UPSERT rejected with clear error | 1 |
 | E | Datahike adapter refactor: use new primitives | 1 |
 | F | Datahike `d/system-at` wrapper | 1 |
 | G | pg-datahike `datahike.system_at` session vars + SQL passthrough | 1 |
