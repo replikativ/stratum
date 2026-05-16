@@ -311,8 +311,21 @@
    single target). Recognizes `VALID_TIME` and `SYSTEM_TIME` axes;
    currently only `VALID_TIME` is honored by the server."
   [^String sql]
-  (let [m (re-find #"(?is)\bFOR\s+PORTION\s+OF\s+(VALID_TIME|SYSTEM_TIME)\s+FROM\s+" sql)]
-    (if-not m
+  ;; `FOR ALL VALID_TIME` / `FOR VALID_TIME ALL` (and the same for
+  ;; SYSTEM_TIME) — XTDB v2 grammar `Sql.g4:830`. Strip first and
+  ;; emit `:period {:axis ... :from MIN :to MAX}` so the lowering
+  ;; treats it as a window spanning all time.
+  (if-let [all-m (re-find #"(?is)\bFOR\s+(?:ALL\s+(VALID_TIME|SYSTEM_TIME)|(VALID_TIME|SYSTEM_TIME)\s+ALL)\b" sql)]
+    (let [axis (or (nth all-m 1) (nth all-m 2))
+          full ^String (first all-m)
+          start (.indexOf sql full)
+          rewritten (str (subs sql 0 start) (subs sql (+ start (.length full))))]
+      {:sql rewritten
+       :period {:axis (keyword (.toLowerCase ^String axis))
+                :from Long/MIN_VALUE
+                :to   Long/MAX_VALUE}})
+    (let [m (re-find #"(?is)\bFOR\s+PORTION\s+OF\s+(VALID_TIME|SYSTEM_TIME)\s+FROM\s+" sql)]
+      (if-not m
       {:sql sql :period nil}
       (let [[full-prefix axis] m
             start (.indexOf sql ^String full-prefix)
@@ -342,4 +355,4 @@
         {:sql rewritten
          :period {:axis (keyword (.toLowerCase ^String axis))
                   :from vf-val
-                  :to vt-val}}))))
+                  :to vt-val}})))))

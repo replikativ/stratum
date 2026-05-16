@@ -2469,3 +2469,54 @@
           (is (= 1711929600000000
                  (stratum.index/idx-get-long (:index (:_valid_to cols)) 0))))
         (finally (server/stop srv))))))
+
+;; ============================================================================
+;; P1-5: FOR ALL VALID_TIME DML scope
+;; ============================================================================
+
+(defn- normalize-ws ^String [^String s]
+  (-> s (.replaceAll "\\s+" " ") .trim))
+
+(deftest preprocess-for-all-valid-time-strips-clause
+  (testing "FOR ALL VALID_TIME produces a period spanning all time"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "DELETE FROM t FOR ALL VALID_TIME WHERE eid = 1")]
+      (is (= "DELETE FROM t WHERE eid = 1" (normalize-ws (:sql r))))
+      (is (= :valid_time (:axis (:period r))))
+      (is (= Long/MIN_VALUE (:from (:period r))))
+      (is (= Long/MAX_VALUE (:to (:period r)))))))
+
+(deftest preprocess-valid-time-all-trailing-form
+  (testing "VALID_TIME ALL trailing form also works"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "DELETE FROM t FOR VALID_TIME ALL WHERE eid = 1")]
+      (is (= "DELETE FROM t WHERE eid = 1" (normalize-ws (:sql r))))
+      (is (= :valid_time (:axis (:period r)))))))
+
+(deftest sql-delete-for-all-valid-time-drops-every-matching-slice
+  (testing "DELETE FOR ALL VALID_TIME retracts all vt-slices of matching rows"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "salaries"
+          (with-meta
+            ;; Two slices for eid=1, plus one for eid=2 (untouched).
+            {:eid         (stratum.index/index-from-seq :int64 [1 1 2])
+             :salary      (stratum.index/index-from-seq :int64 [100 110 200])
+             :_valid_from (stratum.index/index-from-seq :int64 [1000 2000 1500])
+             :_valid_to   (stratum.index/index-from-seq :int64 [2000 Long/MAX_VALUE Long/MAX_VALUE])}
+            {:bitemporal {:valid {:from-col :_valid_from
+                                  :to-col   :_valid_to
+                                  :unit     :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec "DELETE FROM salaries FOR ALL VALID_TIME WHERE eid = 1"
+                    (:registry srv) (:data-dir srv))]
+          (is (re-find #"^DELETE" (.commandTag qr))))
+        ;; Both eid=1 rows should be dropped; eid=2 untouched.
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              eids (mapv #(stratum.index/idx-get-long (:index (:eid cols)) %) (range n))]
+          (is (= 1 n))
+          (is (= [2] eids)))
+        (finally (server/stop srv))))))

@@ -443,9 +443,14 @@
       (let [{vf-col :from-col vt-col :to-col vt-unit :unit} valid-cfg
             close-vt-val (or (coerce-temporal-value (:valid-from tx-meta) vt-unit)
                              (now-in-unit vt-unit))
+            ;; `:valid-to` explicitly present in tx-meta selects the
+            ;; bounded surgery path even when the value is MAX (the
+            ;; `FOR ALL VALID_TIME` form passes `Long/MAX_VALUE` and
+            ;; expects every matching row to be dropped).
+            bounded? (contains? tx-meta :valid-to)
             close-vt-end (or (coerce-temporal-value (:valid-to tx-meta) vt-unit)
                              Long/MAX_VALUE)
-            _ (when (not= close-vt-end Long/MAX_VALUE)
+            _ (when bounded?
                 ;; Bounded retract has explicit [vf, vt) — reject
                 ;; zero-width / reverse periods that would silently
                 ;; degenerate the overlap test to a no-op.
@@ -460,7 +465,6 @@
             ;;   straddles both    → split (truncate + append right tail)
             ;; Bounded retract is unconditional — no `:auto-split?` flag,
             ;; the bounded form IS the surgical semantic.
-            bounded? (not= close-vt-end Long/MAX_VALUE)
             n (long row-count-val)]
         (if bounded?
           ;; ----- Bounded retract (SQL:2011 FOR PORTION OF VALID_TIME) -----

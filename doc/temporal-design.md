@@ -165,6 +165,28 @@ are three reasonable behaviors:
 3. **Accept** (silent). Not exposed — backdated overlaps that aren't
    handled by the writer become a correctness problem at read time.
 
+### Bounded INSERT / UPDATE FOR PORTION OF — pre-existing-overlap caveat
+
+`INSERT FOR PORTION OF VALID_TIME` and `UPDATE FOR PORTION OF
+VALID_TIME` are append-only with respect to pre-existing data.
+Stratum follows SQL:2011 non-sequenced semantics: each matching row
+gets independently updated (or, for INSERT, the new row is appended
+without checking whether the slice was already populated).
+
+If two pre-existing rows already overlap each other within the
+target slice (a data-quality issue), bounded UPDATE produces two
+overlapping output slices — both with fresh `_system_from`. Reads
+at the new system-time will see both. Stratum does not enforce
+WITHOUT OVERLAPS at write time. (XTDB v2 takes the same approach:
+its `upsert-rel-indexer` calls `logPut` per matched row without an
+overlap check; the read-time trie merge resolves which event
+"wins" at each (vt-time, system-time) point. We don't have a trie
+merge, so the responsibility lands on the writer.)
+
+To get surgical replacement (drop the slice + assert one new row),
+compose `DELETE FOR PORTION OF VALID_TIME …` and `INSERT FOR
+PORTION OF VALID_TIME …` as two statements in your transaction.
+
 Reject-by-default matches kontor's audit constraints (an accountant
 filing a backdated invoice shouldn't have one write produce three
 rows of audit trail without explicit opt-in). Auto-split is opt-in
