@@ -653,94 +653,152 @@
 ;; Valid-Time Metadata Config
 ;; ============================================================================
 
-(deftest vt-config-stamps-temporal-unit-on-construction
-  (testing ":valid-time metadata tags the two named cols with :temporal-unit"
+(deftest bitemporal-valid-axis-stamps-temporal-unit
+  (testing ":bitemporal {:valid {...}} tags the two named cols with :temporal-unit"
     (let [ds (dataset/make-dataset
               {:e (long-array [1 2])
                :_valid_from (long-array [1700000000000000 1710000000000000])
                :_valid_to   (long-array [1710000000000000 Long/MAX_VALUE])}
               {:name "vt"
-               :metadata {:valid-time {:from-col :_valid_from
-                                       :to-col   :_valid_to}}})]
+               :metadata {:bitemporal
+                          {:valid {:from-col :_valid_from
+                                   :to-col   :_valid_to}}}})]
       (is (= :micros (:temporal-unit (dataset/column ds :_valid_from))))
       (is (= :micros (:temporal-unit (dataset/column ds :_valid_to))))
       (testing "non-vt columns are unaffected"
         (is (nil? (:temporal-unit (dataset/column ds :e)))))
-      (testing "vt-config helper returns the config with :unit defaulted"
+      (testing "bitemporal-config helper returns the :valid axis with :unit defaulted"
+        (is (= {:valid {:from-col :_valid_from :to-col :_valid_to :unit :micros}}
+               (dataset/bitemporal-config ds))))
+      (testing "valid-time-config / system-time-config per-axis helpers"
         (is (= {:from-col :_valid_from :to-col :_valid_to :unit :micros}
-               (dataset/vt-config ds)))))))
+               (dataset/valid-time-config ds)))
+        (is (nil? (dataset/system-time-config ds)))))))
 
-(deftest vt-config-honours-explicit-unit
-  (testing "explicit :unit overrides the :micros default"
+(deftest bitemporal-both-axes-symmetric
+  (testing "configuring :valid + :system at once stamps both pairs"
+    (let [ds (dataset/make-dataset
+              {:e (long-array [1])
+               :_valid_from  (long-array [1700000000000000])
+               :_valid_to    (long-array [Long/MAX_VALUE])
+               :_system_from (long-array [1700000000000000])
+               :_system_to   (long-array [Long/MAX_VALUE])}
+              {:metadata
+               {:bitemporal {:valid  {:from-col :_valid_from
+                                      :to-col   :_valid_to}
+                             :system {:from-col :_system_from
+                                      :to-col   :_system_to}}}})]
+      (is (= :micros (:temporal-unit (dataset/column ds :_valid_from))))
+      (is (= :micros (:temporal-unit (dataset/column ds :_valid_to))))
+      (is (= :micros (:temporal-unit (dataset/column ds :_system_from))))
+      (is (= :micros (:temporal-unit (dataset/column ds :_system_to))))
+      (testing "bitemporal-config exposes both axes"
+        (let [cfg (dataset/bitemporal-config ds)]
+          (is (some? (:valid cfg)))
+          (is (some? (:system cfg))))))))
+
+(deftest bitemporal-only-system-axis
+  (testing "system-only datasets are valid — :valid axis is optional"
+    (let [ds (dataset/make-dataset
+              {:e (long-array [1])
+               :_system_from (long-array [1700000000000000])
+               :_system_to   (long-array [Long/MAX_VALUE])}
+              {:metadata
+               {:bitemporal {:system {:from-col :_system_from
+                                      :to-col   :_system_to}}}})]
+      (is (nil? (dataset/valid-time-config ds)))
+      (is (= {:from-col :_system_from :to-col :_system_to :unit :micros}
+             (dataset/system-time-config ds))))))
+
+(deftest bitemporal-honours-explicit-unit
+  (testing "explicit :unit overrides the :micros default per-axis"
     (let [ds (dataset/make-dataset
               {:_valid_from (long-array [19000 19365])
                :_valid_to   (long-array [19365 Long/MAX_VALUE])}
-              {:metadata {:valid-time {:from-col :_valid_from
-                                       :to-col   :_valid_to
-                                       :unit     :days}}})]
+              {:metadata
+               {:bitemporal {:valid {:from-col :_valid_from
+                                     :to-col   :_valid_to
+                                     :unit     :days}}}})]
       (is (= :days (:temporal-unit (dataset/column ds :_valid_from))))
       (is (= :days (:temporal-unit (dataset/column ds :_valid_to))))
-      (is (= :days (:unit (dataset/vt-config ds)))))))
+      (is (= :days (:unit (dataset/valid-time-config ds)))))))
 
-(deftest vt-config-rejects-missing-column
-  (testing "make-dataset throws if :valid-time names a column that does not exist"
+(deftest bitemporal-rejects-missing-column
+  (testing "make-dataset throws if an axis names a missing column"
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"valid-time config references missing column"
+         clojure.lang.ExceptionInfo #":bitemporal :valid references missing column"
          (dataset/make-dataset
           {:_valid_from (long-array [1 2])}
-          {:metadata {:valid-time {:from-col :_valid_from
-                                   :to-col   :_valid_to}}})))))
+          {:metadata
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to}}}})))))
 
-(deftest vt-config-rejects-wrong-type
-  (testing "make-dataset throws if a vt column is not :int64"
+(deftest bitemporal-rejects-wrong-type
+  (testing "make-dataset throws if an axis column is not :int64"
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"valid-time column must be :int64"
+         clojure.lang.ExceptionInfo #":bitemporal :valid column must be :int64"
          (dataset/make-dataset
           {:_valid_from (double-array [1.0 2.0])
            :_valid_to   (long-array   [3 4])}
-          {:metadata {:valid-time {:from-col :_valid_from
-                                   :to-col   :_valid_to}}})))))
+          {:metadata
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to}}}})))))
 
-(deftest vt-config-rejects-conflicting-temporal-unit
-  (testing "make-dataset throws if a vt column already carries a different :temporal-unit"
+(deftest bitemporal-rejects-conflicting-temporal-unit
+  (testing "make-dataset throws if a column carries a different :temporal-unit"
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"valid-time unit conflicts"
+         clojure.lang.ExceptionInfo #":bitemporal :valid unit conflicts"
          (dataset/make-dataset
           {:_valid_from {:type :int64
                          :data (long-array [1 2])
                          :temporal-unit :millis}
            :_valid_to   (long-array [3 4])}
-          {:metadata {:valid-time {:from-col :_valid_from
-                                   :to-col   :_valid_to}}})))))
+          {:metadata
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to}}}})))))
 
-(deftest vt-config-survives-sync-load-round-trip
-  (testing "after sync!/load, the :valid-time tag is restamped on the restored columns"
+(deftest bitemporal-survives-sync-load-round-trip
+  (testing "after sync!/load, both axes' tags are restamped"
     (let [store (make-store)
           ds (dataset/make-dataset
-              {:e (index/index-from-seq :int64 [1 2 3])
-               :_valid_from (index/index-from-seq
-                             :int64 [1700000000000000
-                                     1710000000000000
-                                     1720000000000000])
-               :_valid_to   (index/index-from-seq
-                             :int64 [1710000000000000
-                                     1720000000000000
-                                     Long/MAX_VALUE])}
-              {:name "vt"
-               :metadata {:valid-time {:from-col :_valid_from
-                                       :to-col   :_valid_to}}})]
+              {:e            (index/index-from-seq :int64 [1 2 3])
+               :_valid_from  (index/index-from-seq :int64 [1700000000000000
+                                                           1710000000000000
+                                                           1720000000000000])
+               :_valid_to    (index/index-from-seq :int64 [1710000000000000
+                                                           1720000000000000
+                                                           Long/MAX_VALUE])
+               :_system_from (index/index-from-seq :int64 [1700000000000000
+                                                           1710000000000000
+                                                           1720000000000000])
+               :_system_to   (index/index-from-seq :int64 [Long/MAX_VALUE
+                                                           Long/MAX_VALUE
+                                                           Long/MAX_VALUE])}
+              {:name "bt"
+               :metadata
+               {:bitemporal {:valid  {:from-col :_valid_from
+                                      :to-col   :_valid_to}
+                             :system {:from-col :_system_from
+                                      :to-col   :_system_to}}}})]
       (dataset/sync! ds store "main")
       (let [loaded (dataset/load store "main")]
-        (testing "metadata round-trips intact"
-          (is (= {:from-col :_valid_from :to-col :_valid_to :unit :micros}
-                 (dataset/vt-config loaded))))
-        (testing "columns carry :temporal-unit after load"
+        (testing "metadata round-trips intact for both axes"
+          (let [cfg (dataset/bitemporal-config loaded)]
+            (is (= {:from-col :_valid_from :to-col :_valid_to :unit :micros}
+                   (:valid cfg)))
+            (is (= {:from-col :_system_from :to-col :_system_to :unit :micros}
+                   (:system cfg)))))
+        (testing "all four window columns carry :temporal-unit after load"
           (is (= :micros (:temporal-unit (dataset/column loaded :_valid_from))))
-          (is (= :micros (:temporal-unit (dataset/column loaded :_valid_to)))))
-        (testing "non-vt column is unaffected"
+          (is (= :micros (:temporal-unit (dataset/column loaded :_valid_to))))
+          (is (= :micros (:temporal-unit (dataset/column loaded :_system_from))))
+          (is (= :micros (:temporal-unit (dataset/column loaded :_system_to)))))
+        (testing "non-axis column unaffected"
           (is (nil? (:temporal-unit (dataset/column loaded :e)))))))))
 
-(deftest vt-config-nil-on-non-vt-dataset
-  (testing "vt-config returns nil for a dataset with no :valid-time metadata"
+(deftest bitemporal-config-nil-on-non-bitemporal-dataset
+  (testing "bitemporal-config returns nil for a dataset with no :bitemporal metadata"
     (let [ds (dataset/make-dataset {:x (long-array [1 2 3])})]
-      (is (nil? (dataset/vt-config ds))))))
+      (is (nil? (dataset/bitemporal-config ds)))
+      (is (nil? (dataset/valid-time-config ds)))
+      (is (nil? (dataset/system-time-config ds))))))

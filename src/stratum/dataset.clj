@@ -430,57 +430,87 @@
         columns))
 
 ;; ============================================================================
-;; Valid-Time Configuration
+;; Bitemporal configuration
+;;
+;; A dataset opts into bitemporal semantics via
+;;   :metadata {:bitemporal {:valid  {:from-col <kw> :to-col <kw> :unit U}
+;;                           :system {:from-col <kw> :to-col <kw> :unit U}}}
+;; Either axis is optional; both are processed identically. See
+;; doc/temporal-design.md for the full design and rationale.
 ;; ============================================================================
 
-(defn- apply-vt-config
-  "If `metadata` carries a `:valid-time` config of the form
-     `{:from-col <kw> :to-col <kw> :unit :days/:seconds/:millis/:micros}`
-   validate the two named columns and stamp them with `:temporal-unit unit`
-   on the column map. Called from both `make-dataset` (first construction)
-   and `load` (restore from storage), so the temporal-unit tag is always
-   present when downstream consumers read a vt-aware dataset. The default
-   unit `:micros` matches the DuckDB TIMESTAMP convention.
+(defn- apply-axis-config
+  "Validate one bitemporal axis (`:valid` or `:system`) and stamp the
+   two named columns with `:temporal-unit unit`. Axis-kw is just for
+   error messages. Throws on missing column ref, non-int64 column
+   type, or conflicting pre-existing `:temporal-unit`."
+  [cols axis-kw axis-spec]
+  (let [{:keys [from-col to-col]
+         unit :unit
+         :or  {unit :micros}} axis-spec
+        tag (fn [col-name]
+              (let [c (get cols col-name)]
+                (when (nil? c)
+                  (throw (ex-info (str ":bitemporal " axis-kw " references missing column")
+                                  {:axis axis-kw
+                                   :config axis-spec
+                                   :missing col-name
+                                   :columns (vec (keys cols))})))
+                (when (not= :int64 (:type c))
+                  (throw (ex-info (str ":bitemporal " axis-kw " column must be :int64")
+                                  {:axis axis-kw
+                                   :config axis-spec
+                                   :column col-name
+                                   :type (:type c)})))
+                (when (and (:temporal-unit c) (not= (:temporal-unit c) unit))
+                  (throw (ex-info (str ":bitemporal " axis-kw " unit conflicts with column :temporal-unit")
+                                  {:axis axis-kw
+                                   :config axis-spec
+                                   :column col-name
+                                   :existing-unit (:temporal-unit c)
+                                   :config-unit unit})))
+                (assoc c :temporal-unit unit)))]
+    (assoc cols
+           from-col (tag from-col)
+           to-col   (tag to-col))))
 
-   Throws on: missing column reference, non-int64 column type, conflicting
-   pre-existing `:temporal-unit`."
+(defn- apply-bitemporal-config
+  "If `metadata` carries a `:bitemporal` config, stamp the configured
+   axes' columns with `:temporal-unit`. Called from both `make-dataset`
+   (first construction) and `load` (restore from storage), so the
+   `:temporal-unit` tag is always present when downstream consumers
+   read a bitemporal dataset. Metadata is the source of truth since
+   per-column commit payloads don't persist `:temporal-unit`."
   [cols metadata]
-  (if-let [vt (:valid-time metadata)]
-    (let [{:keys [from-col to-col]
-           unit :unit
-           :or  {unit :micros}} vt
-          tag (fn [col-name]
-                (let [c (get cols col-name)]
-                  (when (nil? c)
-                    (throw (ex-info "valid-time config references missing column"
-                                    {:valid-time vt
-                                     :missing col-name
-                                     :columns (vec (keys cols))})))
-                  (when (not= :int64 (:type c))
-                    (throw (ex-info "valid-time column must be :int64"
-                                    {:valid-time vt
-                                     :column col-name
-                                     :type (:type c)})))
-                  (when (and (:temporal-unit c) (not= (:temporal-unit c) unit))
-                    (throw (ex-info "valid-time unit conflicts with column :temporal-unit"
-                                    {:valid-time vt
-                                     :column col-name
-                                     :existing-unit (:temporal-unit c)
-                                     :config-unit unit})))
-                  (assoc c :temporal-unit unit)))]
-      (assoc cols
-             from-col (tag from-col)
-             to-col   (tag to-col)))
-    cols))
+  (let [bt (:bitemporal metadata)]
+    (cond-> cols
+      (:valid  bt) (apply-axis-config :valid  (:valid  bt))
+      (:system bt) (apply-axis-config :system (:system bt)))))
 
-(defn vt-config
-  "Return the validated `:valid-time` config map from a dataset's metadata,
-   or `nil` if the dataset is not vt-aware. `:unit` is defaulted to `:micros`
-   if absent. Used by adapters and the planner to discover which two columns
-   form the bitemporal valid-time window without parsing column names."
+(defn bitemporal-config
+  "Return the validated `:bitemporal` config map from a dataset's
+   metadata, or `nil` if the dataset is not bitemporal. Each axis
+   spec gets `:unit` defaulted to `:micros` if absent. Used by
+   adapters and the planner to discover which columns form the
+   valid-time / system-time windows without parsing names."
   [ds]
-  (when-let [vt (:valid-time (:metadata ds))]
-    (merge {:unit :micros} vt)))
+  (when-let [bt (:bitemporal (:metadata ds))]
+    (cond-> {}
+      (:valid bt)  (assoc :valid  (merge {:unit :micros} (:valid bt)))
+      (:system bt) (assoc :system (merge {:unit :micros} (:system bt))))))
+
+(defn valid-time-config
+  "Return just the validated `:valid` axis spec, or nil if the dataset
+   has no valid-time axis. Convenience for callers that only care
+   about the valid-time window (the common case for SCD2 adapters)."
+  [ds]
+  (:valid (bitemporal-config ds)))
+
+(defn system-time-config
+  "Return just the validated `:system` axis spec, or nil if the
+   dataset has no system-time axis."
+  [ds]
+  (:system (bitemporal-config ds)))
 
 ;; ============================================================================
 ;; Constructor
@@ -499,10 +529,13 @@
      opts: {:name \"table-name\"       ; Dataset name (default: \"unnamed\")
             :metadata {...}}           ; User metadata map
 
-   When `metadata` contains `:valid-time {:from-col <kw> :to-col <kw> :unit U}`
-   the two named columns are stamped with `:temporal-unit U` (default
-   `:micros`). The vt-config round-trips through `sync!`/`load`. See
-   `vt-config` for the read-back helper.
+   When `metadata` contains
+     `:bitemporal {:valid {:from-col <kw> :to-col <kw> :unit U}
+                   :system {:from-col <kw> :to-col <kw> :unit U}}`
+   the configured axis' two columns are stamped with `:temporal-unit U`
+   (default `:micros`). Either axis is optional. The config round-trips
+   through `sync!`/`load`. See `bitemporal-config` (and the per-axis
+   `valid-time-config` / `system-time-config`) for read-back helpers.
 
    Returns: StratumDataset with normalized columns
 
@@ -525,10 +558,10 @@
                              [col-name (column/encode-column v)])))
                     col-map)
 
-         ;; Apply :valid-time metadata config: stamp :temporal-unit on the two
-         ;; vt-window columns so downstream date kernels dispatch correctly,
-         ;; and surface validation errors early (missing col / wrong type).
-         cols (apply-vt-config cols metadata)
+         ;; Apply :bitemporal metadata config: stamp :temporal-unit on the
+         ;; window columns of every configured axis (:valid, :system), and
+         ;; surface validation errors early (missing col / wrong type).
+         cols (apply-bitemporal-config cols metadata)
 
          ;; Infer schema from normalized columns
          sch (infer-schema cols)
@@ -703,11 +736,12 @@
                                    (assoc :dict (into-array String (:dict col-info))
                                           :dict-type (:dict-type col-info)))]))
                    columns))
-        ;; Re-stamp :temporal-unit on the vt-window columns from the
-        ;; round-tripped metadata. The per-column commit payload does not
-        ;; persist :temporal-unit, so the source of truth is metadata —
-        ;; same logic as make-dataset, applied on restore.
-        restored-columns (apply-vt-config restored-columns metadata)
+        ;; Re-stamp :temporal-unit on the configured axes' window
+        ;; columns from the round-tripped metadata. The per-column
+        ;; commit payload does not persist :temporal-unit, so the
+        ;; source of truth is :metadata. Same logic as make-dataset,
+        ;; applied on restore.
+        restored-columns (apply-bitemporal-config restored-columns metadata)
         commit-info {:id commit-id :branch (when-not (uuid? branch-or-commit) branch-or-commit)}]
 
     (with-meta
