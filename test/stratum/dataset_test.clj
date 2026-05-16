@@ -802,3 +802,217 @@
       (is (nil? (dataset/bitemporal-config ds)))
       (is (nil? (dataset/valid-time-config ds)))
       (is (nil? (dataset/system-time-config ds))))))
+
+;; ============================================================================
+;; Phase B — temporal write primitives (append! / upsert! / retract!)
+;; ============================================================================
+
+(defn- vt-only-ds [rows]
+  (let [eids       (mapv :eid rows)
+        salaries   (mapv :salary rows)
+        vfs        (mapv :_valid_from rows)
+        vts        (mapv :_valid_to rows)]
+    (dataset/make-dataset
+     {:eid         (index/index-from-seq :int64 eids)
+      :salary      (index/index-from-seq :int64 salaries)
+      :_valid_from (index/index-from-seq :int64 vfs)
+      :_valid_to   (index/index-from-seq :int64 vts)}
+     {:name "emp"
+      :metadata
+      {:bitemporal {:valid {:from-col :_valid_from
+                            :to-col   :_valid_to}}}})))
+
+(defn- ds-rows [ds]
+  (vec (for [i (range (dataset/row-count ds))]
+         (into {} (for [k (dataset/column-names ds)]
+                    [k (let [col (dataset/column ds k)]
+                         (cond
+                           (:data col)
+                           (let [arr (:data col)]
+                             (cond
+                               (instance? (Class/forName "[J") arr) (aget ^longs arr i)
+                               (instance? (Class/forName "[D") arr) (aget ^doubles arr i)
+                               :else nil))
+                           (:index col) (index/idx-get-long (:index col) i)))])))))
+
+(deftest append!-auto-stamps-axis-columns-from-tx-meta
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds
+                   transient
+                   (dataset/append! {:eid 2 :salary 80000}
+                                    {:valid-from 1709251200000000})
+                   persistent!)
+        rows (ds-rows result)
+        bob (first (filter #(= 1 (:eid %)) rows))
+        alice (first (filter #(= 2 (:eid %)) rows))]
+    (testing "explicit :valid-from in tx-meta is stamped"
+      (is (= 1709251200000000 (:_valid_from alice))))
+    (testing ":valid-to defaults to Long/MAX_VALUE"
+      (is (= Long/MAX_VALUE (:_valid_to alice))))
+    (testing "previously-existing row untouched"
+      (is (= 1704067200000000 (:_valid_from bob)))
+      (is (= Long/MAX_VALUE (:_valid_to bob))))))
+
+(deftest append!-defaults-valid-from-to-now-when-tx-meta-absent
+  (let [ds  (vt-only-ds [])
+        before (* 1000 (System/currentTimeMillis))
+        result (-> ds transient
+                   (dataset/append! {:eid 1 :salary 100000})
+                   persistent!)
+        after  (* 1000 (System/currentTimeMillis))
+        row    (first (ds-rows result))]
+    (testing ":valid-from defaults to now-in-micros within the call window"
+      (is (<= before (:_valid_from row) after)))
+    (testing ":valid-to defaults to Long/MAX_VALUE"
+      (is (= Long/MAX_VALUE (:_valid_to row))))))
+
+(deftest upsert!-closes-old-row-and-appends-new
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]]
+                                     :set {:salary 110000}}
+                                    {:valid-from 1719792000000000})
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "two rows after upsert: closed-old + open-new"
+      (is (= 2 (count rows))))
+    (testing "old row's :_valid_to closed to new tx-meta's :valid-from"
+      (let [closed (first (filter #(= 100000 (:salary %)) rows))]
+        (is (= 1704067200000000 (:_valid_from closed)))
+        (is (= 1719792000000000 (:_valid_to closed)))))
+    (testing "new row carries merged values + open vt-window"
+      (let [new-row (first (filter #(= 110000 (:salary %)) rows))]
+        (is (= 1 (:eid new-row)))
+        (is (= 1719792000000000 (:_valid_from new-row)))
+        (is (= Long/MAX_VALUE (:_valid_to new-row)))))))
+
+(deftest upsert!-skips-already-closed-rows
+  ;; Multiple historical versions; only the open one should be closed.
+  (let [ds (vt-only-ds [{:eid 1 :salary 90000
+                         :_valid_from 1700000000000000
+                         :_valid_to   1704067200000000}
+                        {:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]]
+                                     :set {:salary 110000}}
+                                    {:valid-from 1719792000000000})
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "three rows after upsert"
+      (is (= 3 (count rows))))
+    (testing "already-closed historical row untouched"
+      (let [old (first (filter #(= 90000 (:salary %)) rows))]
+        (is (= 1700000000000000 (:_valid_from old)))
+        (is (= 1704067200000000 (:_valid_to old)))))))
+
+(deftest retract!-closes-open-row-without-reopening
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/retract! {:where [[:= :eid 1]]}
+                                     {:valid-from 1719792000000000})
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "row count unchanged (retract is close-only, no append)"
+      (is (= 1 (count rows))))
+    (testing ":_valid_to closed to tx-meta :valid-from"
+      (is (= 1719792000000000 (:_valid_to (first rows)))))))
+
+(deftest upsert!-throws-on-non-bitemporal-dataset
+  (let [ds (dataset/make-dataset
+            {:eid (index/index-from-seq :int64 [1])
+             :salary (index/index-from-seq :int64 [100])})]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"upsert! requires a :valid axis"
+         (-> ds transient
+             (dataset/upsert! {:where [[:= :eid 1]] :set {:salary 200}}))))))
+
+(deftest retract!-throws-on-non-bitemporal-dataset
+  (let [ds (dataset/make-dataset
+            {:eid (index/index-from-seq :int64 [1])
+             :salary (index/index-from-seq :int64 [100])})]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"retract! requires a :valid axis"
+         (-> ds transient
+             (dataset/retract! {:where [[:= :eid 1]]}))))))
+
+(deftest append!-works-on-non-bitemporal-dataset-with-tx-meta
+  (testing "non-bitemporal datasets ignore tx-meta and require all columns"
+    (let [ds (dataset/make-dataset
+              {:x (index/index-from-seq :int64 [])})
+          result (-> ds transient
+                     (dataset/append! {:x 42} {:valid-from 999})
+                     persistent!)]
+      (is (= 1 (dataset/row-count result)))
+      (is (= 42 (index/idx-get-long (:index (dataset/column result :x)) 0))))))
+
+(deftest both-axes-append!-stamps-both-pairs
+  (let [ds (dataset/make-dataset
+            {:eid          (index/index-from-seq :int64 [])
+             :salary       (index/index-from-seq :int64 [])
+             :_valid_from  (index/index-from-seq :int64 [])
+             :_valid_to    (index/index-from-seq :int64 [])
+             :_system_from (index/index-from-seq :int64 [])
+             :_system_to   (index/index-from-seq :int64 [])}
+            {:metadata
+             {:bitemporal
+              {:valid  {:from-col :_valid_from  :to-col :_valid_to}
+               :system {:from-col :_system_from :to-col :_system_to}}}})
+        result (-> ds transient
+                   (dataset/append! {:eid 1 :salary 100000}
+                                    {:valid-from  1704067200000000
+                                     :system-from 1700000000000000})
+                   persistent!)
+        row (first (for [i (range (dataset/row-count result))]
+                     (into {} (for [k (dataset/column-names result)]
+                                [k (index/idx-get-long
+                                    (:index (dataset/column result k)) i)]))))]
+    (testing "both axes' :_from values come from tx-meta"
+      (is (= 1704067200000000 (:_valid_from row)))
+      (is (= 1700000000000000 (:_system_from row))))
+    (testing "both axes' :_to default to Long/MAX_VALUE"
+      (is (= Long/MAX_VALUE (:_valid_to row)))
+      (is (= Long/MAX_VALUE (:_system_to row))))))
+
+(deftest upsert!-merges-previous-row-values-when-set-is-partial
+  ;; If :set only supplies some columns, the new row should inherit the
+  ;; rest from the previous (closed) row.
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   ;; :set only carries :salary; :eid should be inherited
+                   (dataset/upsert! {:where [[:= :eid 1]]
+                                     :set {:salary 110000}}
+                                    {:valid-from 1719792000000000})
+                   persistent!)
+        new-row (first (filter #(= 110000 (:salary %)) (ds-rows result)))]
+    (testing "new row inherits :eid from the previous open row"
+      (is (= 1 (:eid new-row))))))
+
+(deftest upsert!-supports-fn-where-predicate
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}
+                        {:eid 2 :salary 80000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where (fn [r] (= 1 (:eid r)))
+                                     :set {:salary 110000}}
+                                    {:valid-from 1719792000000000})
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "fn predicate matches only eid=1"
+      (is (= 3 (count rows)))  ;; 2 original + 1 new
+      (is (= 1 (count (filter #(and (= 1 (:eid %)) (= 110000 (:salary %))) rows)))))
+    (testing "eid=2 row stays open"
+      (let [bob2 (first (filter #(= 2 (:eid %)) rows))]
+        (is (= Long/MAX_VALUE (:_valid_to bob2)))))))

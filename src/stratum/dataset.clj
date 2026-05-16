@@ -19,6 +19,16 @@
 ;; Protocol: Dataset Interface
 ;; ============================================================================
 
+;; Forward declarations for helpers used inside the StratumDataset
+;; deftype but defined further down the file (next to make-dataset /
+;; load, where they're also used).
+(declare merge-axis-defaults
+         materialize-row
+         eval-pred
+         coerce-temporal-value
+         now-in-unit
+         apply-axis-config)
+
 (defprotocol IDataset
   "Core dataset protocol for Stratum columnar engine.
 
@@ -84,11 +94,54 @@
 
   ;; Transient mutation
   (set-at! [this col-name row val]
-    "Set value at row position in a column. Must be transient.")
+    "Set value at row position in a column. Must be transient.
+     Cell-level — bypasses temporal semantics. Use upsert!/retract!
+     for SCD2 close-and-reopen.")
 
-  (append! [this row-map]
+  (append! [this row-map] [this row-map tx-meta]
     "Append row values across all columns. Must be transient.
-     row-map: {col-kw value}")
+     row-map: {col-kw value}.
+
+     For bitemporal datasets (`:metadata {:bitemporal {...}}`), the
+     2-arg form takes a `tx-meta` map carrying `:valid-from`,
+     `:valid-to`, `:system-from`, `:system-to`. Any axis column
+     missing from `row-map` is auto-stamped from the corresponding
+     tx-meta key or from defaults:
+       :valid-from  → now-in-axis-unit
+       :valid-to    → Long/MAX_VALUE
+       :system-from → now-in-axis-unit
+       :system-to   → Long/MAX_VALUE
+     The 1-arg form behaves like the 2-arg form with `nil` tx-meta.")
+
+  (upsert! [this opts] [this opts tx-meta]
+    "SCD2 close-and-reopen on a bitemporal dataset. Must be transient.
+
+     opts: {:where <predicate> :set {col-kw value ...}}
+       :where  - row predicate; either a vector clause
+                 (e.g. [[:= :eid 1]]) or a function `(fn [row-map])`
+       :set    - the new column values for the appended row;
+                 columns omitted here inherit from the previous
+                 (closed) row, so partial updates work.
+
+     For every matching row whose `:valid` axis is currently open
+     (`_valid_to = Long/MAX_VALUE`), closes it to the tx-meta
+     `:valid-from`, then appends a new row with the merged values +
+     the new vt-window. The new row's axis columns are auto-stamped
+     just like `append!`.
+
+     Throws when the dataset is not bitemporal (no `:valid` axis).")
+
+  (retract! [this opts] [this opts tx-meta]
+    "Close-without-reopen on a bitemporal dataset. Must be transient.
+
+     opts: {:where <predicate>}
+
+     For every matching open row, closes its `_valid_to` to the
+     tx-meta `:valid-from`. Does not append. Logically a retraction
+     over the specified vt slice. Physical purge stays on
+     `:db/purge`-style semantics — never auto-triggered here.
+
+     Throws when the dataset is not bitemporal.")
 
   ;; Persistence
   (sync! [this store branch]
@@ -181,16 +234,100 @@
     this)
 
   (append! [this row-map]
+    (append! this row-map nil))
+
+  (append! [this row-map tx-meta]
     (when-not edit
       (throw (IllegalStateException. "Cannot mutate persistent dataset. Call transient first.")))
-    (doseq [[col-name col-data] columns-field]
-      (let [val (get row-map col-name)]
-        (when (nil? val)
-          (throw (ex-info "append! requires values for all columns"
-                          {:missing col-name :columns (keys columns-field)})))
-        (idx/idx-append! (:index col-data) val)))
-    (set! row-count-val (unchecked-inc row-count-val))
-    this)
+    (let [bt-cfg (when (or (:bitemporal ds-metadata-field) tx-meta)
+                   ;; Re-compute the config from metadata to avoid taking the
+                   ;; bitemporal-config function dependency on `this`.
+                   (let [bt (:bitemporal ds-metadata-field)]
+                     (cond-> {}
+                       (:valid bt)  (assoc :valid  (merge {:unit :micros} (:valid bt)))
+                       (:system bt) (assoc :system (merge {:unit :micros} (:system bt))))))
+          ;; Auto-stamp configured axis columns from tx-meta + defaults.
+          row (if bt-cfg
+                (merge-axis-defaults row-map bt-cfg tx-meta)
+                row-map)]
+      (doseq [[col-name col-data] columns-field]
+        (let [val (get row col-name)]
+          (when (nil? val)
+            (throw (ex-info "append! requires values for all columns"
+                            {:missing col-name
+                             :columns (keys columns-field)
+                             :hint (when bt-cfg
+                                     "configured bitemporal axis columns are auto-stamped from tx-meta or now() — supply them in row-map or pass tx-meta")})))
+          (idx/idx-append! (:index col-data) val)))
+      (set! row-count-val (unchecked-inc row-count-val))
+      this))
+
+  (upsert! [this opts] (upsert! this opts nil))
+
+  (upsert! [this {:keys [where set] :as opts} tx-meta]
+    (when-not edit
+      (throw (IllegalStateException. "Cannot mutate persistent dataset. Call transient first.")))
+    (let [bt (:bitemporal ds-metadata-field)
+          valid-cfg (when (:valid bt) (merge {:unit :micros} (:valid bt)))
+          system-cfg (when (:system bt) (merge {:unit :micros} (:system bt)))]
+      (when-not valid-cfg
+        (throw (ex-info "upsert! requires a :valid axis on the dataset's :bitemporal config"
+                        {:metadata ds-metadata-field})))
+      (when (nil? where)
+        (throw (ex-info "upsert! requires :where" {:opts opts})))
+      (let [{vf-col :from-col vt-col :to-col vt-unit :unit} valid-cfg
+            close-vt-val (or (coerce-temporal-value (:valid-from tx-meta) vt-unit)
+                             (now-in-unit vt-unit))
+            n (long row-count-val)
+            ;; Pass 1: find matching open rows. Captures their full
+            ;; row-maps for merging into the new appended row(s).
+            close-rows (loop [i 0 acc (transient [])]
+                         (if (>= i n)
+                           (persistent! acc)
+                           (let [row (materialize-row columns-field i)
+                                 open? (= (long (get row vt-col)) Long/MAX_VALUE)
+                                 match? (and open? (eval-pred where row))]
+                             (recur (inc i)
+                                    (if match? (conj! acc [i row]) acc)))))]
+        ;; Pass 2: close each matched row's :valid-to and append a
+        ;; merged new row with the new vt-window.
+        (doseq [[i prev-row] close-rows]
+          (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val)
+          (let [merged-row (merge (dissoc prev-row vf-col vt-col
+                                          (:from-col system-cfg) (:to-col system-cfg))
+                                  set)]
+            ;; Force :valid-from to the close value; append! will fill
+            ;; :_valid_to (defaulting to MAX) and the :system axis.
+            (append! this
+                     (assoc merged-row vf-col close-vt-val)
+                     tx-meta)))
+        this)))
+
+  (retract! [this opts] (retract! this opts nil))
+
+  (retract! [this {:keys [where] :as opts} tx-meta]
+    (when-not edit
+      (throw (IllegalStateException. "Cannot mutate persistent dataset. Call transient first.")))
+    (let [bt (:bitemporal ds-metadata-field)
+          valid-cfg (when (:valid bt) (merge {:unit :micros} (:valid bt)))]
+      (when-not valid-cfg
+        (throw (ex-info "retract! requires a :valid axis on the dataset's :bitemporal config"
+                        {:metadata ds-metadata-field})))
+      (when (nil? where)
+        (throw (ex-info "retract! requires :where" {:opts opts})))
+      (let [{vt-col :to-col vt-unit :unit} valid-cfg
+            close-vt-val (or (coerce-temporal-value (:valid-from tx-meta) vt-unit)
+                             (now-in-unit vt-unit))
+            n (long row-count-val)]
+        (loop [i 0]
+          (when (< i n)
+            (let [row (materialize-row columns-field i)
+                  open? (= (long (get row vt-col)) Long/MAX_VALUE)
+                  match? (and open? (eval-pred where row))]
+              (when match?
+                (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val)))
+            (recur (inc i))))
+        this)))
 
   ;; ========================================================================
   ;; Persistence
@@ -511,6 +648,181 @@
    dataset has no system-time axis."
   [ds]
   (:system (bitemporal-config ds)))
+
+;; ============================================================================
+;; Temporal write helpers
+;; ============================================================================
+
+(defn- now-in-unit
+  "Current wall-clock time as a long in the requested `:temporal-unit`.
+   Used to default `:valid-from` / `:system-from` when the caller
+   doesn't supply one. `(System/currentTimeMillis)` returns millis;
+   multiplying by 1000 gives micros, dividing by 1000 gives seconds,
+   etc."
+  ^long [unit]
+  (let [ms (System/currentTimeMillis)]
+    (case unit
+      :micros  (* 1000 ms)
+      :millis  ms
+      :seconds (quot ms 1000)
+      :days    (quot ms 86400000)
+      ;; Unknown unit — fall back to millis. apply-axis-config rejects
+      ;; unknown units at make-dataset time, so this is defensive.
+      ms)))
+
+(defn- coerce-temporal-value
+  "Coerce a temporal value to a long in the axis' unit. Accepts:
+     java.util.Date   → millis-since-epoch converted to unit
+     java.time.Instant → millis-since-epoch converted to unit
+     Long / int       → already in unit, passthrough
+   Returns nil for nil input (caller decides on default)."
+  ^Long [v unit]
+  (when (some? v)
+    (cond
+      (instance? java.util.Date v)
+      (let [ms (.getTime ^java.util.Date v)]
+        (case unit
+          :micros  (* 1000 ms)
+          :millis  ms
+          :seconds (quot ms 1000)
+          :days    (quot ms 86400000)
+          ms))
+
+      (instance? java.time.Instant v)
+      (let [ms (.toEpochMilli ^java.time.Instant v)]
+        (case unit
+          :micros  (* 1000 ms)
+          :millis  ms
+          :seconds (quot ms 1000)
+          :days    (quot ms 86400000)
+          ms))
+
+      (number? v)
+      (long v)
+
+      :else
+      (throw (ex-info "Unsupported temporal value type"
+                      {:value v :type (type v) :unit unit})))))
+
+(defn- merge-axis-defaults
+  "For each configured axis (`:valid`, `:system`), if `row-map`
+   doesn't already contain the axis' from-col / to-col, fill them
+   from the matching tx-meta key (`:valid-from` / `:valid-to` /
+   `:system-from` / `:system-to`) coerced to the axis' unit, or
+   from defaults: now-in-unit for `:_from`, `Long/MAX_VALUE` for
+   `:_to`.
+
+   Returns the augmented row-map. Caller's explicit values in
+   `row-map` always win over tx-meta values, which always win over
+   defaults."
+  [row-map bt-cfg tx-meta]
+  (cond-> row-map
+    (:valid bt-cfg)
+    (as-> r
+          (let [{:keys [from-col to-col unit]} (:valid bt-cfg)]
+            (cond-> r
+              (not (contains? r from-col))
+              (assoc from-col (or (coerce-temporal-value (:valid-from tx-meta) unit)
+                                  (now-in-unit unit)))
+              (not (contains? r to-col))
+              (assoc to-col (or (coerce-temporal-value (:valid-to tx-meta) unit)
+                                Long/MAX_VALUE)))))
+
+    (:system bt-cfg)
+    (as-> r
+          (let [{:keys [from-col to-col unit]} (:system bt-cfg)]
+            (cond-> r
+              (not (contains? r from-col))
+              (assoc from-col (or (coerce-temporal-value (:system-from tx-meta) unit)
+                                  (now-in-unit unit)))
+              (not (contains? r to-col))
+              (assoc to-col (or (coerce-temporal-value (:system-to tx-meta) unit)
+                                Long/MAX_VALUE)))))))
+
+(defn- eval-pred
+  "Minimal stratum-style predicate evaluator for `upsert!`/`retract!`
+   `:where` clauses. Supports vector predicates `[op col val]` for
+   `:= := :< :<= :> :>= :!= :in`, vector `[:and pred ...]` /
+   `[:or pred ...]` / `[:not pred]`, OR a Clojure function
+   `(fn [row-map] bool)`. Returns truthy/falsy.
+
+   Not a full planner integration — Phase B intentionally keeps this
+   in pure Clojure. Stratum-planner pushdown is a Phase C+ task."
+  [pred row]
+  (cond
+    (fn? pred) (pred row)
+
+    (and (vector? pred) (vector? (first pred)))
+    ;; Top-level [[op col val] [op col val] ...] is implicit AND
+    (every? #(eval-pred % row) pred)
+
+    (vector? pred)
+    (let [[op & args] pred]
+      (case op
+        :=   (= (get row (first args)) (second args))
+        :!=  (not= (get row (first args)) (second args))
+        :<   (let [v (get row (first args))] (and (some? v) (< v (second args))))
+        :<=  (let [v (get row (first args))] (and (some? v) (<= v (second args))))
+        :>   (let [v (get row (first args))] (and (some? v) (> v (second args))))
+        :>=  (let [v (get row (first args))] (and (some? v) (>= v (second args))))
+        :in  (contains? (set (second args)) (get row (first args)))
+        :and (every? #(eval-pred % row) args)
+        :or  (some #(eval-pred % row) args)
+        :not (not (eval-pred (first args) row))
+        (throw (ex-info "Unsupported predicate op for upsert!/retract!"
+                        {:op op :pred pred}))))
+
+    :else
+    (throw (ex-info "Unsupported predicate shape" {:pred pred}))))
+
+(defn- read-col-at
+  "Read column value at row position `i`. Handles array-backed
+   (`:data`) and index-backed (`:index`) columns plus string-dict
+   decoding."
+  [col-data ^long i]
+  (let [data (:data col-data)
+        dict (:dict col-data)
+        idx  (:index col-data)]
+    (cond
+      ;; Dict-encoded string column (data is long[] of codes)
+      dict
+      (let [^longs arr (or data (idx/idx-materialize-to-array idx))
+            code (aget arr i)]
+        (when-not (= code Long/MIN_VALUE)
+          (aget ^"[Ljava.lang.String;" dict (int code))))
+
+      ;; Raw double array
+      (and data (instance? (Class/forName "[D") data))
+      (aget ^doubles data i)
+
+      ;; Raw String array
+      (and data (instance? (Class/forName "[Ljava.lang.String;") data))
+      (aget ^"[Ljava.lang.String;" data i)
+
+      ;; Raw long array
+      (and data (instance? (Class/forName "[J") data))
+      (aget ^longs data i)
+
+      ;; Index-backed
+      idx
+      (case (idx/idx-datatype idx)
+        :float64 (idx/idx-get-double idx i)
+        :int64   (idx/idx-get-long idx i)
+        nil)
+
+      :else nil)))
+
+(defn- materialize-row
+  "Read row `i` from each column in `cols` as a row-map. Used by
+   `upsert!`/`retract!` for predicate evaluation against in-transient
+   rows. No intermediate vector allocation."
+  [cols ^long i]
+  (persistent!
+   (reduce-kv
+    (fn [m col-name col-data]
+      (assoc! m col-name (read-col-at col-data i)))
+    (transient {})
+    cols)))
 
 ;; ============================================================================
 ;; Constructor
