@@ -154,6 +154,20 @@
         {:keys [sql period]} (if select-stmt?
                                {:sql sql :period nil}
                                (preprocess-for-portion-of-valid-time sql))
+        ;; ERASE is a physical purge across both temporal axes; mixing
+        ;; it with `FOR PORTION OF VALID_TIME` is ambiguous (a slice-
+        ;; bounded ERASE doesn't have a well-defined semantic — either
+        ;; the slice is purged or every matching row is, and the two
+        ;; readings disagree). Reject up front rather than silently
+        ;; routing through one branch and dropping the other.
+        _ (when (and erase-stmt? period)
+            (throw (ex-info (str "ERASE does not compose with FOR PORTION OF "
+                                 "VALID_TIME — ERASE purges physically across "
+                                 "both temporal axes; for a slice-bounded "
+                                 "logical retract use DELETE FOR PORTION OF "
+                                 "VALID_TIME.")
+                            {:error :sql/erase-with-portion-of
+                             :period period})))
         ^String sql sql
         n (.length sql)
         sb (StringBuilder. n)
@@ -489,13 +503,18 @@
 (defn- spec->predicate-sql
   "Build the WHERE-clause SQL fragment for a temporal spec.
    Uses the SQL:2011 convention `_valid_from` / `_valid_to`.
-   Currently emits unqualified column names — multi-table SELECT
-   with per-table FOR VALID_TIME on bitemporal joins would need
-   qualified refs (and stratum's planner to recognize them); for
-   the single-table MVP this works cleanly.
 
-   `qualifier` is currently unused but kept in the signature for
-   the eventual multi-table extension.
+   Emits unqualified column names. The single-table SELECT case (the
+   common MVP) works directly because the planner resolves
+   `_valid_from` against the only source. The multi-table case where
+   two joined tables each carry a `FOR VALID_TIME` clause is a
+   documented limitation — making this fragment qualified
+   (`<table>._valid_from`) requires teaching the planner's column
+   resolver to strip the qualifier, which is out of scope here. Until
+   that lands, two-`FOR VALID_TIME` SELECTs against joined bitemporal
+   tables are unsupported; single-table works.
+
+   `qualifier` is captured for the future extension but unused today.
 
    The half-open inclusion test is `vf <= at AND vt > at` for
    AS OF, and the half-open range overlap is `vf <= to AND vt >

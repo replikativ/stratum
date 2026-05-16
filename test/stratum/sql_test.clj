@@ -2836,6 +2836,96 @@
       ;; Row 1 contains (deleted). Row 2 doesn't (kept).
       (is (= [2] survivors)))))
 
+(deftest sql-equals-period-allen-predicate-via-delete
+  (testing "EQUALS_PERIOD: DELETE rows where both endpoints match exactly"
+    (let [survivors (allen-delete-survivors
+                      {:eid    [1 2 3]
+                       :a_from [100 100 200]
+                       :a_to   [200 200 300]
+                       :b_from [100 100 100]
+                       :b_to   [200 300 200]}
+                      "DELETE FROM intervals WHERE EQUALS_PERIOD(a_from, a_to, b_from, b_to)")]
+      ;; Row 1: a=[100,200) b=[100,200) → equal → DELETE.
+      ;; Row 2: a=[100,200) b=[100,300) → NOT equal → KEEP.
+      ;; Row 3: a=[200,300) b=[100,200) → NOT equal → KEEP.
+      (is (= [2 3] survivors)))))
+
+(deftest sql-immediately-precedes-allen-predicate-via-delete
+  (testing "IMMEDIATELY_PRECEDES: A.to == B.from"
+    (let [survivors (allen-delete-survivors
+                      {:eid    [1 2 3]
+                       :a_from [100 100 100]
+                       :a_to   [200 199 201]
+                       :b_from [200 200 200]
+                       :b_to   [300 300 300]}
+                      "DELETE FROM intervals WHERE IMMEDIATELY_PRECEDES(a_from, a_to, b_from, b_to)")]
+      ;; Row 1: a_to=200 == b_from=200 → DELETE.
+      ;; Row 2: a_to=199 != 200 → KEEP. Row 3: a_to=201 != 200 → KEEP.
+      (is (= [2 3] survivors)))))
+
+(deftest sql-succeeds-allen-predicate-via-delete
+  (testing "SUCCEEDS: A.from >= B.to (touching counts)"
+    (let [survivors (allen-delete-survivors
+                      {:eid    [1 2 3]
+                       :a_from [200 250 199]
+                       :a_to   [300 350 250]
+                       :b_from [100 100 100]
+                       :b_to   [200 200 200]}
+                      "DELETE FROM intervals WHERE SUCCEEDS(a_from, a_to, b_from, b_to)")]
+      ;; Row 1: a_from=200 >= b_to=200 → touching, SUCCEEDS, DELETE.
+      ;; Row 2: a_from=250 >= 200 → DELETE.
+      ;; Row 3: a_from=199 < 200 → KEEP.
+      (is (= [3] survivors)))))
+
+(deftest sql-strictly-succeeds-allen-predicate-via-delete
+  (testing "STRICTLY_SUCCEEDS: A.from > B.to (no touching)"
+    (let [survivors (allen-delete-survivors
+                      {:eid    [1 2]
+                       :a_from [200 201]
+                       :a_to   [300 300]
+                       :b_from [100 100]
+                       :b_to   [200 200]}
+                      "DELETE FROM intervals WHERE STRICTLY_SUCCEEDS(a_from, a_to, b_from, b_to)")]
+      ;; Row 1: a_from=200 == b_to=200 (touching) → NOT strictly succeeds → KEEP.
+      ;; Row 2: a_from=201 > 200 → STRICTLY succeeds → DELETE.
+      (is (= [1] survivors)))))
+
+(deftest sql-immediately-succeeds-allen-predicate-via-delete
+  (testing "IMMEDIATELY_SUCCEEDS: A.from == B.to"
+    (let [survivors (allen-delete-survivors
+                      {:eid    [1 2 3]
+                       :a_from [200 199 201]
+                       :a_to   [300 300 300]
+                       :b_from [100 100 100]
+                       :b_to   [200 200 200]}
+                      "DELETE FROM intervals WHERE IMMEDIATELY_SUCCEEDS(a_from, a_to, b_from, b_to)")]
+      ;; Row 1: a_from=200 == b_to=200 → DELETE.
+      ;; Row 2/3: a_from != b_to → KEEP.
+      (is (= [2 3] survivors)))))
+
+(deftest sql-meets-allen-predicate-via-delete
+  (testing "MEETS: alias for IMMEDIATELY_PRECEDES (A.to == B.from)"
+    (let [survivors (allen-delete-survivors
+                      {:eid    [1 2]
+                       :a_from [100 100]
+                       :a_to   [200 199]
+                       :b_from [200 200]
+                       :b_to   [300 300]}
+                      "DELETE FROM intervals WHERE MEETS(a_from, a_to, b_from, b_to)")]
+      ;; Row 1: a_to=200 == b_from=200 → MEETS → DELETE.
+      ;; Row 2: a_to=199 != 200 → KEEP.
+      (is (= [2] survivors)))))
+
+(deftest sql-erase-with-portion-of-rejected
+  (testing "ERASE + FOR PORTION OF VALID_TIME is rejected at parse time"
+    (let [r (sql/parse-sql
+              (str "ERASE FROM t FOR PORTION OF VALID_TIME "
+                   "FROM '2024-01-01' TO '2024-07-01' WHERE eid = 1")
+              {"t" {:eid (long-array [])}})]
+      (is (some? (:error r)))
+      (is (re-find #"ERASE does not compose with FOR PORTION OF VALID_TIME"
+                   (:error r))))))
+
 (deftest sql-allen-bad-arity-throws
   (testing "Allen predicates require exactly 4 args"
     (let [reg {"intervals" {:eid (long-array [1])

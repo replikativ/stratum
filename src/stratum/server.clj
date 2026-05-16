@@ -335,6 +335,14 @@
         new-cols (dataset/columns mutated)
         new-cols (if meta (with-meta new-cols meta) new-cols)]
     {:new-cols new-cols
+     ;; SQL clients read `UPDATE N` as "N rows participated in the
+     ;; surgery." We report the pre-mutation WHERE-match count, NOT
+     ;; the number of physical slices the bounded-update produced
+     ;; (which can be larger after a 3-way split). This matches
+     ;; Postgres's semantic for partitioned-table UPDATEs where the
+     ;; physical row count is divorced from the logical "rows
+     ;; affected." Callers needing physical counts should diff
+     ;; row-count(before) vs row-count(after).
      :n-updated (count (filter #(eval-dml-predicate existing where %)
                                 (range (col-row-count (val (first existing))))))}))
 
