@@ -2621,7 +2621,7 @@
         (finally (server/stop srv))))))
 
 ;; ============================================================================
-;; P0-3: open-ended FOR PORTION OF VALID_TIME (no TO)
+;; FOR PORTION OF VALID_TIME FROM x — open-ended (no TO)
 ;; ============================================================================
 
 (deftest preprocess-for-portion-of-valid-time-without-to-defaults-to-max
@@ -2667,7 +2667,7 @@
         (finally (server/stop srv))))))
 
 ;; ============================================================================
-;; P1-5: FOR ALL VALID_TIME DML scope
+;; FOR ALL VALID_TIME — DML applies across every vt-window
 ;; ============================================================================
 
 (defn- normalize-ws ^String [^String s]
@@ -2718,7 +2718,7 @@
         (finally (server/stop srv))))))
 
 ;; ============================================================================
-;; P1-6: extra temporal-literal forms in FOR PORTION OF VALID_TIME
+;; Extra temporal-literal forms in FOR PORTION OF VALID_TIME
 ;; ============================================================================
 
 (deftest preprocess-for-portion-of-current-timestamp
@@ -2755,7 +2755,7 @@
             "DELETE FROM t FOR PORTION OF VALID_TIME FROM contract_start TO contract_end WHERE eid = 1")))))
 
 ;; ============================================================================
-;; P1-3: Allen interval predicates as SQL functions
+;; Allen interval predicates as SQL functions
 ;;
 ;; 4-arg function form `(a_from, a_to, b_from, b_to)` works on any
 ;; pair of int64 columns, not just the bitemporal axis. PERIOD value
@@ -2936,7 +2936,7 @@
       (is (re-find #"requires 4 args" (or (:error parsed) ""))))))
 
 ;; ============================================================================
-;; P1-1: SELECT-side FOR VALID_TIME (AS OF | BETWEEN | FROM-TO | ALL)
+;; SELECT-side FOR VALID_TIME (AS OF / BETWEEN / FROM-TO / ALL)
 ;;
 ;; Preprocessor rewrites the temporal clause into equivalent WHERE
 ;; predicates over the table's _valid_from / _valid_to columns. Uses
@@ -3028,7 +3028,7 @@
         (finally (server/stop srv))))))
 
 ;; ============================================================================
-;; P2-3: SQL session SET datahike.clock_time
+;; SQL session SET datahike.clock_time
 ;; ============================================================================
 
 (deftest sql-set-clock-time-pins-defaults
@@ -3064,7 +3064,7 @@
         (finally (server/stop srv))))))
 
 ;; ============================================================================
-;; P2-1: ERASE DML — GDPR-style physical purge
+;; ERASE DML — GDPR-style physical purge
 ;; ============================================================================
 
 (deftest sql-erase-from-physically-purges-rows
@@ -3128,7 +3128,7 @@
         (finally (server/stop srv))))))
 
 ;; ============================================================================
-;; Col-vs-col SELECT predicates (P2-followup from kontor doc/research/61)
+;; Col-vs-col SELECT predicates — planner-limitation workaround
 ;;
 ;; SELECT WHERE <col1> OP <col2> now evaluates correctly. Unlocks
 ;; SELECT-side Allen predicates (P1-3 worked in DML only without this).
@@ -3169,7 +3169,7 @@
       (is (= [1 3] (sort eids))))))
 
 ;; ============================================================================
-;; P2-4: paired (vf, vt) zone-map pruning
+;; paired (vf, vt) zone-map pruning
 ;;
 ;; Audit verdict: the existing per-predicate zone-map machinery in
 ;; `stratum.query.group-by/build-zone-filters` + `classify-chunk`

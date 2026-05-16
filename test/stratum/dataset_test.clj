@@ -1230,7 +1230,7 @@
                  (-> ds transient (dataset/ds-delete-rows! [5]))))))
 
 ;; ============================================================================
-;; P0-2: validate-period! — reject zero-width and reverse temporal windows
+;; validate-period! — reject zero-width and reverse temporal windows
 ;; ============================================================================
 
 (deftest append!-rejects-zero-width-valid-window
@@ -1272,7 +1272,7 @@
                                          {:valid-from 5000 :valid-to 3000})))))))
 
 ;; ============================================================================
-;; P0-1: SCD2-on-both-axes — system-time symmetry on every vt mutation
+;; SCD2-on-both-axes — system-time symmetry on every vt mutation
 ;;
 ;; In a bitemporal dataset, an upsert/retract/bounded-update must NOT
 ;; mutate vt in place on the old row — that would silently rewrite
@@ -1405,7 +1405,7 @@
         "valid-only mode: original closed in place + new merged row = 2")))
 
 ;; ============================================================================
-;; P2-3: *clock-time-millis* dynamic var for repeatable test runs
+;; *clock-time-millis* dynamic var for repeatable test runs
 ;; ============================================================================
 
 (deftest now-in-unit-honors-clock-time-millis-binding

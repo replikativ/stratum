@@ -143,10 +143,10 @@
         ;; both temporal axes. Rewrite to `DELETE FROM …` and tag
         ;; with `:erase? true` so the server bypasses any
         ;; logical-retract path and routes directly to
-        ;; `ds-delete-rows!`. (XTDB v2 has the same DML verb for
-        ;; GDPR-style right-to-be-forgotten purges; we expose it
-        ;; with the same SQL surface but our own implementation
-        ;; via the existing `ds-delete-rows!` primitive.)
+        ;; `ds-delete-rows!`. `ERASE` is the conventional SQL verb
+        ;; for GDPR-style right-to-be-forgotten purges across
+        ;; temporal axes (vs `DELETE FOR PORTION OF`, which is a
+        ;; bounded logical retract).
         sql (if erase-stmt?
               (.replaceFirst ^String sql "(?i)\\s*ERASE\\s+FROM" "DELETE FROM")
               sql)

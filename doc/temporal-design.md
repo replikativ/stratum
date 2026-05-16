@@ -140,9 +140,6 @@ did the DB *show* at exactly that instant") should derive it from
 the next-later row's `_system_from` for the same entity — or use a
 storage layer that's append-only by construction.
 
-See `doc/research/63-xtdb-v2-system-time-semantic.md` (kontor
-internal) for the analysis behind this design choice.
-
 ## Write primitives
 
 Three primitives in `stratum.dataset`, all returning a new dataset value:
@@ -424,37 +421,33 @@ as AsOfDB today, just one more axis.
 
 ## Why now
 
-PR #26's column-convention foundation is correct but inert. Every
-non-trivial write surface in stratum is currently vt-blind (see
-`doc/research/58-stratum-vt-followup.md` in kontor). Without the
-primitives, every adapter has to re-invent SCD2 — which is exactly
-what `datahike-bitemporal-v1`'s adapter does today, with 150 LOC of
-close-and-reopen logic that belongs in stratum core.
+Before this work, stratum's write surface was valid-time-blind: the
+column-convention foundation existed but no primitive in stratum core
+performed close-and-reopen, so every adapter that needed SCD2 had to
+re-invent it on top of `assoc-column` and `append!`. The datahike
+adapter alone carried ~150 LOC of close-and-reopen logic that should
+have lived in stratum.
 
 After this PR:
 - One canonical SCD2 in stratum.
 - Adapters become thin (datahike adapter shrinks by ~100 LOC).
-- pg-datahike SQL surface speaks SQL:2011 directly.
-- Both axes get equal treatment from the planner.
+- A consuming PG-wire layer can speak SQL:2011 `FOR PORTION OF
+  VALID_TIME` directly without a custom translator.
+- Both temporal axes get equal treatment from the planner.
 
-## Phases (review-able commit boundaries)
+## Phases
 
-| Phase | Scope | Commits |
-|---|---|---|
-| A | Schema redesign: `:bitemporal {:valid :system}` | 1 |
-| B | Write primitives: `vt-append!` / `vt-update!` / `vt-delete!` | 2 |
-| C | Overlap detection: reject by default | 1 |
-| C+ | Auto-split: truncate partial-left + drop fully-superseded (via `ds-delete-rows!`) | 1 |
-| D | SQL grammar `FOR PORTION OF VALID_TIME` (DELETE) + bounded retract! + index-backed SQL DELETE | 1 |
-| D+ | `FOR PORTION OF VALID_TIME` on UPDATE + INSERT (via `bounded-update!`); UPSERT rejected with clear error | 1 |
-| E | Datahike adapter refactor: use new primitives | 1 |
-| F | Datahike `d/system-at` wrapper | 1 |
-| G | pg-datahike `datahike.system_at` session vars + SQL passthrough | 1 |
+| Phase | Scope |
+|---|---|
+| A | Schema redesign: `:bitemporal {:valid :system}` |
+| B | Write primitives: `vt-append!` / `vt-update!` / `vt-delete!` |
+| C | Overlap detection: reject by default |
+| C+ | Auto-split: truncate partial-left + drop fully-superseded (via `ds-delete-rows!`) |
+| D | SQL grammar `FOR PORTION OF VALID_TIME` (DELETE) + bounded retract! + index-backed SQL DELETE |
+| D+ | `FOR PORTION OF VALID_TIME` on UPDATE + INSERT (via `bounded-update!`); UPSERT rejected with clear error |
 
-Phases A-D land in stratum on the existing `feature/valid-time` branch
-(PR #26 retitled). Phase E lands in `datahike-bitemporal-v1`'s
-`feature/bitemporal-v1` (PR #828). Phases F-G land in
-pg-datahike's `feature/valid-time` (PR #7).
+A–D ship as this PR. Downstream consumers (the datahike adapter,
+PG-wire SQL passthrough) live in their own repos and land separately.
 
 ## Tests we'll add
 
@@ -498,6 +491,3 @@ pg-datahike's `feature/valid-time` (PR #7).
   algebra, the Snodgrass-style temporal database literature) informed
   the high-level shape; the implementation here is derived from the
   SQL:2011 specification, not from any specific reference codebase.
-- Internal kontor research notes (not shipped with stratum)
-  enumerated point-in-time gap analyses and terminology surveys
-  that motivated this PR's expansion.

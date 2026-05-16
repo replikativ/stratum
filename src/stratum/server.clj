@@ -1108,7 +1108,7 @@
               ;; instead of the array rebuild path below. The arrays
               ;; path is preserved unchanged for CREATE TABLE statements.
               (if (index-backed-cols? existing)
-                ;; `ERASE FROM …` (P2-1, kontor doc/research/61) bypasses
+                ;; `ERASE FROM …` bypasses
                 ;; the bounded-retract path and always physically purges
                 ;; via `ds-delete-rows!` — the distinct verb makes the
                 ;; "destroys across both axes" intent explicit. Plain

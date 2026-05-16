@@ -638,7 +638,7 @@
       ;; RHS arg is either a numeric literal, a string, a set (for
       ;; `:in`), or — when the predicate compares two columns —
       ;; another keyword to be resolved per-row. The arg-resolver
-      ;; handles the col-vs-col case (P2-followup); column predicates
+      ;; handles the col-vs-col case; column predicates
       ;; like `[:_valid_from :lt :_valid_to]` then evaluate correctly
       ;; in SELECT WHERE clauses, not just DML.
       (let [col-data (if (keyword? col-ref) (get col-arrays col-ref) col-ref)
