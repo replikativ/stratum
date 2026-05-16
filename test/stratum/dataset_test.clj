@@ -1228,3 +1228,178 @@
                          :_valid_from 1 :_valid_to Long/MAX_VALUE}])]
     (is (thrown? IndexOutOfBoundsException
                  (-> ds transient (dataset/ds-delete-rows! [5]))))))
+
+;; ============================================================================
+;; P0-2: validate-period! — reject zero-width and reverse temporal windows
+;; ============================================================================
+
+(deftest append!-rejects-zero-width-valid-window
+  (testing "append! with vf == vt throws"
+    (let [ds (vt-only-ds [])]
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo #"Invalid valid window"
+            (-> ds transient
+                (dataset/append! {:eid 1 :salary 100
+                                  :_valid_from 1000 :_valid_to 1000})))))))
+
+(deftest append!-rejects-reverse-valid-window
+  (testing "append! with vf > vt throws"
+    (let [ds (vt-only-ds [])]
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo #"Invalid valid window"
+            (-> ds transient
+                (dataset/append! {:eid 1 :salary 100
+                                  :_valid_from 2000 :_valid_to 1000})))))))
+
+(deftest bounded-retract!-rejects-zero-width-period
+  (testing "retract! with :valid-to == :valid-from throws"
+    (let [ds (vt-only-ds [{:eid 1 :salary 100
+                           :_valid_from 1000 :_valid_to Long/MAX_VALUE}])]
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo #"Invalid valid window"
+            (-> ds transient
+                (dataset/retract! {:where [[:= :eid 1]]}
+                                  {:valid-from 2000 :valid-to 2000})))))))
+
+(deftest bounded-update!-rejects-reverse-period
+  (testing "bounded-update! with reverse period throws"
+    (let [ds (vt-only-ds [{:eid 1 :salary 100
+                           :_valid_from 1000 :_valid_to Long/MAX_VALUE}])]
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo #"Invalid valid window"
+            (-> ds transient
+                (dataset/bounded-update! {:where [[:= :eid 1]] :set {:salary 999}}
+                                         {:valid-from 5000 :valid-to 3000})))))))
+
+;; ============================================================================
+;; P0-1: SCD2-on-both-axes — system-time symmetry on every vt mutation
+;;
+;; In a bitemporal dataset, an upsert/retract/bounded-update must NOT
+;; mutate vt in place on the old row — that would silently rewrite
+;; the past. Instead, close _system_to on the old row and append the
+;; surviving slice(s) with fresh _system_from. AS OF queries at past
+;; system-time then still see the pre-surgery state.
+;; ============================================================================
+
+(defn- bitemporal-ds [rows]
+  (let [eids       (mapv :eid rows)
+        salaries   (mapv :salary rows)
+        vfs        (mapv :_valid_from rows)
+        vts        (mapv :_valid_to rows)
+        sfs        (mapv :_system_from rows)
+        sts        (mapv :_system_to rows)]
+    (dataset/make-dataset
+     {:eid          (index/index-from-seq :int64 eids)
+      :salary       (index/index-from-seq :int64 salaries)
+      :_valid_from  (index/index-from-seq :int64 vfs)
+      :_valid_to    (index/index-from-seq :int64 vts)
+      :_system_from (index/index-from-seq :int64 sfs)
+      :_system_to   (index/index-from-seq :int64 sts)}
+     {:name "emp"
+      :metadata
+      {:bitemporal {:valid  {:from-col :_valid_from :to-col :_valid_to}
+                    :system {:from-col :_system_from :to-col :_system_to}}}})))
+
+(defn- bitemporal-rows [ds]
+  (vec (for [i (range (dataset/row-count ds))]
+         (into {} (for [k (dataset/column-names ds)]
+                    [k (index/idx-get-long (:index (dataset/column ds k)) i)])))))
+
+(deftest upsert!-on-bitemporal-closes-system-to-on-prior-row
+  ;; Setup: at system-time 1000, the user asserted "eid 1 salary 100,
+  ;; valid Jan-MAX". At system-time 2000, the user upserts a new
+  ;; salary 110 valid from Jul. We expect:
+  ;;   - The original [Jan, MAX) salary=100 row stays at vf=Jan vt=MAX
+  ;;     (vt is NOT mutated) but its system-to is closed to 2000.
+  ;;   - A successor [Jan, Jul) salary=100 row is appended at system 2000.
+  ;;   - The new [Jul, MAX) salary=110 row is appended at system 2000.
+  (let [ds (bitemporal-ds [{:eid 1 :salary 100
+                            :_valid_from 1000000 :_valid_to Long/MAX_VALUE
+                            :_system_from 1000 :_system_to Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]]
+                                     :set {:eid 1 :salary 110}}
+                                    {:valid-from 7000000
+                                     :system-from 2000})
+                   persistent!)
+        rows (bitemporal-rows result)]
+    (testing "three rows: original (system-closed), successor historical, new current"
+      (is (= 3 (count rows))))
+    (testing "original row retained vt=MAX but its system-to is now 2000"
+      (let [orig (first (filter #(and (= 1000 (:_system_from %))
+                                      (= 1000000 (:_valid_from %))
+                                      (= Long/MAX_VALUE (:_valid_to %)))
+                                rows))]
+        (is (some? orig) "the originally-asserted row must still exist")
+        (is (= 2000 (:_system_to orig))
+            "its system-to should be closed at the surgery system-time")))
+    (testing "successor for the truncated [Jan, Jul) at system 2000"
+      (let [hist (first (filter #(and (= 2000 (:_system_from %))
+                                      (= 1000000 (:_valid_from %))
+                                      (= 7000000 (:_valid_to %)))
+                                rows))]
+        (is (some? hist))
+        (is (= 100 (:salary hist)))))
+    (testing "new [Jul, MAX) at system 2000 with merged salary"
+      (let [new-row (first (filter #(and (= 2000 (:_system_from %))
+                                         (= 7000000 (:_valid_from %)))
+                                   rows))]
+        (is (some? new-row))
+        (is (= 110 (:salary new-row)))
+        (is (= Long/MAX_VALUE (:_valid_to new-row)))))))
+
+(deftest retract!-bounded-on-bitemporal-closes-system-on-split
+  ;; Single row [Jan, Sep) salary=100 originally written at system 1000.
+  ;; Retract over [Apr, Jul) at system 2000.
+  ;; Expected after surgery:
+  ;;   Original [Jan, Sep) system-closed to 2000.
+  ;;   Successor [Jan, Apr) at system 2000.
+  ;;   Successor [Jul, Sep) at system 2000.
+  ;; AS OF system-time 1500: should see the original [Jan, Sep) row.
+  ;; AS OF system-time 2500: should see two slices [Jan, Apr) + [Jul, Sep).
+  (let [ds (bitemporal-ds [{:eid 1 :salary 100
+                            :_valid_from 1000000 :_valid_to 9000000
+                            :_system_from 1000 :_system_to Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/retract! {:where [[:= :eid 1]]}
+                                     {:valid-from 4000000
+                                      :valid-to 7000000
+                                      :system-from 2000})
+                   persistent!)
+        rows (bitemporal-rows result)]
+    (testing "three rows: closed original + two replacement slices"
+      (is (= 3 (count rows))))
+    (testing "original system-closed at 2000"
+      (let [orig (first (filter #(and (= 1000 (:_system_from %))
+                                      (= 1000000 (:_valid_from %))
+                                      (= 9000000 (:_valid_to %)))
+                                rows))]
+        (is (some? orig))
+        (is (= 2000 (:_system_to orig)))))
+    (testing "left replacement [Jan, Apr) at system 2000"
+      (let [left (first (filter #(and (= 2000 (:_system_from %))
+                                      (= 1000000 (:_valid_from %))
+                                      (= 4000000 (:_valid_to %)))
+                                rows))]
+        (is (some? left))))
+    (testing "right replacement [Jul, Sep) at system 2000"
+      (let [right (first (filter #(and (= 2000 (:_system_from %))
+                                       (= 7000000 (:_valid_from %))
+                                       (= 9000000 (:_valid_to %)))
+                                 rows))]
+        (is (some? right))))))
+
+(deftest valid-only-upsert!-keeps-in-place-mutation
+  ;; Regression: when no system axis is configured, the existing
+  ;; in-place vt mutation behavior must be preserved (no extra
+  ;; "historical successor" row appears).
+  (let [ds (vt-only-ds [{:eid 1 :salary 100
+                         :_valid_from 1000 :_valid_to Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]]
+                                     :set {:eid 1 :salary 110}}
+                                    {:valid-from 5000})
+                   persistent!)
+        rows (ds-rows result)]
+    (is (= 2 (count rows))
+        "valid-only mode: original closed in place + new merged row = 2")))

@@ -2423,3 +2423,49 @@
           (is (some? (.error qr)))
           (is (re-find #"not supported" (.error qr))))
         (finally (server/stop srv))))))
+
+;; ============================================================================
+;; P0-3: open-ended FOR PORTION OF VALID_TIME (no TO)
+;; ============================================================================
+
+(deftest preprocess-for-portion-of-valid-time-without-to-defaults-to-max
+  (testing "FROM x with no TO is the open-ended form: vt = Long/MAX_VALUE"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "DELETE FROM t FOR PORTION OF VALID_TIME FROM '2024-04-01' WHERE eid = 1")]
+      (is (= "DELETE FROM t WHERE eid = 1" (.trim ^String (:sql r))))
+      (is (= :valid_time (:axis (:period r))))
+      (is (= 1711929600000000 (:from (:period r))))
+      (is (= Long/MAX_VALUE (:to (:period r)))))))
+
+(deftest sql-delete-for-portion-open-ended-retracts-from-instant
+  (testing "DELETE FOR PORTION OF FROM x (no TO) closes valid-to to x for matching rows"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "salaries"
+          (with-meta
+            ;; Open row [Jan-2024, MAX) with salary=100.
+            {:eid         (stratum.index/index-from-seq :int64 [1])
+             :salary      (stratum.index/index-from-seq :int64 [100])
+             :_valid_from (stratum.index/index-from-seq :int64 [1704067200000000])
+             :_valid_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])}
+            {:bitemporal {:valid {:from-col :_valid_from
+                                  :to-col   :_valid_to
+                                  :unit     :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec (str "DELETE FROM salaries "
+                         "FOR PORTION OF VALID_TIME FROM '2024-04-01' "
+                         "WHERE eid = 1")
+                    (:registry srv) (:data-dir srv))]
+          (is (re-find #"^DELETE" (.commandTag qr))))
+        ;; Row should be truncated to [Jan-2024, Apr-2024) — the
+        ;; open-ended retract closes valid-to at the start instant.
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))]
+          (is (= 1 n))
+          (is (= 1704067200000000
+                 (stratum.index/idx-get-long (:index (:_valid_from cols)) 0)))
+          (is (= 1711929600000000
+                 (stratum.index/idx-get-long (:index (:_valid_to cols)) 0))))
+        (finally (server/stop srv))))))

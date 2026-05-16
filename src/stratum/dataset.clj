@@ -27,7 +27,10 @@
          eval-pred
          coerce-temporal-value
          now-in-unit
-         apply-axis-config)
+         validate-period!
+         apply-axis-config
+         system-now-from-tx-meta
+         replace-row-bitemporal!)
 
 (defprotocol IDataset
   "Core dataset protocol for Stratum columnar engine.
@@ -261,6 +264,12 @@
           row (if bt-cfg
                 (merge-axis-defaults row-map bt-cfg tx-meta)
                 row-map)]
+      ;; Reject zero-width / reverse windows BEFORE we touch any column.
+      ;; XTDB v2 enforces vf < vt at every entry point; we do the same.
+      (when-let [{:keys [from-col to-col]} (:valid bt-cfg)]
+        (validate-period! (long (get row from-col)) (long (get row to-col)) :valid))
+      (when-let [{:keys [from-col to-col]} (:system bt-cfg)]
+        (validate-period! (long (get row from-col)) (long (get row to-col)) :system))
       (doseq [[col-name col-data] columns-field]
         (let [val (get row col-name)]
           (when (nil? val)
@@ -370,24 +379,52 @@
         ;;      truncate) would point at the wrong row.
         ;;   3. append! the new rows (close-safe merged-row, or degenerate
         ;;      insert).
-        (doseq [[i _prev-row] close-safe]
-          (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
-        (doseq [[i _r] auto-truncate]
-          (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
-        (when (seq auto-drop)
-          (ds-delete-rows! this (mapv first auto-drop)))
-        (doseq [[_i prev-row] close-safe]
-          (let [merged-row (merge (dissoc prev-row vf-col vt-col
-                                          (:from-col system-cfg) (:to-col system-cfg))
-                                  set)]
-            (append! this
-                     (assoc merged-row vf-col close-vt-val)
-                     tx-meta)))
-        ;; If no safe rows matched (entity has no current open version),
-        ;; the upsert degenerates to a plain insert with the user's
-        ;; :set as the row payload. Auto-stamping happens in append!.
-        (when (empty? close-safe)
-          (append! this set (assoc tx-meta :valid-from close-vt-val)))
+        (if system-cfg
+          ;; ----- Bitemporal path (SCD2-on-both-axes) -----
+          ;; Every mutation of a row's vt-window is also a system-time
+          ;; event: close the old row's _system_to, append the
+          ;; replacement(s) with a fresh _system_from. This preserves
+          ;; the audit chain so `FOR SYSTEM_TIME AS OF <past>` still
+          ;; sees the pre-surgery state.
+          (let [system-now (system-now-from-tx-meta system-cfg tx-meta)]
+            (doseq [[i prev-row] close-safe]
+              (let [orig-vf (long (get prev-row vf-col))]
+                (replace-row-bitemporal!
+                  this prev-row i system-now valid-cfg system-cfg
+                  [{:vf orig-vf :vt close-vt-val}
+                   {:vf close-vt-val :vt Long/MAX_VALUE :data set}]
+                  tx-meta)))
+            (doseq [[i prev-row] auto-truncate]
+              (let [orig-vf (long (get prev-row vf-col))]
+                (replace-row-bitemporal!
+                  this prev-row i system-now valid-cfg system-cfg
+                  [{:vf orig-vf :vt close-vt-val}]
+                  tx-meta)))
+            (doseq [[i prev-row] auto-drop]
+              (replace-row-bitemporal!
+                this prev-row i system-now valid-cfg system-cfg
+                []
+                tx-meta))
+            (when (empty? close-safe)
+              (append! this set
+                       (assoc tx-meta :valid-from close-vt-val
+                              :system-from system-now))))
+          ;; ----- Valid-only path (existing in-place mutation) -----
+          (do
+            (doseq [[i _prev-row] close-safe]
+              (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+            (doseq [[i _r] auto-truncate]
+              (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+            (when (seq auto-drop)
+              (ds-delete-rows! this (mapv first auto-drop)))
+            (doseq [[_i prev-row] close-safe]
+              (let [merged-row (merge (dissoc prev-row vf-col vt-col)
+                                      set)]
+                (append! this
+                         (assoc merged-row vf-col close-vt-val)
+                         tx-meta)))
+            (when (empty? close-safe)
+              (append! this set (assoc tx-meta :valid-from close-vt-val)))))
         this)))
 
   (retract! [this opts] (retract! this opts nil))
@@ -408,6 +445,11 @@
                              (now-in-unit vt-unit))
             close-vt-end (or (coerce-temporal-value (:valid-to tx-meta) vt-unit)
                              Long/MAX_VALUE)
+            _ (when (not= close-vt-end Long/MAX_VALUE)
+                ;; Bounded retract has explicit [vf, vt) — reject
+                ;; zero-width / reverse periods that would silently
+                ;; degenerate the overlap test to a no-op.
+                (validate-period! close-vt-val close-vt-end :valid))
             ;; Bounded retract — SQL:2011 `FOR PORTION OF VALID_TIME
             ;; FROM x TO y DELETE` semantic. For each matching row's
             ;; window [row-vf, row-vt), apply surgery against
@@ -460,33 +502,54 @@
                                    acc
                                    (update acc klass conj! [i row]))))
                         (recur (inc i) acc)))))]
-            ;; 1. Truncate vt-col on partial-left + split rows (set-at!
-            ;;    on vt → new-vf).
-            (doseq [[i _r] trunc-vt]
-              (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
-            ;; 2. Truncate vf-col on partial-right rows (set-at! on vf
-            ;;    → new-vt).
-            (doseq [[i _r] trunc-vf]
-              (idx/idx-set! (:index (get columns-field vf-col)) i close-vt-end))
-            ;; 3. For each split row, truncate its vt now (set-at!), and
-            ;;    remember the right-tail to append after drops.
-            (let [tails (mapv (fn [[i r]]
-                                (idx/idx-set! (:index (get columns-field vt-col))
-                                              i close-vt-val)
-                                (-> r
-                                    (assoc vf-col close-vt-end)
-                                    (dissoc (:from-col system-cfg)
-                                            (:to-col system-cfg))))
-                              splits)]
-              ;; 4. Drop fully-superseded rows (index shift — must come
-              ;;    after all set-at! ops on captured indices).
-              (when (seq drops)
-                (ds-delete-rows! this (mapv first drops)))
-              ;; 5. Append the split right-tails. append! auto-stamps
-              ;;    the system axis from tx-meta / now().
-              (doseq [tail tails]
-                (append! this tail tx-meta)))
-            this)
+            (if system-cfg
+              ;; ----- Bitemporal bounded retract -----
+              ;; Each surgery class gets its system-time event: close
+              ;; old row's system-to, append the surviving slice(s)
+              ;; with fresh system-from. Drops have no replacements.
+              (let [system-now (system-now-from-tx-meta system-cfg tx-meta)]
+                (doseq [[i prev-row] drops]
+                  (replace-row-bitemporal!
+                    this prev-row i system-now valid-cfg system-cfg
+                    []
+                    tx-meta))
+                (doseq [[i prev-row] trunc-vt]
+                  (let [orig-vf (long (get prev-row vf-col))]
+                    (replace-row-bitemporal!
+                      this prev-row i system-now valid-cfg system-cfg
+                      [{:vf orig-vf :vt close-vt-val}]
+                      tx-meta)))
+                (doseq [[i prev-row] trunc-vf]
+                  (let [orig-vt (long (get prev-row vt-col))]
+                    (replace-row-bitemporal!
+                      this prev-row i system-now valid-cfg system-cfg
+                      [{:vf close-vt-end :vt orig-vt}]
+                      tx-meta)))
+                (doseq [[i prev-row] splits]
+                  (let [orig-vf (long (get prev-row vf-col))
+                        orig-vt (long (get prev-row vt-col))]
+                    (replace-row-bitemporal!
+                      this prev-row i system-now valid-cfg system-cfg
+                      [{:vf orig-vf :vt close-vt-val}
+                       {:vf close-vt-end :vt orig-vt}]
+                      tx-meta)))
+                this)
+              ;; ----- Valid-only bounded retract (existing in-place) -----
+              (do
+                (doseq [[i _r] trunc-vt]
+                  (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+                (doseq [[i _r] trunc-vf]
+                  (idx/idx-set! (:index (get columns-field vf-col)) i close-vt-end))
+                (let [tails (mapv (fn [[i r]]
+                                    (idx/idx-set! (:index (get columns-field vt-col))
+                                                  i close-vt-val)
+                                    (-> r (assoc vf-col close-vt-end)))
+                                  splits)]
+                  (when (seq drops)
+                    (ds-delete-rows! this (mapv first drops)))
+                  (doseq [tail tails]
+                    (append! this tail tx-meta)))
+                this)))
           ;; ----- Open-window retract (existing behavior) -----
           (let [{:keys [close-safe overlaps]}
                 (loop [i 0 acc {:close-safe (transient [])
@@ -524,13 +587,36 @@
                                                  (assoc (select-keys r [vf-col vt-col]) :row-idx i))
                                                overlaps)
                                :hint "pass :auto-split? true to split overlapping rows, or restructure the write"})))
-            (doseq [[i _row] close-safe]
-              (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
-            (doseq [[i _r] auto-truncate]
-              (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
-            (when (seq auto-drop)
-              (ds-delete-rows! this (mapv first auto-drop)))
-            this)))))
+            (if system-cfg
+              ;; ----- Bitemporal open-window retract -----
+              (let [system-now (system-now-from-tx-meta system-cfg tx-meta)]
+                (doseq [[i prev-row] close-safe]
+                  (let [orig-vf (long (get prev-row vf-col))]
+                    (replace-row-bitemporal!
+                      this prev-row i system-now valid-cfg system-cfg
+                      [{:vf orig-vf :vt close-vt-val}]
+                      tx-meta)))
+                (doseq [[i prev-row] auto-truncate]
+                  (let [orig-vf (long (get prev-row vf-col))]
+                    (replace-row-bitemporal!
+                      this prev-row i system-now valid-cfg system-cfg
+                      [{:vf orig-vf :vt close-vt-val}]
+                      tx-meta)))
+                (doseq [[i prev-row] auto-drop]
+                  (replace-row-bitemporal!
+                    this prev-row i system-now valid-cfg system-cfg
+                    []
+                    tx-meta))
+                this)
+              ;; ----- Valid-only open-window retract -----
+              (do
+                (doseq [[i _row] close-safe]
+                  (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+                (doseq [[i _r] auto-truncate]
+                  (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+                (when (seq auto-drop)
+                  (ds-delete-rows! this (mapv first auto-drop)))
+                this)))))))
 
   (ds-delete-rows! [this row-idxs]
     (when-not edit
@@ -926,6 +1012,36 @@
       (throw (ex-info "Unsupported temporal value type"
                       {:value v :type (type v) :unit unit})))))
 
+(defn- validate-period!
+  "Reject zero-width and reverse temporal windows. SQL:2011 + XTDB v2
+   require `from < to`; stratum's bounded surgery silently degenerates
+   to a no-op when `to <= from` (overlap test collapses), so any
+   downstream `bounded-update!`/`retract!`/`bounded-INSERT` on an
+   invalid window silently swallows the user's intent.
+
+   Pass `axis` (`:valid` or `:system`) for an informative error."
+  [^long from ^long to axis]
+  (when-not (< from to)
+    (throw (ex-info (str "Invalid " (name axis) " window: from >= to "
+                         "(zero-width or reverse). "
+                         "stratum requires a strictly positive half-open interval [from, to).")
+                    {:axis axis :from from :to to}))))
+
+(defn- system-now-from-tx-meta
+  "Pick the system-time stamp for a batch of SCD2 mutations. Honors
+   `:system-from` in tx-meta (replayable test runs / regulator
+   replays) or falls back to `now-in-unit` on the system axis. The
+   *same* `system-now` is used to close every old row's system-to AND
+   to stamp every successor row's system-from inside a single
+   transactional surgery — so AS OF queries get a coherent cut.
+
+   Returns nil when the dataset has no `:system` axis configured."
+  [system-cfg tx-meta]
+  (when system-cfg
+    (let [unit (:unit system-cfg)]
+      (or (coerce-temporal-value (:system-from tx-meta) unit)
+          (now-in-unit unit)))))
+
 (defn- merge-axis-defaults
   "For each configured axis (`:valid`, `:system`), if `row-map`
    doesn't already contain the axis' from-col / to-col, fill them
@@ -1047,6 +1163,54 @@
     cols)))
 
 ;; ============================================================================
+;; SCD2-on-both-axes surgery helper.
+;;
+;; In a bitemporal dataset (both `:valid` AND `:system` axes
+;; configured), an SCD2 mutation of an existing row's valid window
+;; must ALSO advance the system axis — otherwise a query `FOR
+;; SYSTEM_TIME AS OF <past-instant>` would return post-correction
+;; data, which collapses the audit story. XTDB v2 achieves this by
+;; being event-sourced; we achieve it by closing the old row's
+;; `_system_to` in place and appending one or more "replacement"
+;; rows carrying the new valid window AND a fresh `_system_from`.
+;;
+;; For non-bitemporal (valid-only) datasets we keep the existing
+;; in-place vt-col mutation behavior — there's no system-time to
+;; preserve.
+;; ============================================================================
+
+(defn- replace-row-bitemporal!
+  "Apply SCD2-on-both-axes surgery for the row at index `i`. The
+   row's pre-mutation snapshot is `prev-row` (captured before any
+   mutation). Closes the row's `_system_to` to `system-now`, then
+   appends one row per `replacement-spec`. Each replacement is a
+   map `{:vf x :vt y :data {...}?}`: the appended row inherits
+   `prev-row` minus the four axis columns, then gets `vf-col`=vf,
+   `vt-col`=vt, and the merged `:data` (if any). `append!` stamps
+   the appended row's system axis from `tx-meta :system-from
+   system-now`.
+
+   `replacement-specs` may be empty — a pure 'drop in valid-time'
+   that still advances system-time on the old row."
+  [this prev-row i system-now valid-cfg system-cfg replacement-specs tx-meta]
+  (let [{vf-col :from-col vt-col :to-col} valid-cfg
+        {sys-from-col :from-col sys-to-col :to-col} system-cfg
+        cols (columns this)
+        successor-tx-meta (assoc tx-meta :system-from system-now)]
+    ;; 1. Close the old row's system-to. The row stays in storage at
+    ;;    index `i` with its original vf/vt/data/sys-from intact — so
+    ;;    AS OF queries at `system-time < system-now` still see it.
+    (idx/idx-set! (:index (get cols sys-to-col)) i system-now)
+    ;; 2. Append the replacement(s). Each gets fresh system-from from
+    ;;    `successor-tx-meta`; the system-to defaults to MAX.
+    (doseq [{:keys [vf vt data]} replacement-specs]
+      (let [base (dissoc prev-row vf-col vt-col sys-from-col sys-to-col)
+            row  (-> base
+                     (merge (or data {}))
+                     (assoc vf-col vf vt-col vt))]
+        (append! this row successor-tx-meta)))))
+
+;; ============================================================================
 ;; SQL:2011 bounded-window UPDATE: `UPDATE … FOR PORTION OF VALID_TIME
 ;; FROM x TO y SET col=val WHERE p`. Decomposes into:
 ;;   1. capture matching rows that overlap [x, y) (including their
@@ -1089,6 +1253,7 @@
         {vf-col :from-col vt-col :to-col vt-unit :unit} valid
         new-vf (coerce-temporal-value (:valid-from tx-meta) vt-unit)
         new-vt (coerce-temporal-value (:valid-to tx-meta) vt-unit)
+        _ (validate-period! (long new-vf) (long new-vt) :valid)
         cols-snap (columns ds)
         n (row-count ds)
         ;; Step 1: capture matching rows that overlap [new-vf, new-vt).

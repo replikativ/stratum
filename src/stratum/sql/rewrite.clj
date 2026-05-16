@@ -282,12 +282,30 @@
 
         :else (recur (inc j) paren)))))
 
+(def ^:private dml-tail-keywords
+  "Keywords that terminate a `FOR PORTION OF VALID_TIME` clause when
+   walking forward through the SQL. Matches the keyword set XTDB v2
+   uses in its `Sql.g4:828-829` grammar and adds the SQL DML tail
+   tokens we want to preserve (WHERE, SET, VALUES, RETURNING, etc.).
+   `to` is included so the FROM scan stops at the optional TO keyword."
+  #{"to" "where" "set" "values" "returning" "from" "using" "select"})
+
+(def ^:private dml-tail-keywords-no-to
+  "Same as `dml-tail-keywords` but without `to` — used for the TO
+   expression's terminator scan."
+  #{"where" "set" "values" "returning" "from" "using" "select"})
+
 (defn preprocess-for-portion-of-valid-time
-  "Strip SQL:2011 `FOR PORTION OF VALID_TIME FROM <x> TO <y>` from a DML
-   statement. Returns `{:sql rewritten :period [vf-micros vt-micros]}` if
-   the clause is present, otherwise `{:sql sql :period nil}`. The
+  "Strip SQL:2011 `FOR PORTION OF VALID_TIME FROM <x> [TO <y>]` from a
+   DML statement. Returns `{:sql rewritten :period {:axis :from :to}}`
+   if the clause is present, otherwise `{:sql sql :period nil}`. The
    downstream parser then sees a plain INSERT / UPDATE / DELETE and the
    server attaches `:period` back when lowering to stratum primitives.
+
+   The `TO` clause is optional — when absent, the period extends to
+   `Long/MAX_VALUE` (XTDB v2 calls this `xtdb/end-of-time`,
+   `Sql.g4:828-829`). The open-ended form is useful for retracting
+   from a point forward.
 
    Only one occurrence is recognized per statement (DML applies to a
    single target). Recognizes `VALID_TIME` and `SYSTEM_TIME` axes;
@@ -299,17 +317,27 @@
       (let [[full-prefix axis] m
             start (.indexOf sql ^String full-prefix)
             after-from (+ start (.length ^String full-prefix))
-            to-pos (long (find-balanced-end sql after-from #{"to"}))
-            from-expr (subs sql after-from to-pos)
-            ;; skip "TO"
-            [after-to-kw _] (read-word sql (long (skip-ws-and-comments sql to-pos)))
-            after-to (long after-to-kw)
-            tail-pos (long (find-balanced-end sql after-to #{"where" "set" "values" "returning"
-                                                              "from" "using" "select"}))
-            ;; If the terminator is the end of statement (semicolon, EOL), tail-pos = n.
-            to-expr (subs sql after-to tail-pos)
+            ;; Walk forward to either a literal TO keyword or to the
+            ;; next DML tail keyword (WHERE/SET/...) — that's where
+            ;; the FROM expression ends.
+            from-end-pos (long (find-balanced-end sql after-from dml-tail-keywords))
+            from-expr (subs sql after-from from-end-pos)
+            ;; Peek: is the terminator a TO keyword (open-bounded
+            ;; form) or a tail keyword (open-ended form)?
+            [_ first-kw] (read-word sql (long (skip-ws-and-comments sql from-end-pos)))
+            has-to? (= "to" first-kw)
+            [tail-pos to-expr]
+            (if has-to?
+              (let [after-to-kw (long (->> (skip-ws-and-comments sql from-end-pos)
+                                           (read-word sql)
+                                           first))
+                    tp (long (find-balanced-end sql after-to-kw dml-tail-keywords-no-to))]
+                [tp (subs sql after-to-kw tp)])
+              [from-end-pos nil])
             vf-val (parse-temporal-literal from-expr)
-            vt-val (parse-temporal-literal to-expr)
+            vt-val (if has-to?
+                     (parse-temporal-literal to-expr)
+                     Long/MAX_VALUE)
             rewritten (str (subs sql 0 start) (subs sql tail-pos))]
         {:sql rewritten
          :period {:axis (keyword (.toLowerCase ^String axis))
