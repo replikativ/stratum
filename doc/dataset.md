@@ -28,7 +28,9 @@ This document covers Stratum's dataset type, persistence model, and temporal que
 
 Options for `make-dataset`:
 - `:name` - Dataset name string (default: `"unnamed"`)
-- `:metadata` - User metadata map (stored in commits)
+- `:metadata` - User metadata map (stored in commits). A reserved key
+  `:valid-time {:from-col <kw> :to-col <kw> :unit :micros}` opts the
+  dataset into bitemporal valid-time queries — see [Valid-Time Window](#valid-time-window).
 
 ### Column Types
 
@@ -187,6 +189,59 @@ This walks the commit history and finds the most recent commit with `"datahike/t
 (def ds-at-time (st/resolve store "trades" {:as-of commit-uuid}))
 (def ds-at-tx (st/resolve store "trades" {:as-of-tx 42}))
 ```
+
+### Valid-Time Window
+
+The temporal axes above are **transaction-time** (the time something was committed). Many domains — accounting, contracts, regulatory reporting — also need **valid-time** (when a fact was true in the modelled world), which can be very different from the commit time. Stratum supports valid-time as an opt-in column convention on `make-dataset`:
+
+```clojure
+(st/make-dataset
+  {:eid         (long-array [1 1 2])
+   :salary      (long-array [100000 110000 80000])
+   :_valid_from (long-array [1704067200000000  ;; 2024-01-01 μs
+                             1719792000000000  ;; 2024-07-01 μs
+                             1709251200000000]);; 2024-03-01 μs
+   :_valid_to   (long-array [1719792000000000
+                             Long/MAX_VALUE
+                             Long/MAX_VALUE])}
+  {:name "salaries"
+   :metadata {:valid-time {:from-col :_valid_from
+                           :to-col   :_valid_to
+                           :unit     :micros}}})
+```
+
+When `:metadata` carries `:valid-time {:from-col <kw> :to-col <kw>}`, `make-dataset` validates that:
+
+- both named columns exist,
+- both are `:int64`,
+- no conflicting pre-existing `:temporal-unit` is set,
+
+and stamps each with `:temporal-unit :micros` (the default — overridable to `:days`, `:seconds`, `:millis`). The two columns are then queryable like any other temporal column, including `DATE_TRUNC` / `EXTRACT` and zone-map range pruning. `:unit` defaults to `:micros` to match the DuckDB `TIMESTAMP` convention used by the SQL surface.
+
+Read the config back via `stratum.dataset/vt-config`:
+
+```clojure
+(dataset/vt-config ds)
+;; => {:from-col :_valid_from :to-col :_valid_to :unit :micros}
+```
+
+The metadata round-trips through `sync!` / `load`; the per-column `:temporal-unit` tag is re-applied automatically on restore (the metadata is the source of truth, since the per-column commit payload doesn't carry it).
+
+Half-open `[from, to)` windows are the recommended encoding. `Long/MAX_VALUE` is the conventional open-ended sentinel; zone-map pruning handles it without special-casing.
+
+Typical as-of-vt query (one entity's salary on a given date):
+
+```clojure
+(st/q {:from "salaries"
+       :where [[:= :eid 1]
+               [:<= :_valid_from at-micros]
+               [:>  :_valid_to   at-micros]]
+       :select [:salary]})
+```
+
+For per-row SCD2 (close the previous window when an entity is updated), see `datahike-bitemporal-v1`'s `stratum.datahike` adapter, which uses this convention as its on-disk row layout.
+
+The `bench/baseline-vt-branch.txt` snapshot captures three valid-time bench shapes — point-in-vt at 1% selectivity, 50% selectivity with the `MAX_VALUE` sentinel, and group-by with vt filter — alongside the standard tier 1-9 set, so regressions on the underlying scan + zone-map paths are caught against the same reference.
 
 ## Integration with Query Engine
 

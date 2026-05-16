@@ -220,7 +220,7 @@ Fressian handlers serialize PSS nodes (Leaf, Branch), ChunkEntry records (with c
 
 **Random UUID** (default): Each `idx-sync!` assigns fresh random UUIDs to new/dirty PSS nodes. Two syncs of identical data produce different addresses.
 
-**Content-addressed (merkle)**: When `{:metadata {:crypto-hash? true}}` is set on index creation, addresses are computed deterministically from content - Branch addresses hash child addresses, Leaf addresses hash chunk-ids and stats. Identical content always produces the same commit ID, enabling deduplication and integrity verification.
+**Content-addressed (merkle)**: When `{:metadata {:crypto-hash? true}}` is set on index creation, addresses are computed deterministically from content - Branch addresses hash child addresses, Leaf addresses hash chunk-ids and stats. Identical content always produces the same commit ID, enabling deduplication and integrity verification. See [`doc/audit.md`](audit.md) for the verification API (`stratum.audit/verify-chain`, the `IAuditable` protocol, and `:deep?` PSS-tree walks).
 
 ### Storage Layout in Konserve
 
