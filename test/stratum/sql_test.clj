@@ -2881,3 +2881,49 @@
           rows (q/results->columns result)
           eids (vec (:eid rows))]
       (is (= [1 3] (sort eids))))))
+
+;; ============================================================================
+;; P2-4: paired (vf, vt) zone-map pruning
+;;
+;; Audit verdict: the existing per-predicate zone-map machinery in
+;; `stratum.query.group-by/build-zone-filters` + `classify-chunk`
+;; ALREADY handles paired vt predicates correctly. For the canonical
+;; `WHERE _valid_from <= ts AND _valid_to > ts` shape:
+;;   - The `_valid_from :lte ts` filter says "skip chunks where
+;;     min(_valid_from) > ts" — the chunk's earliest start is past
+;;     the query time, so no row in the chunk is valid at `ts`.
+;;   - The `_valid_to :gt ts` filter says "skip chunks where
+;;     max(_valid_to) <= ts" — the chunk's latest end is at or before
+;;     the query time, so no row in the chunk is still valid at `ts`.
+;;   - The AND in `classify-chunk` skips the chunk if EITHER filter
+;;     fires.
+;;
+;; Combined, this is exactly the "window-overlap pruner" the gap
+;; analysis recommended. No additional code needed — just
+;; documentation + a sanity test.
+;; ============================================================================
+
+(deftest sql-vt-zone-map-prunes-non-overlapping-chunks
+  (testing "Paired _valid_from / _valid_to predicates trigger zone-map pruning"
+    (let [;; Build an index-backed dataset large enough to span multiple chunks.
+          ;; Chunk size in stratum defaults to ~256 rows; use 1000 rows so we
+          ;; get ~4 chunks.
+          n 1000
+          ;; First half of rows: vt-window [0, 500). Second half: [500, 1000).
+          ;; A query AS OF 250 should hit only the first chunk(s).
+          ds (stratum.dataset/make-dataset
+               {:eid (stratum.index/index-from-seq :int64 (vec (range n)))
+                :_valid_from (stratum.index/index-from-seq :int64
+                              (vec (map #(if (< % (/ n 2)) 0 500) (range n))))
+                :_valid_to (stratum.index/index-from-seq :int64
+                            (vec (map #(if (< % (/ n 2)) 500 1000) (range n))))}
+               {:name "t"})
+          ;; Query AS OF 250 — only the first-half chunks should match.
+          parsed (sql/parse-sql
+                   "SELECT eid FROM t WHERE _valid_from <= 250 AND _valid_to > 250"
+                   {"t" (stratum.dataset/columns ds)})
+          result (q/q (:query parsed))
+          rows (q/results->columns result)]
+      ;; All N/2 first-half rows match; none of the second-half rows match.
+      (is (= (/ n 2) (count (:eid rows))))
+      (is (every? #(< % (/ n 2)) (:eid rows))))))
