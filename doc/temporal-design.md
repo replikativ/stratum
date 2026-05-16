@@ -74,6 +74,75 @@ in. Adapters that don't need row-level system-time leave the config
 unset, and stratum falls back to commit-time. The choice is per-table,
 not global.
 
+## System-time semantic
+
+`_system_from` is set at write time and never overwritten — it pins
+when the database first knew the row. `_system_to` starts at
+`Long/MAX_VALUE` ("still open") and is closed only when an SCD2
+correction supersedes the row. Together the pair forms a half-open
+period `[from, to)` describing the system-time interval during which
+the row's valid-time window was the database's current belief.
+
+Concretely, after a backdated correction:
+
+- The **old row** keeps its original `_valid_from` and `_valid_to`
+  untouched. Its `_system_to` is closed to `now`. It still represents
+  "what the DB used to believe", reachable by `FOR SYSTEM_TIME AS OF
+  <past>` queries.
+- One or more **successor rows** are appended with fresh
+  `_system_from = now`, carrying the new valid-time window(s) and any
+  updated values.
+
+A reader filters with `_system_from <= s AND _system_to > s` to get
+the rows the DB believed at system-instant `s`, plus the standard
+`_valid_from <= v AND _valid_to > v` for the valid-time slice. Two
+half-open intervals, two AND'd predicates, four columns — that's the
+whole model.
+
+### Why mutate `_system_to` instead of keeping rows append-only?
+
+Stratum stores rows in a classical SCD2 layout: every row is a tuple
+that physically exists at one location in the secondary index. To
+distinguish "row was the DB's belief at time `s`" from "row has been
+superseded", we need *some* per-row marker of the supersession point.
+The two natural shapes are:
+
+1. **Closed-period** (what stratum does): write `_system_to` on the
+   old row when it's superseded. One predicate at read time
+   (`_system_to > s`), one column write per correction.
+2. **Append-only**: never touch the old row; rely on the existence of
+   a newer row to imply supersession. Requires a per-entity merge at
+   read time to pick the row with the latest `_system_from <= s` for
+   each `(eid, vt-slice)`.
+
+The closed-period approach is the right fit for stratum's
+secondary-index substrate, where reads dominate writes and a single
+predicate filter is cheaper than a per-entity merge pass. The
+append-only approach is what event-sourced bitemporal stores do; it
+trades read-time work for write-time simplicity.
+
+### Caveat: reading `_system_to` at past system-time
+
+The closed-period design has one subtlety. If you query
+`SELECT _system_to FROM t FOR SYSTEM_TIME AS OF <past>`, the value
+you'll see for the old row is the *closure instant*, not the
+`Long/MAX_VALUE` it held at the queried system-time. The
+`(from <= s < to)` predicate still answers visibility correctly —
+the row's row-visibility at past system-time is preserved — but the
+literal column value is the post-mutation one.
+
+Practical impact for accounting / audit workloads: low. Queries ask
+"which rows were the DB's belief at time `s`?", not "what was each
+row's `_system_to` value at `s`?". The visibility filter is the
+audit-relevant question, and it works. Workloads that need the
+literal historical `_system_to` (regulatory reconstructions of "what
+did the DB *show* at exactly that instant") should derive it from
+the next-later row's `_system_from` for the same entity — or use a
+storage layer that's append-only by construction.
+
+See `doc/research/63-xtdb-v2-system-time-semantic.md` (kontor
+internal) for the analysis behind this design choice.
+
 ## Write primitives
 
 Three primitives in `stratum.dataset`, all returning a new dataset value:
