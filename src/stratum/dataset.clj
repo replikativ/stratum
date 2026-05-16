@@ -1289,18 +1289,28 @@
               {:row row
                :slice-vf (max row-vf new-vf)
                :slice-vt (min row-vt new-vt)})))]
-    ;; Step 2: retract over [new-vf, new-vt). The bounded retract
-    ;; handles every overlap class — drop / truncate-vt / truncate-vf
-    ;; / split — preserving the non-overlap parts of each matched row.
-    (retract! ds {:where where} tx-meta)
-    ;; Step 3: assert the updated slice per captured row.
-    (doseq [{:keys [row slice-vf slice-vt]} overlapping]
-      (let [merged (-> row
-                       (merge set)
-                       (assoc vf-col slice-vf vt-col slice-vt)
-                       (dissoc (get-in cfg [:system :from-col])
-                               (get-in cfg [:system :to-col])))]
-        (append! ds merged tx-meta)))
+    ;; Step 2 + 3 share ONE system-now stamp. `retract!` (bounded
+    ;; branch) closes each affected row's `_system_to` to its own
+    ;; `system-now`; `append!` stamps each replacement slice's
+    ;; `_system_from`. Without pinning up front, the two calls each
+    ;; resolve `now-in-unit` separately and can drift by ≥1 µs —
+    ;; violating the "same system-now for the whole surgery"
+    ;; invariant the dataset documents. Pre-pinning makes
+    ;; `bounded-update!` a single bitemporal event in the eyes of
+    ;; downstream readers, mirroring the single-call behavior of
+    ;; `upsert!` / `retract!`.
+    (let [tx-meta' (cond-> tx-meta
+                     (and (:system cfg) (not (contains? tx-meta :system-from)))
+                     (assoc :system-from
+                            (system-now-from-tx-meta (:system cfg) tx-meta)))]
+      (retract! ds {:where where} tx-meta')
+      (doseq [{:keys [row slice-vf slice-vt]} overlapping]
+        (let [merged (-> row
+                         (merge set)
+                         (assoc vf-col slice-vf vt-col slice-vt)
+                         (dissoc (get-in cfg [:system :from-col])
+                                 (get-in cfg [:system :to-col])))]
+          (append! ds merged tx-meta'))))
     ds))
 
 ;; ============================================================================
