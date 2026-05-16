@@ -1016,3 +1016,117 @@
     (testing "eid=2 row stays open"
       (let [bob2 (first (filter #(= 2 (:eid %)) rows))]
         (is (= Long/MAX_VALUE (:_valid_to bob2)))))))
+
+;; ============================================================================
+;; Phase C — overlap detection (reject by default; auto-split is deferred)
+;; ============================================================================
+
+(deftest upsert!-rejects-backdated-write-overlapping-open-row
+  ;; Existing open row [Jul-2024, MAX). New write tries :valid-from
+  ;; Apr-2024 (backdated). The new write's [Apr, MAX) would overlap
+  ;; the open [Jul, MAX). Reject.
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1719792000000000  ;; 2024-07-01
+                         :_valid_to   Long/MAX_VALUE}])]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"upsert! would overlap"
+         (-> ds transient
+             (dataset/upsert! {:where [[:= :eid 1]] :set {:salary 110000}}
+                              {:valid-from 1714521600000000})))))) ;; 2024-04-30
+
+(deftest upsert!-rejects-overlap-with-already-closed-historical
+  ;; Two historical rows: Jan-Jul (closed) and Jul-MAX (open).
+  ;; New write :valid-from Apr-2024 would overlap BOTH the closed
+  ;; Jan-Jul row AND the open row.
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000  ;; 2024-01-01
+                         :_valid_to   1719792000000000} ;; 2024-07-01
+                        {:eid 1 :salary 110000
+                         :_valid_from 1719792000000000
+                         :_valid_to   Long/MAX_VALUE}])]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"upsert! would overlap"
+         (-> ds transient
+             (dataset/upsert! {:where [[:= :eid 1]] :set {:salary 95000}}
+                              {:valid-from 1714521600000000}))))))
+
+(deftest upsert!-auto-split-is-deferred
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1719792000000000
+                         :_valid_to   Long/MAX_VALUE}])]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #":auto-split\? not yet implemented"
+         (-> ds transient
+             (dataset/upsert! {:where [[:= :eid 1]] :set {:salary 110000}
+                               :auto-split? true}
+                              {:valid-from 1714521600000000}))))))
+
+(deftest upsert!-tolerates-historical-rows-strictly-before-new-vf
+  ;; Closed row entirely in the past (Nov-Jan), open row Jan-MAX,
+  ;; new write Jul-2024. Only the open row's [Jan, MAX) is touched;
+  ;; the closed Nov-Jan row is left alone (entirely before new-vf).
+  (let [ds (vt-only-ds [{:eid 1 :salary 90000
+                         :_valid_from 1700000000000000  ;; Nov-2023
+                         :_valid_to   1704067200000000} ;; Jan-2024
+                        {:eid 1 :salary 100000
+                         :_valid_from 1704067200000000  ;; Jan-2024
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]] :set {:salary 110000}}
+                                    {:valid-from 1719792000000000}) ;; Jul-2024
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "three rows after the historic-aware upsert"
+      (is (= 3 (count rows))))
+    (testing "ancient closed row untouched"
+      (is (= 1700000000000000
+             (:_valid_from (first (filter #(= 90000 (:salary %)) rows))))))))
+
+(deftest upsert!-on-new-entity-degenerates-to-insert
+  ;; No matching open row exists for eid=99 → upsert! falls through to
+  ;; appending the :set payload as a brand-new row, auto-stamping the
+  ;; axis columns. Matches the spirit of "INSERT … ON CONFLICT UPDATE".
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 99]]
+                                     :set {:eid 99 :salary 50000}}
+                                    {:valid-from 1719792000000000})
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "two rows: original eid=1 + new eid=99"
+      (is (= 2 (count rows))))
+    (testing "new row is the inserted eid=99"
+      (let [new-row (first (filter #(= 99 (:eid %)) rows))]
+        (is (= 50000 (:salary new-row)))
+        (is (= 1719792000000000 (:_valid_from new-row)))
+        (is (= Long/MAX_VALUE (:_valid_to new-row)))))))
+
+(deftest retract!-rejects-overlap-with-historical-window
+  ;; Closing into a historical period (Jan-Jul is already closed; trying
+  ;; to retract from Apr-2024 would touch a window we no longer own).
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   1719792000000000}
+                        {:eid 1 :salary 110000
+                         :_valid_from 1719792000000000
+                         :_valid_to   Long/MAX_VALUE}])]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"retract! would touch rows"
+         (-> ds transient
+             (dataset/retract! {:where [[:= :eid 1]]}
+                               {:valid-from 1714521600000000}))))))
+
+(deftest retract!-auto-split-is-deferred
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   1719792000000000}
+                        {:eid 1 :salary 110000
+                         :_valid_from 1719792000000000
+                         :_valid_to   Long/MAX_VALUE}])]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #":auto-split\? not yet implemented"
+         (-> ds transient
+             (dataset/retract! {:where [[:= :eid 1]] :auto-split? true}
+                               {:valid-from 1714521600000000}))))))

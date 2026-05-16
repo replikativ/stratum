@@ -264,7 +264,7 @@
 
   (upsert! [this opts] (upsert! this opts nil))
 
-  (upsert! [this {:keys [where set] :as opts} tx-meta]
+  (upsert! [this {:keys [where set auto-split?] :as opts} tx-meta]
     (when-not edit
       (throw (IllegalStateException. "Cannot mutate persistent dataset. Call transient first.")))
     (let [bt (:bitemporal ds-metadata-field)
@@ -279,33 +279,86 @@
             close-vt-val (or (coerce-temporal-value (:valid-from tx-meta) vt-unit)
                              (now-in-unit vt-unit))
             n (long row-count-val)
-            ;; Pass 1: find matching open rows. Captures their full
-            ;; row-maps for merging into the new appended row(s).
-            close-rows (loop [i 0 acc (transient [])]
-                         (if (>= i n)
-                           (persistent! acc)
-                           (let [row (materialize-row columns-field i)
-                                 open? (= (long (get row vt-col)) Long/MAX_VALUE)
-                                 match? (and open? (eval-pred where row))]
-                             (recur (inc i)
-                                    (if match? (conj! acc [i row]) acc)))))]
-        ;; Pass 2: close each matched row's :valid-to and append a
-        ;; merged new row with the new vt-window.
-        (doseq [[i prev-row] close-rows]
+            ;; Pass 1: classify every matching row. A row is :close-safe
+            ;; iff it's currently open (vt=MAX) AND its vf is strictly
+            ;; before the new write's vf — i.e. closing it to new-vf
+            ;; produces a non-empty, non-backwards window. Anything else
+            ;; that matches the predicate has a vt-window overlapping
+            ;; the new write's [new-vf, MAX) range.
+            ;;
+            ;; SQL:2011 "application-time-period tables" allow either
+            ;; rejecting overlapping writes (the conservative default
+            ;; we ship) or surgically splitting historical rows so the
+            ;; new write slots in (the `:auto-split?` opt-in, staged
+            ;; for a follow-up). Auto-split mirrors XTDB v2's
+            ;; without-overlaps invariant in concept; the precise
+            ;; semantics here are determined by the predicate language
+            ;; and the SCD2 row layout chosen by the dataset config.
+            ;; A matching row falls into one of three classes vs the
+            ;; new write's [new-vf, MAX) window:
+            ;;   :close-safe — open row whose vf < new-vf; we close it
+            ;;                 to new-vf and append a new row.
+            ;;   :no-conflict — closed row entirely in the past
+            ;;                  (row-vt <= new-vf). Ignored.
+            ;;   :overlap     — anything else; can't proceed without
+            ;;                  auto-split.
+            {:keys [close-safe overlaps]}
+            (loop [i 0 acc {:close-safe (transient [])
+                            :overlaps (transient [])}]
+              (if (>= i n)
+                {:close-safe (persistent! (:close-safe acc))
+                 :overlaps   (persistent! (:overlaps acc))}
+                (let [row (materialize-row columns-field i)]
+                  (if (eval-pred where row)
+                    (let [row-vf (long (get row vf-col))
+                          row-vt (long (get row vt-col))
+                          open?  (= row-vt Long/MAX_VALUE)
+                          klass (cond
+                                  (and open? (< row-vf close-vt-val)) :close-safe
+                                  ;; Closed row entirely before new-vf — no overlap
+                                  (and (not open?) (<= row-vt close-vt-val)) :no-conflict
+                                  :else :overlaps)]
+                      (recur (inc i)
+                             (if (= :no-conflict klass)
+                               acc
+                               (update acc klass conj! [i row]))))
+                    (recur (inc i) acc)))))]
+        (when (seq overlaps)
+          (cond
+            auto-split?
+            (throw (ex-info ":auto-split? not yet implemented; reject is the only policy"
+                            {:overlaps (mapv second overlaps)
+                             :new-window [close-vt-val Long/MAX_VALUE]
+                             :hint "split / truncate / drop overlaps manually for now"}))
+
+            :else
+            (throw (ex-info "upsert! would overlap existing rows' vt-windows"
+                            {:where where
+                             :new-window [close-vt-val Long/MAX_VALUE]
+                             :overlaps (mapv (fn [[i r]]
+                                               (assoc (select-keys r [vf-col vt-col]) :row-idx i))
+                                             overlaps)
+                             :hint "pass :auto-split? true to split overlapping rows (Phase C+ — not yet implemented), or restructure the write"}))))
+        ;; Pass 2: close each safe row's :valid-to and append a merged
+        ;; new row with the new vt-window.
+        (doseq [[i prev-row] close-safe]
           (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val)
           (let [merged-row (merge (dissoc prev-row vf-col vt-col
                                           (:from-col system-cfg) (:to-col system-cfg))
                                   set)]
-            ;; Force :valid-from to the close value; append! will fill
-            ;; :_valid_to (defaulting to MAX) and the :system axis.
             (append! this
                      (assoc merged-row vf-col close-vt-val)
                      tx-meta)))
+        ;; If no safe rows matched (entity has no current open version),
+        ;; the upsert degenerates to a plain insert with the user's
+        ;; :set as the row payload. Auto-stamping happens in append!.
+        (when (empty? close-safe)
+          (append! this set (assoc tx-meta :valid-from close-vt-val)))
         this)))
 
   (retract! [this opts] (retract! this opts nil))
 
-  (retract! [this {:keys [where] :as opts} tx-meta]
+  (retract! [this {:keys [where auto-split?] :as opts} tx-meta]
     (when-not edit
       (throw (IllegalStateException. "Cannot mutate persistent dataset. Call transient first.")))
     (let [bt (:bitemporal ds-metadata-field)
@@ -315,18 +368,51 @@
                         {:metadata ds-metadata-field})))
       (when (nil? where)
         (throw (ex-info "retract! requires :where" {:opts opts})))
-      (let [{vt-col :to-col vt-unit :unit} valid-cfg
+      (let [{vf-col :from-col vt-col :to-col vt-unit :unit} valid-cfg
             close-vt-val (or (coerce-temporal-value (:valid-from tx-meta) vt-unit)
                              (now-in-unit vt-unit))
-            n (long row-count-val)]
-        (loop [i 0]
-          (when (< i n)
-            (let [row (materialize-row columns-field i)
-                  open? (= (long (get row vt-col)) Long/MAX_VALUE)
-                  match? (and open? (eval-pred where row))]
-              (when match?
-                (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val)))
-            (recur (inc i))))
+            n (long row-count-val)
+            ;; Same classification as upsert!: a matching row is
+            ;; :close-safe iff currently open AND its vf < retract
+            ;; instant. Closed rows entirely before the retract instant
+            ;; are :no-conflict; everything else overlaps the slice.
+            {:keys [close-safe overlaps]}
+            (loop [i 0 acc {:close-safe (transient [])
+                            :overlaps (transient [])}]
+              (if (>= i n)
+                {:close-safe (persistent! (:close-safe acc))
+                 :overlaps   (persistent! (:overlaps acc))}
+                (let [row (materialize-row columns-field i)]
+                  (if (eval-pred where row)
+                    (let [row-vf (long (get row vf-col))
+                          row-vt (long (get row vt-col))
+                          open?  (= row-vt Long/MAX_VALUE)
+                          klass (cond
+                                  (and open? (< row-vf close-vt-val)) :close-safe
+                                  (and (not open?) (<= row-vt close-vt-val)) :no-conflict
+                                  :else :overlaps)]
+                      (recur (inc i)
+                             (if (= :no-conflict klass)
+                               acc
+                               (update acc klass conj! [i row]))))
+                    (recur (inc i) acc)))))]
+        (when (seq overlaps)
+          (cond
+            auto-split?
+            (throw (ex-info ":auto-split? not yet implemented; reject is the only policy"
+                            {:overlaps (mapv second overlaps)
+                             :retract-at close-vt-val}))
+
+            :else
+            (throw (ex-info "retract! would touch rows whose vt-window doesn't cover the retract instant"
+                            {:where where
+                             :retract-at close-vt-val
+                             :overlaps (mapv (fn [[i r]]
+                                               (assoc (select-keys r [vf-col vt-col]) :row-idx i))
+                                             overlaps)
+                             :hint "pass :auto-split? true (Phase C+ — not yet implemented), or restructure the write"}))))
+        (doseq [[i _row] close-safe]
+          (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
         this)))
 
   ;; ========================================================================

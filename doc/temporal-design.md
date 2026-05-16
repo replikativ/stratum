@@ -144,13 +144,17 @@ A write whose `[vf, vt)` window overlaps an already-closed historical
 window on the same matching rows is a *backdated correction*. There
 are three reasonable behaviors:
 
-1. **Reject** (default). Throw with an error citing the overlapping
-   rows. Caller must split the write themselves or pass `:auto-split?
-   true`.
-2. **Auto-split** (`:auto-split? true`). Split the existing window into
-   the pre-overlap and post-overlap pieces, re-assert each, and insert
-   the new write in the middle. Mirrors XTDB v2's
-   `WITHOUT OVERLAPS` invariant (xtdb2/indexer.clj:106-180).
+1. **Reject** (default, implemented). Throw with an error citing the
+   overlapping rows. Caller must split the write themselves.
+2. **Auto-split** (`:auto-split? true`). Split the existing window
+   into the pre-overlap and post-overlap pieces, re-assert each, and
+   insert the new write in the middle. SQL:2011 "application-time
+   period tables" allow this surgical behavior under the
+   *non-sequenced UPDATE* mode; XTDB v2 implements a similar
+   without-overlaps invariant at write time. **Currently raises
+   `not yet implemented`** — the flag is reserved for the follow-up.
+   The reject path covers the safety invariant; the surgical-split
+   implementation is staged for a later commit.
 3. **Accept** (silent). Not exposed — backdated overlaps that aren't
    handled by the writer become a correctness problem at read time.
 
@@ -160,9 +164,29 @@ rows of audit trail without explicit opt-in). Auto-split is opt-in
 and per-call, not per-dataset, so the policy decision lives at the
 edit site.
 
-Overlap detection runs *before* the write, on the same WHERE-matching
-rowset that `vt-update!` would close. Cost: one extra zone-map-pruned
-scan per write — same as the close step itself.
+Classification of matching rows vs the new write's `[new-vf, MAX)`
+window (implemented in `upsert!` / `retract!`):
+
+- **`:close-safe`** — open row (`vt = MAX`) AND `vf < new-vf`. Closing
+  its `vt` to `new-vf` produces a valid, non-empty window. The SCD2
+  close-and-reopen path applies.
+- **`:no-conflict`** — closed row entirely before the new write
+  (`vt <= new-vf`). Ignored; no overlap.
+- **`:overlaps`** — any other matching row. Reject (default) or
+  auto-split (deferred). Includes:
+    - open row with `vf >= new-vf` (would create a backwards window)
+    - closed row with `vt > new-vf` (the new write would land inside
+      an already-closed historical period)
+
+Cost: one extra full scan over matching rows per write (predicate eval
+in pure Clojure). Future Phase C+ work can push the predicate through
+the planner's zone-map pruner for sublinear scaling.
+
+**`upsert!` degenerate-to-insert.** When no rows match the `:where`
+predicate at all, `upsert!` falls through to a plain `append!` of the
+`:set` payload — matching the spirit of SQL `INSERT … ON CONFLICT
+UPDATE`. The new row's axis columns are auto-stamped just like a
+direct `append!`.
 
 ## SQL surface
 
