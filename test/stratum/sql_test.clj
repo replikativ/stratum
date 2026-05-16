@@ -2520,3 +2520,131 @@
           (is (= 1 n))
           (is (= [2] eids)))
         (finally (server/stop srv))))))
+
+;; ============================================================================
+;; P1-6: extra temporal-literal forms in FOR PORTION OF VALID_TIME
+;; ============================================================================
+
+(deftest preprocess-for-portion-of-current-timestamp
+  (testing "CURRENT_TIMESTAMP / NOW / NOW() recognized as temporal literals"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "DELETE FROM t FOR PORTION OF VALID_TIME FROM CURRENT_TIMESTAMP TO END_OF_TIME WHERE eid = 1")]
+      (is (= "DELETE FROM t WHERE eid = 1" (normalize-ws (:sql r))))
+      (is (= Long/MAX_VALUE (:to (:period r))))
+      ;; NOW falls within a generous window of System/currentTimeMillis * 1000.
+      (is (<= (* 1000 (- (System/currentTimeMillis) 60000))
+              (:from (:period r))
+              (* 1000 (+ (System/currentTimeMillis) 60000)))))))
+
+(deftest preprocess-for-portion-of-now-form
+  (testing "NOW and NOW() also work"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "DELETE FROM t FOR PORTION OF VALID_TIME FROM NOW() TO MAX_VALUE WHERE eid = 1")]
+      (is (= :valid_time (:axis (:period r))))
+      (is (number? (:from (:period r))))
+      (is (= Long/MAX_VALUE (:to (:period r)))))))
+
+(deftest preprocess-for-portion-of-start-of-time
+  (testing "START_OF_TIME / MIN_VALUE expand to Long/MIN_VALUE"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "DELETE FROM t FOR PORTION OF VALID_TIME FROM START_OF_TIME TO '2024-04-01' WHERE eid = 1")]
+      (is (= Long/MIN_VALUE (:from (:period r))))
+      (is (= 1711929600000000 (:to (:period r)))))))
+
+(deftest preprocess-for-portion-of-rejects-column-ref
+  (testing "Column reference is not yet supported (clear error message)"
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo #"Column references and per-row expressions are not yet supported"
+          (stratum.sql.rewrite/preprocess-sql
+            "DELETE FROM t FOR PORTION OF VALID_TIME FROM contract_start TO contract_end WHERE eid = 1")))))
+
+;; ============================================================================
+;; P1-3: Allen interval predicates as SQL functions
+;;
+;; 4-arg function form `(a_from, a_to, b_from, b_to)` works on any
+;; pair of int64 columns, not just the bitemporal axis. PERIOD value
+;; type (P1-4) is deferred — the 4-arg form covers the same use cases.
+;; ============================================================================
+
+;; Allen predicates lower to column-vs-column comparisons in the WHERE
+;; clause, which the DML predicate evaluator (`eval-dml-predicate`)
+;; supports natively. The main SELECT planner doesn't yet evaluate
+;; col-vs-col predicates — that requires extending normalize-pred /
+;; the predicate evaluator across execution.clj + group_by.clj and is
+;; a separate gap (tracked as a P2 follow-up). The tests below exercise
+;; the DML code path which is where Allen predicates have immediate value
+;; (DELETE/UPDATE on bitemporal tables).
+
+(defn- allen-delete-survivors
+  "Helper: build an index-backed table, run a DELETE WHERE <allen-pred>,
+   return the surviving :eid values."
+  [cols-map sql]
+  (let [srv (server/start {:port 0})]
+    (try
+      (let [idx-cols (into {} (map (fn [[k v]] [k (stratum.index/index-from-seq :int64 (vec v))])
+                                   cols-map))]
+        (server/register-table! srv "intervals" idx-cols))
+      (let [exec @(resolve 'stratum.server/execute-sql)]
+        (exec sql (:registry srv) (:data-dir srv)))
+      (let [cols (get @(:registry srv) "intervals")
+            n (stratum.index/idx-length (:index (:eid cols)))]
+        (mapv #(stratum.index/idx-get-long (:index (:eid cols)) %) (range n)))
+      (finally (server/stop srv)))))
+
+(deftest sql-overlaps-allen-predicate-via-delete
+  (testing "OVERLAPS(a_from, a_to, b_from, b_to) — DELETE removes overlapping rows"
+    (let [survivors (allen-delete-survivors
+                      {:eid    [1 2 3]
+                       :a_from [100 200 300]
+                       :a_to   [200 300 400]
+                       :b_from [150 350 250]
+                       :b_to   [250 450 350]}
+                      "DELETE FROM intervals WHERE OVERLAPS(a_from, a_to, b_from, b_to)")]
+      ;; Row 1 overlaps (deleted). Row 2 doesn't (kept). Row 3 overlaps (deleted).
+      (is (= [2] survivors)))))
+
+(deftest sql-precedes-allen-predicate-via-delete
+  (testing "PRECEDES(a_from, a_to, b_from, b_to) — DELETE removes preceding rows"
+    (let [survivors (allen-delete-survivors
+                      {:eid    [1 2]
+                       :a_from [100 100]
+                       :a_to   [200 200]
+                       :b_from [200 250]
+                       :b_to   [300 350]}
+                      "DELETE FROM intervals WHERE PRECEDES(a_from, a_to, b_from, b_to)")]
+      ;; Both precede (touching counts), both deleted.
+      (is (= [] survivors)))))
+
+(deftest sql-strictly-precedes-no-touching-via-delete
+  (testing "STRICTLY_PRECEDES rejects touching boundaries"
+    (let [survivors (allen-delete-survivors
+                      {:eid    [1 2]
+                       :a_from [100 100]
+                       :a_to   [200 200]
+                       :b_from [200 250]
+                       :b_to   [300 350]}
+                      "DELETE FROM intervals WHERE STRICTLY_PRECEDES(a_from, a_to, b_from, b_to)")]
+      ;; Row 1: a_to=b_from=200 — touching → not strictly preceding → KEEP.
+      ;; Row 2: a_to=200 < b_from=250 → strictly precedes → DELETE.
+      (is (= [1] survivors)))))
+
+(deftest sql-contains-period-allen-predicate-via-delete
+  (testing "CONTAINS_PERIOD: DELETE rows where A contains B"
+    (let [survivors (allen-delete-survivors
+                      {:eid    [1 2]
+                       :a_from [100 100]
+                       :a_to   [500 200]
+                       :b_from [200 150]
+                       :b_to   [400 250]}
+                      "DELETE FROM intervals WHERE CONTAINS_PERIOD(a_from, a_to, b_from, b_to)")]
+      ;; Row 1 contains (deleted). Row 2 doesn't (kept).
+      (is (= [2] survivors)))))
+
+(deftest sql-allen-bad-arity-throws
+  (testing "Allen predicates require exactly 4 args"
+    (let [reg {"intervals" {:eid (long-array [1])
+                            :a (long-array [1])
+                            :b (long-array [1])}}
+          parsed (sql/parse-sql
+                   "DELETE FROM intervals WHERE OVERLAPS(a, b)" reg)]
+      (is (re-find #"requires 4 args" (or (:error parsed) ""))))))

@@ -225,21 +225,49 @@
 ;; ============================================================================
 
 (defn- parse-temporal-literal
-  "Parse a stratum-temporal literal expression into a `long` in `:micros`.
-   Accepts (case-insensitive prefix optional):
+  "Parse a stratum-temporal *constant-foldable expression* into a
+   `long` in `:micros`. Accepts (case-insensitive):
+
      'YYYY-MM-DD'                — start-of-day UTC
      DATE 'YYYY-MM-DD'           — same
      TIMESTAMP 'YYYY-MM-DD...'   — full ISO instant
      <number>                    — passthrough (already in :micros)
+     CURRENT_TIMESTAMP / NOW / NOW()  — System/currentTimeMillis × 1000
+     END_OF_TIME / MAX_VALUE     — `Long/MAX_VALUE`
+     START_OF_TIME / MIN_VALUE   — `Long/MIN_VALUE`
+
+   Per-row column references and arbitrary expressions are not
+   supported here — the preprocessor needs a single scalar at
+   parse time to attach to the DDL `:period`. Column-ref periods
+   (`FOR PORTION OF VALID_TIME FROM contract_start TO contract_end`)
+   would require per-row period evaluation, deferred to a future
+   commit. For now, callers that need a column-derived period must
+   compute it in application code and pass a literal.
+
    Throws ex-info on unparseable input."
   [^String s]
   (let [trimmed (.trim s)]
     (cond
       (re-matches #"-?\d+" trimmed) (Long/parseLong trimmed)
 
+      (re-matches #"(?i)CURRENT_TIMESTAMP|NOW(?:\s*\(\s*\))?" trimmed)
+      (* 1000 (System/currentTimeMillis))
+
+      (re-matches #"(?i)END_OF_TIME|MAX_VALUE" trimmed)
+      Long/MAX_VALUE
+
+      (re-matches #"(?i)START_OF_TIME|MIN_VALUE" trimmed)
+      Long/MIN_VALUE
+
       :else
       (let [body (or (second (re-find #"(?is)^(?:DATE|TIMESTAMP)?\s*'([^']+)'$" trimmed))
-                     (throw (ex-info "Unparseable temporal literal in FOR PORTION OF VALID_TIME"
+                     (throw (ex-info (str "Unparseable temporal literal in FOR PORTION OF "
+                                          "VALID_TIME — only string literals (`'YYYY-MM-DD'`, "
+                                          "`DATE`/`TIMESTAMP` prefixes), numeric micros, and "
+                                          "the constants CURRENT_TIMESTAMP / NOW / "
+                                          "END_OF_TIME / START_OF_TIME are recognized. Column "
+                                          "references and per-row expressions are not yet "
+                                          "supported.")
                                      {:input s})))]
         (cond
           (re-matches #"\d{4}-\d{2}-\d{2}" body)
