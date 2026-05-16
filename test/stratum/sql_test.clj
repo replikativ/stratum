@@ -2403,6 +2403,202 @@
               (is (= 1719792000000000 (:vt r))))))
         (finally (server/stop srv))))))
 
+(deftest sql-update-for-portion-of-valid-time-with-system-axis
+  ;; SCD2-on-both-axes: when the table is registered with BOTH a
+  ;; `:valid` and a `:system` axis, an `UPDATE FOR PORTION OF
+  ;; VALID_TIME` must close the superseded row's `_system_to` AND
+  ;; stamp every replacement slice's `_system_from` with the SAME
+  ;; `sys-now`. The lowering helper used to drop the `:system` axis
+  ;; from the ad-hoc dataset's metadata, so the SCD2 surgery silently
+  ;; demoted to the valid-only path and `_system_to` was never closed.
+  ;; This test exercises the full bitemporal lowering path.
+  (testing "UPDATE … FOR PORTION OF VALID_TIME preserves system-axis SCD2 on a fully-bitemporal table"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "salaries"
+          (with-meta
+            ;; Single row [Jan, Jul) valid-time, _system_from=tx1,
+            ;; _system_to=MAX. Salary=100.
+            {:eid          (stratum.index/index-from-seq :int64 [1])
+             :salary       (stratum.index/index-from-seq :int64 [100])
+             :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000])
+             :_valid_to    (stratum.index/index-from-seq :int64 [1719792000000000])
+             :_system_from (stratum.index/index-from-seq :int64 [1000000])
+             :_system_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])}
+            {:bitemporal
+             {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+              :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+        ;; UPDATE FOR PORTION OF [Apr, May): straddles → 3-way split.
+        ;; The bitemporal path preserves the OLD row (with closed _system_to)
+        ;; plus appends three replacement slices, all sharing one sys-now.
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec (str "UPDATE salaries SET salary = 999 "
+                         "FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-05-01' "
+                         "WHERE eid = 1")
+                    (:registry srv) (:data-dir srv))]
+          (is (re-find #"^UPDATE" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                        (:index (get cols k)) %)
+                                     (range n)))
+              rows (mapv (fn [i]
+                           {:eid    (nth (read-col :eid) i)
+                            :salary (nth (read-col :salary) i)
+                            :vf     (nth (read-col :_valid_from) i)
+                            :vt     (nth (read-col :_valid_to) i)
+                            :sf     (nth (read-col :_system_from) i)
+                            :st     (nth (read-col :_system_to) i)})
+                         (range n))]
+          ;; 1 old (closed) + 3 new (open _system_to) = 4 rows
+          (is (= 4 n)
+              (str "expected 4 rows (1 closed old + 3 new), got " n ": " rows))
+          (let [closed (filter #(not= Long/MAX_VALUE (:st %)) rows)
+                open   (filter #(= Long/MAX_VALUE (:st %)) rows)]
+            (testing "old [Jan, Jul) row preserved with _system_to closed (SCD2)"
+              (is (= 1 (count closed)))
+              (let [r (first closed)]
+                (is (= 1704067200000000 (:vf r)))
+                (is (= 1719792000000000 (:vt r)))
+                (is (= 100 (:salary r)))
+                (is (= 1000000 (:sf r)))
+                (is (not= Long/MAX_VALUE (:st r))
+                    "old row's _system_to must be closed, not MAX")))
+            (testing "three replacement slices, all with the SAME _system_from (sys-now symmetry)"
+              (is (= 3 (count open)))
+              (let [sys-nows (set (map :sf open))]
+                (is (= 1 (count sys-nows))
+                    (str "all replacement slices must share one sys-now stamp, got: " sys-nows))
+                (let [sys-now (first sys-nows)
+                      old-st  (:st (first closed))]
+                  (is (= sys-now old-st)
+                      "old row's _system_to must equal the replacement slices' _system_from")))
+              (let [by-vf (group-by :vf open)]
+                ;; [Jan, Apr) salary=100
+                (let [r (first (by-vf 1704067200000000))]
+                  (is (some? r))
+                  (is (= 100 (:salary r)))
+                  (is (= 1711929600000000 (:vt r))))
+                ;; [Apr, May) salary=999 — the updated slice
+                (let [r (first (by-vf 1711929600000000))]
+                  (is (some? r))
+                  (is (= 999 (:salary r)))
+                  (is (= 1714521600000000 (:vt r))))
+                ;; [May, Jul) salary=100
+                (let [r (first (by-vf 1714521600000000))]
+                  (is (some? r))
+                  (is (= 100 (:salary r)))
+                  (is (= 1719792000000000 (:vt r))))))))
+        (finally (server/stop srv))))))
+
+(deftest sql-delete-for-portion-of-valid-time-with-system-axis
+  ;; DELETE FOR PORTION OF on a fully-bitemporal table must close
+  ;; (not erase) the superseded row's `_system_to` AND keep the row
+  ;; in storage so `FOR SYSTEM_TIME AS OF <past>` queries still see
+  ;; it. The valid-only path used to be the silent fallback (rows
+  ;; physically dropped, audit lost).
+  (testing "DELETE … FOR PORTION OF VALID_TIME preserves system-axis SCD2"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "salaries"
+          (with-meta
+            {:eid          (stratum.index/index-from-seq :int64 [1])
+             :salary       (stratum.index/index-from-seq :int64 [100])
+             :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000])
+             :_valid_to    (stratum.index/index-from-seq :int64 [1719792000000000])
+             :_system_from (stratum.index/index-from-seq :int64 [1000000])
+             :_system_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])}
+            {:bitemporal
+             {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+              :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+        ;; DELETE FOR PORTION OF [Apr, May): row [Jan, Jul) splits.
+        ;; Result: 1 closed-old + 2 surviving slices ([Jan, Apr), [May, Jul)).
+        (let [exec @(resolve 'stratum.server/execute-sql)]
+          (exec (str "DELETE FROM salaries "
+                     "FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-05-01' "
+                     "WHERE eid = 1")
+                (:registry srv) (:data-dir srv)))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                        (:index (get cols k)) %)
+                                     (range n)))
+              rows (mapv (fn [i]
+                           {:eid    (nth (read-col :eid) i)
+                            :salary (nth (read-col :salary) i)
+                            :vf     (nth (read-col :_valid_from) i)
+                            :vt     (nth (read-col :_valid_to) i)
+                            :sf     (nth (read-col :_system_from) i)
+                            :st     (nth (read-col :_system_to) i)})
+                         (range n))
+              closed (filter #(not= Long/MAX_VALUE (:st %)) rows)
+              open   (filter #(= Long/MAX_VALUE (:st %)) rows)]
+          (is (= 3 n) (str "1 closed old + 2 surviving slices, got: " rows))
+          (testing "old [Jan, Jul) preserved with _system_to closed"
+            (is (= 1 (count closed)))
+            (is (= 1000000 (:sf (first closed))))
+            (is (not= Long/MAX_VALUE (:st (first closed)))))
+          (testing "two surviving slices ([Jan, Apr), [May, Jul)), one sys-now"
+            (is (= 2 (count open)))
+            (let [sys-nows (set (map :sf open))]
+              (is (= 1 (count sys-nows)))
+              (is (= (:st (first closed)) (first sys-nows))
+                  "old _system_to equals replacements' _system_from"))
+            (let [vfs (set (map :vf open))]
+              (is (= #{1704067200000000 1714521600000000} vfs)))))
+        (finally (server/stop srv))))))
+
+(deftest sql-insert-for-portion-of-valid-time-with-system-axis
+  ;; INSERT FOR PORTION OF on a fully-bitemporal table must stamp the
+  ;; new row's _system_from with a fresh sys-now (not Long/MAX_VALUE,
+  ;; not the unit-default of "now-in-unit at append time" — explicitly,
+  ;; the same sys-now that any concurrent surgery in the same physical
+  ;; tx would use). This test asserts the inserted row has a real
+  ;; sys-from (non-MAX) and _system_to=MAX.
+  (testing "INSERT … FOR PORTION OF VALID_TIME stamps _system_from on a fully-bitemporal table"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "salaries"
+          (with-meta
+            ;; Start empty.
+            {:eid          (stratum.index/index-from-seq :int64 [])
+             :salary       (stratum.index/index-from-seq :int64 [])
+             :_valid_from  (stratum.index/index-from-seq :int64 [])
+             :_valid_to    (stratum.index/index-from-seq :int64 [])
+             :_system_from (stratum.index/index-from-seq :int64 [])
+             :_system_to   (stratum.index/index-from-seq :int64 [])}
+            {:bitemporal
+             {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+              :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)]
+          (exec (str "INSERT INTO salaries (eid, salary) "
+                     "VALUES (1, 100) "
+                     "FOR PORTION OF VALID_TIME FROM '2024-01-01' TO '2024-07-01'")
+                (:registry srv) (:data-dir srv)))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                        (:index (get cols k)) %)
+                                     (range n)))
+              rows (mapv (fn [i] {:vf (nth (read-col :_valid_from) i)
+                                  :vt (nth (read-col :_valid_to) i)
+                                  :sf (nth (read-col :_system_from) i)
+                                  :st (nth (read-col :_system_to) i)})
+                         (range n))]
+          (is (= 1 n))
+          (let [{:keys [vf vt sf st]} (first rows)]
+            (is (= 1704067200000000 vf))
+            (is (= 1719792000000000 vt))
+            (is (and (pos? sf) (not= Long/MAX_VALUE sf))
+                "_system_from must be a real sys-now stamp, not 0 or MAX")
+            (is (= Long/MAX_VALUE st)
+                "_system_to must be MAX (open) for a fresh insertion")))
+        (finally (server/stop srv))))))
+
 (deftest sql-upsert-for-portion-of-valid-time-rejected
   (testing "INSERT … ON CONFLICT … FOR PORTION OF VALID_TIME throws a clear error"
     (let [srv (server/start {:port 0})]

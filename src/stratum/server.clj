@@ -59,14 +59,21 @@
 ;; ============================================================================
 
 (defn- encode-table-columns
-  "Pre-encode table columns: auto-detect types and dict-encode String[] columns."
+  "Pre-encode table columns: auto-detect types and dict-encode String[]
+   columns. **Preserves the column-map's metadata** — callers register
+   bitemporal tables via `(with-meta {...} {:bitemporal {...}})` and
+   the metadata is the canonical source of truth for axis configuration
+   read by `bitemporal-valid-cfg` / `bitemporal-ds-meta`. Dropping it
+   here would silently demote any SQL DML on the table to the
+   valid-only or columns-inferred path."
   [columns]
-  (into {}
-        (map (fn [[col-name col-data]]
-               (let [k (if (keyword? col-name) col-name (keyword col-name))
-                     encoded (q/encode-column col-data)]
-                 [k encoded])))
-        columns))
+  (cond-> (into {}
+                (map (fn [[col-name col-data]]
+                       (let [k (if (keyword? col-name) col-name (keyword col-name))
+                             encoded (q/encode-column col-data)]
+                         [k encoded])))
+                columns)
+    (meta columns) (with-meta (meta columns))))
 
 ;; ----------------------------------------------------------------------------
 ;; Row-level helpers — uniform across raw-array tables (CREATE TABLE) and
@@ -223,17 +230,45 @@
             new-cols (if meta (with-meta new-cols meta) new-cols)]
         {:new-cols new-cols :n-deleted (count delete-idxs)}))))
 
+(defn- bitemporal-axis-cfg
+  "Infer one axis (`:valid` or `:system`) of a bitemporal config from
+   a table-registry column map. Prefers metadata (`:bitemporal {axis-kw
+   {...}}`); falls back to the SQL:2011 convention column names
+   (`_valid_from`/`_valid_to`, `_system_from`/`_system_to`). Returns
+   `nil` when neither source yields the axis."
+  [existing meta axis-kw]
+  (let [bt-meta (:bitemporal meta)
+        [from-col to-col] (case axis-kw
+                            :valid  [:_valid_from  :_valid_to]
+                            :system [:_system_from :_system_to])]
+    (or (get bt-meta axis-kw)
+        (when (and (contains? existing from-col)
+                   (contains? existing to-col))
+          {:from-col from-col :to-col to-col :unit :micros}))))
+
 (defn- bitemporal-valid-cfg
-  "Infer the `:valid` axis config for a table-registry column map.
-   Prefers metadata (`:bitemporal {:valid {...}}` on the column map),
-   falls back to the SQL:2011 convention column names. Returns nil if
-   neither is discoverable."
+  "Convenience: infer just the `:valid` axis for a table. Same
+   precedence rule as `bitemporal-axis-cfg`."
   [existing meta]
-  (let [bt-meta (:bitemporal meta)]
-    (or (:valid bt-meta)
-        (when (and (contains? existing :_valid_from)
-                   (contains? existing :_valid_to))
-          {:from-col :_valid_from :to-col :_valid_to :unit :micros}))))
+  (bitemporal-axis-cfg existing meta :valid))
+
+(defn- bitemporal-ds-meta
+  "Build the dataset-level `:bitemporal` metadata used to construct an
+   ad-hoc dataset from a table-registry column map for SQL DML
+   lowering. **Preserves the `:system` axis** — either from metadata
+   or from the SQL:2011 column-name convention — so the SCD2-on-both-
+   axes surgery in `dataset/upsert!` / `retract!` /
+   `bounded-update!` fires.
+
+   `valid` is the inferred valid-axis config (typically from
+   `bitemporal-valid-cfg`); it overrides any `:valid` in the table's
+   existing bitemporal metadata. The `:system` axis is inferred via
+   `bitemporal-axis-cfg`."
+  [existing meta valid]
+  (let [bt   (or (:bitemporal meta) {})
+        sys  (bitemporal-axis-cfg existing meta :system)]
+    {:bitemporal (cond-> (assoc bt :valid valid)
+                   sys (assoc :system sys))}))
 
 (defn- insert-portion-via-index-backend
   "Apply a SQL:2011 `INSERT … FOR PORTION OF VALID_TIME FROM x TO y`
@@ -256,7 +291,7 @@
                                  "column list: `INSERT INTO t (col1, col2) VALUES (...)` — "
                                  "the period fills in " (:from-col valid) " / " (:to-col valid))
                             {:table table})))
-        ds-meta (merge (or (:bitemporal meta) {}) {:bitemporal {:valid valid}})
+        ds-meta (bitemporal-ds-meta existing meta valid)
         ds (dataset/make-dataset existing {:name table :metadata ds-meta})
         mutated (reduce (fn [tds row-vals]
                           (let [row-map (zipmap col-list row-vals)]
@@ -289,7 +324,7 @@
                           (assoc m col expr))
                         {}
                         assignments)
-        ds-meta (merge (or (:bitemporal meta) {}) {:bitemporal {:valid valid}})
+        ds-meta (bitemporal-ds-meta existing meta valid)
         ds (dataset/make-dataset existing {:name table :metadata ds-meta})
         mutated (-> ds
                     transient
@@ -317,14 +352,7 @@
    discoverable."
   [^String table existing where period meta]
   (let [{vf-val :from vt-val :to} period
-        ;; Try to read bitemporal config from the table-meta first
-        ;; (set by the user at register time). Otherwise fall back to
-        ;; the SQL:2011 convention column names.
-        bt-meta (:bitemporal meta)
-        valid (or (:valid bt-meta)
-                  (when (and (contains? existing :_valid_from)
-                             (contains? existing :_valid_to))
-                    {:from-col :_valid_from :to-col :_valid_to :unit :micros}))
+        valid (bitemporal-valid-cfg existing meta)
         _ (when-not valid
             (throw (ex-info (str "DELETE FOR PORTION OF VALID_TIME requires a "
                                  ":valid axis on the table — either set "
@@ -332,7 +360,7 @@
                                  "metadata, or use _valid_from / _valid_to columns")
                             {:table table
                              :existing-cols (vec (keys existing))})))
-        ds-meta (merge (or bt-meta {}) {:bitemporal {:valid valid}})
+        ds-meta (bitemporal-ds-meta existing meta valid)
         before-count (col-row-count (val (first existing)))
         ds (dataset/make-dataset existing {:name table :metadata ds-meta})
         mutated (-> ds
