@@ -18,10 +18,10 @@
 
 (set! *warn-on-reflection* true)
 
-;; Forward declaration: preprocess-sql calls this, but the implementation
-;; (and its helpers parse-temporal-literal / find-balanced-end) live further
-;; down to keep the ASOF preprocessor near the top of the file.
-(declare preprocess-for-portion-of-valid-time)
+;; Forward declarations: preprocess-sql calls these, but the
+;; implementations live further down the file.
+(declare preprocess-for-portion-of-valid-time
+         preprocess-select-temporal)
 
 ;; ============================================================================
 ;; Low-level scanner — skips strings, comments, identifiers correctly
@@ -131,7 +131,17 @@
    Joins inside subqueries (paren-depth > 0) are not counted at the top level
    and are not eligible for ASOF rewriting in this pass."
   [^String sql]
-  (let [{:keys [sql period]} (preprocess-for-portion-of-valid-time sql)
+  (let [;; Dispatch FOR-VALID_TIME handling on statement type: DML
+        ;; statements (DELETE / UPDATE / INSERT) emit a `:period`
+        ;; side channel; SELECT statements get the clause rewritten
+        ;; into WHERE predicates inline. Otherwise the FOR ALL form
+        ;; would be claimed by both preprocessors.
+        [_ leading] (read-word sql (long (skip-ws-and-comments sql 0)))
+        select-stmt? (= "select" leading)
+        sql (if select-stmt? (preprocess-select-temporal sql) sql)
+        {:keys [sql period]} (if select-stmt?
+                               {:sql sql :period nil}
+                               (preprocess-for-portion-of-valid-time sql))
         ^String sql sql
         n (.length sql)
         sb (StringBuilder. n)
@@ -384,3 +394,248 @@
          :period {:axis (keyword (.toLowerCase ^String axis))
                   :from vf-val
                   :to vt-val}})))))
+
+;; ============================================================================
+;; Public: SQL:2011 SELECT-side `FOR VALID_TIME (AS OF | BETWEEN |
+;; FROM…TO | ALL)` preprocessor.
+;;
+;; Rewrites `… FROM t [alias?] FOR VALID_TIME <spec> …` by stripping
+;; the temporal clause and injecting an equivalent WHERE predicate
+;; over the table's `_valid_from` / `_valid_to` columns. The
+;; convention is the SQL:2011 + XTDB v2 column naming; tables that
+;; use custom axis column names (via `:bitemporal {:valid {:from-col
+;; …}}`) need to expose them under those names for the SELECT
+;; surface (or use a view).
+;;
+;; Supported specs (matching XTDB v2 `Sql.g4:578-593`):
+;;   FOR VALID_TIME AS OF <expr>
+;;   FOR VALID_TIME BETWEEN <expr> AND <expr>
+;;   FOR VALID_TIME FROM <expr> TO <expr>
+;;   FOR (ALL VALID_TIME | VALID_TIME ALL)
+;;
+;; Multi-table support: each table-ref can carry its own temporal
+;; spec; predicates are qualified with the table-name (or alias if
+;; the user provided one). Joins work as long as each FOR
+;; VALID_TIME follows its table reference.
+;; ============================================================================
+
+(def ^:private select-temporal-tail-keywords
+  "Keywords that terminate a SELECT-side `FOR VALID_TIME` clause walk."
+  #{"where" "group" "order" "limit" "offset" "having" "union" "intersect"
+    "except" "join" "inner" "left" "right" "full" "outer" "cross" "on"
+    "for"})
+
+(defn- parse-select-temporal-spec
+  "Walk forward from `start` past a `FOR VALID_TIME` keyword pair and
+   parse the spec. Returns `[new-pos spec]` where `spec` is one of:
+     {:kind :as-of  :at v}
+     {:kind :between :from a :to b}
+     {:kind :from-to :from a :to b}
+     {:kind :all}
+   or `nil` if no recognized spec follows."
+  [^String sql ^long start]
+  (let [[wend* w1] (next-keyword sql start)
+        wend (long wend*)]
+    (cond
+      (= "as" w1)
+      (let [[w2end* w2] (next-keyword sql wend)]
+        (when (= "of" w2)
+          (let [w2end (long w2end*)
+                expr-end (long (find-balanced-end sql w2end
+                                                  select-temporal-tail-keywords))
+                expr (subs sql w2end expr-end)]
+            [expr-end {:kind :as-of :at (parse-temporal-literal expr)}])))
+
+      (= "between" w1)
+      (let [from-end (long (find-balanced-end sql wend #{"and"}))
+            from-expr (subs sql wend from-end)
+            [after-and* _] (next-keyword sql from-end)
+            after-and (long after-and*)
+            to-end (long (find-balanced-end sql after-and
+                                            select-temporal-tail-keywords))
+            to-expr (subs sql after-and to-end)]
+        [to-end {:kind :between
+                 :from (parse-temporal-literal from-expr)
+                 :to   (parse-temporal-literal to-expr)}])
+
+      (= "from" w1)
+      (let [from-end (long (find-balanced-end sql wend #{"to"}))
+            from-expr (subs sql wend from-end)
+            [after-to* _] (next-keyword sql from-end)
+            after-to (long after-to*)
+            to-end (long (find-balanced-end sql after-to
+                                            select-temporal-tail-keywords))
+            to-expr (subs sql after-to to-end)]
+        [to-end {:kind :from-to
+                 :from (parse-temporal-literal from-expr)
+                 :to   (parse-temporal-literal to-expr)}])
+
+      :else nil)))
+
+(defn- spec->predicate-sql
+  "Build the WHERE-clause SQL fragment for a temporal spec.
+   Uses the SQL:2011 convention `_valid_from` / `_valid_to`.
+   Currently emits unqualified column names — multi-table SELECT
+   with per-table FOR VALID_TIME on bitemporal joins would need
+   qualified refs (and stratum's planner to recognize them); for
+   the single-table MVP this works cleanly.
+
+   `qualifier` is currently unused but kept in the signature for
+   the eventual multi-table extension.
+
+   The half-open inclusion test is `vf <= at AND vt > at` for
+   AS OF, and the half-open range overlap is `vf <= to AND vt >
+   from` for BETWEEN / FROM-TO. Returns nil for `:all` (no filter)."
+  [_qualifier {:keys [kind at from to]}]
+  (case kind
+    :all     nil
+    :as-of   (str "_valid_from <= " at " AND _valid_to > " at)
+    :between (str "_valid_from <= " to " AND _valid_to > " from)
+    :from-to (str "_valid_from <= " to " AND _valid_to > " from)))
+
+(defn- find-for-valid-time-clause
+  "Scan `sql` for the next `FOR VALID_TIME <spec>` or `FOR ALL
+   VALID_TIME` / `FOR VALID_TIME ALL` clause. Returns `[start end
+   spec]` for the next such clause, or nil. `start` is the position
+   of the `FOR` keyword; `end` is just past the spec."
+  [^String sql]
+  (let [n (.length sql)]
+    (loop [i 0]
+      (cond
+        (>= i n) nil
+
+        (= \' (.charAt sql i)) (recur (long (skip-string sql i \')))
+        (= \" (.charAt sql i)) (recur (long (skip-string sql i \")))
+
+        (and (or (Character/isLetter (.charAt sql i)) (= \_ (.charAt sql i)))
+             ;; Lower-case `for` at any letter boundary.
+             (or (zero? i)
+                 (not (word-char? (.charAt sql (dec i))))))
+        (let [[wend* w] (read-word sql i)
+              wend (long wend*)]
+          (if (= "for" w)
+            (let [[k1end* k1] (next-keyword sql wend)
+                  k1end (long k1end*)]
+              (cond
+                ;; `FOR VALID_TIME …`
+                (= "valid_time" k1)
+                (let [[k2end* k2] (next-keyword sql k1end)]
+                  (cond
+                    ;; `FOR VALID_TIME ALL`
+                    (= "all" k2)
+                    [i (long k2end*) {:kind :all}]
+                    :else
+                    (if-let [[spec-end spec] (parse-select-temporal-spec sql k1end)]
+                      [i (long spec-end) spec]
+                      (recur wend))))
+                ;; `FOR ALL VALID_TIME`
+                (= "all" k1)
+                (let [[k2end* k2] (next-keyword sql k1end)]
+                  (if (= "valid_time" k2)
+                    [i (long k2end*) {:kind :all}]
+                    (recur wend)))
+                ;; Other FOR keywords (FOR PORTION OF / FOR SYSTEM_TIME) —
+                ;; not our concern; skip past `for` only.
+                :else (recur wend)))
+            (recur wend)))
+
+        :else (recur (inc i))))))
+
+(defn- table-qualifier-before
+  "Walk backwards from `for-pos` to find the table name (or alias)
+   that the `FOR VALID_TIME` clause attaches to. Returns the
+   qualifier string, or nil if not discoverable. Pattern: the
+   immediately-preceding identifier is the table-or-alias; if the
+   one before that is also an identifier (no comma/keyword in
+   between) and the closer one isn't a SQL keyword, the closer
+   one is the alias.
+
+   Simple heuristic — good for `FROM t FOR VALID_TIME …` and
+   `FROM t alias FOR VALID_TIME …` but stops short of fully
+   parsing arbitrary FROM expressions."
+  [^String sql ^long for-pos]
+  (let [;; Find the identifier immediately before for-pos.
+        end (long (loop [j (dec for-pos)]
+                    (cond
+                      (neg? j) 0
+                      (Character/isWhitespace (.charAt sql j)) (recur (dec j))
+                      :else (inc j))))
+        start (long (loop [j (dec end)]
+                      (cond
+                        (neg? j) 0
+                        (word-char? (.charAt sql j)) (recur (dec j))
+                        :else (inc j))))]
+    (when (and (> end start) (Character/isLetter (.charAt sql start)))
+      (subs sql start end))))
+
+(defn- inject-where-predicates
+  "Splice `predicates` (a vector of SQL strings) into `sql`'s WHERE
+   clause. Creates a WHERE if one isn't present (inserted before
+   GROUP BY / ORDER BY / LIMIT / etc.). If WHERE exists, ANDs the
+   new predicates onto the front of its expression."
+  [^String sql predicates]
+  (if (empty? predicates)
+    sql
+    (let [n (.length sql)
+          where-keywords #{"group" "order" "limit" "offset" "having"
+                           "union" "intersect" "except"}
+          ;; Find WHERE keyword position, if any.
+          where-pos
+          (loop [i 0]
+            (cond
+              (>= i n) -1
+              (= \' (.charAt sql i)) (recur (long (skip-string sql i \')))
+              (= \" (.charAt sql i)) (recur (long (skip-string sql i \")))
+              (and (or (Character/isLetter (.charAt sql i)) (= \_ (.charAt sql i)))
+                   (or (zero? i)
+                       (not (word-char? (.charAt sql (dec i))))))
+              (let [[wend* w] (read-word sql i)]
+                (if (= "where" w)
+                  i
+                  (recur (long wend*))))
+              :else (recur (inc i))))
+          ;; Find a "stop" keyword position (GROUP/ORDER/...) for
+          ;; locating where to insert WHERE when none exists.
+          stop-pos
+          (loop [i 0]
+            (cond
+              (>= i n) n
+              (= \' (.charAt sql i)) (recur (long (skip-string sql i \')))
+              (= \" (.charAt sql i)) (recur (long (skip-string sql i \")))
+              (and (or (Character/isLetter (.charAt sql i)) (= \_ (.charAt sql i)))
+                   (or (zero? i)
+                       (not (word-char? (.charAt sql (dec i))))))
+              (let [[wend* w] (read-word sql i)]
+                (if (contains? where-keywords w)
+                  i
+                  (recur (long wend*))))
+              :else (recur (inc i))))
+          pred-str (clojure.string/join " AND " predicates)]
+      (if (neg? where-pos)
+        ;; No WHERE — insert one before the stop position (or at end).
+        (str (subs sql 0 stop-pos)
+             " WHERE " pred-str " "
+             (subs sql stop-pos))
+        ;; WHERE exists — splice " (preds) AND " right after the keyword.
+        (let [[after-where-kw* _] (read-word sql where-pos)
+              after-where (long after-where-kw*)]
+          (str (subs sql 0 after-where) " (" pred-str ") AND"
+               (subs sql after-where)))))))
+
+(defn preprocess-select-temporal
+  "Rewrite SELECT-side `FOR VALID_TIME <spec>` clauses into
+   equivalent WHERE predicates. Returns the rewritten SQL string.
+   Multiple `FOR VALID_TIME` clauses (one per table-ref in a join)
+   are collected and ANDed into the WHERE clause.
+
+   See module docstring above for the supported specs."
+  [^String sql]
+  (loop [sql sql, preds []]
+    (if-let [[start end spec] (find-for-valid-time-clause sql)]
+      (let [qualifier (table-qualifier-before sql start)
+            new-pred (when qualifier (spec->predicate-sql qualifier spec))
+            ;; Strip the FOR VALID_TIME clause from start..end.
+            stripped (str (subs sql 0 start) (subs sql end))]
+        (recur stripped
+               (if new-pred (conj preds new-pred) preds)))
+      (inject-where-predicates sql preds))))

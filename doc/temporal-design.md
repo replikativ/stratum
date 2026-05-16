@@ -283,6 +283,61 @@ Plain `DELETE WHERE` / `INSERT VALUES` / `UPDATE WHERE` (without
 `FOR PORTION OF`) on an index-backed table also route through
 `ds-delete-rows!` / `append!` / array-rebuild appropriately.
 
+### SELECT-side temporal grammar
+
+`SELECT … FROM t FOR VALID_TIME (AS OF x | BETWEEN x AND y |
+FROM x TO y | ALL)` is rewritten by the same preprocessor into
+equivalent `WHERE` predicates over the table's `_valid_from` /
+`_valid_to` columns. Convention is SQL:2011 + XTDB v2 default
+naming; tables that opt into a custom axis via `:bitemporal
+{:valid {:from-col …}}` would need a view to expose the canonical
+names for SELECT-side use (or extend the preprocessor to consult
+the registry — deferred).
+
+```sql
+-- point-in-vt
+SELECT salary FROM salaries
+  FOR VALID_TIME AS OF '2024-04-01'
+  WHERE eid = 1;
+
+-- range overlap
+SELECT eid, salary FROM salaries
+  FOR VALID_TIME BETWEEN '2024-01-01' AND '2024-07-01';
+
+-- explicit half-open
+SELECT eid, salary FROM salaries
+  FOR VALID_TIME FROM '2024-01-01' TO '2024-07-01';
+
+-- no temporal filter (full vt-history)
+SELECT eid, salary FROM salaries FOR ALL VALID_TIME;
+```
+
+The rewriter strips the clause and injects the equivalent
+predicate into `WHERE`. Multi-table joins each carrying their own
+`FOR VALID_TIME` work as well — predicates are accumulated and
+ANDed onto the WHERE clause.
+
+### Allen interval predicates
+
+`OVERLAPS`, `EQUALS_PERIOD`, `CONTAINS_PERIOD`, `PRECEDES` /
+`STRICTLY_PRECEDES` / `IMMEDIATELY_PRECEDES`, `SUCCEEDS` /
+`STRICTLY_SUCCEEDS` / `IMMEDIATELY_SUCCEEDS`, and `MEETS` are
+available as 4-arg WHERE-clause functions taking
+`(a_from, a_to, b_from, b_to)`. Generic over any int64 column
+pair — works for the bitemporal axis, application-domain date
+ranges, or arbitrary intervals.
+
+```sql
+DELETE FROM events
+  WHERE OVERLAPS(event_start, event_end, blackout_start, blackout_end);
+```
+
+Allen predicates currently work in DML WHERE clauses (the DML
+evaluator handles column-vs-column comparisons natively). SELECT
+WHERE with Allen predicates lowers correctly but stratum's main
+query planner doesn't yet evaluate col-vs-col predicates — tracked
+as a P2 follow-up.
+
 ## Four-axis composability
 
 Both axes are wrappers, both compose:

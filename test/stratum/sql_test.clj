@@ -2648,3 +2648,95 @@
           parsed (sql/parse-sql
                    "DELETE FROM intervals WHERE OVERLAPS(a, b)" reg)]
       (is (re-find #"requires 4 args" (or (:error parsed) ""))))))
+
+;; ============================================================================
+;; P1-1: SELECT-side FOR VALID_TIME (AS OF | BETWEEN | FROM-TO | ALL)
+;;
+;; Preprocessor rewrites the temporal clause into equivalent WHERE
+;; predicates over the table's _valid_from / _valid_to columns. Uses
+;; the SQL:2011 + XTDB v2 convention column names.
+;; ============================================================================
+
+(deftest preprocess-select-temporal-as-of-injects-where
+  (testing "FOR VALID_TIME AS OF rewrites to WHERE predicates"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "SELECT eid FROM salaries FOR VALID_TIME AS OF '2024-04-01'")]
+      (is (re-find #"WHERE\s+\(?_valid_from\s+<=\s+\d+"
+                   (:sql r)))
+      (is (re-find #"_valid_to\s+>\s+\d+"
+                   (:sql r))))))
+
+(deftest preprocess-select-temporal-between-form
+  (testing "FOR VALID_TIME BETWEEN x AND y emits overlap predicate"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "SELECT eid FROM salaries FOR VALID_TIME BETWEEN '2024-01-01' AND '2024-07-01'")]
+      ;; Expect: vf <= Jul AND vt > Jan (half-open overlap)
+      (is (re-find #"_valid_from\s+<=\s+1719792000000000"
+                   (:sql r)))
+      (is (re-find #"_valid_to\s+>\s+1704067200000000"
+                   (:sql r))))))
+
+(deftest preprocess-select-temporal-from-to-form
+  (testing "FOR VALID_TIME FROM x TO y has same semantic as BETWEEN"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "SELECT eid FROM salaries FOR VALID_TIME FROM '2024-01-01' TO '2024-07-01'")]
+      (is (re-find #"_valid_from\s+<=\s+1719792000000000"
+                   (:sql r)))
+      (is (re-find #"_valid_to\s+>\s+1704067200000000"
+                   (:sql r))))))
+
+(deftest preprocess-select-for-all-valid-time-no-filter
+  (testing "FOR ALL VALID_TIME on SELECT strips the clause without adding a filter"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "SELECT eid FROM salaries FOR ALL VALID_TIME")]
+      (is (re-find #"(?i)^\s*SELECT\s+eid\s+FROM\s+salaries\s*$"
+                   (:sql r))
+          "FOR ALL VALID_TIME should leave the SQL with no extra WHERE")
+      (is (nil? (:period r))
+          "SELECT-side ALL doesn't emit a :period side channel"))))
+
+(deftest preprocess-select-temporal-preserves-existing-where
+  (testing "Existing WHERE is preserved; temporal preds prepended via AND"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "SELECT eid FROM salaries FOR VALID_TIME AS OF '2024-04-01' WHERE eid = 1")
+          s (:sql r)]
+      (is (.contains ^String s "WHERE"))
+      (is (.contains ^String s "_valid_from"))
+      (is (.contains ^String s "_valid_to"))
+      (is (.contains ^String s "eid = 1"))
+      ;; Temporal preds appear BEFORE the original eid=1 predicate.
+      (is (< (.indexOf ^String s "_valid_from")
+             (.indexOf ^String s "eid = 1"))))))
+
+(deftest sql-select-as-of-end-to-end-on-index-backed-table
+  (testing "SELECT … FOR VALID_TIME AS OF returns rows valid at that instant"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "salaries"
+          (with-meta
+            ;; Two slices: [Jan, Jul) salary=100, [Jul, MAX) salary=110.
+            {:eid          (stratum.index/index-from-seq :int64 [1 1])
+             :salary       (stratum.index/index-from-seq :int64 [100 110])
+             :_valid_from  (stratum.index/index-from-seq :int64
+                             [1704067200000000 1719792000000000])
+             :_valid_to    (stratum.index/index-from-seq :int64
+                             [1719792000000000 Long/MAX_VALUE])}
+            {:bitemporal {:valid {:from-col :_valid_from
+                                  :to-col   :_valid_to
+                                  :unit     :micros}}}))
+        ;; Query at Apr-2024: should return only the [Jan, Jul) slice.
+        (let [parsed (sql/parse-sql
+                       "SELECT salary FROM salaries FOR VALID_TIME AS OF '2024-04-01'"
+                       @(:registry srv))
+              result (q/q (:query parsed))
+              rows (q/results->columns result)]
+          (is (= [100] (vec (:salary rows)))))
+        ;; Query at Sep-2024: should return only the [Jul, MAX) slice.
+        (let [parsed (sql/parse-sql
+                       "SELECT salary FROM salaries FOR VALID_TIME AS OF '2024-09-01'"
+                       @(:registry srv))
+              result (q/q (:query parsed))
+              rows (q/results->columns result)]
+          (is (= [110] (vec (:salary rows)))))
+        (finally (server/stop srv))))))
