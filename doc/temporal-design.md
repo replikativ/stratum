@@ -321,10 +321,11 @@ direct `append!`.
 Stratum's SQL recognises SQL:2011 temporal forms directly:
 
 ```sql
--- per-query SQL:2011 SELECT forms
+-- per-query SQL:2011 SELECT forms (VALID_TIME only — SYSTEM_TIME
+-- on SELECT is not yet implemented; the rewriter recognises
+-- VALID_TIME and skips other FOR keywords.)
 SELECT * FROM employees
-  FOR VALID_TIME AS OF '2024-04-15'
-  FOR SYSTEM_TIME AS OF '2024-04-20';
+  FOR VALID_TIME AS OF '2024-04-15';
 
 SELECT * FROM employees
   FOR VALID_TIME BETWEEN '2024-01-01' AND '2024-12-31';
@@ -403,9 +404,19 @@ SELECT eid, salary FROM salaries FOR ALL VALID_TIME;
 ```
 
 The rewriter strips the clause and injects the equivalent
-predicate into `WHERE`. Multi-table joins each carrying their own
-`FOR VALID_TIME` work as well — predicates are accumulated and
-ANDed onto the WHERE clause.
+predicate into `WHERE`.
+
+**Multi-table limitation**: only one `FOR VALID_TIME` clause per
+SELECT is supported today. The emitted predicate uses unqualified
+column names (`_valid_from`/`_valid_to`), so two clauses on a
+joined SELECT would both reference the same unqualified columns
+and the planner cannot disambiguate them. A second clause throws
+`:sql/multi-for-valid-time-unsupported`. The proper fix is
+qualifier-aware predicate emission; until then, callers needing
+per-table temporal filters on a join should write the WHERE
+predicates explicitly with `<table>._valid_from` /
+`<table>._valid_to` refs (which the planner DOES handle since the
+qualifier is part of the column identifier the parser sees).
 
 ### Allen interval predicates
 
@@ -422,11 +433,15 @@ DELETE FROM events
   WHERE OVERLAPS(event_start, event_end, blackout_start, blackout_end);
 ```
 
-Allen predicates currently work in DML WHERE clauses (the DML
-evaluator handles column-vs-column comparisons natively). SELECT
-WHERE with Allen predicates lowers correctly but stratum's main
-query planner doesn't yet evaluate col-vs-col predicates — tracked
-as a P2 follow-up.
+Allen predicates work in both DML and SELECT WHERE clauses. The
+DML evaluator handles col-vs-col natively; the SELECT planner
+resolves keyword RHS args via `eval-pred-scalar`'s `resolve-arg`
+and column-pruning retains RHS keyword refs (via
+`plan/pred-columns`'s RHS scan), so an Allen predicate referencing
+two columns evaluates correctly through the non-SIMD mask path.
+SIMD-acceleration of col-vs-col is the residual deferred item —
+small datasets and bitemporal-pattern queries (where the planner
+falls back to the scalar evaluator) are unaffected.
 
 ## Composing the two axes
 

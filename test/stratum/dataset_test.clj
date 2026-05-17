@@ -1280,6 +1280,27 @@
                 (dataset/append! {:eid 1 :salary 100
                                   :_valid_from 1000 :_valid_to 1000})))))))
 
+(deftest append!-rejects-explicit-nil-axis-value
+  ;; Regression lock for copilot review-3 P1: pre-fix,
+  ;; `validate-period!` was called with `(long (get row from-col))`
+  ;; — if the caller supplied an explicit nil in row-map for an
+  ;; axis col (bypassing the tx-meta default merge), `(long nil)`
+  ;; threw a bare NullPointerException instead of a clear ex-info.
+  (testing "append! with explicit nil axis value throws clear ex-info, not NPE"
+    (let [ds (vt-only-ds [])]
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo
+            #"append! requires non-nil :valid axis :from-col"
+            (-> ds transient
+                (dataset/append! {:eid 1 :salary 100
+                                  :_valid_from nil :_valid_to 9999}))))
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo
+            #"append! requires non-nil :valid axis :to-col"
+            (-> ds transient
+                (dataset/append! {:eid 1 :salary 100
+                                  :_valid_from 1000 :_valid_to nil})))))))
+
 (deftest append!-rejects-reverse-valid-window
   (testing "append! with vf > vt throws"
     (let [ds (vt-only-ds [])]

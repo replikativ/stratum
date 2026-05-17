@@ -2599,6 +2599,61 @@
                 "_system_to must be MAX (open) for a fresh insertion")))
         (finally (server/stop srv))))))
 
+(deftest sql-insert-for-portion-of-rejects-axis-cols-in-col-list
+  ;; Regression lock for copilot review-3 P1
+  ;; (server.clj `insert-portion-via-index-backend`): if the
+  ;; user-supplied col-list includes the valid-time axis columns,
+  ;; the row-map carries the user's explicit values and
+  ;; `append!`'s tx-meta default-merge doesn't overwrite them — so
+  ;; `FOR PORTION OF VALID_TIME` is silently ignored. Reject up
+  ;; front so the confused intent surfaces.
+  (testing "INSERT … FOR PORTION OF VALID_TIME with axis cols in column list throws"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "salaries"
+          (with-meta
+            {:eid          (stratum.index/index-from-seq :int64 [])
+             :salary       (stratum.index/index-from-seq :int64 [])
+             :_valid_from  (stratum.index/index-from-seq :int64 [])
+             :_valid_to    (stratum.index/index-from-seq :int64 [])
+             :_system_from (stratum.index/index-from-seq :int64 [])
+             :_system_to   (stratum.index/index-from-seq :int64 [])}
+            {:bitemporal
+             {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+              :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult r
+              (exec (str "INSERT INTO salaries "
+                         "(eid, salary, _valid_from, _valid_to) "
+                         "VALUES (1, 100, 0, 0) "
+                         "FOR PORTION OF VALID_TIME FROM '2024-01-01' TO '2024-07-01'")
+                    (:registry srv) (:data-dir srv))]
+          (is (some? (.error r))
+              "execute-sql must surface a clear error; pre-fix accepted the bogus axis values and silently ignored the period")
+          (is (re-find #"must not include the valid-time axis columns" (.error r))
+              (str "Error message should explain the conflict. got: " (.error r))))
+        (finally (server/stop srv))))))
+
+(deftest sql-set-datahike-clock-time-rejects-unparseable
+  ;; Regression lock for copilot review-3 P2 (sql.clj:2111):
+  ;; pre-fix, `SET datahike.clock_time = '<garbage>'` parsed
+  ;; failure into `:settings nil` and returned a successful SET
+  ;; — typos passed silently with no clock change.
+  (testing "SET datahike.clock_time with an unparseable value returns an error"
+    (let [srv (server/start {:port 0})]
+      (try
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult r
+              (exec "SET datahike.clock_time = 'not-a-date'"
+                    (:registry srv) (:data-dir srv))]
+          (is (some? (.error r))
+              "unparseable value must error, not silently no-op")
+          (is (re-find #"unparseable value" (.error r))
+              (str "Error message should mention 'unparseable value'. got: "
+                   (.error r))))
+        (finally (server/stop srv))))))
+
 (deftest sql-select-col-vs-col-where-keeps-rhs-column
   ;; Regression lock for copilot review #3 (group_by.clj:655):
   ;; `pred-columns` (plan.clj:387) only scanned the LHS column,

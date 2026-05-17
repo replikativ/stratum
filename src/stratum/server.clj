@@ -331,6 +331,24 @@
                            (or (:from-col valid) "_valid_from") " / "
                            (or (:to-col valid) "_valid_to"))
                       {:table table}))))
+  ;; The period is meant to fill the axis columns; if the user
+  ;; ALSO names them in col-list, the row-map would carry an
+  ;; explicit value and `append!`'s tx-meta default-merge wouldn't
+  ;; overwrite it — FOR PORTION OF would be silently ignored.
+  ;; Reject so the user's confused intent surfaces. (Copilot
+  ;; review-3 P1.)
+  (let [valid-cfg (bitemporal-valid-cfg existing meta)
+        axis-cols (when valid-cfg
+                    #{(:from-col valid-cfg) (:to-col valid-cfg)})
+        clash (when axis-cols (filterv axis-cols col-list))]
+    (when (seq clash)
+      (throw (ex-info (str "INSERT … FOR PORTION OF VALID_TIME column list "
+                           "must not include the valid-time axis columns — "
+                           "the period fills them. Got " (vec clash) " in col-list.")
+                      {:table table
+                       :axis-cols axis-cols
+                       :col-list col-list
+                       :overlap (set clash)}))))
   (let [new-cols (with-bitemporal-dataset
                    table existing meta "INSERT FOR PORTION OF VALID_TIME"
                    (fn [tds _valid]

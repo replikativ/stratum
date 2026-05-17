@@ -2095,19 +2095,36 @@
                      clear? (and trimmed
                                  (or (.equalsIgnoreCase ^String trimmed "DEFAULT")
                                      (.equalsIgnoreCase ^String trimmed "NULL")))
-                     millis (when-not clear?
-                              (try
-                                ;; Reuse rewrite/parse-temporal-literal —
-                                ;; it returns micros so divide by 1000 to
-                                ;; get the millis we store.
-                                (quot ^long (rewrite/parse-temporal-literal trimmed) 1000)
-                                (catch Exception _ nil)))]
-                 {:system true
-                  :tag "SET"
-                  :settings (cond
-                              clear?  {:clock-time-millis :clear}
-                              millis  {:clock-time-millis millis}
-                              :else   nil)}))}
+                     ;; Surface parse failure as a user-visible
+                     ;; error instead of a silent no-op. Pre-fix,
+                     ;; `SET datahike.clock_time = 'whatever'` with
+                     ;; an unparseable value returned a successful
+                     ;; `SET` tag but didn't update the session
+                     ;; clock — typos passed unnoticed. (Copilot
+                     ;; review-3 P2.)
+                     parse-result (when-not clear?
+                                    (try
+                                      ;; Reuse rewrite/parse-temporal-literal —
+                                      ;; it returns micros so divide by 1000 to
+                                      ;; get the millis we store.
+                                      {:millis (quot ^long (rewrite/parse-temporal-literal trimmed) 1000)}
+                                      (catch Exception e
+                                        {:error (str "SET datahike.clock_time: "
+                                                     "unparseable value `" trimmed "`. "
+                                                     "Accepted forms: 'YYYY-MM-DD', "
+                                                     "DATE/TIMESTAMP 'YYYY-MM-DD…', a numeric epoch-micros, "
+                                                     "CURRENT_TIMESTAMP / NOW / END_OF_TIME / START_OF_TIME, "
+                                                     "or DEFAULT / NULL to clear. (" (.getMessage e) ")")})))]
+                 (cond
+                   clear?
+                   {:system true :tag "SET" :settings {:clock-time-millis :clear}}
+
+                   (:millis parse-result)
+                   {:system true :tag "SET"
+                    :settings {:clock-time-millis (:millis parse-result)}}
+
+                   :else
+                   {:error (:error parse-result)})))}
 
    {:pattern #"(?i)^\s*SET\s+"
     :handler (fn [_sql _reg] {:system true :tag "SET"})}

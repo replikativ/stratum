@@ -266,10 +266,25 @@
                 row-map)]
       ;; Reject zero-width / reverse windows BEFORE we touch any column.
       ;; SQL:2011 requires vf < vt; we enforce it at every entry point.
-      (when-let [{:keys [from-col to-col]} (:valid bt-cfg)]
-        (validate-period! (long (get row from-col)) (long (get row to-col)) :valid))
-      (when-let [{:keys [from-col to-col]} (:system bt-cfg)]
-        (validate-period! (long (get row from-col)) (long (get row to-col)) :system))
+      ;;
+      ;; Validate axis values are non-nil first so an explicit nil
+      ;; (e.g. caller passes `{:_valid_from nil}` directly in row-map,
+      ;; bypassing the tx-meta default merge) surfaces as a clear
+      ;; `ex-info` rather than a bare NPE in `(long nil)`. Copilot
+      ;; review-3 P1.
+      (letfn [(check-axis [axis-kw spec]
+                (when-let [{:keys [from-col to-col]} spec]
+                  (let [vf (get row from-col)
+                        vt (get row to-col)]
+                    (when (nil? vf)
+                      (throw (ex-info (str "append! requires non-nil " axis-kw " axis :from-col value")
+                                      {:axis axis-kw :column from-col :row row})))
+                    (when (nil? vt)
+                      (throw (ex-info (str "append! requires non-nil " axis-kw " axis :to-col value")
+                                      {:axis axis-kw :column to-col :row row})))
+                    (validate-period! (long vf) (long vt) axis-kw))))]
+        (check-axis :valid (:valid bt-cfg))
+        (check-axis :system (:system bt-cfg)))
       (doseq [[col-name col-data] columns-field]
         (let [val (get row col-name)]
           (when (nil? val)
