@@ -19,3 +19,9 @@ _site/
 
 # Clay temp directory
 .clay-temp/
+
+# Private research notes + benches that reference other systems' internals —
+# kept locally for analysis but not published.
+doc/research/64-stratum-vs-xtdb2-bitemporal-architecture.md
+doc/research/65-xtdb-users-and-bitemporal-use-cases.md
+bench/bitemporal_probe.clj

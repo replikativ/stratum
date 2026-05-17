@@ -404,7 +404,6 @@ implements `WITH SYSTEM VERSIONING`:
 | **MariaDB**    | ✗ Rejected | Same |
 | **PostgreSQL** (17/18 syntax landing) | ✗ Not exposed | Same |
 | **Oracle Flashback** | ✗ N/A | Undo-log replay; not user-writable |
-| **XTDB v2** | ✗ Not in grammar; offers a whole-tx `SYSTEM_TIME = <expr>` tx-option | Equivalent to stratum's `:system-from` escape hatch — pins the recording clock at tx granularity, not a slice of a row's past system-time |
 | **IBM Db2**, **Teradata** | ✓ Supported | Allow per-row regulated tampering |
 
 Stratum takes the audit-integrity stance.
