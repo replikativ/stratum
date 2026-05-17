@@ -151,6 +151,23 @@
 
       :else nil)))
 
+(defn- nil-safe-arith
+  "SQL 3-valued logic for `:+/:-/:*/:/` applied to two
+   already-evaluated operands. Returns nil if either operand is
+   nil (NULL propagation); also returns nil on `:/` by zero.
+   Shared by every per-row arithmetic evaluator below
+   (eval-dml-predicate, the UPSERT eval-val, the UPDATE eval-row,
+   …) — copilot review #2 + agent-discovered duplicates."
+  [op l r]
+  (when (and (some? l) (some? r))
+    (case op
+      :+ (+ (double l) (double r))
+      :- (- (double l) (double r))
+      :* (* (double l) (double r))
+      :/ (when-not (zero? (double r))
+           (/ (double l) (double r)))
+      nil)))
+
 (defn- eval-dml-predicate
   "Evaluate the DML-style predicate list (each pred is `[op col val]`)
    against row `i` of a column-map. Returns truthy/falsy. Reusable
@@ -165,25 +182,9 @@
                                (string? e)  e
                                (nil? e)     nil
                                (vector? e)
-                               ;; SQL 3-valued logic: NULL propagates
-                               ;; through arithmetic. If either operand
-                               ;; is nil (NULL sentinel decoded by
-                               ;; read-cell), the expression is NULL —
-                               ;; downstream comparisons already treat
-                               ;; nil as non-matching via their
-                               ;; `(some? l) (some? r)` guards.
-                               ;; Division by zero also returns nil
-                               ;; rather than throwing.
-                               (let [l (eval-val (nth e 1))
-                                     r (eval-val (nth e 2))]
-                                 (when (and (some? l) (some? r))
-                                   (case (first e)
-                                     :+ (+ (double l) (double r))
-                                     :- (- (double l) (double r))
-                                     :* (* (double l) (double r))
-                                     :/ (when-not (zero? (double r))
-                                          (/ (double l) (double r)))
-                                     nil)))))]
+                               (nil-safe-arith (first e)
+                                               (eval-val (nth e 1))
+                                               (eval-val (nth e 2)))))]
               (case (first pred)
                 :=   (let [l (eval-val (nth pred 1))
                            r (eval-val (nth pred 2))]
@@ -889,16 +890,9 @@
                                                            (string? e) e
                                                            (nil? e) nil
                                                            (vector? e)
-                                                           (case (first e)
-                                                             :+ (+ (double (eval-val (nth e 1)))
-                                                                   (double (eval-val (nth e 2))))
-                                                             :- (- (double (eval-val (nth e 1)))
-                                                                   (double (eval-val (nth e 2))))
-                                                             :* (* (double (eval-val (nth e 1)))
-                                                                   (double (eval-val (nth e 2))))
-                                                             :/ (/ (double (eval-val (nth e 1)))
-                                                                   (double (eval-val (nth e 2))))
-                                                             nil)))
+                                                           (nil-safe-arith (first e)
+                                                                           (eval-val (nth e 1))
+                                                                           (eval-val (nth e 2)))))
                                               v (eval-val expr)]
                                           (set-val arr match-idx v)))
                                       {:cols cols :n-rows n-rows
@@ -1029,16 +1023,9 @@
                                  (string? e) e
                                  (nil? e) nil
                                  (vector? e)
-                                 (case (first e)
-                                   :+ (+ (double (eval-row (nth e 1) target-table from-table target-i from-i))
-                                         (double (eval-row (nth e 2) target-table from-table target-i from-i)))
-                                   :- (- (double (eval-row (nth e 1) target-table from-table target-i from-i))
-                                         (double (eval-row (nth e 2) target-table from-table target-i from-i)))
-                                   :* (* (double (eval-row (nth e 1) target-table from-table target-i from-i))
-                                         (double (eval-row (nth e 2) target-table from-table target-i from-i)))
-                                   :/ (/ (double (eval-row (nth e 1) target-table from-table target-i from-i))
-                                         (double (eval-row (nth e 2) target-table from-table target-i from-i)))
-                                   nil)))
+                                 (nil-safe-arith (first e)
+                                                 (eval-row (nth e 1) target-table from-table target-i from-i)
+                                                 (eval-row (nth e 2) target-table from-table target-i from-i))))
                         ;; Evaluate predicate for a row pair
                     eval-pred-row (fn [pred target-table from-table target-i from-i]
                                     (let [ev (fn [e] (eval-row e target-table from-table target-i from-i))]

@@ -2672,6 +2672,73 @@
           (is (= [10 Long/MIN_VALUE] vs)))
         (finally (server/stop srv))))))
 
+(deftest sql-update-arithmetic-on-null-column-handles-3vl
+  ;; Regression lock for pattern-hunt P0-A (server.clj:1025
+  ;; eval-row): UPDATE's per-row expression evaluator had the
+  ;; same arithmetic NPE shape the copilot review #2 fix removed
+  ;; from eval-dml-predicate. Reproducer: UPDATE ... SET col = v
+  ;; + 1 WHERE id = … against a row whose v is the NULL sentinel.
+  ;; Pre-fix: `(double nil)` NPE, swallowed into an error
+  ;; QueryResult, no rows updated. Post-fix: shared `nil-safe-arith`
+  ;; helper short-circuits to nil, the SET value falls back to
+  ;; NULL (target column retains MIN_VALUE).
+  (testing "UPDATE … SET col = v + 1 on a row with NULL v does not NPE"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        ;; CREATE TABLE makes a raw-array table — that's what
+        ;; routes through the UPDATE :else branch where eval-row
+        ;; lives. (register-table! with stratum indexes routes
+        ;; through the index-backed UPDATE path which uses
+        ;; eval-dml-predicate — already fixed by copilot #2.)
+        (exec "CREATE TABLE t (id BIGINT, v BIGINT, w BIGINT)"
+              (:registry srv) (:data-dir srv))
+        (exec "INSERT INTO t (id, v, w) VALUES (1, 10, 0), (2, NULL, 0), (3, 20, 0)"
+              (:registry srv) (:data-dir srv))
+        (let [^PgWireServer$QueryResult r
+              (exec "UPDATE t SET w = v + 1 WHERE id <= 3"
+                    (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r))
+              (str "execute-sql must not error; pre-fix surfaced "
+                   "an NPE swallowed into the error QR. got: "
+                   (.error r))))
+        (let [cols (get @(:registry srv) "t")
+              ws  (vec (aclone ^longs (:w cols)))]
+          (is (= [11 Long/MIN_VALUE 21] ws)
+              "row 1: 10+1=11; row 2: NULL+1 → NULL (sentinel); row 3: 20+1=21"))
+        (finally (server/stop srv))))))
+
+(deftest sql-upsert-do-update-arithmetic-on-null-handles-3vl
+  ;; Regression lock for pattern-hunt P0-B (server.clj:882
+  ;; eval-val in UPSERT DO UPDATE): same NPE shape in the
+  ;; ON CONFLICT … DO UPDATE SET col = col + EXCLUDED.col path.
+  ;; Reproducer: insert into a uniq-index table where the
+  ;; conflicting row's column is NULL. Pre-fix: NPE; post-fix:
+  ;; NULL propagates, conflicting row stays NULL.
+  (testing "INSERT … ON CONFLICT DO UPDATE SET balance = balance + 100 with NULL balance"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        ;; CREATE TABLE for raw-array storage; eval-val lives in
+        ;; the UPSERT DO UPDATE path that operates on raw arrays.
+        (exec "CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT)"
+              (:registry srv) (:data-dir srv))
+        (exec "INSERT INTO accounts (id, balance) VALUES (42, NULL)"
+              (:registry srv) (:data-dir srv))
+        (let [^PgWireServer$QueryResult r
+              (exec (str "INSERT INTO accounts (id, balance) VALUES (42, 100) "
+                         "ON CONFLICT (id) DO UPDATE SET balance = "
+                         "accounts.balance + 100")
+                    (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r))
+              (str "execute-sql must not error; pre-fix NPE swallowed: "
+                   (.error r))))
+        (let [cols (get @(:registry srv) "accounts")
+              bs   (vec (aclone ^longs (:balance cols)))]
+          (is (= [Long/MIN_VALUE] bs)
+              "NULL + 100 → NULL (sentinel preserved); pre-fix threw NPE"))
+        (finally (server/stop srv))))))
+
 (deftest sql-plain-insert-bitemporal-preserves-system-axis
   ;; Regression lock for copilot review #1 (server.clj:719):
   ;; the plain-INSERT-with-columns path on an index-backed bitemporal
