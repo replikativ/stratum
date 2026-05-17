@@ -258,7 +258,7 @@ Typical as-of-vt query (one entity's salary on a given date):
        :select [:salary]})
 ```
 
-For per-row SCD2 (close the previous window when an entity is updated), use the `vt-append!` / `vt-update!` / `vt-delete!` primitives — see [`temporal-design.md`](temporal-design.md) for the API and overlap-policy.
+For per-row SCD2 (close the previous window when an entity is updated), use the `append!` / `upsert!` / `retract!` / `bounded-update!` write primitives — see [`temporal-design.md`](temporal-design.md) for the API and overlap-policy.
 
 The valid-time bench shapes (point-in-vt at 1% selectivity, 50% selectivity with the `MAX_VALUE` sentinel, group-by with vt filter) are exercised alongside the standard tier 1-9 set in `bench/olap_bench.clj`.
 

@@ -235,9 +235,21 @@ are three reasonable behaviors:
      - `row-vf < new-vf < row-vt` — partial left overlap; *truncate*
        the row's `vt` down to `new-vf`. The historical prefix
        `[row-vf, new-vf)` is preserved.
-     - `row-vf >= new-vf` — row is entirely inside the new write's
-       range; *drop* it physically via `ds-delete-rows!` (fans
-       `idx-delete!` across every column).
+     - `row-vf >= new-vf` — row is entirely superseded by the new
+       write. How the supersession is recorded depends on the
+       table's bitemporal mode:
+       - **valid-only** (`:bitemporal {:valid …}`, no `:system`):
+         the superseded row is *dropped physically* via
+         `ds-delete-rows!` (fans `idx-delete!` across every
+         column). No system-time view of the prior state is kept.
+       - **fully bitemporal** (`:bitemporal {:valid … :system …}`):
+         the superseded row is *closed logically* — its
+         `_system_to` is shifted from MAX to the current sys-now
+         and the row stays in storage. The system-time view at
+         `t < sys-now` continues to see the prior state; only
+         the as-of-now view treats it as gone. This is the
+         standard SCD2-on-both-axes behaviour and is what makes
+         the audit trail walkable.
    Then `upsert!` appends the new merged row (or degenerates to a
    plain insert if no `:close-safe` rows matched). `retract!` runs
    the same reshape with no append step. SQL:2011
