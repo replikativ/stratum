@@ -674,8 +674,9 @@
       (throw (IllegalStateException. "Cannot sync transient dataset. Call persistent! first.")))
     (validate-all-indices! columns-field "sync!")
 
-    ;; Wrap in storage lock to prevent concurrent GC from deleting freshly written chunks
-    (storage/with-storage-lock
+    ;; Wrap in per-store storage lock to prevent concurrent GC on the same
+    ;; store from deleting freshly written chunks.
+    (storage/with-storage-lock store
       (fn []
         ;; 1. Sync each index column (no branch)
         (let [synced-columns

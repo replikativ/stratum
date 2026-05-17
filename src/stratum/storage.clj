@@ -26,42 +26,56 @@
 ;; ============================================================================
 
 (def ^:private store-locks
-  "Per-store GC/sync coordination locks. Pre-fix (round-4 agent
-   P2 #5.1), `gc-lock` was a single process-global Object —
-   concurrent sync/gc on UNRELATED stores serialized
-   unnecessarily, and a hung sync on one store blocked every
-   other store. Per-store locks let unrelated work proceed in
-   parallel. Keyed by store identity via a ConcurrentHashMap so
-   the map itself doesn't need external locking."
+  "Per-store GC/sync coordination locks, keyed by the store
+   reference itself. Map identity follows the store's `.equals`
+   semantics:
+
+   - Konserve memory store / typical deftypes: default Object
+     equality (identity) → distinct instances get distinct locks.
+   - File-store / S3-store records with content-based equality:
+     two instances configured against the same backing storage
+     share a lock — which is what we want (they protect the same
+     physical data).
+
+   Worst case for an oddly-implemented backend is two locks
+   collapsed into one (over-locking, safe). Under-locking is
+   impossible: distinct keys always get distinct locks.
+
+   Stratum apps typically run with a small bounded set of stores
+   per JVM (often one), so we don't worry about cleanup. Inspect
+   the current set via `(locked-stores)`."
   (java.util.concurrent.ConcurrentHashMap.))
 
 (defn- store-lock
-  "Lazily-allocate a per-store Object lock keyed by store
-   identity (using IdentityHashMap-style equality via
-   `System/identityHashCode` + an extra hop). Returns the same
-   Object for the same store across calls."
+  "Lazily allocate (or return) the Object monitor associated with
+   `store`. Same store across calls → same Object. The
+   `putIfAbsent` cycle resolves the racy double-allocation."
   [store]
-  (let [k (System/identityHashCode store)]
-    (or (.get ^java.util.concurrent.ConcurrentHashMap store-locks k)
-        (let [o (Object.)
-              existing (.putIfAbsent ^java.util.concurrent.ConcurrentHashMap store-locks k o)]
-          (or existing o)))))
+  (or (.get ^java.util.concurrent.ConcurrentHashMap store-locks store)
+      (let [o (Object.)
+            existing (.putIfAbsent ^java.util.concurrent.ConcurrentHashMap store-locks store o)]
+        (or existing o))))
 
 (defn with-storage-lock
   "Execute f while holding the per-store GC/sync coordination
-   lock. Used by ds-sync! to prevent concurrent GC on the same
-   store from deleting freshly written chunks. Different stores
-   never block each other.
+   lock. Used by `ds-sync!` and `gc!` so that on a single store
+   the two cannot interleave: `gc!`'s mark phase walks branch
+   heads to determine reachability, then sweeps unreachable PSS
+   nodes. If `ds-sync!` writes a fresh chunk between mark and
+   sweep, the sweep would otherwise delete a node referenced by
+   the just-updated branch head, corrupting the dataset.
 
-   Arity-2 takes the store; arity-1 falls back to a process-global
-   lock for backward compatibility (callers that don't have a
-   store handle handy)."
-  ([f]
-   ;; Backward-compat: process-global lock for callers without
-   ;; a store handle.
-   (locking store-locks (f)))
-  ([store f]
-   (locking (store-lock store) (f))))
+   Different stores never block each other."
+  [store f]
+  (locking (store-lock store) (f)))
+
+(defn locked-stores
+  "Returns the set of stores that have an allocated coordination
+   lock (i.e. have ever been passed to `with-storage-lock` in
+   this JVM). For introspection / debugging — the keys are the
+   actual store references."
+  []
+  (set (.keySet ^java.util.concurrent.ConcurrentHashMap store-locks)))
 
 ;; ============================================================================
 ;; Commit ID Generation
@@ -216,7 +230,8 @@
 
    Returns: map with :deleted-pss-nodes, :deleted-index-commits, :deleted-dataset-commits counts."
   [store]
-  (locking (store-lock store)
+  (with-storage-lock store
+    (fn []
     (let [;; 1. Find all branches and their HEAD commits
           branches (or (list-dataset-branches store) #{})
 
@@ -263,7 +278,7 @@
        :deleted-dataset-commits (count dead-ds-commits)
        :kept-pss-nodes (count reachable-pss-addrs)
        :kept-index-commits (count reachable-idx-commits)
-       :kept-dataset-commits (count reachable-ds-commits)})))
+       :kept-dataset-commits (count reachable-ds-commits)}))))
 
 ;; ============================================================================
 ;; Temporal Lookups
