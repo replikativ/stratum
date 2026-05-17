@@ -803,6 +803,44 @@
       (is (nil? (dataset/valid-time-config ds)))
       (is (nil? (dataset/system-time-config ds))))))
 
+(deftest bitemporal-config-rejects-unknown-unit
+  ;; Regression lock for round-3 agent P1: `apply-axis-config`
+  ;; previously accepted any value for `:unit` and silently fell
+  ;; back to `:millis` in `now-in-unit` / `coerce-temporal-value`
+  ;; (case-default branches), corrupting bitemporal writes/reads
+  ;; for any user passing a typo.
+  (testing "make-dataset throws on unrecognized :bitemporal axis :unit"
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo
+          #":bitemporal .* :unit must be one of"
+          (dataset/make-dataset
+            {:eid         (long-array [1])
+             :_valid_from (long-array [1000])
+             :_valid_to   (long-array [Long/MAX_VALUE])}
+            {:metadata
+             {:bitemporal {:valid {:from-col :_valid_from
+                                   :to-col   :_valid_to
+                                   :unit     :nanos}}}})))))
+
+(deftest bitemporal-config-rejects-same-from-and-to-cols
+  ;; Regression lock for round-3 agent P1: `apply-axis-config`
+  ;; pre-fix did `(assoc cols from-col … to-col …)` with whatever
+  ;; the user passed. If from-col == to-col, the assoc collapses to
+  ;; one key; every SCD2 surgery then read/wrote the same column
+  ;; for both window bounds and every row's window degenerated
+  ;; to [t, t) after first write.
+  (testing "make-dataset throws when :from-col equals :to-col"
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo
+          #":from-col and :to-col must differ"
+          (dataset/make-dataset
+            {:eid (long-array [1])
+             :ts  (long-array [1000])}
+            {:metadata
+             {:bitemporal {:valid {:from-col :ts
+                                   :to-col   :ts
+                                   :unit     :micros}}}})))))
+
 ;; ============================================================================
 ;; Phase B — temporal write primitives (append! / upsert! / retract!)
 ;; ============================================================================

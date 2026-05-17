@@ -897,6 +897,29 @@
   (let [{:keys [from-col to-col]
          unit :unit
          :or  {unit :micros}} axis-spec
+        ;; Reject unknown :unit at make-dataset time so the silent
+        ;; fallback to :millis in now-in-unit / coerce-temporal-value
+        ;; (when the case-default branch fires) can't corrupt
+        ;; bitemporal writes/reads. Round-3 agent P1 #2.
+        _ (when-not (#{:micros :millis :seconds :days} unit)
+            (throw (ex-info (str ":bitemporal " axis-kw " :unit must be one of "
+                                 ":micros / :millis / :seconds / :days")
+                            {:axis axis-kw
+                             :config axis-spec
+                             :unit unit
+                             :allowed-units #{:micros :millis :seconds :days}})))
+        ;; Reject from-col == to-col — `(assoc cols from-col … to-col …)`
+        ;; with identical keys collapses to a single entry, then surgery
+        ;; reads/writes the same column for both axis bounds; every
+        ;; window degenerates to [t, t) after first write. Round-3
+        ;; agent P1 #3.
+        _ (when (= from-col to-col)
+            (throw (ex-info (str ":bitemporal " axis-kw
+                                 " :from-col and :to-col must differ")
+                            {:axis axis-kw
+                             :config axis-spec
+                             :from-col from-col
+                             :to-col to-col})))
         tag (fn [col-name]
               (let [c (get cols col-name)]
                 (when (nil? c)
