@@ -11,7 +11,8 @@
   (:require [stratum.column :as column]
             [stratum.index :as idx]
             [stratum.storage :as storage])
-  (:import [stratum.index PersistentColumnIndex]))
+  (:import [stratum.index PersistentColumnIndex]
+           [stratum.internal ColumnOpsString]))
 
 (set! *warn-on-reflection* true)
 
@@ -1594,9 +1595,23 @@
                                           :source :index
                                           :index restored-idx}
                                    ;; Restore dict for string-encoded columns
+                                   ;; + rebuild the bigram/alpha masks used
+                                   ;; by `query/predicate.clj`'s LIKE/ILIKE
+                                   ;; fast path. The masks live in-memory
+                                   ;; only (function of the dict, not
+                                   ;; persisted), so they must be rebuilt
+                                   ;; on every load — pre-fix `nil` masks
+                                   ;; cast to ^ints / ^longs and primitive-
+                                   ;; NPE'd in `arrayStringLikeFastMasked`.
+                                   ;; (Round-4 agent P0.)
                                    (:dict col-info)
-                                   (assoc :dict (into-array String (:dict col-info))
-                                          :dict-type (:dict-type col-info)))]))
+                                   (as-> col-map
+                                         (let [dict-arr (into-array String (:dict col-info))]
+                                           (assoc col-map
+                                                  :dict dict-arr
+                                                  :dict-type (:dict-type col-info)
+                                                  :dict-alpha-masks (ColumnOpsString/buildDictAlphaMasks dict-arr)
+                                                  :dict-bigram-masks (ColumnOpsString/buildDictBigramMasks dict-arr)))))]))
                    columns))
         ;; Re-stamp :temporal-unit on the configured axes' window
         ;; columns from the round-tripped metadata. The per-column
