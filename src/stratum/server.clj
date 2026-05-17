@@ -22,6 +22,7 @@
   (:require [stratum.query :as q]
             [stratum.sql :as sql]
             [stratum.dataset :as dataset]
+            [stratum.index :as idx]
             [stratum.files :as files]
             [stratum.iforest :as iforest]
             [clojure.string :as str])
@@ -58,14 +59,341 @@
 ;; ============================================================================
 
 (defn- encode-table-columns
-  "Pre-encode table columns: auto-detect types and dict-encode String[] columns."
+  "Pre-encode table columns: auto-detect types and dict-encode String[]
+   columns. **Preserves the column-map's metadata** — callers register
+   bitemporal tables via `(with-meta {...} {:bitemporal {...}})` and
+   the metadata is the canonical source of truth for axis configuration
+   read by `bitemporal-valid-cfg` / `bitemporal-ds-meta`. Dropping it
+   here would silently demote any SQL DML on the table to the
+   valid-only or columns-inferred path."
   [columns]
-  (into {}
-        (map (fn [[col-name col-data]]
-               (let [k (if (keyword? col-name) col-name (keyword col-name))
-                     encoded (q/encode-column col-data)]
-                 [k encoded])))
-        columns))
+  (cond-> (into {}
+                (map (fn [[col-name col-data]]
+                       (let [k (if (keyword? col-name) col-name (keyword col-name))
+                             encoded (q/encode-column col-data)]
+                         [k encoded])))
+                columns)
+    (meta columns) (with-meta (meta columns))))
+
+;; ----------------------------------------------------------------------------
+;; Row-level helpers — uniform across raw-array tables (CREATE TABLE) and
+;; encoded index-backed tables (register-table! with stratum indexes).
+;; ----------------------------------------------------------------------------
+
+(defn- col-row-count
+  "Length of a single column entry in the table-registry. Handles raw
+   `[J` / `[D` / `[Ljava.lang.String;` arrays AND encoded
+   `{:source :index :index PSI ...}` / `{:type ... :data <arr>}` maps."
+  ^long [col]
+  (cond
+    (nil? col) 0
+    (instance? (Class/forName "[J") col) (alength ^longs col)
+    (instance? (Class/forName "[D") col) (alength ^doubles col)
+    (instance? (Class/forName "[Ljava.lang.String;") col)
+    (alength ^"[Ljava.lang.String;" col)
+    (and (map? col) (= :index (:source col))) (idx/idx-length (:index col))
+    (and (map? col) (:data col))
+    (let [arr (:data col)]
+      (cond
+        (instance? (Class/forName "[J") arr) (alength ^longs arr)
+        (instance? (Class/forName "[D") arr) (alength ^doubles arr)
+        :else 0))
+    :else 0))
+
+(defn- index-backed-cols?
+  "True when every column entry is encoded with `:source :index` —
+   i.e. the table was registered through stratum's columnar engine
+   and DML must route through `idx-*!` primitives instead of array
+   rebuilds."
+  [cols]
+  (and (seq cols)
+       (every? (fn [[_k v]] (and (map? v) (= :index (:source v))))
+               cols)))
+
+(defn- read-cell
+  "Read the value of `col-name` at row `i` from a table-registry entry.
+   Returns nil for NULL sentinels (Long/MIN_VALUE / NaN / nil String).
+   Mirrors the per-column dispatch used by DML predicate evaluation but
+   covers both raw arrays AND encoded index columns."
+  [existing col-name ^long i]
+  (let [col (get existing col-name)]
+    (cond
+      (instance? (Class/forName "[J") col)
+      (let [v (aget ^longs col i)]
+        (when-not (= v Long/MIN_VALUE) v))
+
+      (instance? (Class/forName "[D") col)
+      (let [v (aget ^doubles col i)]
+        (when-not (Double/isNaN v) v))
+
+      (instance? (Class/forName "[Ljava.lang.String;") col)
+      (aget ^"[Ljava.lang.String;" col i)
+
+      (and (map? col) (= :index (:source col)))
+      (let [index (:index col)
+            datatype (:type col)
+            dict (:dict col)]
+        (cond
+          dict
+          (let [code (idx/idx-get-long index i)]
+            (when-not (= code Long/MIN_VALUE)
+              (aget ^"[Ljava.lang.String;" dict (int code))))
+
+          (= :int64 datatype)
+          (let [v (idx/idx-get-long index i)]
+            (when-not (= v Long/MIN_VALUE) v))
+
+          (= :float64 datatype)
+          (let [v (idx/idx-get-double index i)]
+            (when-not (Double/isNaN v) v))
+
+          :else nil))
+
+      :else nil)))
+
+(defn- eval-dml-predicate
+  "Evaluate the DML-style predicate list (each pred is `[op col val]`)
+   against row `i` of a column-map. Returns truthy/falsy. Reusable
+   across UPDATE / DELETE / UPSERT branches; works on both raw-array
+   and index-backed columns via `read-cell`."
+  [existing where ^long i]
+  (every? (fn [pred]
+            (let [eval-val (fn eval-val [e]
+                             (cond
+                               (keyword? e) (read-cell existing e i)
+                               (number? e)  e
+                               (string? e)  e
+                               (nil? e)     nil
+                               (vector? e)
+                               (case (first e)
+                                 :+ (+ (double (eval-val (nth e 1)))
+                                       (double (eval-val (nth e 2))))
+                                 :- (- (double (eval-val (nth e 1)))
+                                       (double (eval-val (nth e 2))))
+                                 :* (* (double (eval-val (nth e 1)))
+                                       (double (eval-val (nth e 2))))
+                                 :/ (/ (double (eval-val (nth e 1)))
+                                       (double (eval-val (nth e 2))))
+                                 nil)))]
+              (case (first pred)
+                :=   (let [l (eval-val (nth pred 1))
+                           r (eval-val (nth pred 2))]
+                       (and (some? l) (some? r) (= l r)))
+                (:!= :<>) (let [l (eval-val (nth pred 1))
+                                r (eval-val (nth pred 2))]
+                            (and (some? l) (some? r) (not= l r)))
+                :>   (let [l (eval-val (nth pred 1))
+                           r (eval-val (nth pred 2))]
+                       (and (some? l) (some? r) (> (double l) (double r))))
+                :<   (let [l (eval-val (nth pred 1))
+                           r (eval-val (nth pred 2))]
+                       (and (some? l) (some? r) (< (double l) (double r))))
+                :>=  (let [l (eval-val (nth pred 1))
+                           r (eval-val (nth pred 2))]
+                       (and (some? l) (some? r) (>= (double l) (double r))))
+                :<=  (let [l (eval-val (nth pred 1))
+                           r (eval-val (nth pred 2))]
+                       (and (some? l) (some? r) (<= (double l) (double r))))
+                :is-null     (nil? (eval-val (nth pred 1)))
+                :is-not-null (some? (eval-val (nth pred 1)))
+                false)))
+          where))
+
+(defn- delete-via-index-backend
+  "Apply a DELETE to a fully-index-backed table. Builds a sorted-desc
+   list of row indices to delete, then fans `dataset/ds-delete-rows!`
+   across a transient wrapper. Returns the new column map + delete
+   count.
+
+   `existing` — the registry's column map for `table` (must be
+                fully index-backed; callers gate on `index-backed-cols?`).
+   `where`    — predicate list, or nil to delete all rows.
+   `meta`     — original metadata to re-attach on the result map."
+  [^String table existing where meta]
+  (let [first-col (val (first existing))
+        n-rows    (col-row-count first-col)
+        ;; Phase 1: scan once, collect row indices matching `where`.
+        delete-idxs
+        (if (nil? where)
+          (vec (range n-rows))
+          (vec (filter #(eval-dml-predicate existing where %)
+                       (range n-rows))))]
+    (if (empty? delete-idxs)
+      {:new-cols existing :n-deleted 0}
+      ;; Phase 2: wrap as dataset, drop rows via the transient primitive.
+      (let [ds (dataset/make-dataset existing {:name table})
+            mutated (-> ds
+                        transient
+                        (dataset/ds-delete-rows! delete-idxs)
+                        persistent!)
+            new-cols (dataset/columns mutated)
+            new-cols (if meta (with-meta new-cols meta) new-cols)]
+        {:new-cols new-cols :n-deleted (count delete-idxs)}))))
+
+(defn- bitemporal-axis-cfg
+  "Infer one axis (`:valid` or `:system`) of a bitemporal config from
+   a table-registry column map. Prefers metadata (`:bitemporal {axis-kw
+   {...}}`); falls back to the SQL:2011 convention column names
+   (`_valid_from`/`_valid_to`, `_system_from`/`_system_to`). Returns
+   `nil` when neither source yields the axis."
+  [existing meta axis-kw]
+  (let [bt-meta (:bitemporal meta)
+        [from-col to-col] (case axis-kw
+                            :valid  [:_valid_from  :_valid_to]
+                            :system [:_system_from :_system_to])]
+    (or (get bt-meta axis-kw)
+        (when (and (contains? existing from-col)
+                   (contains? existing to-col))
+          {:from-col from-col :to-col to-col :unit :micros}))))
+
+(defn- bitemporal-valid-cfg
+  "Convenience: infer just the `:valid` axis for a table. Same
+   precedence rule as `bitemporal-axis-cfg`."
+  [existing meta]
+  (bitemporal-axis-cfg existing meta :valid))
+
+(defn- bitemporal-ds-meta
+  "Build the dataset-level `:bitemporal` metadata used to construct an
+   ad-hoc dataset from a table-registry column map for SQL DML
+   lowering. **Preserves the `:system` axis** — either from metadata
+   or from the SQL:2011 column-name convention — so the SCD2-on-both-
+   axes surgery in `dataset/upsert!` / `retract!` /
+   `bounded-update!` fires.
+
+   `valid` is the inferred valid-axis config (typically from
+   `bitemporal-valid-cfg`); it overrides any `:valid` in the table's
+   existing bitemporal metadata. The `:system` axis is inferred via
+   `bitemporal-axis-cfg`."
+  [existing meta valid]
+  (let [bt   (or (:bitemporal meta) {})
+        sys  (bitemporal-axis-cfg existing meta :system)]
+    {:bitemporal (cond-> (assoc bt :valid valid)
+                   sys (assoc :system sys))}))
+
+(defn- with-bitemporal-dataset
+  "Run a SQL DML surgery against a registered bitemporal table. Wraps
+   `existing` in a transient stratum dataset with correct bitemporal
+   metadata (preserving the `:system` axis when present), invokes
+   `surgery-fn` to apply the mutation, persists, and returns the new
+   column-map with the table-registry metadata re-applied.
+
+   `surgery-fn` is `(fn [tds valid-cfg] mutated-transient-tds)`. It
+   receives the transient dataset AND the resolved `:valid` axis
+   config (useful for per-helper error messages or column-name
+   lookups). Returning the mutated transient is the contract.
+
+   `verb-name` is the SQL verb used in the not-a-bitemporal-table
+   error (`'INSERT FOR PORTION OF VALID_TIME'`, etc.).
+
+   Centralises the boilerplate that was duplicated across the three
+   `*-portion-via-index-backend` builders: valid-axis discovery,
+   throw-on-missing, ds-meta construction (with `:system` axis
+   preservation), make-dataset, transient → mutate → persistent,
+   and metadata re-application."
+  [^String table existing meta verb-name surgery-fn]
+  (let [valid (bitemporal-valid-cfg existing meta)
+        _ (when-not valid
+            (throw (ex-info (str verb-name " requires a :valid axis on the table")
+                            {:table table :existing-cols (vec (keys existing))})))
+        ds-meta (bitemporal-ds-meta existing meta valid)
+        ds (dataset/make-dataset existing {:name table :metadata ds-meta})
+        mutated (-> ds transient (surgery-fn valid) persistent!)
+        new-cols (dataset/columns mutated)]
+    (cond-> new-cols meta (with-meta meta))))
+
+(defn- insert-portion-via-index-backend
+  "Apply a SQL:2011 `INSERT … FOR PORTION OF VALID_TIME FROM x TO y`
+   on an index-backed bitemporal table. Each row in `rows` (positional
+   per `col-list`, which must be supplied since the period fills in
+   the temporal cols) is `append!`'d with `:valid-from` / `:valid-to`
+   in tx-meta so `append!`'s axis auto-stamping picks them up.
+
+   The user MUST supply an explicit column list naming all the
+   non-temporal columns; the temporal cols are filled from the
+   period. If `col-list` is nil (positional VALUES with no column
+   names) we throw — the temporal columns are positionally ambiguous."
+  [^String table existing col-list rows period meta]
+  (when-not col-list
+    (let [valid (bitemporal-valid-cfg existing meta)]
+      (throw (ex-info (str "INSERT FOR PORTION OF VALID_TIME requires an explicit "
+                           "column list: `INSERT INTO t (col1, col2) VALUES (...)` — "
+                           "the period fills in "
+                           (or (:from-col valid) "_valid_from") " / "
+                           (or (:to-col valid) "_valid_to"))
+                      {:table table}))))
+  (let [new-cols (with-bitemporal-dataset
+                   table existing meta "INSERT FOR PORTION OF VALID_TIME"
+                   (fn [tds _valid]
+                     (reduce (fn [t row-vals]
+                               (dataset/append! t (zipmap col-list row-vals)
+                                                {:valid-from (:from period)
+                                                 :valid-to   (:to period)}))
+                             tds rows)))]
+    {:new-cols new-cols :n-inserted (count rows)}))
+
+(defn- update-portion-via-index-backend
+  "Apply a SQL:2011 `UPDATE … FOR PORTION OF VALID_TIME FROM x TO y
+   SET col=val WHERE p` on an index-backed bitemporal table by
+   lowering to `dataset/bounded-update!`. The :set assignments are
+   evaluated as literal values (no expressions — sub-expressions in
+   SET are a P2 future addition)."
+  [^String table existing where assignments period meta]
+  (let [set-map (reduce (fn [m {:keys [col expr]}]
+                          (when-not (or (number? expr) (string? expr) (nil? expr))
+                            (throw (ex-info "UPDATE FOR PORTION OF VALID_TIME only supports literal SET values"
+                                            {:assignment {:col col :expr expr}
+                                             :hint "expression evaluation in SET is deferred"})))
+                          (assoc m col expr))
+                        {}
+                        assignments)
+        new-cols (with-bitemporal-dataset
+                   table existing meta "UPDATE FOR PORTION OF VALID_TIME"
+                   (fn [tds _valid]
+                     (dataset/bounded-update! tds {:where (or where []) :set set-map}
+                                              {:valid-from (:from period)
+                                               :valid-to   (:to period)})))]
+    {:new-cols new-cols
+     ;; SQL clients read `UPDATE N` as "N rows participated in the
+     ;; surgery." We report the pre-mutation WHERE-match count, NOT
+     ;; the number of physical slices the bounded-update produced
+     ;; (which can be larger after a 3-way split). This matches
+     ;; Postgres's semantic for partitioned-table UPDATEs where the
+     ;; physical row count is divorced from the logical "rows
+     ;; affected." Callers needing physical counts should diff
+     ;; row-count(before) vs row-count(after).
+     :n-updated (count (filter #(eval-dml-predicate existing where %)
+                                (range (col-row-count (val (first existing))))))}))
+
+(defn- delete-portion-via-index-backend
+  "Apply a SQL:2011 `DELETE … FOR PORTION OF VALID_TIME FROM x TO y`
+   to an index-backed table. Lowers to `retract!` on a transient
+   stratum dataset with `:valid-from` + `:valid-to` in tx-meta —
+   `retract!` then performs the bounded surgery (truncate / shift /
+   split / drop) per overlapping row.
+
+   The bitemporal axis config is inferred from the column-map's
+   metadata; if the user registered a table without bitemporal
+   metadata, we infer reasonable defaults from the column names
+   (`_valid_from` + `_valid_to`). Throws if neither convention is
+   discoverable."
+  [^String table existing where period meta]
+  (let [{vf-val :from vt-val :to} period
+        before-count (col-row-count (val (first existing)))
+        new-cols (with-bitemporal-dataset
+                   table existing meta "DELETE FOR PORTION OF VALID_TIME"
+                   (fn [tds _valid]
+                     (dataset/retract! tds {:where (or where [])}
+                                       {:valid-from vf-val :valid-to vt-val})))
+        after-count (col-row-count (val (first new-cols)))]
+    ;; "DELETE N" tag reports rows physically removed. With bounded
+    ;; retract, splits ADD rows (one tail per split), which doesn't
+    ;; map cleanly to a "DELETE n" count. We report
+    ;; max(0, before-after) so a pure-shift or pure-truncate reports
+    ;; 0, a drop reports the count, and a split reports a smaller
+    ;; number than reality. Refinement deferred until a real SQL
+    ;; client cares about the exact semantics here.
+    {:new-cols new-cols
+     :n-deleted (max 0 (- before-count after-count))}))
 
 ;; ============================================================================
 ;; Query Handler
@@ -254,14 +582,37 @@
       [@result @extra-reg])))
 
 (defn- execute-sql
-  "Execute a SQL statement against the registry and return a QueryResult."
+  "Execute a SQL statement against the registry and return a QueryResult.
+
+   `SET datahike.clock_time = …` is honored as a session-scoped
+   binding by writing the parsed millis to
+   `(get @table-registry-atom \"__settings__\" :clock-time-millis)`;
+   every subsequent execute-sql call runs inside a `binding` form
+   that pins `dataset/*clock-time-millis*` to that value, so DML
+   defaults (`:valid-from` / `:system-from` when omitted) become
+   repeatable. `SET datahike.clock_time = DEFAULT` clears the
+   binding."
   [sql table-registry-atom data-dir-atom]
   (try
     (let [raw-registry @table-registry-atom
           registry     (resolve-live-tables raw-registry)
           [sql extra]  (resolve-file-refs sql @data-dir-atom)
           registry     (merge registry extra)
-          parsed       (sql/parse-sql sql registry)]
+          parsed       (sql/parse-sql sql registry)
+          ;; If parse surfaced a SET datahike.clock_time setting,
+          ;; merge it into the registry's `__settings__` map.
+          settings (:settings parsed)]
+      (when settings
+        (cond
+          (= :clear (:clock-time-millis settings))
+          (swap! table-registry-atom update "__settings__" dissoc :clock-time-millis)
+          (number? (:clock-time-millis settings))
+          (swap! table-registry-atom assoc-in
+                 ["__settings__" :clock-time-millis]
+                 (:clock-time-millis settings))))
+      (binding [dataset/*clock-time-millis*
+                (or (get-in @table-registry-atom ["__settings__" :clock-time-millis])
+                    dataset/*clock-time-millis*)]
       (cond
             ;; EXPLAIN [(ANALYZE)] [(FORMAT JSON)] query
         (:explain parsed)
@@ -343,6 +694,51 @@
             (let [existing (get @table-registry-atom table)]
               (when-not existing
                 (throw (ex-info (str "Table not found: " table) {:table table})))
+              (cond
+                ;; INSERT … FOR PORTION OF VALID_TIME on a fully
+                ;; index-backed bitemporal table lowers to append!
+                ;; with vf/vt stamped from the period.
+                (and (:period ddl)
+                     (= :valid_time (:axis (:period ddl)))
+                     (index-backed-cols? existing))
+                (let [{:keys [new-cols n-inserted]}
+                      (insert-portion-via-index-backend
+                        table existing (:columns ddl) rows (:period ddl) (meta existing))]
+                  (swap! table-registry-atom assoc table new-cols)
+                  (PgWireServer$QueryResult/empty (str "INSERT 0 " n-inserted)))
+
+                ;; Plain INSERT on an index-backed bitemporal table
+                ;; with explicit column list lowers to append! so
+                ;; the user can supply vf/vt directly.
+                (and (index-backed-cols? existing) (:columns ddl))
+                (let [valid (bitemporal-valid-cfg existing (meta existing))
+                      ds-meta (merge (or (:bitemporal (meta existing)) {})
+                                     (when valid {:bitemporal {:valid valid}}))
+                      ds (dataset/make-dataset existing
+                                               (cond-> {:name table}
+                                                 (seq ds-meta) (assoc :metadata ds-meta)))
+                      mutated (reduce (fn [tds row-vals]
+                                        (dataset/append! tds (zipmap (:columns ddl) row-vals)))
+                                      (transient ds)
+                                      rows)
+                      sealed (persistent! mutated)
+                      new-cols (dataset/columns sealed)
+                      new-cols (if-let [m (meta existing)] (with-meta new-cols m) new-cols)]
+                  (swap! table-registry-atom assoc table new-cols)
+                  (PgWireServer$QueryResult/empty (str "INSERT 0 " (count rows))))
+
+                ;; Index-backed table without explicit column list — reject
+                ;; rather than silently mismatch positions against an
+                ;; encoded column map (whose iteration order isn't guaranteed
+                ;; to match a SQL `CREATE TABLE` order).
+                (index-backed-cols? existing)
+                (throw (ex-info
+                         (str "INSERT on a stratum-index-backed table requires an explicit "
+                              "column list: `INSERT INTO " table " (col1, col2, ...) VALUES (...)`")
+                         {:table table}))
+
+                :else
+                (do
               (let [col-keys (vec (keys existing))
                     n-existing (if-let [first-col (get existing (first col-keys))]
                                  (cond
@@ -394,12 +790,30 @@
                     new-cols (with-meta new-cols (meta existing))]
                 (swap! table-registry-atom assoc table new-cols))
               (PgWireServer$QueryResult/empty
-               (str "INSERT 0 " (count rows))))
+               (str "INSERT 0 " (count rows))))))
 
             :upsert
             (let [existing (get @table-registry-atom table)]
               (when-not existing
                 (throw (ex-info (str "Table not found: " table) {:table table})))
+              ;; UPSERT (INSERT … ON CONFLICT) combined with FOR
+              ;; PORTION OF VALID_TIME has subtle semantics — the
+              ;; conflict target needs to be evaluated *per slice*,
+              ;; not per (positional) row. Reject explicitly rather
+              ;; than silently doing the wrong thing.
+              (when (:period ddl)
+                (throw (ex-info
+                         (str "INSERT … ON CONFLICT … FOR PORTION OF VALID_TIME "
+                              "is not supported. Use INSERT FOR PORTION OF + "
+                              "UPDATE FOR PORTION OF as separate statements, "
+                              "or DELETE FOR PORTION OF + INSERT FOR PORTION OF.")
+                         {:table table
+                          :period (:period ddl)})))
+              (when (and (index-backed-cols? existing) (nil? (:period ddl)))
+                (throw (ex-info
+                         (str "INSERT … ON CONFLICT on stratum-index-backed tables "
+                              "is not yet supported. Use plain INSERT + UPDATE separately.")
+                         {:table table})))
               (let [col-keys (vec (keys existing))
                     n-existing (let [first-col (get existing (first col-keys))]
                                  (cond
@@ -525,6 +939,22 @@
             (let [existing (get @table-registry-atom table)]
               (when-not existing
                 (throw (ex-info (str "Table not found: " table) {:table table})))
+              (cond
+                ;; UPDATE … FOR PORTION OF VALID_TIME on a fully
+                ;; index-backed bitemporal table lowers to
+                ;; dataset/bounded-update! (SQL:2011 non-sequenced UPDATE).
+                (and (:period ddl)
+                     (= :valid_time (:axis (:period ddl)))
+                     (index-backed-cols? existing))
+                (let [{:keys [new-cols n-updated]}
+                      (update-portion-via-index-backend
+                        table existing where assignments
+                        (:period ddl) (meta existing))]
+                  (swap! table-registry-atom assoc table new-cols)
+                  (PgWireServer$QueryResult/empty (str "UPDATE " n-updated)))
+
+                :else
+                (do
               (let [;; FROM table for UPDATE FROM (joined updates)
                     from-existing (when from
                                     (let [ft (get @table-registry-atom (:table from))]
@@ -671,12 +1101,43 @@
                      assignments)]
                 (swap! table-registry-atom assoc table
                        (with-meta new-cols (meta existing)))
-                (PgWireServer$QueryResult/empty (str "UPDATE " n-matched))))
+                (PgWireServer$QueryResult/empty (str "UPDATE " n-matched))))))
 
             :delete
             (let [existing (get @table-registry-atom table)]
               (when-not existing
                 (throw (ex-info (str "Table not found: " table) {:table table})))
+              ;; Index-backed tables (registered via stratum's columnar
+              ;; engine — `register-table!` with `idx/index-from-seq`
+              ;; columns) route through `ds-delete-rows!` (no period)
+              ;; or `retract!` (with FOR PORTION OF VALID_TIME period)
+              ;; instead of the array rebuild path below. The arrays
+              ;; path is preserved unchanged for CREATE TABLE statements.
+              (if (index-backed-cols? existing)
+                ;; `ERASE FROM …` bypasses
+                ;; the bounded-retract path and always physically purges
+                ;; via `ds-delete-rows!` — the distinct verb makes the
+                ;; "destroys across both axes" intent explicit. Plain
+                ;; DELETE today also routes to ds-delete-rows! on
+                ;; index-backed tables; ERASE just hardens the contract.
+                (let [period (:period ddl)
+                      erase? (:erase? ddl)
+                      {:keys [new-cols n-deleted]}
+                      (cond
+                        erase?
+                        (delete-via-index-backend
+                          table existing where (meta existing))
+
+                        (and period (= :valid_time (:axis period)))
+                        (delete-portion-via-index-backend
+                          table existing where period (meta existing))
+
+                        :else
+                        (delete-via-index-backend
+                          table existing where (meta existing)))
+                      tag (if erase? "ERASE" "DELETE")]
+                  (swap! table-registry-atom assoc table new-cols)
+                  (PgWireServer$QueryResult/empty (str tag " " n-deleted)))
               (let [col-keys (vec (keys existing))
                     n-rows (let [first-col (get existing (first col-keys))]
                              (cond
@@ -788,7 +1249,7 @@
                                col-keys))]
                 (swap! table-registry-atom assoc table
                        (with-meta new-cols (meta existing)))
-                (PgWireServer$QueryResult/empty (str "DELETE " n-deleted))))))
+                (PgWireServer$QueryResult/empty (str "DELETE " n-deleted)))))))
 
             ;; Parse/translation error
         (:error parsed)
@@ -809,7 +1270,7 @@
           (sql/format-results result))
 
         :else
-        (PgWireServer$QueryResult. "Internal error: unexpected parse result")))
+        (PgWireServer$QueryResult. "Internal error: unexpected parse result"))))
     (catch Exception e
       (PgWireServer$QueryResult. (str (.getMessage e))))))
 

@@ -28,7 +28,10 @@ This document covers Stratum's dataset type, persistence model, and temporal que
 
 Options for `make-dataset`:
 - `:name` - Dataset name string (default: `"unnamed"`)
-- `:metadata` - User metadata map (stored in commits)
+- `:metadata` - User metadata map (stored in commits). A reserved key
+  `:bitemporal {:valid {...} :system {...}}` opts the dataset into
+  bitemporal valid-time / system-time semantics — see
+  [Bitemporal Windows](#bitemporal-windows).
 
 ### Column Types
 
@@ -187,6 +190,77 @@ This walks the commit history and finds the most recent commit with `"datahike/t
 (def ds-at-time (st/resolve store "trades" {:as-of commit-uuid}))
 (def ds-at-tx (st/resolve store "trades" {:as-of-tx 42}))
 ```
+
+### Bitemporal Windows
+
+The temporal axes above are **tx-time** (when something was *committed* to this dataset). Many domains — accounting, contracts, regulatory reporting — also need **valid-time** (when a fact was *true in the modelled world*) and sometimes **system-time** (when the DB *recorded* a fact, per-row, distinct from per-commit). Stratum supports both as opt-in column conventions on `make-dataset`. See [`temporal-design.md`](temporal-design.md) for the full design.
+
+```clojure
+(st/make-dataset
+  {:eid          (long-array [1 1 2])
+   :salary       (long-array [100000 110000 80000])
+   :_valid_from  (long-array [1704067200000000  ;; 2024-01-01 μs
+                              1719792000000000  ;; 2024-07-01 μs
+                              1709251200000000]);; 2024-03-01 μs
+   :_valid_to    (long-array [1719792000000000
+                              Long/MAX_VALUE
+                              Long/MAX_VALUE])
+   :_system_from (long-array [1704067200000000
+                              1719792000000000
+                              1709251200000000])
+   :_system_to   (long-array [Long/MAX_VALUE
+                              Long/MAX_VALUE
+                              Long/MAX_VALUE])}
+  {:name "salaries"
+   :metadata
+   {:bitemporal
+    {:valid  {:from-col :_valid_from
+              :to-col   :_valid_to
+              :unit     :micros}
+     :system {:from-col :_system_from
+              :to-col   :_system_to
+              :unit     :micros}}}})
+```
+
+Either axis is optional — a dataset can opt into only `:valid` (most common), only `:system`, or both. Each axis is processed identically:
+
+- both named columns exist,
+- both are `:int64`,
+- no conflicting pre-existing `:temporal-unit` is set,
+
+and `make-dataset` stamps each pair with `:temporal-unit :micros` (the default — overridable to `:days`, `:seconds`, `:millis`). The columns are queryable like any other temporal column, including `DATE_TRUNC` / `EXTRACT` and zone-map range pruning. The `:micros` default matches the DuckDB `TIMESTAMP` convention used by the SQL surface and the SQL:2011 application-time-period table convention.
+
+Read the config back via `stratum.dataset/bitemporal-config`:
+
+```clojure
+(dataset/bitemporal-config ds)
+;; => {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+;;     :system {:from-col :_system_from :to-col :_system_to :unit :micros}}
+
+(dataset/valid-time-config ds)
+;; => {:from-col :_valid_from :to-col :_valid_to :unit :micros}
+
+(dataset/system-time-config ds)
+;; => {:from-col :_system_from :to-col :_system_to :unit :micros}
+```
+
+The metadata round-trips through `sync!` / `load`; the per-column `:temporal-unit` tag is re-applied automatically on restore (metadata is the source of truth, since per-column commit payloads don't persist `:temporal-unit`).
+
+Half-open `[from, to)` windows are the canonical encoding. `Long/MAX_VALUE` is the open-ended sentinel; zone-map pruning handles it without special-casing.
+
+Typical as-of-vt query (one entity's salary on a given date):
+
+```clojure
+(st/q {:from "salaries"
+       :where [[:= :eid 1]
+               [:<= :_valid_from at-micros]
+               [:>  :_valid_to   at-micros]]
+       :select [:salary]})
+```
+
+For per-row SCD2 (close the previous window when an entity is updated), use the `vt-append!` / `vt-update!` / `vt-delete!` primitives — see [`temporal-design.md`](temporal-design.md) for the API and overlap-policy.
+
+The valid-time bench shapes (point-in-vt at 1% selectivity, 50% selectivity with the `MAX_VALUE` sentinel, group-by with vt filter) are exercised alongside the standard tier 1-9 set in `bench/olap_bench.clj`.
 
 ## Integration with Query Engine
 

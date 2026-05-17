@@ -1664,6 +1664,198 @@
     (run-asof-bench "ASOF-Q3 mismatch" #(asof-q3-stratum data) conn asof-q3-sql)))
 
 ;; ============================================================================
+;; Tier 10: Valid-Time As-Of Benchmarks (feature/valid-time)
+;; ============================================================================
+;;
+;; Three shapes that exercise the bitemporal valid-time read path
+;; introduced on `feature/valid-time`. The convention is two long columns
+;; per row, `_valid_from` and `_valid_to` (microseconds-since-epoch),
+;; with the half-open window `[vf, vt)`. Predicates compile to
+;; `_valid_from <= at AND _valid_to > at` — two ops already supported
+;; by stratum's predicate kernel and zone-map pruner.
+;;
+;;   VT-Q1 1% sel     — 10M rows, 100 windows × 100K rows, at = middle of
+;;                      one window → ~1% of rows match. Compares cost to
+;;                      a plain WHERE range scan with the same selectivity.
+;;   VT-Q2 50% + ∞    — 10M rows, half-and-half: even-indexed rows have
+;;                      `_valid_to = Long/MAX_VALUE` (open-ended); odd-
+;;                      indexed have a narrow window that almost never
+;;                      hits. Exercises zone-map handling of the sentinel.
+;;   VT-Q3 group-by   — 10M rows + 100 accounts, vt filter + GROUP BY
+;;                      mod-100 → SUM(amount). Mirrors a typical
+;;                      "trial-balance as-of date X" accounting shape;
+;;                      the group-by keeps the join out for now.
+
+(def ^:private vt-q1-n 10000000)
+(def ^:private vt-q1-windows 100)        ;; → 100K rows per window, 1% match
+(def ^:private vt-q1-at 50)              ;; pick window 50 → vt-from <= 50 < vt-to
+
+(defn- gen-vt-q1 [^long n ^long n-windows]
+  ;; Each row's window covers `[k, k+1)` where k = row-index mod n-windows.
+  ;; Amount is just the row index for a reproducible non-trivial SUM.
+  (let [vf  (long-array n)
+        vt  (long-array n)
+        amt (long-array n)]
+    (dotimes [i n]
+      (let [k (mod i n-windows)]
+        (aset vf  i (long k))
+        (aset vt  i (long (inc k)))
+        (aset amt i (long i))))
+    {:vf vf :vt vt :amt amt :n n}))
+
+(defn- gen-vt-q2 [^long n]
+  ;; All rows share vf = 0 (zone-map pruning is trivial on vf).
+  ;; Even i: vt = Long/MAX_VALUE  (open-ended, always matches at any `at`)
+  ;; Odd i:  vt = 1               (always fails for at > 1)
+  ;; → exactly 50% selectivity, and the Long/MAX_VALUE sentinel
+  ;;   participates in vt's zone-map (mixed-value chunks force the
+  ;;   pruner to fall through to row-level evaluation).
+  (let [vf  (long-array n)
+        vt  (long-array n)
+        amt (long-array n)
+        at  100]
+    (dotimes [i n]
+      (aset vf i 0)
+      (aset vt i (if (even? i) Long/MAX_VALUE 1))
+      (aset amt i (long i)))
+    {:vf vf :vt vt :amt amt :n n :at at}))
+
+(defn- gen-vt-q3 [^long n ^long n-accounts ^long n-windows]
+  ;; Trial-balance shape: each row has (account-id, amount, vt-window).
+  ;; account-id = i mod n-accounts. Window setup mirrors VT-Q1.
+  (let [acct (long-array n)
+        amt  (long-array n)
+        vf   (long-array n)
+        vt   (long-array n)]
+    (dotimes [i n]
+      (aset acct i (long (mod i n-accounts)))
+      (aset amt  i (long (mod i 1000)))
+      (let [k (mod i n-windows)]
+        (aset vf i (long k))
+        (aset vt i (long (inc k)))))
+    {:acct acct :amt amt :vf vf :vt vt :n n}))
+
+;; --- DuckDB bulk loaders ---
+
+(defn- load-vt-q1-into-duckdb! [^Connection conn data]
+  (println "  Loading VT-Q1 data into DuckDB...")
+  (duckdb-jdbc-exec! conn "DROP TABLE IF EXISTS vt_q1")
+  (let [n (long (:n data))
+        ^longs vf (:vf data) ^longs vt (:vt data) ^longs amt (:amt data)
+        dconn (->duck-conn conn)]
+    (duckdb-jdbc-exec! conn "CREATE TABLE vt_q1 (vf BIGINT, vt BIGINT, amt BIGINT)")
+    (with-open [^DuckDBAppender app (.createAppender dconn "main" "vt_q1")]
+      (dotimes [i n]
+        (.beginRow app) (.append app (aget vf i)) (.append app (aget vt i))
+        (.append app (aget amt i)) (.endRow app)))))
+
+(defn- load-vt-q2-into-duckdb! [^Connection conn data]
+  (println "  Loading VT-Q2 data into DuckDB...")
+  (duckdb-jdbc-exec! conn "DROP TABLE IF EXISTS vt_q2")
+  (let [n (long (:n data))
+        ^longs vf (:vf data) ^longs vt (:vt data) ^longs amt (:amt data)
+        dconn (->duck-conn conn)]
+    (duckdb-jdbc-exec! conn "CREATE TABLE vt_q2 (vf BIGINT, vt BIGINT, amt BIGINT)")
+    (with-open [^DuckDBAppender app (.createAppender dconn "main" "vt_q2")]
+      (dotimes [i n]
+        (.beginRow app) (.append app (aget vf i)) (.append app (aget vt i))
+        (.append app (aget amt i)) (.endRow app)))))
+
+(defn- load-vt-q3-into-duckdb! [^Connection conn data]
+  (println "  Loading VT-Q3 data into DuckDB...")
+  (duckdb-jdbc-exec! conn "DROP TABLE IF EXISTS vt_q3")
+  (let [n (long (:n data))
+        ^longs acct (:acct data) ^longs amt (:amt data)
+        ^longs vf (:vf data) ^longs vt (:vt data)
+        dconn (->duck-conn conn)]
+    (duckdb-jdbc-exec! conn
+                       "CREATE TABLE vt_q3 (acct BIGINT, amt BIGINT, vf BIGINT, vt BIGINT)")
+    (with-open [^DuckDBAppender app (.createAppender dconn "main" "vt_q3")]
+      (dotimes [i n]
+        (.beginRow app) (.append app (aget acct i)) (.append app (aget amt i))
+        (.append app (aget vf i)) (.append app (aget vt i)) (.endRow app)))))
+
+;; --- Stratum + DuckDB queries ---
+
+(defn- vt-q1-stratum [data]
+  (q/q {:from {:vf (:vf data) :vt (:vt data) :amt (:amt data)}
+        :where [[:<= :vf vt-q1-at] [:> :vt vt-q1-at]]
+        :agg [[:sum :amt]]}))
+
+(def ^:private vt-q1-sql
+  (str "SELECT SUM(amt) FROM vt_q1 WHERE vf <= " vt-q1-at " AND vt > " vt-q1-at))
+
+(defn- vt-q2-stratum [data]
+  (let [at (long (:at data))]
+    (q/q {:from {:vf (:vf data) :vt (:vt data) :amt (:amt data)}
+          :where [[:<= :vf at] [:> :vt at]]
+          :agg [[:sum :amt]]})))
+
+(defn- vt-q2-sql [data]
+  (let [at (long (:at data))]
+    (str "SELECT SUM(amt) FROM vt_q2 WHERE vf <= " at " AND vt > " at)))
+
+(defn- vt-q3-stratum [data]
+  (q/q {:from {:acct (:acct data) :amt (:amt data)
+               :vf   (:vf data)   :vt  (:vt data)}
+        :where [[:<= :vf vt-q1-at] [:> :vt vt-q1-at]]
+        :group [:acct]
+        :agg   [[:sum :amt]]}))
+
+(def ^:private vt-q3-sql
+  (str "SELECT acct, SUM(amt) FROM vt_q3 "
+       "WHERE vf <= " vt-q1-at " AND vt > " vt-q1-at " "
+       "GROUP BY acct ORDER BY acct"))
+
+(defn- run-vt-bench
+  [name stratum-fn ^Connection conn duckdb-sql]
+  (println (str "\n=== " name " ==="))
+  (gc!)
+  (let [;; Smoke check: Stratum row-count == DuckDB row-count (a:b reductions
+        ;; will differ unless we hand-roll a sum extractor — for the
+        ;; correctness gate we use row counts as the canonical match).
+        s-rows (count (stratum-fn))]
+    (with-open [^Statement stmt (.createStatement conn)
+                ^ResultSet rs (.executeQuery stmt
+                                             (str "WITH q AS (" duckdb-sql ") "
+                                                  "SELECT COUNT(*) FROM q"))]
+      (when (.next rs)
+        (let [d-rows (.getLong rs 1)]
+          (println (format "  Stratum rows=%d  DuckDB rows=%d  %s"
+                           s-rows d-rows
+                           (if (= s-rows d-rows) "MATCH" "*** MISMATCH ***")))))))
+  (gc!)
+  (let [s-1t (bench-1t stratum-fn) _ (gc!)
+        s-nt (bench    stratum-fn) _ (gc!)
+        d-1t (duckdb-bench conn duckdb-sql :threads 1) _ (gc!)
+        d-nt (duckdb-bench conn duckdb-sql)]
+    (println (format "  Stratum (1T): %s | (NT): %s"
+                     (fmt-ms (:median s-1t)) (fmt-ms (:median s-nt))))
+    (println (format "  DuckDB  (1T): %s | (NT): %s"
+                     (fmt-ms (:median d-1t)) (fmt-ms (:median d-nt))))
+    (println (format "  Ratio 1T: %s" (fmt-ratio (:median s-1t) (:median d-1t))))
+    {:stratum-1t (:median s-1t) :stratum (:median s-nt)
+     :duckdb-1t  (:median d-1t) :duckdb  (:median d-nt)}))
+
+(defn- bench-vt-q1 [^Connection conn]
+  (println (str "\n--- VT-Q1 1% sel (" vt-q1-n " rows, " vt-q1-windows " windows) ---"))
+  (let [data (gen-vt-q1 vt-q1-n vt-q1-windows)]
+    (load-vt-q1-into-duckdb! conn data)
+    (run-vt-bench "VT-Q1 1% sel" #(vt-q1-stratum data) conn vt-q1-sql)))
+
+(defn- bench-vt-q2 [^Connection conn]
+  (println (str "\n--- VT-Q2 50% sel + Long/MAX_VALUE sentinel (" vt-q1-n " rows) ---"))
+  (let [data (gen-vt-q2 vt-q1-n)]
+    (load-vt-q2-into-duckdb! conn data)
+    (run-vt-bench "VT-Q2 50% + ∞" #(vt-q2-stratum data) conn (vt-q2-sql data))))
+
+(defn- bench-vt-q3 [^Connection conn]
+  (println (str "\n--- VT-Q3 group-by + vt filter (" vt-q1-n " rows, 100 accts) ---"))
+  (let [data (gen-vt-q3 vt-q1-n 100 vt-q1-windows)]
+    (load-vt-q3-into-duckdb! conn data)
+    (run-vt-bench "VT-Q3 group-by" #(vt-q3-stratum data) conn vt-q3-sql)))
+
+;; ============================================================================
 ;; Bitmap Semi-Join Benchmarks
 ;; ============================================================================
 
@@ -2701,7 +2893,11 @@
                     [:section "Tier 9: ASOF JOIN"]
                     [:asof-q1 "ASOF-Q1: dense 5M×5M, 50 keys, sorted"]
                     [:asof-q2 "ASOF-Q2: unpart 10M×100K, random ts"]
-                    [:asof-q3 "ASOF-Q3: mismatch 6M×1.6K, sec vs hour"]]]
+                    [:asof-q3 "ASOF-Q3: mismatch 6M×1.6K, sec vs hour"]
+                    [:section "Tier 10: Valid-Time As-Of"]
+                    [:vt-q1 "VT-Q1: 1% sel, 10M rows, 100 windows"]
+                    [:vt-q2 "VT-Q2: 50% sel + Long/MAX_VALUE sentinel"]
+                    [:vt-q3 "VT-Q3: group-by acct + vt filter"]]]
     ;; Walk bench-defs: print section headers only when following data exists
     (let [pending-section (atom nil)]
       (doseq [[k label] bench-defs]
@@ -3053,7 +3249,8 @@
                      "t6" "6" "stat" "statistical"
                      "t7" "7" "win" "window"
                      "t8" "8" "tpcds" "ds"
-                     "t9" "9" "asof"}
+                     "t9" "9" "asof"
+                     "t10" "10" "vt" "valid-time"}
         parsed (group-by #(try (Long/parseLong %) :n (catch Exception _ :tier)) args)
         n (if-let [ns (:n parsed)] (Long/parseLong (first ns)) default-n)
         ;; Scale-adaptive warmup & iterations
@@ -3387,6 +3584,21 @@
             (when (run-q? "q1") (gc!) (swap! all-results merge-best {:asof-q1 (bench-asof-q1 conn)}))
             (when (run-q? "q2") (gc!) (swap! all-results merge-best {:asof-q2 (bench-asof-q2 conn)}))
             (when (run-q? "q3") (gc!) (swap! all-results merge-best {:asof-q3 (bench-asof-q3 conn)}))
+            (finally (.close conn)))))
+
+      ;; === Tier 10: Valid-Time As-Of ===
+      ;; Three shapes that exercise the bitemporal valid-time read path:
+      ;;   VT-Q1 1% selectivity, VT-Q2 50% sel + Long/MAX_VALUE sentinel,
+      ;;   VT-Q3 group-by + vt filter (trial-balance-as-of shape).
+      ;; Fixed at 10M rows; `n` is ignored so the shapes stay comparable.
+      (when (run-tier? "t10" "10" "vt" "valid-time")
+        (println "\n\n=== Tier 10: Valid-Time As-Of ===")
+        (gc!)
+        (let [conn (duckdb-jdbc-connect "")]
+          (try
+            (when (run-q? "q1") (gc!) (swap! all-results merge-best {:vt-q1 (bench-vt-q1 conn)}))
+            (when (run-q? "q2") (gc!) (swap! all-results merge-best {:vt-q2 (bench-vt-q2 conn)}))
+            (when (run-q? "q3") (gc!) (swap! all-results merge-best {:vt-q3 (bench-vt-q3 conn)}))
             (finally (.close conn)))))
 
       ;; === Tier 7: Window Function Micro-Benchmark ===

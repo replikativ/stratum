@@ -648,3 +648,789 @@
       ;; Round-trip:
       (let [loaded (dataset/load store "main")]
         (is (= 3 (dataset/row-count loaded)))))))
+
+;; ============================================================================
+;; Valid-Time Metadata Config
+;; ============================================================================
+
+(deftest bitemporal-valid-axis-stamps-temporal-unit
+  (testing ":bitemporal {:valid {...}} tags the two named cols with :temporal-unit"
+    (let [ds (dataset/make-dataset
+              {:e (long-array [1 2])
+               :_valid_from (long-array [1700000000000000 1710000000000000])
+               :_valid_to   (long-array [1710000000000000 Long/MAX_VALUE])}
+              {:name "vt"
+               :metadata {:bitemporal
+                          {:valid {:from-col :_valid_from
+                                   :to-col   :_valid_to}}}})]
+      (is (= :micros (:temporal-unit (dataset/column ds :_valid_from))))
+      (is (= :micros (:temporal-unit (dataset/column ds :_valid_to))))
+      (testing "non-vt columns are unaffected"
+        (is (nil? (:temporal-unit (dataset/column ds :e)))))
+      (testing "bitemporal-config helper returns the :valid axis with :unit defaulted"
+        (is (= {:valid {:from-col :_valid_from :to-col :_valid_to :unit :micros}}
+               (dataset/bitemporal-config ds))))
+      (testing "valid-time-config / system-time-config per-axis helpers"
+        (is (= {:from-col :_valid_from :to-col :_valid_to :unit :micros}
+               (dataset/valid-time-config ds)))
+        (is (nil? (dataset/system-time-config ds)))))))
+
+(deftest bitemporal-both-axes-symmetric
+  (testing "configuring :valid + :system at once stamps both pairs"
+    (let [ds (dataset/make-dataset
+              {:e (long-array [1])
+               :_valid_from  (long-array [1700000000000000])
+               :_valid_to    (long-array [Long/MAX_VALUE])
+               :_system_from (long-array [1700000000000000])
+               :_system_to   (long-array [Long/MAX_VALUE])}
+              {:metadata
+               {:bitemporal {:valid  {:from-col :_valid_from
+                                      :to-col   :_valid_to}
+                             :system {:from-col :_system_from
+                                      :to-col   :_system_to}}}})]
+      (is (= :micros (:temporal-unit (dataset/column ds :_valid_from))))
+      (is (= :micros (:temporal-unit (dataset/column ds :_valid_to))))
+      (is (= :micros (:temporal-unit (dataset/column ds :_system_from))))
+      (is (= :micros (:temporal-unit (dataset/column ds :_system_to))))
+      (testing "bitemporal-config exposes both axes"
+        (let [cfg (dataset/bitemporal-config ds)]
+          (is (some? (:valid cfg)))
+          (is (some? (:system cfg))))))))
+
+(deftest bitemporal-only-system-axis
+  (testing "system-only datasets are valid — :valid axis is optional"
+    (let [ds (dataset/make-dataset
+              {:e (long-array [1])
+               :_system_from (long-array [1700000000000000])
+               :_system_to   (long-array [Long/MAX_VALUE])}
+              {:metadata
+               {:bitemporal {:system {:from-col :_system_from
+                                      :to-col   :_system_to}}}})]
+      (is (nil? (dataset/valid-time-config ds)))
+      (is (= {:from-col :_system_from :to-col :_system_to :unit :micros}
+             (dataset/system-time-config ds))))))
+
+(deftest bitemporal-honours-explicit-unit
+  (testing "explicit :unit overrides the :micros default per-axis"
+    (let [ds (dataset/make-dataset
+              {:_valid_from (long-array [19000 19365])
+               :_valid_to   (long-array [19365 Long/MAX_VALUE])}
+              {:metadata
+               {:bitemporal {:valid {:from-col :_valid_from
+                                     :to-col   :_valid_to
+                                     :unit     :days}}}})]
+      (is (= :days (:temporal-unit (dataset/column ds :_valid_from))))
+      (is (= :days (:temporal-unit (dataset/column ds :_valid_to))))
+      (is (= :days (:unit (dataset/valid-time-config ds)))))))
+
+(deftest bitemporal-rejects-missing-column
+  (testing "make-dataset throws if an axis names a missing column"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #":bitemporal :valid references missing column"
+         (dataset/make-dataset
+          {:_valid_from (long-array [1 2])}
+          {:metadata
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to}}}})))))
+
+(deftest bitemporal-rejects-wrong-type
+  (testing "make-dataset throws if an axis column is not :int64"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #":bitemporal :valid column must be :int64"
+         (dataset/make-dataset
+          {:_valid_from (double-array [1.0 2.0])
+           :_valid_to   (long-array   [3 4])}
+          {:metadata
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to}}}})))))
+
+(deftest bitemporal-rejects-conflicting-temporal-unit
+  (testing "make-dataset throws if a column carries a different :temporal-unit"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #":bitemporal :valid unit conflicts"
+         (dataset/make-dataset
+          {:_valid_from {:type :int64
+                         :data (long-array [1 2])
+                         :temporal-unit :millis}
+           :_valid_to   (long-array [3 4])}
+          {:metadata
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to}}}})))))
+
+(deftest bitemporal-survives-sync-load-round-trip
+  (testing "after sync!/load, both axes' tags are restamped"
+    (let [store (make-store)
+          ds (dataset/make-dataset
+              {:e            (index/index-from-seq :int64 [1 2 3])
+               :_valid_from  (index/index-from-seq :int64 [1700000000000000
+                                                           1710000000000000
+                                                           1720000000000000])
+               :_valid_to    (index/index-from-seq :int64 [1710000000000000
+                                                           1720000000000000
+                                                           Long/MAX_VALUE])
+               :_system_from (index/index-from-seq :int64 [1700000000000000
+                                                           1710000000000000
+                                                           1720000000000000])
+               :_system_to   (index/index-from-seq :int64 [Long/MAX_VALUE
+                                                           Long/MAX_VALUE
+                                                           Long/MAX_VALUE])}
+              {:name "bt"
+               :metadata
+               {:bitemporal {:valid  {:from-col :_valid_from
+                                      :to-col   :_valid_to}
+                             :system {:from-col :_system_from
+                                      :to-col   :_system_to}}}})]
+      (dataset/sync! ds store "main")
+      (let [loaded (dataset/load store "main")]
+        (testing "metadata round-trips intact for both axes"
+          (let [cfg (dataset/bitemporal-config loaded)]
+            (is (= {:from-col :_valid_from :to-col :_valid_to :unit :micros}
+                   (:valid cfg)))
+            (is (= {:from-col :_system_from :to-col :_system_to :unit :micros}
+                   (:system cfg)))))
+        (testing "all four window columns carry :temporal-unit after load"
+          (is (= :micros (:temporal-unit (dataset/column loaded :_valid_from))))
+          (is (= :micros (:temporal-unit (dataset/column loaded :_valid_to))))
+          (is (= :micros (:temporal-unit (dataset/column loaded :_system_from))))
+          (is (= :micros (:temporal-unit (dataset/column loaded :_system_to)))))
+        (testing "non-axis column unaffected"
+          (is (nil? (:temporal-unit (dataset/column loaded :e)))))))))
+
+(deftest bitemporal-config-nil-on-non-bitemporal-dataset
+  (testing "bitemporal-config returns nil for a dataset with no :bitemporal metadata"
+    (let [ds (dataset/make-dataset {:x (long-array [1 2 3])})]
+      (is (nil? (dataset/bitemporal-config ds)))
+      (is (nil? (dataset/valid-time-config ds)))
+      (is (nil? (dataset/system-time-config ds))))))
+
+;; ============================================================================
+;; Phase B — temporal write primitives (append! / upsert! / retract!)
+;; ============================================================================
+
+(defn- vt-only-ds [rows]
+  (let [eids       (mapv :eid rows)
+        salaries   (mapv :salary rows)
+        vfs        (mapv :_valid_from rows)
+        vts        (mapv :_valid_to rows)]
+    (dataset/make-dataset
+     {:eid         (index/index-from-seq :int64 eids)
+      :salary      (index/index-from-seq :int64 salaries)
+      :_valid_from (index/index-from-seq :int64 vfs)
+      :_valid_to   (index/index-from-seq :int64 vts)}
+     {:name "emp"
+      :metadata
+      {:bitemporal {:valid {:from-col :_valid_from
+                            :to-col   :_valid_to}}}})))
+
+(defn- ds-rows [ds]
+  (vec (for [i (range (dataset/row-count ds))]
+         (into {} (for [k (dataset/column-names ds)]
+                    [k (let [col (dataset/column ds k)]
+                         (cond
+                           (:data col)
+                           (let [arr (:data col)]
+                             (cond
+                               (instance? (Class/forName "[J") arr) (aget ^longs arr i)
+                               (instance? (Class/forName "[D") arr) (aget ^doubles arr i)
+                               :else nil))
+                           (:index col) (index/idx-get-long (:index col) i)))])))))
+
+(deftest append!-auto-stamps-axis-columns-from-tx-meta
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds
+                   transient
+                   (dataset/append! {:eid 2 :salary 80000}
+                                    {:valid-from 1709251200000000})
+                   persistent!)
+        rows (ds-rows result)
+        bob (first (filter #(= 1 (:eid %)) rows))
+        alice (first (filter #(= 2 (:eid %)) rows))]
+    (testing "explicit :valid-from in tx-meta is stamped"
+      (is (= 1709251200000000 (:_valid_from alice))))
+    (testing ":valid-to defaults to Long/MAX_VALUE"
+      (is (= Long/MAX_VALUE (:_valid_to alice))))
+    (testing "previously-existing row untouched"
+      (is (= 1704067200000000 (:_valid_from bob)))
+      (is (= Long/MAX_VALUE (:_valid_to bob))))))
+
+(deftest append!-defaults-valid-from-to-now-when-tx-meta-absent
+  (let [ds  (vt-only-ds [])
+        before (* 1000 (System/currentTimeMillis))
+        result (-> ds transient
+                   (dataset/append! {:eid 1 :salary 100000})
+                   persistent!)
+        after  (* 1000 (System/currentTimeMillis))
+        row    (first (ds-rows result))]
+    (testing ":valid-from defaults to now-in-micros within the call window"
+      (is (<= before (:_valid_from row) after)))
+    (testing ":valid-to defaults to Long/MAX_VALUE"
+      (is (= Long/MAX_VALUE (:_valid_to row))))))
+
+(deftest upsert!-closes-old-row-and-appends-new
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]]
+                                     :set {:salary 110000}}
+                                    {:valid-from 1719792000000000})
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "two rows after upsert: closed-old + open-new"
+      (is (= 2 (count rows))))
+    (testing "old row's :_valid_to closed to new tx-meta's :valid-from"
+      (let [closed (first (filter #(= 100000 (:salary %)) rows))]
+        (is (= 1704067200000000 (:_valid_from closed)))
+        (is (= 1719792000000000 (:_valid_to closed)))))
+    (testing "new row carries merged values + open vt-window"
+      (let [new-row (first (filter #(= 110000 (:salary %)) rows))]
+        (is (= 1 (:eid new-row)))
+        (is (= 1719792000000000 (:_valid_from new-row)))
+        (is (= Long/MAX_VALUE (:_valid_to new-row)))))))
+
+(deftest upsert!-skips-already-closed-rows
+  ;; Multiple historical versions; only the open one should be closed.
+  (let [ds (vt-only-ds [{:eid 1 :salary 90000
+                         :_valid_from 1700000000000000
+                         :_valid_to   1704067200000000}
+                        {:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]]
+                                     :set {:salary 110000}}
+                                    {:valid-from 1719792000000000})
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "three rows after upsert"
+      (is (= 3 (count rows))))
+    (testing "already-closed historical row untouched"
+      (let [old (first (filter #(= 90000 (:salary %)) rows))]
+        (is (= 1700000000000000 (:_valid_from old)))
+        (is (= 1704067200000000 (:_valid_to old)))))))
+
+(deftest retract!-closes-open-row-without-reopening
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/retract! {:where [[:= :eid 1]]}
+                                     {:valid-from 1719792000000000})
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "row count unchanged (retract is close-only, no append)"
+      (is (= 1 (count rows))))
+    (testing ":_valid_to closed to tx-meta :valid-from"
+      (is (= 1719792000000000 (:_valid_to (first rows)))))))
+
+(deftest upsert!-throws-on-non-bitemporal-dataset
+  (let [ds (dataset/make-dataset
+            {:eid (index/index-from-seq :int64 [1])
+             :salary (index/index-from-seq :int64 [100])})]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"upsert! requires a :valid axis"
+         (-> ds transient
+             (dataset/upsert! {:where [[:= :eid 1]] :set {:salary 200}}))))))
+
+(deftest retract!-throws-on-non-bitemporal-dataset
+  (let [ds (dataset/make-dataset
+            {:eid (index/index-from-seq :int64 [1])
+             :salary (index/index-from-seq :int64 [100])})]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"retract! requires a :valid axis"
+         (-> ds transient
+             (dataset/retract! {:where [[:= :eid 1]]}))))))
+
+(deftest append!-works-on-non-bitemporal-dataset-with-tx-meta
+  (testing "non-bitemporal datasets ignore tx-meta and require all columns"
+    (let [ds (dataset/make-dataset
+              {:x (index/index-from-seq :int64 [])})
+          result (-> ds transient
+                     (dataset/append! {:x 42} {:valid-from 999})
+                     persistent!)]
+      (is (= 1 (dataset/row-count result)))
+      (is (= 42 (index/idx-get-long (:index (dataset/column result :x)) 0))))))
+
+(deftest both-axes-append!-stamps-both-pairs
+  (let [ds (dataset/make-dataset
+            {:eid          (index/index-from-seq :int64 [])
+             :salary       (index/index-from-seq :int64 [])
+             :_valid_from  (index/index-from-seq :int64 [])
+             :_valid_to    (index/index-from-seq :int64 [])
+             :_system_from (index/index-from-seq :int64 [])
+             :_system_to   (index/index-from-seq :int64 [])}
+            {:metadata
+             {:bitemporal
+              {:valid  {:from-col :_valid_from  :to-col :_valid_to}
+               :system {:from-col :_system_from :to-col :_system_to}}}})
+        result (-> ds transient
+                   (dataset/append! {:eid 1 :salary 100000}
+                                    {:valid-from  1704067200000000
+                                     :system-from 1700000000000000})
+                   persistent!)
+        row (first (for [i (range (dataset/row-count result))]
+                     (into {} (for [k (dataset/column-names result)]
+                                [k (index/idx-get-long
+                                    (:index (dataset/column result k)) i)]))))]
+    (testing "both axes' :_from values come from tx-meta"
+      (is (= 1704067200000000 (:_valid_from row)))
+      (is (= 1700000000000000 (:_system_from row))))
+    (testing "both axes' :_to default to Long/MAX_VALUE"
+      (is (= Long/MAX_VALUE (:_valid_to row)))
+      (is (= Long/MAX_VALUE (:_system_to row))))))
+
+(deftest upsert!-merges-previous-row-values-when-set-is-partial
+  ;; If :set only supplies some columns, the new row should inherit the
+  ;; rest from the previous (closed) row.
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   ;; :set only carries :salary; :eid should be inherited
+                   (dataset/upsert! {:where [[:= :eid 1]]
+                                     :set {:salary 110000}}
+                                    {:valid-from 1719792000000000})
+                   persistent!)
+        new-row (first (filter #(= 110000 (:salary %)) (ds-rows result)))]
+    (testing "new row inherits :eid from the previous open row"
+      (is (= 1 (:eid new-row))))))
+
+(deftest upsert!-supports-fn-where-predicate
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}
+                        {:eid 2 :salary 80000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where (fn [r] (= 1 (:eid r)))
+                                     :set {:salary 110000}}
+                                    {:valid-from 1719792000000000})
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "fn predicate matches only eid=1"
+      (is (= 3 (count rows)))  ;; 2 original + 1 new
+      (is (= 1 (count (filter #(and (= 1 (:eid %)) (= 110000 (:salary %))) rows)))))
+    (testing "eid=2 row stays open"
+      (let [bob2 (first (filter #(= 2 (:eid %)) rows))]
+        (is (= Long/MAX_VALUE (:_valid_to bob2)))))))
+
+;; ============================================================================
+;; Phase C — overlap detection (reject by default; auto-split is deferred)
+;; ============================================================================
+
+(deftest upsert!-rejects-backdated-write-overlapping-open-row
+  ;; Existing open row [Jul-2024, MAX). New write tries :valid-from
+  ;; Apr-2024 (backdated). The new write's [Apr, MAX) would overlap
+  ;; the open [Jul, MAX). Reject.
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1719792000000000  ;; 2024-07-01
+                         :_valid_to   Long/MAX_VALUE}])]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"upsert! would overlap"
+         (-> ds transient
+             (dataset/upsert! {:where [[:= :eid 1]] :set {:salary 110000}}
+                              {:valid-from 1714521600000000})))))) ;; 2024-04-30
+
+(deftest upsert!-rejects-overlap-with-already-closed-historical
+  ;; Two historical rows: Jan-Jul (closed) and Jul-MAX (open).
+  ;; New write :valid-from Apr-2024 would overlap BOTH the closed
+  ;; Jan-Jul row AND the open row.
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000  ;; 2024-01-01
+                         :_valid_to   1719792000000000} ;; 2024-07-01
+                        {:eid 1 :salary 110000
+                         :_valid_from 1719792000000000
+                         :_valid_to   Long/MAX_VALUE}])]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"upsert! would overlap"
+         (-> ds transient
+             (dataset/upsert! {:where [[:= :eid 1]] :set {:salary 95000}}
+                              {:valid-from 1714521600000000}))))))
+
+(deftest upsert!-auto-split-truncates-open-row-when-new-vf-is-inside-it
+  ;; Single open row [Jul-2024, MAX). Backdated upsert at Apr-2024 with
+  ;; :auto-split? true: row's open vt is in the future, so close-safe
+  ;; doesn't apply (row-vf=Jul > new-vf=Apr); instead auto-split must
+  ;; DROP the row (it's entirely inside [Apr, MAX)) and append the new
+  ;; row from `:set`.
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1719792000000000  ;; Jul-2024
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]] :set {:eid 1 :salary 110000}
+                                     :auto-split? true}
+                                    {:valid-from 1714521600000000}) ;; Apr-2024
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "exactly one row survives — the original was dropped, new appended"
+      (is (= 1 (count rows)))
+      (is (= 110000 (:salary (first rows))))
+      (is (= 1714521600000000 (:_valid_from (first rows))))
+      (is (= Long/MAX_VALUE (:_valid_to (first rows)))))))
+
+(deftest upsert!-auto-split-truncates-closed-historical-with-partial-left-overlap
+  ;; Closed row [Jan, Jul). Backdated upsert at Apr (inside the row).
+  ;; row-vf=Jan < new-vf=Apr < row-vt=Jul → TRUNCATE row to [Jan, Apr),
+  ;; then append new [Apr, MAX).
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000  ;; Jan-2024
+                         :_valid_to   1719792000000000} ;; Jul-2024
+                        {:eid 1 :salary 110000
+                         :_valid_from 1719792000000000  ;; Jul-2024
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]] :set {:eid 1 :salary 95000}
+                                     :auto-split? true}
+                                    {:valid-from 1714521600000000}) ;; Apr-2024
+                   persistent!)
+        rows (sort-by :_valid_from (ds-rows result))]
+    (testing "two rows after split: truncated historical + new write"
+      (is (= 2 (count rows))))
+    (testing "historical row truncated to [Jan, Apr)"
+      (is (= 100000 (:salary (first rows))))
+      (is (= 1704067200000000 (:_valid_from (first rows))))
+      (is (= 1714521600000000 (:_valid_to (first rows)))))
+    (testing "new row covers [Apr, MAX)"
+      (is (= 95000 (:salary (second rows))))
+      (is (= 1714521600000000 (:_valid_from (second rows))))
+      (is (= Long/MAX_VALUE (:_valid_to (second rows)))))
+    (testing "the future open row [Jul, MAX) was dropped (row-vf >= new-vf)"
+      (is (not-any? #(= 110000 (:salary %)) rows)))))
+
+(deftest upsert!-auto-split-leaves-other-entities-alone
+  ;; eid=2 has an open row but doesn't match :where [:= :eid 1].
+  ;; Auto-split on eid=1 must not touch eid=2.
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1719792000000000
+                         :_valid_to   Long/MAX_VALUE}
+                        {:eid 2 :salary 80000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]] :set {:eid 1 :salary 999}
+                                     :auto-split? true}
+                                    {:valid-from 1714521600000000})
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "eid=2 untouched"
+      (let [r2 (first (filter #(= 2 (:eid %)) rows))]
+        (is (some? r2))
+        (is (= 80000 (:salary r2)))
+        (is (= 1704067200000000 (:_valid_from r2)))
+        (is (= Long/MAX_VALUE (:_valid_to r2)))))))
+
+(deftest upsert!-tolerates-historical-rows-strictly-before-new-vf
+  ;; Closed row entirely in the past (Nov-Jan), open row Jan-MAX,
+  ;; new write Jul-2024. Only the open row's [Jan, MAX) is touched;
+  ;; the closed Nov-Jan row is left alone (entirely before new-vf).
+  (let [ds (vt-only-ds [{:eid 1 :salary 90000
+                         :_valid_from 1700000000000000  ;; Nov-2023
+                         :_valid_to   1704067200000000} ;; Jan-2024
+                        {:eid 1 :salary 100000
+                         :_valid_from 1704067200000000  ;; Jan-2024
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]] :set {:salary 110000}}
+                                    {:valid-from 1719792000000000}) ;; Jul-2024
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "three rows after the historic-aware upsert"
+      (is (= 3 (count rows))))
+    (testing "ancient closed row untouched"
+      (is (= 1700000000000000
+             (:_valid_from (first (filter #(= 90000 (:salary %)) rows))))))))
+
+(deftest upsert!-on-new-entity-degenerates-to-insert
+  ;; No matching open row exists for eid=99 → upsert! falls through to
+  ;; appending the :set payload as a brand-new row, auto-stamping the
+  ;; axis columns. Matches the spirit of "INSERT … ON CONFLICT UPDATE".
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 99]]
+                                     :set {:eid 99 :salary 50000}}
+                                    {:valid-from 1719792000000000})
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "two rows: original eid=1 + new eid=99"
+      (is (= 2 (count rows))))
+    (testing "new row is the inserted eid=99"
+      (let [new-row (first (filter #(= 99 (:eid %)) rows))]
+        (is (= 50000 (:salary new-row)))
+        (is (= 1719792000000000 (:_valid_from new-row)))
+        (is (= Long/MAX_VALUE (:_valid_to new-row)))))))
+
+(deftest retract!-rejects-overlap-with-historical-window
+  ;; Closing into a historical period (Jan-Jul is already closed; trying
+  ;; to retract from Apr-2024 would touch a window we no longer own).
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   1719792000000000}
+                        {:eid 1 :salary 110000
+                         :_valid_from 1719792000000000
+                         :_valid_to   Long/MAX_VALUE}])]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"retract! would touch rows"
+         (-> ds transient
+             (dataset/retract! {:where [[:= :eid 1]]}
+                               {:valid-from 1714521600000000}))))))
+
+(deftest retract!-auto-split-truncates-historical-and-drops-future
+  ;; Closed [Jan, Jul) + open [Jul, MAX). Backdated retract at Apr:
+  ;; closed row spans Apr → TRUNCATE to [Jan, Apr); open row's
+  ;; vf=Jul >= Apr → DROP.
+  (let [ds (vt-only-ds [{:eid 1 :salary 100000
+                         :_valid_from 1704067200000000
+                         :_valid_to   1719792000000000}
+                        {:eid 1 :salary 110000
+                         :_valid_from 1719792000000000
+                         :_valid_to   Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/retract! {:where [[:= :eid 1]] :auto-split? true}
+                                     {:valid-from 1714521600000000})
+                   persistent!)
+        rows (ds-rows result)]
+    (testing "only the truncated historical row survives"
+      (is (= 1 (count rows)))
+      (is (= 100000 (:salary (first rows))))
+      (is (= 1704067200000000 (:_valid_from (first rows))))
+      (is (= 1714521600000000 (:_valid_to (first rows)))))))
+
+(deftest ds-delete-rows!-shifts-correctly
+  ;; Delete two rows from a 5-row dataset; verify the remaining rows
+  ;; keep their column-aligned values.
+  (let [ds (vt-only-ds (for [i (range 5)]
+                         {:eid i :salary (* 100 (inc i))
+                          :_valid_from i :_valid_to Long/MAX_VALUE}))
+        out (-> ds transient
+                (dataset/ds-delete-rows! [1 3])
+                persistent!)
+        rows (ds-rows out)]
+    (testing "row count is reduced"
+      (is (= 3 (count rows)))
+      (is (= 3 (dataset/row-count out))))
+    (testing "surviving rows keep column alignment"
+      (is (= [0 2 4] (mapv :eid rows)))
+      (is (= [100 300 500] (mapv :salary rows))))))
+
+(deftest ds-delete-rows!-requires-transient
+  (let [ds (vt-only-ds [{:eid 1 :salary 100
+                         :_valid_from 1 :_valid_to Long/MAX_VALUE}])]
+    (is (thrown? IllegalStateException
+                 (dataset/ds-delete-rows! ds [0])))))
+
+(deftest ds-delete-rows!-rejects-out-of-bounds
+  (let [ds (vt-only-ds [{:eid 1 :salary 100
+                         :_valid_from 1 :_valid_to Long/MAX_VALUE}])]
+    (is (thrown? IndexOutOfBoundsException
+                 (-> ds transient (dataset/ds-delete-rows! [5]))))))
+
+;; ============================================================================
+;; validate-period! — reject zero-width and reverse temporal windows
+;; ============================================================================
+
+(deftest append!-rejects-zero-width-valid-window
+  (testing "append! with vf == vt throws"
+    (let [ds (vt-only-ds [])]
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo #"Invalid valid window"
+            (-> ds transient
+                (dataset/append! {:eid 1 :salary 100
+                                  :_valid_from 1000 :_valid_to 1000})))))))
+
+(deftest append!-rejects-reverse-valid-window
+  (testing "append! with vf > vt throws"
+    (let [ds (vt-only-ds [])]
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo #"Invalid valid window"
+            (-> ds transient
+                (dataset/append! {:eid 1 :salary 100
+                                  :_valid_from 2000 :_valid_to 1000})))))))
+
+(deftest bounded-retract!-rejects-zero-width-period
+  (testing "retract! with :valid-to == :valid-from throws"
+    (let [ds (vt-only-ds [{:eid 1 :salary 100
+                           :_valid_from 1000 :_valid_to Long/MAX_VALUE}])]
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo #"Invalid valid window"
+            (-> ds transient
+                (dataset/retract! {:where [[:= :eid 1]]}
+                                  {:valid-from 2000 :valid-to 2000})))))))
+
+(deftest bounded-update!-rejects-reverse-period
+  (testing "bounded-update! with reverse period throws"
+    (let [ds (vt-only-ds [{:eid 1 :salary 100
+                           :_valid_from 1000 :_valid_to Long/MAX_VALUE}])]
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo #"Invalid valid window"
+            (-> ds transient
+                (dataset/bounded-update! {:where [[:= :eid 1]] :set {:salary 999}}
+                                         {:valid-from 5000 :valid-to 3000})))))))
+
+;; ============================================================================
+;; SCD2-on-both-axes — system-time symmetry on every vt mutation
+;;
+;; In a bitemporal dataset, an upsert/retract/bounded-update must NOT
+;; mutate vt in place on the old row — that would silently rewrite
+;; the past. Instead, close _system_to on the old row and append the
+;; surviving slice(s) with fresh _system_from. AS OF queries at past
+;; system-time then still see the pre-surgery state.
+;; ============================================================================
+
+(defn- bitemporal-ds [rows]
+  (let [eids       (mapv :eid rows)
+        salaries   (mapv :salary rows)
+        vfs        (mapv :_valid_from rows)
+        vts        (mapv :_valid_to rows)
+        sfs        (mapv :_system_from rows)
+        sts        (mapv :_system_to rows)]
+    (dataset/make-dataset
+     {:eid          (index/index-from-seq :int64 eids)
+      :salary       (index/index-from-seq :int64 salaries)
+      :_valid_from  (index/index-from-seq :int64 vfs)
+      :_valid_to    (index/index-from-seq :int64 vts)
+      :_system_from (index/index-from-seq :int64 sfs)
+      :_system_to   (index/index-from-seq :int64 sts)}
+     {:name "emp"
+      :metadata
+      {:bitemporal {:valid  {:from-col :_valid_from :to-col :_valid_to}
+                    :system {:from-col :_system_from :to-col :_system_to}}}})))
+
+(defn- bitemporal-rows [ds]
+  (vec (for [i (range (dataset/row-count ds))]
+         (into {} (for [k (dataset/column-names ds)]
+                    [k (index/idx-get-long (:index (dataset/column ds k)) i)])))))
+
+(deftest upsert!-on-bitemporal-closes-system-to-on-prior-row
+  ;; Setup: at system-time 1000, the user asserted "eid 1 salary 100,
+  ;; valid Jan-MAX". At system-time 2000, the user upserts a new
+  ;; salary 110 valid from Jul. We expect:
+  ;;   - The original [Jan, MAX) salary=100 row stays at vf=Jan vt=MAX
+  ;;     (vt is NOT mutated) but its system-to is closed to 2000.
+  ;;   - A successor [Jan, Jul) salary=100 row is appended at system 2000.
+  ;;   - The new [Jul, MAX) salary=110 row is appended at system 2000.
+  (let [ds (bitemporal-ds [{:eid 1 :salary 100
+                            :_valid_from 1000000 :_valid_to Long/MAX_VALUE
+                            :_system_from 1000 :_system_to Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]]
+                                     :set {:eid 1 :salary 110}}
+                                    {:valid-from 7000000
+                                     :system-from 2000})
+                   persistent!)
+        rows (bitemporal-rows result)]
+    (testing "three rows: original (system-closed), successor historical, new current"
+      (is (= 3 (count rows))))
+    (testing "original row retained vt=MAX but its system-to is now 2000"
+      (let [orig (first (filter #(and (= 1000 (:_system_from %))
+                                      (= 1000000 (:_valid_from %))
+                                      (= Long/MAX_VALUE (:_valid_to %)))
+                                rows))]
+        (is (some? orig) "the originally-asserted row must still exist")
+        (is (= 2000 (:_system_to orig))
+            "its system-to should be closed at the surgery system-time")))
+    (testing "successor for the truncated [Jan, Jul) at system 2000"
+      (let [hist (first (filter #(and (= 2000 (:_system_from %))
+                                      (= 1000000 (:_valid_from %))
+                                      (= 7000000 (:_valid_to %)))
+                                rows))]
+        (is (some? hist))
+        (is (= 100 (:salary hist)))))
+    (testing "new [Jul, MAX) at system 2000 with merged salary"
+      (let [new-row (first (filter #(and (= 2000 (:_system_from %))
+                                         (= 7000000 (:_valid_from %)))
+                                   rows))]
+        (is (some? new-row))
+        (is (= 110 (:salary new-row)))
+        (is (= Long/MAX_VALUE (:_valid_to new-row)))))))
+
+(deftest retract!-bounded-on-bitemporal-closes-system-on-split
+  ;; Single row [Jan, Sep) salary=100 originally written at system 1000.
+  ;; Retract over [Apr, Jul) at system 2000.
+  ;; Expected after surgery:
+  ;;   Original [Jan, Sep) system-closed to 2000.
+  ;;   Successor [Jan, Apr) at system 2000.
+  ;;   Successor [Jul, Sep) at system 2000.
+  ;; AS OF system-time 1500: should see the original [Jan, Sep) row.
+  ;; AS OF system-time 2500: should see two slices [Jan, Apr) + [Jul, Sep).
+  (let [ds (bitemporal-ds [{:eid 1 :salary 100
+                            :_valid_from 1000000 :_valid_to 9000000
+                            :_system_from 1000 :_system_to Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/retract! {:where [[:= :eid 1]]}
+                                     {:valid-from 4000000
+                                      :valid-to 7000000
+                                      :system-from 2000})
+                   persistent!)
+        rows (bitemporal-rows result)]
+    (testing "three rows: closed original + two replacement slices"
+      (is (= 3 (count rows))))
+    (testing "original system-closed at 2000"
+      (let [orig (first (filter #(and (= 1000 (:_system_from %))
+                                      (= 1000000 (:_valid_from %))
+                                      (= 9000000 (:_valid_to %)))
+                                rows))]
+        (is (some? orig))
+        (is (= 2000 (:_system_to orig)))))
+    (testing "left replacement [Jan, Apr) at system 2000"
+      (let [left (first (filter #(and (= 2000 (:_system_from %))
+                                      (= 1000000 (:_valid_from %))
+                                      (= 4000000 (:_valid_to %)))
+                                rows))]
+        (is (some? left))))
+    (testing "right replacement [Jul, Sep) at system 2000"
+      (let [right (first (filter #(and (= 2000 (:_system_from %))
+                                       (= 7000000 (:_valid_from %))
+                                       (= 9000000 (:_valid_to %)))
+                                 rows))]
+        (is (some? right))))))
+
+(deftest valid-only-upsert!-keeps-in-place-mutation
+  ;; Regression: when no system axis is configured, the existing
+  ;; in-place vt mutation behavior must be preserved (no extra
+  ;; "historical successor" row appears).
+  (let [ds (vt-only-ds [{:eid 1 :salary 100
+                         :_valid_from 1000 :_valid_to Long/MAX_VALUE}])
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 1]]
+                                     :set {:eid 1 :salary 110}}
+                                    {:valid-from 5000})
+                   persistent!)
+        rows (ds-rows result)]
+    (is (= 2 (count rows))
+        "valid-only mode: original closed in place + new merged row = 2")))
+
+;; ============================================================================
+;; *clock-time-millis* dynamic var for repeatable test runs
+;; ============================================================================
+
+(deftest now-in-unit-honors-clock-time-millis-binding
+  (testing "Binding *clock-time-millis* pins the time source"
+    (let [ds (vt-only-ds [])
+          pinned 1704067200000]   ;; Jan-01-2024 millis
+      ;; append! without :valid-from defaults to now → should be the pinned value
+      ;; in micros (×1000).
+      (let [result (binding [dataset/*clock-time-millis* pinned]
+                     (-> ds transient
+                         (dataset/append! {:eid 1 :salary 100})
+                         persistent!))
+            row (first (ds-rows result))]
+        (is (= (* 1000 pinned) (:_valid_from row))
+            "valid-from must equal the pinned clock-time × 1000 (millis → micros)")))))
+
+(deftest now-in-unit-without-binding-uses-system-clock
+  (testing "When *clock-time-millis* is nil, falls back to wall-clock"
+    (let [ds (vt-only-ds [])
+          before-millis (System/currentTimeMillis)
+          result (-> ds transient
+                     (dataset/append! {:eid 1 :salary 100})
+                     persistent!)
+          after-millis (System/currentTimeMillis)
+          row (first (ds-rows result))
+          vf-millis (quot (:_valid_from row) 1000)]
+      (is (<= before-millis vf-millis after-millis)
+          "valid-from millis should fall in [before, after] window"))))
