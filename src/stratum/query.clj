@@ -653,7 +653,14 @@
                                                                                 :or (doseq [sub (subvec p 2)] (walk sub))
                                                                                 :fn (swap! ks conj (first p))
                                                                                 (:in :not-in) (swap! ks conj (first p))
-                                                                                (when (keyword? (first p)) (swap! ks conj (first p))))))]
+                                                                                (do
+                                                                                  (when (keyword? (first p))
+                                                                                    (swap! ks conj (first p)))
+                                                                                  ;; RHS keyword args (col-vs-col)
+                                                                                  ;; — round-3 agent dedupe.
+                                                                                  (doseq [a (subvec p 2)]
+                                                                                    (when (keyword? a)
+                                                                                      (swap! ks conj a)))))))]
                                                                     (doseq [p non-simd-preds] (walk p)))
                                                                   @ks)
                                               ;; Only materialize those columns, keep others as indices

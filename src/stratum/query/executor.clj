@@ -90,10 +90,19 @@
         ;; 4. Non-SIMD → mask compilation
         [simd-preds non-simd-preds] (pred/split-preds preds columns)
         [preds columns] (if (seq non-simd-preds)
-                          (let [pred-col-keys (into #{} (keep (fn [p]
-                                                                (let [c (first p)]
-                                                                  (when (keyword? c) c))))
-                                                    non-simd-preds)
+                          (let [;; Collect both LHS (`first p`) and any
+                                ;; keyword RHS args (col-vs-col). Same
+                                ;; shape fix as plan/pred-columns
+                                ;; (copilot review #3) — round-3 agent
+                                ;; found this duplicate walker still
+                                ;; LHS-only.
+                                pred-col-keys
+                                (into #{}
+                                      (mapcat (fn [p]
+                                                (let [lhs (first p)]
+                                                  (concat (when (keyword? lhs) [lhs])
+                                                          (filter keyword? (subvec p 2))))))
+                                      non-simd-preds)
                                 partial-mat (reduce (fn [cs k]
                                                       (if-let [c (get cs k)]
                                                         (assoc cs k (cols/materialize-column c))

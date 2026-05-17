@@ -200,7 +200,21 @@
                           :or (doseq [sub (subvec p 2)] (walk-pred sub))
                           :fn (swap! all-cols conj (first p))
                           (:in :not-in) (swap! all-cols conj (first p))
-                          (when (keyword? (first p)) (swap! all-cols conj (first p))))))]
+                          (do
+                            (when (keyword? (first p))
+                              (swap! all-cols conj (first p)))
+                            ;; Scan RHS args for keyword col-vs-col
+                            ;; refs — `[:_valid_from :lt :_valid_to]`
+                            ;; references BOTH cols. Pre-fix only LHS
+                            ;; was tracked; pruning trimmed RHS and
+                            ;; the compiled mask hit a missing col-sym
+                            ;; at compile time. Same shape as the
+                            ;; `pred-columns` fix in plan.clj (copilot
+                            ;; review #3); round-3 agent found this
+                            ;; duplicate walker still buggy.
+                            (doseq [a (subvec p 2)]
+                              (when (keyword? a)
+                                (swap! all-cols conj a)))))))]
               (doseq [p non-simd-preds] (walk-pred p)))
           needed-cols (vec (filterv #(contains? columns %) @all-cols))
 
