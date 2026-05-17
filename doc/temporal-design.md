@@ -594,6 +594,162 @@ With this work in place:
   VALID_TIME` directly without a custom translator.
 - Both temporal axes get equal treatment from the planner.
 
+## How Stratum compares to other bitemporal engines
+
+Bitemporal storage shows up in three architectural shapes today; the
+one you pick should match your workload, not your taste in databases.
+This section sketches the alternatives and where Stratum sits.
+
+A longer engine-by-engine comparison — including non-SQL bitemporal
+systems like Datomic and the bitemporal capabilities of Datahike —
+will live in the Datahike docs once Datahike's own bitemporal support
+ships. This section focuses on the picking decision for users
+evaluating Stratum specifically.
+
+### When to pick what
+
+| If your workload is mainly… | Pick |
+|---|---|
+| Analytics / OLAP on a recent snapshot with occasional valid-time corrections (accounting, claims, ERP back-office, IoT late-telemetry, audit-grade SCD2) | **Stratum** |
+| Mixed read/write where most reads are "as of now" on a wide table and the bitemporal axes are columns you'd touch anyway | **Stratum** |
+| Bulk supersession of thousands of rows in one transaction (period-end re-pricing, regulatory restatement) | **Stratum** |
+| Distributed, append-only event log scaled across object storage with multiple read replicas; long per-entity histories accessed by primary key | **XTDB v2** |
+| Schemaless / "document" model with a bitemporal substrate | **XTDB v2** |
+| Off-the-shelf relational DB with only *system-time* versioning (no `_valid_from`) and you can live without true bitemporal | **PostgreSQL `temporal_tables` / MariaDB / IBM Db2 / SQL Server** |
+| Cloud-warehouse "Time Travel" (one-axis, system-time only, fixed retention window) | **Snowflake / BigQuery / Delta Lake** — only if a single axis is enough |
+
+### Stratum
+
+Per-column primitive arrays (`long[]` / `double[]`) wrapped in
+chunked persistent indices with per-chunk zone-map stats. Bitemporal
+axes are just four extra `int64` columns
+(`_valid_from`/`_valid_to`/`_system_from`/`_system_to`) stored
+side-by-side with user columns. Writes use mutate-in-place SCD2
+surgery: close the matched row's `_system_to`, append the new row
+under a shared `sys-now` stamp. Reads compose VT and ST predicates as
+two extra terms in the same SIMD pass that already evaluates the
+user's `WHERE`. Single-process, JVM-embedded, no log.
+
+The bet: most read workloads are "as-of-now" or "as-of-recent" on a
+wide table, where one materialised row per logical entity is
+dramatically more cache- and SIMD-friendly than reconstructing
+visibility from an event log. Filter-aggregate, group-by, and SCD2
+update workloads inherit Stratum's existing OLAP performance for
+free; bitemporal isn't a tax on the query path.
+
+### XTDB v2 (MPL-2.0, JUXT)
+
+Apache Arrow trie files on a `BufferPool` over local disk or object
+storage. A bitemporal update is one immutable event row in an
+append-only log; visibility at a queried (system-time, valid-time)
+instant is reconstructed at read time per entity. The on-disk schema
+is fixed (`_iid`, `_system_from`, `_valid_from`, `_valid_to`, op);
+`_system_to` is derived, never persisted. A single-writer indexer
+thread serialises ops, flushes blocks of a log-structured trie, and
+compactors merge them; readers fan out across replicas.
+
+Where it beats Stratum: distributed scale-out, deep per-entity
+histories (the `_iid` trie gives O(log N) navigation to the entity's
+events), schemaless documents, log-tailing reads. Where it loses:
+bulk filter-aggregate over recent data — every read still has to
+project per-entity polygons before the user predicate fires, with no
+SIMD-fused path.
+
+### SQL:2011 system-versioned tables in mainstream RDBMSes
+
+PostgreSQL (via the `temporal_tables` extension or recent
+`postgres_temporal` work), MariaDB 10.3+, IBM Db2, and Microsoft SQL
+Server all implement *system-versioned tables* — one row per logical
+entity in the "current" table plus a history table that records the
+old row on `UPDATE`. The SQL surface is similar to Stratum's
+(`FOR SYSTEM_TIME AS OF`, `FROM…TO`, `ALL`), but **none of them
+implement valid-time** out of the box. If your domain truly needs
+both axes (you care what the system *believed* at time T about what
+was *true* at time T'), you're either layering valid-time on top in
+the application, or you're picking a bitemporal-native engine.
+
+These systems shine when you already operate a mainstream RDBMS and
+the only thing you need is "show me yesterday's row state"; they
+struggle when valid-time corrections are routine or when the
+audit-window is unbounded (history tables grow without natural
+compaction).
+
+### Cloud-warehouse Time Travel (Snowflake / BigQuery / Delta Lake)
+
+A snapshot-based system-time facility with a bounded retention
+window (typically 1–90 days). Useful for accidental-delete recovery
+and short-term temporal queries; not a bitemporal substrate. No
+valid-time, no audit-grade unbounded history, no SQL:2011 `FOR
+PORTION OF` DML.
+
+### Capability matrix
+
+| Capability | Stratum | XTDB v2 | SQL:2011 system-versioned RDBMSes | Time Travel |
+|---|---|---|---|---|
+| Valid-time axis | ✔ | ✔ | ✗ | ✗ |
+| System-time axis | ✔ | ✔ | ✔ | ✔ (bounded) |
+| `FOR (SYSTEM\|VALID)_TIME AS OF / BETWEEN / FROM…TO / ALL` | ✔ | ✔ | system-time only | system-time only |
+| `FOR PORTION OF VALID_TIME` DML | ✔ | ✔ | ✗ | ✗ |
+| Allen predicates (OVERLAPS, CONTAINS, …) | ✔ (10 fns) | ✔ (period-typed) | ◐ (some have OVERLAPS) | ✗ |
+| `MERGE` / upsert with VT portion | ✗ (two-statement workaround) | ✔ (`PATCH INTO`) | n/a (no VT) | n/a |
+| `ERASE` / hard purge | Clojure DSL only | ✔ SQL `ERASE FROM` | varies | retention-based |
+| Distributed scale-out / replicas | ✗ | ✔ | RDBMS-dependent | ✔ |
+| Log-tailing / streaming reads | ✗ | ✔ | RDBMS-dependent | ✗ |
+| Per-entity primary-key index | ✗ (column scan + zone maps) | ✔ (`_iid` hash trie) | ✔ (B-tree) | n/a |
+| SIMD-fused filter+aggregate over temporal columns | ✔ | ✗ | depends on engine | depends |
+| Embedded / single-JAR | ✔ | ✗ (indexer + log + replicas) | ✗ | ✗ (managed service) |
+| Schemaless / dynamic columns | ✗ | ✔ | ✗ | ◐ |
+
+### Honest weaknesses of Stratum
+
+So you know precisely when *not* to pick Stratum:
+
+1. **Single-process.** There is no replication / sharding story. If
+   you need N read replicas off the same write log, look elsewhere.
+2. **No log; recovery loads a snapshot.** The commit graph is the
+   audit trail at snapshot granularity. For "show me the literal
+   database state shown to a user at 2024-08-13 14:32:00.123", note
+   the `_system_to` mutate-in-place caveat (see *Caveat: reading
+   `_system_to` at past system-time* above).
+3. **No per-entity index.** Entity lookup is a SIMD-filtered scan
+   over the (typically dict-encoded) `:eid` column with zone-map
+   pruning. Asymptotically beaten by XTDB v2's `_iid` hash trie for
+   *highly* selective `WHERE eid = ?` on tables with many entities
+   — likely irrelevant for analytical workloads, relevant for
+   OLTP-flavoured key-value access.
+4. **No streaming / log-tailing reads.** Readers see snapshots
+   taken at `sync!` boundaries. Real-time consumers need a different
+   pattern (or a thin layer above Stratum that polls).
+5. **Single-writer is implicit, not architectural.** The dataset
+   API doesn't enforce a global single-writer invariant —
+   concurrent writers on the same dataset are a correctness problem
+   the caller must avoid (a server / coordinator handles this in
+   practice).
+6. **`MERGE` / SQL upsert with VT portion isn't supported.**
+   `DELETE FOR PORTION OF` + `INSERT FOR PORTION OF` as two
+   statements covers the same ground; a fused single-statement form
+   is rejected at parse time as ambiguous.
+7. **Schemaless / document model isn't supported.** Stratum's
+   columns are typed at dataset creation; if you need union-typed
+   "documents" in the storage layer, XTDB v2 is the natural fit.
+
+### Where Stratum should structurally win
+
+1. **Filter-aggregate over recent data with VT/ST predicates.** The
+   bitemporal columns join the same SIMD-fused predicate path that
+   already beats DuckDB on TPC-H Q1/Q6 and ClickBench shapes.
+2. **Wide as-of-now point queries.** One row × N columns vs a log
+   scan + per-entity reconstruction.
+3. **Bulk SCD2 corrections.** One transaction that supersedes 10k
+   matched rows is two predicate evaluations + 10k column writes +
+   10k appends, all in-memory.
+4. **REPL-driven historical import.** The Clojure DSL's
+   `:system-from` tx-meta is one function call; equivalents in
+   log-architected engines route through the indexer.
+5. **Embedded / co-resident-with-application.** One JAR plus a
+   Konserve store; no external dependencies, no indexer process, no
+   broker.
+
 ## Phases
 
 The work landed in phases for review-ability:
