@@ -658,8 +658,18 @@
 (defn preprocess-select-temporal
   "Rewrite SELECT-side `FOR VALID_TIME <spec>` clauses into
    equivalent WHERE predicates. Returns the rewritten SQL string.
-   Multiple `FOR VALID_TIME` clauses (one per table-ref in a join)
-   are collected and ANDed into the WHERE clause.
+
+   **Multi-clause limit**: only one `FOR VALID_TIME` clause per
+   SELECT is supported today. The emitted predicate is unqualified
+   (`_valid_from`/`_valid_to`); two clauses on a joined SELECT both
+   reference the same unqualified columns and the planner's
+   resolver picks an arbitrary source — silently wrong. Reject at
+   preprocess time rather than ship that. The proper fix is
+   qualifier-aware column resolution in the planner; until then,
+   callers needing multi-table vt should write the predicates
+   themselves with explicit `<table>._valid_from` refs (which the
+   planner does handle in WHERE since the qualifier is part of the
+   column identifier the parser sees).
 
    See module docstring above for the supported specs."
   [^String sql]
@@ -669,6 +679,16 @@
             new-pred (when qualifier (spec->predicate-sql qualifier spec))
             ;; Strip the FOR VALID_TIME clause from start..end.
             stripped (str (subs sql 0 start) (subs sql end))]
+        (when (and new-pred (seq preds))
+          (throw (ex-info (str "Multi-table SELECT with more than one "
+                               "FOR VALID_TIME clause is not yet supported "
+                               "— the rewriter emits unqualified column "
+                               "refs (`_valid_from`/`_valid_to`) which the "
+                               "planner cannot disambiguate across joined "
+                               "tables. Write the predicates explicitly "
+                               "with `<table>._valid_from` qualifiers, or "
+                               "split into separate queries.")
+                          {:error :sql/multi-for-valid-time-unsupported})))
         (recur stripped
                (if new-pred (conj preds new-pred) preds)))
       (inject-where-predicates sql preds))))

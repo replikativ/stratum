@@ -270,6 +270,37 @@
     {:bitemporal (cond-> (assoc bt :valid valid)
                    sys (assoc :system sys))}))
 
+(defn- with-bitemporal-dataset
+  "Run a SQL DML surgery against a registered bitemporal table. Wraps
+   `existing` in a transient stratum dataset with correct bitemporal
+   metadata (preserving the `:system` axis when present), invokes
+   `surgery-fn` to apply the mutation, persists, and returns the new
+   column-map with the table-registry metadata re-applied.
+
+   `surgery-fn` is `(fn [tds valid-cfg] mutated-transient-tds)`. It
+   receives the transient dataset AND the resolved `:valid` axis
+   config (useful for per-helper error messages or column-name
+   lookups). Returning the mutated transient is the contract.
+
+   `verb-name` is the SQL verb used in the not-a-bitemporal-table
+   error (`'INSERT FOR PORTION OF VALID_TIME'`, etc.).
+
+   Centralises the boilerplate that was duplicated across the three
+   `*-portion-via-index-backend` builders: valid-axis discovery,
+   throw-on-missing, ds-meta construction (with `:system` axis
+   preservation), make-dataset, transient → mutate → persistent,
+   and metadata re-application."
+  [^String table existing meta verb-name surgery-fn]
+  (let [valid (bitemporal-valid-cfg existing meta)
+        _ (when-not valid
+            (throw (ex-info (str verb-name " requires a :valid axis on the table")
+                            {:table table :existing-cols (vec (keys existing))})))
+        ds-meta (bitemporal-ds-meta existing meta valid)
+        ds (dataset/make-dataset existing {:name table :metadata ds-meta})
+        mutated (-> ds transient (surgery-fn valid) persistent!)
+        new-cols (dataset/columns mutated)]
+    (cond-> new-cols meta (with-meta meta))))
+
 (defn- insert-portion-via-index-backend
   "Apply a SQL:2011 `INSERT … FOR PORTION OF VALID_TIME FROM x TO y`
    on an index-backed bitemporal table. Each row in `rows` (positional
@@ -282,27 +313,22 @@
    period. If `col-list` is nil (positional VALUES with no column
    names) we throw — the temporal columns are positionally ambiguous."
   [^String table existing col-list rows period meta]
-  (let [valid (bitemporal-valid-cfg existing meta)
-        _ (when-not valid
-            (throw (ex-info "INSERT FOR PORTION OF VALID_TIME requires a :valid axis on the table"
-                            {:table table :existing-cols (vec (keys existing))})))
-        _ (when-not col-list
-            (throw (ex-info (str "INSERT FOR PORTION OF VALID_TIME requires an explicit "
-                                 "column list: `INSERT INTO t (col1, col2) VALUES (...)` — "
-                                 "the period fills in " (:from-col valid) " / " (:to-col valid))
-                            {:table table})))
-        ds-meta (bitemporal-ds-meta existing meta valid)
-        ds (dataset/make-dataset existing {:name table :metadata ds-meta})
-        mutated (reduce (fn [tds row-vals]
-                          (let [row-map (zipmap col-list row-vals)]
-                            (dataset/append! tds row-map
-                                             {:valid-from (:from period)
-                                              :valid-to   (:to period)})))
-                        (transient ds)
-                        rows)
-        sealed (persistent! mutated)
-        new-cols (dataset/columns sealed)
-        new-cols (if meta (with-meta new-cols meta) new-cols)]
+  (when-not col-list
+    (let [valid (bitemporal-valid-cfg existing meta)]
+      (throw (ex-info (str "INSERT FOR PORTION OF VALID_TIME requires an explicit "
+                           "column list: `INSERT INTO t (col1, col2) VALUES (...)` — "
+                           "the period fills in "
+                           (or (:from-col valid) "_valid_from") " / "
+                           (or (:to-col valid) "_valid_to"))
+                      {:table table}))))
+  (let [new-cols (with-bitemporal-dataset
+                   table existing meta "INSERT FOR PORTION OF VALID_TIME"
+                   (fn [tds _valid]
+                     (reduce (fn [t row-vals]
+                               (dataset/append! t (zipmap col-list row-vals)
+                                                {:valid-from (:from period)
+                                                 :valid-to   (:to period)}))
+                             tds rows)))]
     {:new-cols new-cols :n-inserted (count rows)}))
 
 (defn- update-portion-via-index-backend
@@ -312,11 +338,7 @@
    evaluated as literal values (no expressions — sub-expressions in
    SET are a P2 future addition)."
   [^String table existing where assignments period meta]
-  (let [valid (bitemporal-valid-cfg existing meta)
-        _ (when-not valid
-            (throw (ex-info "UPDATE FOR PORTION OF VALID_TIME requires a :valid axis on the table"
-                            {:table table :existing-cols (vec (keys existing))})))
-        set-map (reduce (fn [m {:keys [col expr]}]
+  (let [set-map (reduce (fn [m {:keys [col expr]}]
                           (when-not (or (number? expr) (string? expr) (nil? expr))
                             (throw (ex-info "UPDATE FOR PORTION OF VALID_TIME only supports literal SET values"
                                             {:assignment {:col col :expr expr}
@@ -324,16 +346,12 @@
                           (assoc m col expr))
                         {}
                         assignments)
-        ds-meta (bitemporal-ds-meta existing meta valid)
-        ds (dataset/make-dataset existing {:name table :metadata ds-meta})
-        mutated (-> ds
-                    transient
-                    (dataset/bounded-update! {:where (or where []) :set set-map}
-                                             {:valid-from (:from period)
-                                              :valid-to   (:to period)})
-                    persistent!)
-        new-cols (dataset/columns mutated)
-        new-cols (if meta (with-meta new-cols meta) new-cols)]
+        new-cols (with-bitemporal-dataset
+                   table existing meta "UPDATE FOR PORTION OF VALID_TIME"
+                   (fn [tds _valid]
+                     (dataset/bounded-update! tds {:where (or where []) :set set-map}
+                                              {:valid-from (:from period)
+                                               :valid-to   (:to period)})))]
     {:new-cols new-cols
      ;; SQL clients read `UPDATE N` as "N rows participated in the
      ;; surgery." We report the pre-mutation WHERE-match count, NOT
@@ -360,25 +378,13 @@
    discoverable."
   [^String table existing where period meta]
   (let [{vf-val :from vt-val :to} period
-        valid (bitemporal-valid-cfg existing meta)
-        _ (when-not valid
-            (throw (ex-info (str "DELETE FOR PORTION OF VALID_TIME requires a "
-                                 ":valid axis on the table — either set "
-                                 ":bitemporal {:valid {...}} on the registered "
-                                 "metadata, or use _valid_from / _valid_to columns")
-                            {:table table
-                             :existing-cols (vec (keys existing))})))
-        ds-meta (bitemporal-ds-meta existing meta valid)
         before-count (col-row-count (val (first existing)))
-        ds (dataset/make-dataset existing {:name table :metadata ds-meta})
-        mutated (-> ds
-                    transient
-                    (dataset/retract! {:where (or where [])}
-                                      {:valid-from vf-val :valid-to vt-val})
-                    persistent!)
-        new-cols (dataset/columns mutated)
-        new-cols (if meta (with-meta new-cols meta) new-cols)
-        after-count (dataset/row-count mutated)]
+        new-cols (with-bitemporal-dataset
+                   table existing meta "DELETE FOR PORTION OF VALID_TIME"
+                   (fn [tds _valid]
+                     (dataset/retract! tds {:where (or where [])}
+                                       {:valid-from vf-val :valid-to vt-val})))
+        after-count (col-row-count (val (first new-cols)))]
     ;; "DELETE N" tag reports rows physically removed. With bounded
     ;; retract, splits ADD rows (one tail per split), which doesn't
     ;; map cleanly to a "DELETE n" count. We report

@@ -2926,6 +2926,68 @@
       (is (re-find #"ERASE does not compose with FOR PORTION OF VALID_TIME"
                    (:error r))))))
 
+(deftest sql-update-for-portion-of-valid-time-infers-system-axis-from-column-names
+  ;; When a table is registered with `_system_from` / `_system_to`
+  ;; columns but WITHOUT `:bitemporal {:system {...}}` metadata, the
+  ;; SQL DML lowering should still infer the system axis from the
+  ;; SQL:2011 column-name convention. This locks the
+  ;; `bitemporal-axis-cfg` :system fallback path that's parallel to
+  ;; the :valid fallback documented in `delete-portion-via-index-
+  ;; backend`'s docstring.
+  (testing "Registered without :system metadata; SCD2 still fires via column-name inference"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "salaries"
+          ;; NOTE: no :bitemporal metadata at all. Inference must
+          ;; pick up BOTH axes from the column names.
+          {:eid          (stratum.index/index-from-seq :int64 [1])
+           :salary       (stratum.index/index-from-seq :int64 [100])
+           :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000])
+           :_valid_to    (stratum.index/index-from-seq :int64 [1719792000000000])
+           :_system_from (stratum.index/index-from-seq :int64 [1000000])
+           :_system_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])})
+        (let [exec @(resolve 'stratum.server/execute-sql)]
+          (exec (str "UPDATE salaries SET salary = 999 "
+                     "FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-05-01' "
+                     "WHERE eid = 1")
+                (:registry srv) (:data-dir srv)))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                        (:index (get cols k)) %)
+                                     (range n)))
+              rows (mapv (fn [i] {:sf (nth (read-col :_system_from) i)
+                                  :st (nth (read-col :_system_to) i)})
+                         (range n))
+              closed (filter #(not= Long/MAX_VALUE (:st %)) rows)
+              open   (filter #(= Long/MAX_VALUE (:st %)) rows)]
+          (is (= 4 n)
+              "metadata-free table with `_system_*` cols routes through bitemporal path")
+          (is (= 1 (count closed)) "old row closed via inferred system axis")
+          (is (= 3 (count open)) "three replacement slices")
+          (let [sys-nows (set (map :sf open))]
+            (is (= 1 (count sys-nows)) "one shared sys-now")
+            (is (= (:st (first closed)) (first sys-nows))
+                "closed system_to == replacements' system_from (SCD2 symmetry)")))
+        (finally (server/stop srv))))))
+
+(deftest sql-select-multi-for-valid-time-rejected
+  ;; The SELECT-side preprocessor emits unqualified `_valid_from` /
+  ;; `_valid_to` column refs. With two `FOR VALID_TIME` clauses on a
+  ;; joined SELECT, the planner can't disambiguate which table each
+  ;; predicate targets and silently picks one source — silently
+  ;; wrong. Reject at preprocess time.
+  (testing "Two FOR VALID_TIME clauses on a joined SELECT → rejected"
+    (let [r (sql/parse-sql
+              (str "SELECT a.eid, b.eid FROM a FOR VALID_TIME AS OF '2024-04-15' "
+                   "JOIN b FOR VALID_TIME AS OF '2024-04-15' ON a.eid = b.eid")
+              {"a" {:eid (long-array []) :_valid_from (long-array []) :_valid_to (long-array [])}
+               "b" {:eid (long-array []) :_valid_from (long-array []) :_valid_to (long-array [])}})]
+      (is (some? (:error r)))
+      (is (re-find #"Multi-table SELECT with more than one FOR VALID_TIME"
+                   (:error r))))))
+
 (deftest sql-allen-bad-arity-throws
   (testing "Allen predicates require exactly 4 args"
     (let [reg {"intervals" {:eid (long-array [1])
