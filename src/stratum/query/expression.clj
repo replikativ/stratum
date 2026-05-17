@@ -666,23 +666,27 @@
            col-data (get col-arrays source-key)
            col-meta (when *columns-meta* (get *columns-meta* source-key))]
        (case target-type
+         ;; F-016: CAST(long AS DOUBLE) must map Long.MIN_VALUE → NaN so
+         ;; the long-NULL convention crosses the cast boundary; sibling
+         ;; `arrayLongToDouble` does a raw `(double)` and would emit
+         ;; the finite -9.22e18.
          :double
          (cond
            (long-array? col-data)
            (if (and col-meta (:dict col-meta) (= :string (:dict-type col-meta)))
              (ColumnOps/arrayStringToDouble ^longs col-data ^"[Ljava.lang.String;" (:dict col-meta) (int length))
-             (ColumnOps/arrayLongToDouble ^longs col-data (int length)))
+             (ColumnOps/longToDoubleNullSafe ^longs col-data (int length)))
            :else col-data)
          :long
          (cond
            (long-array? col-data)
            (if (and col-meta (:dict col-meta) (= :string (:dict-type col-meta)))
              (let [^longs la (ColumnOps/arrayStringToLong ^longs col-data ^"[Ljava.lang.String;" (:dict col-meta) (int length))]
-               (ColumnOps/arrayLongToDouble la (int length)))
+               (ColumnOps/longToDoubleNullSafe la (int length)))
              (col-as-doubles-cached col-data length cache))
            :else
            (let [^longs la (ColumnOps/arrayDoubleToLong ^doubles col-data (int length))]
-             (ColumnOps/arrayLongToDouble la (int length))))
+             (ColumnOps/longToDoubleNullSafe la (int length))))
          :string
          (throw (ex-info "CAST to string must be pre-materialized" {:expr expr}))))
 

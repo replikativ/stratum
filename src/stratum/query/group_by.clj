@@ -253,9 +253,15 @@
     Double/NaN
 
     (keyword? expr)
+    ;; F-013: map Long.MIN_VALUE → Double/NaN at the leaf so downstream
+    ;; arithmetic (mul/add/sub/div/abs/sqrt/log/date-trunc/extract)
+    ;; propagates NULL via IEEE NaN. Without this, the sentinel becomes
+    ;; finite -9.22e18 and feeds into Hinnant civil-date arithmetic,
+    ;; producing bogus year/month/day for what should be a NULL result.
     (let [col (get col-arrays expr)]
       (if (expr/long-array? col)
-        (double (aget ^longs col i))
+        (let [lv (aget ^longs col i)]
+          (if (= lv Long/MIN_VALUE) Double/NaN (double lv)))
         (aget ^doubles col i)))
 
     (number? expr)
@@ -3553,20 +3559,48 @@
                           (aset accs base (+ (aget accs base) v))
                           (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                       :sum-product
+                      ;; F-009: dual null-check on BOTH operands. The NaN
+                      ;; guard catches double-NaN but a long col reads as
+                      ;; (double Long/MIN_VALUE) = -9.22e18 — finite — and
+                      ;; SUM was dragged by -9.22e18 * other per NULL row.
                       (let [[c1 c2] (:cols agg)
-                            v1 (aget-col (get col-arrays c1) i)
-                            v2 (aget-col (get col-arrays c2) i)]
-                        (when (and (== v1 v1) (== v2 v2))
+                            cd1 (get col-arrays c1)
+                            cd2 (get col-arrays c2)
+                            v1 (aget-col cd1 i)
+                            v2 (aget-col cd2 i)
+                            null1 (or (Double/isNaN v1)
+                                      (and (expr/long-array? cd1)
+                                           (= (aget ^longs cd1 (int i)) Long/MIN_VALUE)))
+                            null2 (or (Double/isNaN v2)
+                                      (and (expr/long-array? cd2)
+                                           (= (aget ^longs cd2 (int i)) Long/MIN_VALUE)))]
+                        (when-not (or null1 null2)
                           (aset accs base (+ (aget accs base) (* v1 v2)))
                           (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                       :count-distinct
-                      (let [v (aget-col (get col-arrays (:col agg)) i)]
-                        (.add ^java.util.HashSet (aget coll-accs agg-idx) (Double/valueOf v))
-                        (aset accs (inc base) (+ (aget accs (inc base)) 1.0)))
+                      ;; F-008: skip NULL sentinels before HashSet.add —
+                      ;; otherwise Long.MIN_VALUE-as-double becomes a
+                      ;; distinct "value".
+                      (let [cd (get col-arrays (:col agg))
+                            v (aget-col cd i)
+                            is-null (or (Double/isNaN v)
+                                        (and (expr/long-array? cd)
+                                             (= (aget ^longs cd (int i)) Long/MIN_VALUE)))]
+                        (when-not is-null
+                          (.add ^java.util.HashSet (aget coll-accs agg-idx) (Double/valueOf v))
+                          (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                       (:median :percentile :approx-quantile)
-                      (let [v (aget-col (get col-arrays (:col agg)) i)]
-                        (.add ^java.util.ArrayList (aget coll-accs agg-idx) (Double/valueOf v))
-                        (aset accs (inc base) (+ (aget accs (inc base)) 1.0)))
+                      ;; F-010: same shape as F-008 — skip NULL before
+                      ;; appending into the ArrayList that feeds the
+                      ;; per-group quickselect.
+                      (let [cd (get col-arrays (:col agg))
+                            v (aget-col cd i)
+                            is-null (or (Double/isNaN v)
+                                        (and (expr/long-array? cd)
+                                             (= (aget ^longs cd (int i)) Long/MIN_VALUE)))]
+                        (when-not is-null
+                          (.add ^java.util.ArrayList (aget coll-accs agg-idx) (Double/valueOf v))
+                          (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                     ;; default
                       (aset accs (inc base) (+ (aget accs (inc base)) 1.0)))
                     (recur (inc agg-idx) (next ag))))))))

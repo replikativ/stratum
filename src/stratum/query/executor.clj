@@ -581,12 +581,35 @@
                                     (aset d (aget k 0) v)
                                     (aset k 0 (inc (aget k 0))))))
                               (java.util.Arrays/copyOf d (aget k 0)))))
+                        ;; F-012: when a predicate mask is present, the
+                        ;; raw `percentileFiltered{,Long}` Java fns
+                        ;; include NULL sentinels in the gather. Build a
+                        ;; compacted double[] combining mask + NULL skip,
+                        ;; then call the unmasked `percentile` kernel.
+                        compact-skip-nulls-masked
+                        (fn ^doubles []
+                          (let [n length
+                                d (double-array (max 1 n))
+                                k (int-array 1)]
+                            (if is-long?
+                              (let [la ^longs col-data]
+                                (dotimes [i n]
+                                  (when (and (== 1 (aget ^longs mask i))
+                                             (not= (aget la i) Long/MIN_VALUE))
+                                    (aset d (aget k 0) (double (aget la i)))
+                                    (aset k 0 (inc (aget k 0))))))
+                              (let [da ^doubles col-data]
+                                (dotimes [i n]
+                                  (when (and (== 1 (aget ^longs mask i))
+                                             (not (Double/isNaN (aget da i))))
+                                    (aset d (aget k 0) (aget da i))
+                                    (aset k 0 (inc (aget k 0)))))))
+                            (java.util.Arrays/copyOf d (aget k 0))))
                         result (case (:op agg)
                                  (:median :percentile)
                                  (if mask
-                                   (if is-long?
-                                     (ColumnOps/percentileFilteredLong ^longs col-data ^longs mask (int length) pct)
-                                     (ColumnOps/percentileFiltered ^doubles col-data ^longs mask (int length) pct))
+                                   (let [^doubles compacted (compact-skip-nulls-masked)]
+                                     (ColumnOps/percentile compacted (alength compacted) pct))
                                    (let [^doubles compacted (compact-skip-nulls)]
                                      (ColumnOps/percentile compacted (alength compacted) pct)))
                                  :approx-quantile
@@ -1214,7 +1237,11 @@
 (defn- having-pred-matches?
   "Scalar evaluation of one normalized having predicate at row `i`,
    using the materialized `columns` map. Mirrors the operator set the
-   legacy `q` window-having pushdown supports."
+   legacy `q` window-having pushdown supports.
+
+   F-014: long Long.MIN_VALUE is mapped to Double/NaN before the IS-NULL
+   check, so the long NULL sentinel reads as NULL rather than as the
+   finite -9.22e18 it would become under a plain `(double aget)` cast."
   [columns ^long i pred]
   (let [col-key (first pred)
         op      (second pred)
@@ -1222,7 +1249,10 @@
         data    (col-array col)
         v (cond
             (expr/double-array? data) (aget ^doubles data i)
-            (expr/long-array? data)   (double (aget ^longs data i))
+            (expr/long-array? data)   (let [lv (aget ^longs data i)]
+                                        (if (= lv Long/MIN_VALUE)
+                                          Double/NaN
+                                          (double lv)))
             :else nil)]
     (cond
       (= op :is-null)     (or (nil? v) (Double/isNaN v))

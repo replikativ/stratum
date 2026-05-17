@@ -3818,6 +3818,10 @@ public final class ColumnOps {
             for (int g = 6; g < numGroupCols; g++) key += (int)(groupCols[g][i] * groupMuls[g]);
 
             long val = distinctCol[i];
+            // F-008 sibling: skip NULL sentinel before insertion. SQL
+            // COUNT(DISTINCT col) excludes NULL; without this the
+            // sentinel becomes a distinct "value" in each group.
+            if (val == Long.MIN_VALUE) continue;
 
             // Lazy-init hash table for this group
             if (groupTables[key] == null) {
@@ -4045,6 +4049,9 @@ public final class ColumnOps {
             for (int g = 6; g < numGroupCols; g++) key += (int)(groupCols[g][i] * groupMuls[g]);
 
             long val = distinctCol[i];
+            // F-008 sibling: skip NULL sentinel before hashing — same
+            // reason as fusedFilterGroupCountDistinctDenseRange above.
+            if (val == Long.MIN_VALUE) continue;
 
             if (groupTables[key] == null) {
                 int cap = 16;
@@ -4242,11 +4249,13 @@ public final class ColumnOps {
      */
     public static double[] groupPercentileDense(long[] groupKeys, double[] values,
                                                  long[] mask, int length, int maxKey, double pct) {
-        // Pass 1: count per-group sizes
+        // Pass 1: count per-group sizes. F-011: skip NaN (double NULL).
         int[] counts = new int[maxKey];
         int totalCount = 0;
         for (int i = 0; i < length; i++) {
             if (mask == null || mask[i] == 1) {
+                double v = values[i];
+                if (Double.isNaN(v)) continue;  // SQL percentile ignores NULL
                 int g = (int) groupKeys[i];
                 if (g >= 0 && g < maxKey) {
                     counts[g]++;
@@ -4263,15 +4272,17 @@ public final class ColumnOps {
             offset += counts[g];
         }
 
-        // Pass 2: scatter values into flat array
+        // Pass 2: scatter values into flat array (same NULL skip).
         double[] flat = new double[totalCount];
         int[] writePos = new int[maxKey];
         System.arraycopy(offsets, 0, writePos, 0, maxKey);
         for (int i = 0; i < length; i++) {
             if (mask == null || mask[i] == 1) {
+                double v = values[i];
+                if (Double.isNaN(v)) continue;
                 int g = (int) groupKeys[i];
                 if (g >= 0 && g < maxKey) {
-                    flat[writePos[g]++] = values[i];
+                    flat[writePos[g]++] = v;
                 }
             }
         }
@@ -4299,10 +4310,13 @@ public final class ColumnOps {
      */
     public static double[] groupPercentileDenseLong(long[] groupKeys, long[] values,
                                                      long[] mask, int length, int maxKey, double pct) {
+        // F-011: skip Long.MIN_VALUE sentinel (long NULL).
         int[] counts = new int[maxKey];
         int totalCount = 0;
         for (int i = 0; i < length; i++) {
             if (mask == null || mask[i] == 1) {
+                long v = values[i];
+                if (v == Long.MIN_VALUE) continue;
                 int g = (int) groupKeys[i];
                 if (g >= 0 && g < maxKey) {
                     counts[g]++;
@@ -4321,9 +4335,11 @@ public final class ColumnOps {
         System.arraycopy(offsets, 0, writePos, 0, maxKey);
         for (int i = 0; i < length; i++) {
             if (mask == null || mask[i] == 1) {
+                long v = values[i];
+                if (v == Long.MIN_VALUE) continue;
                 int g = (int) groupKeys[i];
                 if (g >= 0 && g < maxKey) {
-                    flat[writePos[g]++] = (double) values[i];
+                    flat[writePos[g]++] = (double) v;
                 }
             }
         }
