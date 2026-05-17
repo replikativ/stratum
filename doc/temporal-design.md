@@ -613,7 +613,7 @@ evaluating Stratum specifically.
 | Analytics / OLAP on a recent snapshot with occasional valid-time corrections (accounting, claims, ERP back-office, IoT late-telemetry, audit-grade SCD2) | **Stratum** |
 | Mixed read/write where most reads are "as of now" on a wide table and the bitemporal axes are columns you'd touch anyway | **Stratum** |
 | Bulk supersession of thousands of rows in one transaction (period-end re-pricing, regulatory restatement) | **Stratum** |
-| Distributed, append-only event log scaled across object storage with multiple read replicas; long per-entity histories accessed by primary key | **XTDB v2** |
+| Distributed *write* path with append-only event log, multi-writer coordination handled by the engine, long per-entity histories accessed by primary key | **XTDB v2** |
 | Schemaless / "document" model with a bitemporal substrate | **XTDB v2** |
 | Off-the-shelf relational DB with only *system-time* versioning (no `_valid_from`) and you can live without true bitemporal | **PostgreSQL `temporal_tables` / MariaDB / IBM Db2 / SQL Server** |
 | Cloud-warehouse "Time Travel" (one-axis, system-time only, fixed retention window) | **Snowflake / BigQuery / Delta Lake** — only if a single axis is enough |
@@ -628,7 +628,11 @@ side-by-side with user columns. Writes use mutate-in-place SCD2
 surgery: close the matched row's `_system_to`, append the new row
 under a shared `sys-now` stamp. Reads compose VT and ST predicates as
 two extra terms in the same SIMD pass that already evaluates the
-user's `WHERE`. Single-process, JVM-embedded, no log.
+user's `WHERE`. JVM-embedded; one writer per dataset; readers scale
+out over the underlying Konserve store (tiered backends — S3 +
+`konserve-sync` for local caches — give independent reader processes
+their own latency-shaped view, each pointing at the latest commit
+root).
 
 The bet: most read workloads are "as-of-now" or "as-of-recent" on a
 wide table, where one materialised row per logical entity is
@@ -648,12 +652,17 @@ is fixed (`_iid`, `_system_from`, `_valid_from`, `_valid_to`, op);
 thread serialises ops, flushes blocks of a log-structured trie, and
 compactors merge them; readers fan out across replicas.
 
-Where it beats Stratum: distributed scale-out, deep per-entity
-histories (the `_iid` trie gives O(log N) navigation to the entity's
-events), schemaless documents, log-tailing reads. Where it loses:
-bulk filter-aggregate over recent data — every read still has to
-project per-entity polygons before the user predicate fires, with no
-SIMD-fused path.
+Where it beats Stratum: multi-writer coordination handled by the
+engine, deep per-entity histories (the `_iid` trie gives O(log N)
+navigation to the entity's events), schemaless documents, log-tailing
+reads. Where it loses: bulk filter-aggregate over recent data — every
+read still has to project per-entity polygons before the user
+predicate fires, with no SIMD-fused path. Note that Stratum's
+*reader* fanout is comparable in shape (multiple JVMs reading the
+same content-addressed Konserve store); the gap is on the write side
+— Stratum core has one writer per dataset, while Datahike layers a
+distributed-writer protocol on top and the same primitive could be
+upstreamed into Stratum if needed.
 
 ### SQL:2011 system-versioned tables in mainstream RDBMSes
 
@@ -693,19 +702,27 @@ PORTION OF` DML.
 | Allen predicates (OVERLAPS, CONTAINS, …) | ✔ (10 fns) | ✔ (period-typed) | ◐ (some have OVERLAPS) | ✗ |
 | `MERGE` / upsert with VT portion | ✗ (two-statement workaround) | ✔ (`PATCH INTO`) | n/a (no VT) | n/a |
 | `ERASE` / hard purge | Clojure DSL only | ✔ SQL `ERASE FROM` | varies | retention-based |
-| Distributed scale-out / replicas | ✗ | ✔ | RDBMS-dependent | ✔ |
+| Reader fanout over shared storage | ✔ (Konserve content-addressed; tiered + `konserve-sync` caches) | ✔ | RDBMS-dependent | ✔ |
+| Multi-writer coordination in-engine | ✗ (one writer per dataset; Datahike adds it on top) | ✔ | ✔ | n/a (writes go through the warehouse) |
 | Log-tailing / streaming reads | ✗ | ✔ | RDBMS-dependent | ✗ |
 | Per-entity primary-key index | ✗ (column scan + zone maps) | ✔ (`_iid` hash trie) | ✔ (B-tree) | n/a |
 | SIMD-fused filter+aggregate over temporal columns | ✔ | ✗ | depends on engine | depends |
 | Embedded / single-JAR | ✔ | ✗ (indexer + log + replicas) | ✗ | ✗ (managed service) |
 | Schemaless / dynamic columns | ✗ | ✔ | ✗ | ◐ |
 
-### Honest weaknesses of Stratum
+### Where Stratum doesn't (yet) reach
 
 So you know precisely when *not* to pick Stratum:
 
-1. **Single-process.** There is no replication / sharding story. If
-   you need N read replicas off the same write log, look elsewhere.
+1. **No in-engine multi-writer coordination.** Stratum core
+   serialises writes through a single writer per dataset. Reader
+   processes scale out naturally over the underlying Konserve store
+   (each reader loads the latest commit root and walks the same
+   content-addressed PSS chunks; `konserve-sync` gives a
+   locally-cached copy when read latency matters more than
+   freshness). Datahike layers a distributed writer protocol on top,
+   and the same primitive could be upstreamed into Stratum — but
+   today it lives a layer up.
 2. **No log; recovery loads a snapshot.** The commit graph is the
    audit trail at snapshot granularity. For "show me the literal
    database state shown to a user at 2024-08-13 14:32:00.123", note
@@ -720,16 +737,11 @@ So you know precisely when *not* to pick Stratum:
 4. **No streaming / log-tailing reads.** Readers see snapshots
    taken at `sync!` boundaries. Real-time consumers need a different
    pattern (or a thin layer above Stratum that polls).
-5. **Single-writer is implicit, not architectural.** The dataset
-   API doesn't enforce a global single-writer invariant —
-   concurrent writers on the same dataset are a correctness problem
-   the caller must avoid (a server / coordinator handles this in
-   practice).
-6. **`MERGE` / SQL upsert with VT portion isn't supported.**
+5. **`MERGE` / SQL upsert with VT portion isn't supported.**
    `DELETE FOR PORTION OF` + `INSERT FOR PORTION OF` as two
    statements covers the same ground; a fused single-statement form
    is rejected at parse time as ambiguous.
-7. **Schemaless / document model isn't supported.** Stratum's
+6. **Schemaless / document model isn't supported.** Stratum's
    columns are typed at dataset creation; if you need union-typed
    "documents" in the storage layer, XTDB v2 is the natural fit.
 
