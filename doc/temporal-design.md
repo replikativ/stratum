@@ -10,8 +10,8 @@ We follow Snodgrass / SQL:2011 with two consistent renames for context:
 | Concept | Where | Term |
 |---|---|---|
 | When a fact was true in the modelled world | everywhere | **valid-time** |
-| When the DB recorded the fact (Clojure / EDN APIs) | datahike, stratum query DSL | **tx-time** |
-| Same concept, but in SQL surface | pg-datahike, stratum SQL | **system-time** |
+| When the DB recorded the fact (Clojure / EDN APIs) | stratum query DSL, Clojure Datalog surfaces | **tx-time** |
+| Same concept, surfaced through SQL              | stratum SQL, PG-wire SQL surfaces           | **system-time** |
 | Reading "two axes at once" | everywhere | **bitemporal** |
 
 The axis values use SQL:2011 column names verbatim:
@@ -114,10 +114,10 @@ The two natural shapes are:
    each `(eid, vt-slice)`.
 
 The closed-period approach is the right fit for stratum's
-secondary-index substrate, where reads dominate writes and a single
-predicate filter is cheaper than a per-entity merge pass. The
-append-only approach is what event-sourced bitemporal stores do; it
-trades read-time work for write-time simplicity.
+read-heavy analytical workload: a single predicate filter is cheaper
+than a per-entity merge pass over event history. The append-only
+approach is what event-sourced bitemporal stores do; it trades
+read-time work for write-time simplicity.
 
 ### Caveat: reading `_system_to` at past system-time
 
@@ -306,14 +306,10 @@ direct `append!`.
 
 ## SQL surface
 
-We extend pg-datahike's grammar to recognise SQL:2011 temporal DML:
+Stratum's SQL recognises SQL:2011 temporal forms directly:
 
 ```sql
--- session-scoped temporal pins (PG-wire SET vars)
-SET datahike.valid_at = '2024-04-15T00:00:00Z';
-SET datahike.system_at = '2024-04-20T00:00:00Z';
-
--- per-query SQL:2011 forms
+-- per-query SQL:2011 SELECT forms
 SELECT * FROM employees
   FOR VALID_TIME AS OF '2024-04-15'
   FOR SYSTEM_TIME AS OF '2024-04-20';
@@ -331,6 +327,9 @@ UPDATE employees FOR PORTION OF VALID_TIME FROM '2024-07-01' TO '2024-12-01'
 
 DELETE FROM employees FOR PORTION OF VALID_TIME FROM '2024-09-01' TO '2024-10-01'
   WHERE id = 1;
+
+-- clock pinning for repeatable runs (session-scoped)
+SET datahike.clock_time = '2024-04-15T00:00:00Z';
 ```
 
 JSqlParser 5.2 doesn't grok these tokens, so the path is a pre-tokenise
@@ -417,23 +416,40 @@ WHERE with Allen predicates lowers correctly but stratum's main
 query planner doesn't yet evaluate col-vs-col predicates — tracked
 as a P2 follow-up.
 
-## Four-axis composability
+## Composing the two axes
 
-Both axes are wrappers, both compose:
+Both temporal axes are first-class columns; composing constraints
+across them is just two predicates in the same `:where`. Via the
+stratum query DSL:
 
 ```clojure
-(d/q query
-     (-> conn d/db
-         (d/as-of    tx-T)      ; tx-time AS OF T
-         (d/since    tx-S)      ; tx-time > S
-         (d/valid-at vt-V)      ; valid-time AS OF V
-         (d/system-at st-W)))   ; system-time AS OF W (new in Phase F)
+(st/q {:from dataset
+       :where [[:<= :_valid_from  query-vt]    ; valid-time AS OF query-vt
+               [:>  :_valid_to    query-vt]
+               [:<= :_system_from query-st]    ; system-time AS OF query-st
+               [:>  :_system_to   query-st]]
+       :select [:eid :salary]})
 ```
 
-Each wrapper sets a `timepred` or `xform-after` on the search-context;
-`post-process-datoms` applies them in order; per-datom cost is one
-HashMap probe per axis per unique tx-id (cached). Same cost profile
-as AsOfDB today, just one more axis.
+Via SQL:
+
+```sql
+SELECT eid, salary FROM salaries
+  FOR VALID_TIME  AS OF '2024-04-15'
+  FOR SYSTEM_TIME AS OF '2024-04-20';
+```
+
+The two-axis case is just the one-axis case with two more predicates.
+The columns are stored side-by-side in the same row; the zone-map
+pruner reads both pairs and the SIMD scan filters in one pass. There
+is no per-axis HashMap or wrapper indirection — the axes are columns
+the planner already knows how to handle.
+
+Consumers that embed stratum in a higher-level system (Datalog or
+otherwise) typically expose temporal navigation as that system's
+native API (e.g. `as-of` / `valid-at`-style wrappers); those wrappers
+translate down to the same per-column predicates the SQL/DSL forms
+produce here.
 
 ## Why this design
 
