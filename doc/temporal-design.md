@@ -745,23 +745,6 @@ So you know precisely when *not* to pick Stratum:
    columns are typed at dataset creation; if you need union-typed
    "documents" in the storage layer, XTDB v2 is the natural fit.
 
-### Where Stratum should structurally win
-
-1. **Filter-aggregate over recent data with VT/ST predicates.** The
-   bitemporal columns join the same SIMD-fused predicate path that
-   already beats DuckDB on TPC-H Q1/Q6 and ClickBench shapes.
-2. **Wide as-of-now point queries.** One row × N columns vs a log
-   scan + per-entity reconstruction.
-3. **Bulk SCD2 corrections.** One transaction that supersedes 10k
-   matched rows is two predicate evaluations + 10k column writes +
-   10k appends, all in-memory.
-4. **REPL-driven historical import.** The Clojure DSL's
-   `:system-from` tx-meta is one function call; equivalents in
-   log-architected engines route through the indexer.
-5. **Embedded / co-resident-with-application.** One JAR plus a
-   Konserve store; no external dependencies, no indexer process, no
-   broker.
-
 ## Phases
 
 The work landed in phases for review-ability:
