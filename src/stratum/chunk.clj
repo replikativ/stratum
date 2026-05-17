@@ -36,7 +36,14 @@
   (chunk-as-longs [this] "Return the underlying array as ^longs")
   (chunk-as-doubles [this] "Return the underlying array as ^doubles")
   (chunk-constant? [this] "Return true if this is a constant-value chunk (may not have expanded data)")
-  (chunk-constant-val [this] "Return the constant value (Number) if constant, nil otherwise"))
+  (chunk-constant-val [this] "Return the constant value (Number) if constant, nil otherwise")
+  (chunk-validity [this]
+    "Return the per-row validity bitmap (^longs, 1 bit per row, LSB-first
+     within each long entry; bit=1 → value is non-NULL, bit=0 → value is
+     NULL), or nil for the *all-valid fast path*. Consumers should
+     branch on `(nil? validity)` once at the outermost loop and run the
+     bitmap-free kernel when nil. Length of the bitmap is
+     `(quot (+ row-count 63) 64)`."))
 
 (defprotocol IColChunkMut
   "Mutation protocol - only available in transient mode"
@@ -67,6 +74,101 @@
              (Arrays/fill a (long constant-val))
              a)))
 
+;; ============================================================================
+;; Validity bitmap helpers
+;; ============================================================================
+;;
+;; Phase 0 of the null-handling redesign (see doc/temporal-design.md and the
+;; null-handling audit). Each chunk carries an optional per-row validity
+;; bitmap packed into a long[] (LSB-first within each 64-bit entry):
+;;
+;;     bit set   → value at that row is non-NULL
+;;     bit clear → value is NULL; the data array's value at that slot is
+;;                 the per-type NULL sentinel (Long/MIN_VALUE / Double/NaN)
+;;                 retained for output formatting + hashing
+;;
+;; `nil` validity is the *all-valid fast path* — consumers branch on
+;; `(nil? validity)` once at the outermost loop and run the bitmap-free
+;; kernel when nil. This is DuckDB's `validity_mask == nullptr` pattern.
+;;
+;; Authoritative populate happens at `col-persistent!`: we scan the data
+;; array once for sentinels and either return nil (no NULLs) or build the
+;; bitmap. Transient chunks have `validity = nil` while mid-mutation;
+;; `col-transient` clears any previously-computed bitmap because writes
+;; can introduce or remove NULLs without per-write tracking.
+
+(defn bitmap-entry-count
+  "Number of long[] entries needed to store a per-row validity bitmap
+   for `n-rows`. 64 rows per long entry."
+  [^long n-rows]
+  (quot (+ n-rows 63) 64))
+
+(defn validity-row-valid?
+  "Read bit `i` from a packed long[] validity bitmap; true → row is
+   non-NULL. The bitmap must be non-nil."
+  ^Boolean [^longs validity ^long i]
+  (let [entry (aget validity (quot i 64))
+        bit-pos (rem i 64)]
+    (not (zero? (bit-and entry (bit-shift-left 1 bit-pos))))))
+
+(defn- validity-clear-bit!
+  "Mark row `i` as NULL (clear the bit). Mutates the long[] in place."
+  [^longs validity ^long i]
+  (let [entry-idx (quot i 64)
+        bit-pos (rem i 64)]
+    (aset validity entry-idx
+          (bit-and (aget validity entry-idx)
+                   (bit-not (bit-shift-left 1 bit-pos))))))
+
+(defn- new-all-valid-bitmap
+  "Allocate a long[] bitmap of size for `n-rows`, all bits set (all
+   rows marked valid)."
+  ^longs [^long n-rows]
+  (let [n-entries (bitmap-entry-count n-rows)
+        v (long-array n-entries)]
+    (Arrays/fill v -1)
+    ;; Clear any bits past the last logical row in the final entry
+    ;; (they sit in the same long but represent positions beyond
+    ;; `n-rows`; consumers shouldn't read them but we keep them clean).
+    (let [tail-bits (rem n-rows 64)]
+      (when (and (> n-entries 0) (pos? tail-bits))
+        (let [last-idx (dec n-entries)
+              live-mask (unchecked-dec (bit-shift-left 1 tail-bits))]
+          (aset v last-idx (bit-and (aget v last-idx) live-mask)))))
+    v))
+
+(defn- scan-validity
+  "Scan a primitive data array for NULL sentinels. Returns nil if all
+   `n-rows` values are non-NULL (all-valid fast path), else returns a
+   long[] bitmap with the bits for null rows cleared.
+
+   This is the authoritative bitmap builder. Called from
+   `col-persistent!`, `chunk-from-array`, `chunk-from-bytes`, and the
+   constant-chunk lazy-allocation path."
+  ^longs [data datatype ^long n-rows]
+  (case datatype
+    :int64
+    (let [^longs arr data]
+      (loop [i 0 validity nil]
+        (cond
+          (>= i n-rows) validity
+          (= (aget arr i) Long/MIN_VALUE)
+          (let [v (or validity (new-all-valid-bitmap n-rows))]
+            (validity-clear-bit! v i)
+            (recur (inc i) v))
+          :else (recur (inc i) validity))))
+
+    :float64
+    (let [^doubles arr data]
+      (loop [i 0 validity nil]
+        (cond
+          (>= i n-rows) validity
+          (Double/isNaN (aget arr i))
+          (let [v (or validity (new-all-valid-bitmap n-rows))]
+            (validity-clear-bit! v i)
+            (recur (inc i) v))
+          :else (recur (inc i) validity))))))
+
 (deftype PersistentColChunk
          [^:volatile-mutable data            ; The primitive array (long[] or double[]), nil for unexpanded constant
           ^:volatile-mutable ^long length    ; Logical number of valid elements (mutable for growth)
@@ -76,7 +178,8 @@
           ^:volatile-mutable dirty           ; true if copied (no longer sharing)
           ^:volatile-mutable parent          ; Parent array we forked from (for CoW tracking), cleared after CoW
           ^:volatile-mutable constant-val    ; nil = regular chunk, Number = constant value (lazy expand)
-          metadata]
+          metadata
+          ^:volatile-mutable validity]       ; Per-row validity bitmap (long[]) or nil = all-valid fast path
 
   IColChunk
   (chunk-length [_] length)
@@ -129,6 +232,27 @@
 
   (chunk-constant-val [_]
     constant-val)
+
+  (chunk-validity [_]
+    ;; Persistent chunks: the `validity` field is authoritative (populated
+    ;; at col-persistent!, chunk-from-array, or chunk-from-bytes).
+    ;; Constant chunks: detect "constant is the type's NULL sentinel" and
+    ;; lazy-allocate an all-zeros bitmap (cached into the field for
+    ;; subsequent calls). This is the all-NULL chunk case.
+    ;; Transient chunks (mid-mutation): always return nil; the bitmap is
+    ;; recomputed at col-persistent!.
+    (cond
+      edit nil
+      validity validity
+      (and (some? constant-val)
+           (case datatype
+             :int64   (= (long constant-val) Long/MIN_VALUE)
+             :float64 (Double/isNaN (double constant-val))))
+      (let [v (long-array (bitmap-entry-count length))]
+        ;; All zeros = all NULL. Don't fill with -1 then clear.
+        (set! validity v)
+        v)
+      :else nil))
 
   IColChunkMut
   (write-value! [this idx val]
@@ -250,22 +374,32 @@
     ;; Create a new chunk with a defensive copy of the data array.
     ;; This guarantees isolation: mutating the original (via transient) cannot
     ;; affect the fork, and vice versa. Cost: O(chunk-size) = ~64KB copy.
+    ;; Validity is shared by-reference because forking returns a *persistent*
+    ;; sibling — neither side will mutate the bitmap directly; a subsequent
+    ;; `col-transient` on either side clears its own validity field so a
+    ;; later `col-persistent!` rescan rebuilds from data. (If the fork is
+    ;; later transient'd and the writes happen to leave the data unchanged,
+    ;; the rescan will simply rebuild the same bitmap; cost amortised.)
     (if constant-val
       ;; Constant chunk: share constant-val, no data to copy
       (PersistentColChunk. data length (if data capacity length) datatype nil false
-                           (when data data) constant-val metadata)
+                           (when data data) constant-val metadata validity)
       ;; Regular chunk: copy data array for full isolation
       (let [copied (case datatype
                      :float64 (java.util.Arrays/copyOf ^doubles data (int capacity))
                      :int64 (java.util.Arrays/copyOf ^longs data (int capacity)))]
         (PersistentColChunk. copied length capacity datatype nil false
-                             nil nil metadata))))
+                             nil nil metadata validity))))
 
   (col-transient [this]
     (if edit
       (throw (IllegalStateException. "Already transient"))
       (do
         (set! edit (Object.))
+        ;; Clear cached validity: writes during transient mode can
+        ;; introduce/remove NULLs without per-write tracking. The next
+        ;; col-persistent! rescans data to rebuild.
+        (set! validity nil)
         this)))
 
   (col-persistent! [this]
@@ -280,6 +414,12 @@
                            :int64 (Arrays/copyOf ^longs data (int length)))]
             (set! data new-data)
             (set! capacity length)))
+        ;; Rescan validity from data. Nil result (all-valid) is the
+        ;; common case and incurs no per-row allocation. Skip for
+        ;; constant chunks — their validity is computed on demand from
+        ;; constant-val by `chunk-validity`.
+        (when (and data (nil? constant-val))
+          (set! validity (scan-validity data datatype length)))
         (set! edit nil)
         (set! parent nil)
         this)))
@@ -301,7 +441,7 @@
 
   IObj
   (withMeta [_ m]
-    (PersistentColChunk. data length capacity datatype edit dirty parent constant-val m))
+    (PersistentColChunk. data length capacity datatype edit dirty parent constant-val m validity))
 
   Object
   (toString [_]
@@ -319,6 +459,12 @@
 (defn make-chunk
   "Create a new ColChunk with the given datatype and length.
 
+   The resulting chunk has a zeroed data array; for `:int64` that means
+   every slot is `0`, for `:float64` every slot is `0.0` — *not* the
+   NULL sentinel. Validity is therefore nil (all-valid). Use
+   `chunk-from-array` if you need to import pre-existing data that may
+   contain sentinels.
+
    Example:
      (make-chunk :float64 1000)
      (make-chunk :int64 1000)"
@@ -328,14 +474,18 @@
    (let [arr (case datatype
                :float64 (double-array length)
                :int64 (long-array length))]
-     ;; Initial capacity = length (exact size)
-     (PersistentColChunk. arr length length datatype nil false nil nil nil))))
+     ;; Initial capacity = length (exact size). Zeroed data → all-valid.
+     (PersistentColChunk. arr length length datatype nil false nil nil nil nil))))
 
 (defn make-constant-chunk
   "Create a constant-value ColChunk. Data is lazily expanded on first access.
-   Saves memory for chunks where all values are identical."
+   Saves memory for chunks where all values are identical.
+
+   When `constant-value` IS the type's NULL sentinel (Long/MIN_VALUE for
+   int64, Double/NaN for float64), this represents an all-NULL chunk —
+   `chunk-validity` lazy-allocates the all-zeros bitmap on first call."
   [datatype ^long length constant-value]
-  (PersistentColChunk. nil length length datatype nil false nil constant-value nil))
+  (PersistentColChunk. nil length length datatype nil false nil constant-value nil nil))
 
 (defn chunk-from-seq
   "Create a ColChunk from a sequence of values.
@@ -354,6 +504,10 @@
 (defn chunk-from-array
   "Create a ColChunk from a primitive array (copies the array).
 
+   Imports may contain NULL sentinels (Long/MIN_VALUE or Double/NaN);
+   we scan the data once to build the validity bitmap. Returns
+   `validity = nil` (all-valid fast path) when the input is sentinel-free.
+
    Example:
      (chunk-from-array (double-array [1.0 2.0 3.0]))"
   [arr]
@@ -365,8 +519,9 @@
         length (int (if is-long (alength ^longs arr) (alength ^doubles arr)))
         new-arr (if is-long
                   (Arrays/copyOf ^longs arr length)
-                  (Arrays/copyOf ^doubles arr length))]
-    (PersistentColChunk. new-arr length length datatype nil false nil nil nil)))
+                  (Arrays/copyOf ^doubles arr length))
+        validity (scan-validity new-arr datatype length)]
+    (PersistentColChunk. new-arr length length datatype nil false nil nil nil validity)))
 
 ;; ============================================================================
 ;; Utility functions
@@ -393,14 +548,17 @@
 
 (defn chunk-slice
   "Create a copy of a portion of the chunk.
-   Returns a new chunk with copied data."
+   Returns a new chunk with copied data and a freshly-scanned validity
+   bitmap (cheaper to rescan the sliced range than to bit-shuffle the
+   parent's bitmap)."
   [chunk ^long start ^long end]
   (let [dt (chunk-datatype chunk)
         len (- end start)
         new-arr (case dt
                   :float64 (Arrays/copyOfRange ^doubles (chunk-data chunk) (int start) (int end))
-                  :int64 (Arrays/copyOfRange ^longs (chunk-data chunk) (int start) (int end)))]
-    (PersistentColChunk. new-arr len len dt nil false nil nil nil)))
+                  :int64 (Arrays/copyOfRange ^longs (chunk-data chunk) (int start) (int end)))
+        validity (scan-validity new-arr dt len)]
+    (PersistentColChunk. new-arr len len dt nil false nil nil nil validity)))
 
 ;; ============================================================================
 ;; Serialization (for storage persistence)
@@ -499,7 +657,11 @@
               arr (double-array length)]
           (dotimes [i length]
             (aset arr i (.getDouble bb)))
-          (PersistentColChunk. arr length length datatype nil false nil nil nil))
+          ;; Scan for sentinels — back-compat with pre-bitmap on-disk
+          ;; chunks. New on-disk chunks could persist the bitmap directly
+          ;; (Phase 7 optimisation); the scan is bounded O(length).
+          (PersistentColChunk. arr length length datatype nil false nil nil nil
+                               (scan-validity arr datatype length)))
 
         :int64
         (let [bb (ByteBuffer/wrap data)
@@ -507,7 +669,8 @@
               arr (long-array length)]
           (dotimes [i length]
             (aset arr i (.getLong bb)))
-          (PersistentColChunk. arr length length datatype nil false nil nil nil))
+          (PersistentColChunk. arr length length datatype nil false nil nil nil
+                               (scan-validity arr datatype length)))
 
         ;; Default case with helpful error
         (throw (IllegalArgumentException.
