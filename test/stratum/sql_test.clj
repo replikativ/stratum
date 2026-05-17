@@ -2599,6 +2599,40 @@
                 "_system_to must be MAX (open) for a fresh insertion")))
         (finally (server/stop srv))))))
 
+(deftest sql-select-col-vs-col-where-keeps-rhs-column
+  ;; Regression lock for copilot review #3 (group_by.clj:655):
+  ;; `pred-columns` (plan.clj:387) only scanned the LHS column,
+  ;; so column-pruning trimmed any keyword RHS away from the
+  ;; projected col-arrays map. `eval-pred-scalar`'s `resolve-arg`
+  ;; then did `(get col-arrays a)` → nil → `(aget ^doubles nil i)`
+  ;; → NPE.
+  ;;
+  ;; Reproducer: SELECT projects only :eid, WHERE compares :a < :b.
+  ;; Pre-fix: `:b` was pruned, NPE at evaluation. Post-fix: pruner
+  ;; sees both :a AND :b via the extended `pred-columns`.
+  (testing "SELECT eid FROM t WHERE a < b — RHS column survives pruning"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "t"
+          ;; eid=1: a=5, b=10 (a<b → match)
+          ;; eid=2: a=20, b=15 (a<b false → no match)
+          ;; eid=3: a=7, b=7 (a<b false → no match)
+          {:eid (long-array [1 2 3])
+           :a   (long-array [5 20 7])
+           :b   (long-array [10 15 7])})
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult r
+              (exec "SELECT eid FROM t WHERE a < b ORDER BY eid"
+                    (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r))
+              (str "execute-sql must not error; pre-fix surfaced an "
+                   "NPE swallowed into the error QR. got: "
+                   (.error r)))
+          (is (= [["1"]] (mapv vec (.rows r)))
+              "only eid=1 satisfies a<b (wire-text-mode: rows are stringified)"))
+        (finally (server/stop srv))))))
+
 (deftest sql-dml-arithmetic-where-handles-null-operand
   ;; Regression lock for copilot review #2 (server.clj:176):
   ;; eval-dml-predicate arithmetic (:+/:-/:*/:/) called

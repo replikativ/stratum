@@ -385,17 +385,30 @@
 ;; ============================================================================
 
 (defn- pred-columns
-  "Set of column keywords referenced by a normalized predicate (recursive)."
+  "Set of column keywords referenced by a normalized predicate (recursive).
+
+   Includes both the LHS column (`first pred`) and any keyword RHS
+   args (col-vs-col predicates like `[:_valid_from :lt :_valid_to]`).
+   Without scanning RHS args, column-pruning trims the RHS column
+   from the projected col-arrays map, and `eval-pred-scalar`'s
+   `resolve-arg` then NPEs on `(aget ^doubles other i)` because
+   `(get col-arrays :_valid_to)` returned nil. Copilot review #3."
   [pred]
   (let [op (second pred)]
     (case op
       :or (into #{} (mapcat pred-columns) (subvec pred 2))
       (:in :not-in :fn) (let [c (first pred)] (if (keyword? c) #{c} #{}))
-      (let [col (first pred)]
-        (if (map? col)
-          ;; Expression predicate like [:> {:op :mul :args [:a :b]} 1000]
-          (into #{} (filter keyword?) (:args col))
-          (if (keyword? col) #{col} #{}))))))
+      (let [col (first pred)
+            base (cond
+                   (map? col)     (into #{} (filter keyword?) (:args col))
+                   (keyword? col) #{col}
+                   :else          #{})
+            ;; Scan RHS args (everything from index 2 onward) for
+            ;; keyword column refs — `:lt`/`:gt`/`:eq`/etc accept
+            ;; a literal OR a column ref on the RHS; `:range` and
+            ;; `:not-range` accept two such args.
+            args (subvec pred 2)]
+        (into base (filter keyword?) args)))))
 
 (defn- classify-pred-by-side
   "Classify a predicate as :left, :right, or :cross based on which join side
