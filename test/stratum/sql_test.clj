@@ -3349,6 +3349,34 @@
           (is (= [1 3] eids)))
         (finally (server/stop srv))))))
 
+(deftest sql-select-for-valid-time-survives-leading-comment-with-phrase
+  ;; Regression lock for pattern-hunt P2-B (rewrite.clj:629
+  ;; find-for-valid-time-clause): the SELECT-side scanner
+  ;; handles `'` and `"` string boundaries but did NOT skip SQL
+  ;; line- or block-comments. A leading comment containing the
+  ;; phrase `FOR VALID_TIME AS OF '...'` was treated as a real
+  ;; clause and the rewriter spliced a temporal WHERE inline,
+  ;; producing nonsense SQL. Same root cause as the DML P1s
+  ;; (commits 3aad8b6 + 2978a8a) but in the SELECT scanner.
+  (testing "SELECT with a leading comment that mentions FOR VALID_TIME runs as a plain SELECT"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        (exec "CREATE TABLE t (id BIGINT, name VARCHAR)"
+              (:registry srv) (:data-dir srv))
+        (exec "INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b')"
+              (:registry srv) (:data-dir srv))
+        (let [sql (str "/* audit: FOR VALID_TIME AS OF '2024-01-01' was the original cut */\n"
+                       "SELECT id, name FROM t ORDER BY id")
+              ^PgWireServer$QueryResult r (exec sql (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r))
+              (str "pre-fix: scanner matched inside the comment "
+                   "and rewrote the SELECT with a temporal WHERE. "
+                   "got: " (.error r)))
+          (is (= 2 (count (.rows r)))
+              "all rows returned; no temporal filter applied"))
+        (finally (server/stop srv))))))
+
 (deftest sql-for-portion-of-survives-leading-comment-with-phrase
   ;; Regression lock for pattern-hunt P1 (rewrite.clj:403): the
   ;; `FOR PORTION OF VALID_TIME FROM …` preprocessor used

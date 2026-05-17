@@ -637,6 +637,22 @@
       (cond
         (>= i n) nil
 
+        ;; Skip SQL line- and block-comments so a SELECT with a
+        ;; leading comment such as
+        ;;   /* historical: FOR VALID_TIME AS OF '2024-01-01' */
+        ;;   SELECT … FROM t
+        ;; doesn't trigger the FOR-VALID_TIME rewrite inside the
+        ;; comment. Pattern-hunt P2; same shape as the DML
+        ;; preprocessor P1s fixed in 2978a8a but for the
+        ;; SELECT-side scanner.
+        (and (= \- (.charAt sql i))
+             (< (inc i) n) (= \- (.charAt sql (inc i))))
+        (recur (long (skip-line-comment sql i)))
+
+        (and (= \/ (.charAt sql i))
+             (< (inc i) n) (= \* (.charAt sql (inc i))))
+        (recur (long (skip-block-comment sql i)))
+
         (= \' (.charAt sql i)) (recur (long (skip-string sql i \')))
         (= \" (.charAt sql i)) (recur (long (skip-string sql i \")))
 

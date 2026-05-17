@@ -1888,7 +1888,18 @@
 
 (defn- eval-post-expr
   "Evaluate a post-aggregate expression against a result row.
-   Returns double for arithmetic, or any value for CASE-post (strings, etc.)."
+   Returns double for arithmetic, or any value for CASE-post (strings, etc.).
+
+   TODO (pattern-hunt P2, agent report 2026-05-17): the `0`
+   default below silently coerces missing/NULL aggregate values
+   (e.g. SUM over an empty group) to 0, which is wrong per SQL
+   3VL (`NULL + 1 = NULL`). A correct fix would change the
+   default to nil and propagate nil through arithmetic /
+   comparisons. Deferred because the change ripples into many
+   CASE-post and arithmetic call sites and risks behavioral
+   regression in tests that depend on the current
+   missing-key-as-0 contract. Track as kontor research-note 67
+   ST-PR27-AGENT-P2-A."
   [expr row]
   (cond
     (keyword? expr) (let [v (get row expr 0)] (if (number? v) (double v) v))

@@ -494,7 +494,7 @@ The work landed in phases for review-ability:
 | A | Schema redesign: `:bitemporal {:valid :system}` |
 | B | Write primitives: `append!` / `upsert!` / `retract!` |
 | C | Overlap detection: reject by default |
-| C+ | Auto-split: truncate partial-left + drop fully-superseded (via `ds-delete-rows!`) |
+| C+ | Auto-split: truncate partial-left + supersede (valid-only: drop physically via `ds-delete-rows!`; fully-bitemporal: close `_system_to` to sys-now, keep in storage for audit) |
 | D | SQL grammar `FOR PORTION OF VALID_TIME` (DELETE) + bounded retract! + index-backed SQL DELETE |
 | D+ | `FOR PORTION OF VALID_TIME` on UPDATE + INSERT (via `bounded-update!`); UPSERT rejected with clear error |
 
