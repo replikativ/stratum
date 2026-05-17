@@ -6,11 +6,15 @@ tampering on the underlying konserve blobs surfaces as a recomputed UUID that
 no longer matches the address it's stored under. `stratum.audit` exposes the
 verification surface that turns this property into actionable reports.
 
-The audit namespace mirrors datahike's `datahike.index.audit` in protocol
-shape (`IAuditable`, `-merkle-root`, `-recompute-merkle-root`) and result-map
-vocabulary (`:ok`, `:mismatch`, `:unsupported`, `:advisory`, `:incomplete`),
-so bridges that compose both engines (e.g. datahike's stratum secondary
-index) can pass results through without translation.
+The audit namespace exposes the `IAuditable` protocol
+(`-merkle-root`, `-recompute-merkle-root`) and a small
+result-map vocabulary (`:ok`, `:mismatch`, `:unsupported`, `:advisory`,
+`:incomplete`). Adapters that embed stratum inside a larger storage
+substrate (e.g. as a Datalog secondary index) can implement
+`IAuditable` on their wrapper types to compose stratum verification
+with other engines' verification in one pass; the result-map shape is
+deliberately stable so multi-engine drivers don't need translation
+layers.
 
 ## When to enable
 
@@ -117,10 +121,9 @@ value without going through `verify-chain`:
 internally calls `verify-chain` with `:deep? true` against the live value's
 store, so it has the same cost profile as a deep chain walk.
 
-The same protocol shape lives in datahike (`datahike.index.audit`), and
-bridges like the stratum secondary index in datahike implement `IAuditable`
-on their wrapper types so a single audit pass over a datahike connection
-covers both layers' state.
+When stratum is embedded as a secondary index inside another storage
+substrate, the wrapper type can implement `IAuditable` against its own
+storage so a single multi-engine verification pass covers both layers.
 
 ## `verify-pss-tree-from-cold` — column-level entry
 

@@ -1682,9 +1682,9 @@
 ;;                      indexed have a narrow window that almost never
 ;;                      hits. Exercises zone-map handling of the sentinel.
 ;;   VT-Q3 group-by   — 10M rows + 100 accounts, vt filter + GROUP BY
-;;                      mod-100 → SUM(amount). Mirrors kontor's
-;;                      "trial-balance as-of date X" shape; the group-by
-;;                      keeps the join out for now (Option A in plan §2).
+;;                      mod-100 → SUM(amount). Mirrors a typical
+;;                      "trial-balance as-of date X" accounting shape;
+;;                      the group-by keeps the join out for now.
 
 (def ^:private vt-q1-n 10000000)
 (def ^:private vt-q1-windows 100)        ;; → 100K rows per window, 1% match
@@ -3587,8 +3587,7 @@
             (finally (.close conn)))))
 
       ;; === Tier 10: Valid-Time As-Of ===
-      ;; Three shapes that exercise the bitemporal valid-time read path
-      ;; introduced on feature/valid-time (kontor doc/research/57 §6):
+      ;; Three shapes that exercise the bitemporal valid-time read path:
       ;;   VT-Q1 1% selectivity, VT-Q2 50% sel + Long/MAX_VALUE sentinel,
       ;;   VT-Q3 group-by + vt filter (trial-balance-as-of shape).
       ;; Fixed at 10M rows; `n` is ignored so the shapes stay comparable.

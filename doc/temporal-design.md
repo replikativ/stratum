@@ -1,9 +1,7 @@
 # Temporal Design — Bitemporal Stratum
 
 This document captures the design decisions behind stratum's bitemporal
-write and read surface. It supersedes the original "valid-time column
-convention" framing of an earlier draft of this PR — bitemporality is
-the whole feature, not a column naming guideline.
+write and read surface.
 
 ## Vocabulary
 
@@ -102,7 +100,7 @@ whole model.
 ### Why mutate `_system_to` instead of keeping rows append-only?
 
 Stratum stores rows in a classical SCD2 layout: every row is a tuple
-that physically exists at one location in the secondary index. To
+that physically exists at one location in its columnar dataset. To
 distinguish "row was the DB's belief at time `s`" from "row has been
 superseded", we need *some* per-row marker of the supersession point.
 The two natural shapes are:
@@ -142,32 +140,41 @@ storage layer that's append-only by construction.
 
 ## Write primitives
 
-Three primitives in `stratum.dataset`, all returning a new dataset value:
+Three primitives on `IDataset` (called on a transient dataset, mutate
+in-place, return the transient for threading):
 
 ```clojure
-(vt-append! ds rows-or-cols
-            {:valid-from inst   ; defaults to (System/currentTimeMillis)
-             :valid-to   inst   ; defaults to Long/MAX_VALUE (open)
-             :system-from inst  ; defaults to tx-time (now)
-             :system-to   inst  ; defaults to Long/MAX_VALUE (open)
-             :auto-split? false})
+(append! tds rows-or-cols
+         {:valid-from  inst   ; defaults to now (wall-clock or :db/txInstant override)
+          :valid-to    inst   ; defaults to Long/MAX_VALUE (open)
+          :system-from inst   ; defaults to now (shared with valid-from default)
+          :system-to   inst   ; defaults to Long/MAX_VALUE (open)})
 
-(vt-update! ds {:where    [pred ...]   ; stratum WHERE clause
-                :set      {col val}
-                :valid-from inst       ; required when :valid is configured
-                :valid-to   inst       ; defaults to Long/MAX_VALUE
-                :auto-split? false})
+(upsert! tds {:where    [pred ...]      ; stratum WHERE clause
+              :set      {col val}
+              :auto-split? false}
+             {:valid-from inst         ; defaults to now
+              :valid-to   inst})       ; defaults to Long/MAX_VALUE
 
-(vt-delete! ds {:where    [pred ...]
-                :valid-from inst       ; required when :valid is configured
-                :valid-to   inst       ; defaults to Long/MAX_VALUE
-                :auto-split? false})
+(retract! tds {:where    [pred ...]
+               :auto-split? false}
+              {:valid-from inst        ; defaults to now (close-point)
+               :valid-to   inst})      ; explicit presence selects bounded
+                                       ; surgery (FOR PORTION OF semantic);
+                                       ; absence = open-window close
 ```
 
-**`vt-append!`** writes new rows with the supplied or defaulted vt /
+All three accept an optional `tx-meta` second arg with the temporal
+keys (`:valid-from`, `:valid-to`, `:system-from`, `:system-to`); any
+key absent falls back to wall-clock now for `:_from` and
+`Long/MAX_VALUE` for `:_to`. Pinning the clock for deterministic
+test runs is done via `:db/txInstant` in tx-meta or by binding the
+dynamic var the dataset reads (`*clock-time-millis*`).
+
+**`append!`** writes new rows with the supplied or defaulted vt /
 system windows. No close. Pure insertion.
 
-**`vt-update!`** is the SCD2 close-and-reopen primitive:
+**`upsert!`** is the SCD2 close-and-reopen primitive:
 1. Find rows matching `:where` whose `_valid_to` (or `_system_to`)
    still spans the new window.
 2. Close their `_valid_to` to the new `:valid-from` (write the close
@@ -175,26 +182,35 @@ system windows. No close. Pure insertion.
 3. Append new rows with the merged `:set` values and the new vt /
    system windows.
 
-**`vt-delete!`** is "close without reopen": same find step, set
-`_valid_to` to `:valid-from`, no new rows. Logically a retraction
-over the specified vt slice. Physical purge stays on `:db/purge`
-semantics — never auto-triggered by `vt-delete!`.
+**`retract!`** has two shapes determined by tx-meta presence:
+- **Open-window** (no `:valid-to` in tx-meta): "close without reopen"
+  — find matching rows whose `_valid_to` is `Long/MAX_VALUE`, set
+  `_valid_to` to `:valid-from`. Logical retraction at the close point.
+- **Bounded `FOR PORTION OF`** (`:valid-to` in tx-meta): per-row
+  surgery — drop / truncate-vt / truncate-vf / split — preserving
+  non-overlap parts. Implements SQL:2011 `FOR PORTION OF VALID_TIME …
+  DELETE` semantics.
+
+Physical purge stays on `ds-delete-rows!` — never auto-triggered by
+`retract!`.
 
 ### Why predicate-driven, not entity-keyed?
 
 Stratum core doesn't know what "an entity" is. The `:eid` convention
-is application-specific (kontor uses `:eid`, scriptum would use a
-doc-id, proximum a vector-id). A predicate-driven primitive stays
-generic and reuses the WHERE-clause DSL the planner already
-understands — zone-map pruning and parallel scan come for free.
+is application-specific (one consumer uses `:eid`, a text-search
+adapter would use a doc-id, a vector-search adapter a vector-id). A
+predicate-driven primitive stays generic and reuses the WHERE-clause
+DSL the planner already understands — zone-map pruning and parallel
+scan come for free.
 
 Callers that *do* have an entity key wrap the primitive trivially:
 
 ```clojure
 (defn upsert-entity! [ds eid attrs vt-from]
-  (vt-update! ds {:where      [[:= :eid eid]]
-                  :set        attrs
-                  :valid-from vt-from}))
+  (-> ds transient
+      (upsert! {:where [[:= :eid eid]] :set attrs}
+               {:valid-from vt-from})
+      persistent!))
 ```
 
 ### Why three primitives instead of one?
@@ -293,11 +309,11 @@ direct `append!`.
 We extend pg-datahike's grammar to recognise SQL:2011 temporal DML:
 
 ```sql
--- bitemporal as-of read (already in pg-datahike#7 as session vars)
+-- session-scoped temporal pins (PG-wire SET vars)
 SET datahike.valid_at = '2024-04-15T00:00:00Z';
 SET datahike.system_at = '2024-04-20T00:00:00Z';
 
--- per-query forms (this PR)
+-- per-query SQL:2011 forms
 SELECT * FROM employees
   FOR VALID_TIME AS OF '2024-04-15'
   FOR SYSTEM_TIME AS OF '2024-04-20';
@@ -419,66 +435,81 @@ Each wrapper sets a `timepred` or `xform-after` on the search-context;
 HashMap probe per axis per unique tx-id (cached). Same cost profile
 as AsOfDB today, just one more axis.
 
-## Why now
+## Why this design
 
-Before this work, stratum's write surface was valid-time-blind: the
-column-convention foundation existed but no primitive in stratum core
-performed close-and-reopen, so every adapter that needed SCD2 had to
-re-invent it on top of `assoc-column` and `append!`. The datahike
-adapter alone carried ~150 LOC of close-and-reopen logic that should
-have lived in stratum.
+Stratum is a columnar analytics library that doubles as the storage
+substrate for higher-level systems (a Datalog secondary index, a SQL
+front-end, application code in other repos). Without a canonical
+write-side bitemporal primitive in stratum core, every consumer that
+needed SCD2 had to re-invent close-and-reopen on top of
+`assoc-column` and `append!` — duplicating ~100-200 LOC each, with no
+guarantee they implemented the system-time-symmetry invariant
+correctly.
 
-After this PR:
-- One canonical SCD2 in stratum.
-- Adapters become thin (datahike adapter shrinks by ~100 LOC).
+With this work in place:
+- One canonical SCD2 surgery (`replace-row-bitemporal!`) lives in
+  stratum core, exercised by `append!` / `upsert!` / `retract!` /
+  `bounded-update!`.
+- Consumers (Datalog secondary indices, SQL surfaces, application
+  code) stay thin: thread `:bitemporal` config through `make-
+  dataset` and the primitives do the right thing per-axis.
 - A consuming PG-wire layer can speak SQL:2011 `FOR PORTION OF
   VALID_TIME` directly without a custom translator.
 - Both temporal axes get equal treatment from the planner.
 
 ## Phases
 
+The work landed in phases for review-ability:
+
 | Phase | Scope |
 |---|---|
 | A | Schema redesign: `:bitemporal {:valid :system}` |
-| B | Write primitives: `vt-append!` / `vt-update!` / `vt-delete!` |
+| B | Write primitives: `append!` / `upsert!` / `retract!` |
 | C | Overlap detection: reject by default |
 | C+ | Auto-split: truncate partial-left + drop fully-superseded (via `ds-delete-rows!`) |
 | D | SQL grammar `FOR PORTION OF VALID_TIME` (DELETE) + bounded retract! + index-backed SQL DELETE |
 | D+ | `FOR PORTION OF VALID_TIME` on UPDATE + INSERT (via `bounded-update!`); UPSERT rejected with clear error |
 
-A–D ship as this PR. Downstream consumers (the datahike adapter,
-PG-wire SQL passthrough) live in their own repos and land separately.
+Downstream consumers (secondary-index adapters, PG-wire SQL passthrough)
+live in their own repos and land independently.
 
-## Tests we'll add
+## Test coverage
+
+The shipped suite covers:
 
 - Bitemporal config validation (both axes, only-valid, only-system,
   neither).
-- `vt-append!` round-trip (insert with explicit window, with defaulted
+- `append!` round-trip (insert with explicit window, with defaulted
   window, on both axes).
-- `vt-update!` SCD2 (close + reopen) — `:where` predicate matching,
+- `upsert!` SCD2 (close + reopen) — `:where` predicate matching,
   `:set` value merging.
-- `vt-delete!` close-only.
-- Overlap detection: rejects + auto-split equivalence.
-- Four-axis composition under the planner.
-- SQL grammar round-trip via pg-datahike.
+- `retract!` close-only and bounded `FOR PORTION OF` surgery.
+- Overlap detection: reject + auto-split equivalence.
+- SCD2-on-both-axes: system-time symmetry on every vt mutation
+  (`replace-row-bitemporal!`).
+- `bounded-update!` 3-way split with shared `sys-now` stamp.
+- SQL grammar round-trip via the index-backed DML path.
+- All 10 Allen interval predicates as SQL functions.
 
 ## Things deferred
 
-- **Allen interval rules** (the full set: `overlaps`, `meets`,
-  `during`, `starts`, `finishes`, `equals` with `STRICTLY` /
-  `IMMEDIATELY` variants). Phase H or later — the SQL:2011 stdlib
-  defines 7+; we have only `period-overlaps?`. Datalog-only
-  addition, no schema change.
 - **Per-pattern `{:valid-at t}` annotation** in `:where` so a single
   query can join two relations at different vt instants. Useful for
   reconciliation queries. Open API design call.
-- **Time-slicing helpers** (`d/range-bins`-style: "as of each Friday
+- **Time-slicing helpers** (`range-bins`-style: "as of each Friday
   of 2024, what was the trial balance?"). Useful for reporting; out
   of scope for the substrate.
-- **System-time DML grammar** in stratum SQL (we only auto-stamp
-  `_system_from` on writes; users can't bitemporally correct
-  *system-time* in the way they correct valid-time). Documented
-  limitation; reopen if a real consumer demands it.
+- **System-time DML grammar** in stratum SQL — only auto-stamp
+  `_system_from` on writes; bitemporally *correcting* system-time
+  the way valid-time can be corrected is a documented limitation.
+- **`SET col = <expression>`** in `UPDATE … FOR PORTION OF
+  VALID_TIME`: only literal values today. Expression evaluation
+  requires SELECT/UPDATE engine convergence.
+- **Multi-table SELECT with two `FOR VALID_TIME` clauses**: the
+  rewriter emits unqualified `_valid_from` / `_valid_to` refs that
+  the planner can't disambiguate across joins. Rejected at parse
+  time with a hint to use explicit `<table>.col` qualifiers. Real
+  fix requires qualifier-aware column resolution in the planner.
 
 ## References
 
