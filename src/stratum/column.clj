@@ -3,7 +3,8 @@
 
    Provides column type detection and normalization to canonical format
    used by query engine and datasets."
-  (:require [stratum.index :as index])
+  (:require [stratum.chunk :as chunk]
+            [stratum.index :as index])
   (:import [stratum.index PersistentColumnIndex]
            [stratum.internal ColumnOpsString]))
 
@@ -37,13 +38,20 @@
     (and (map? col-val) (:type col-val) (or (:data col-val) (:index col-val)))
     col-val
 
-    ;; Raw long array
+    ;; Raw long array — scan once for Long.MIN_VALUE sentinels so the
+    ;; downstream kernels can dispatch to their Nullable siblings.
+    ;; Returns nil bitmap when no NULLs present (the common case),
+    ;; preserving the all-valid fast path.
     (instance? (Class/forName "[J") col-val)
-    {:type :int64 :data col-val}
+    (let [v (chunk/scan-validity col-val :int64 (alength ^longs col-val))]
+      (cond-> {:type :int64 :data col-val}
+        v (assoc :validity v)))
 
-    ;; Raw double array
+    ;; Raw double array — same lazy validity derivation.
     (instance? (Class/forName "[D") col-val)
-    {:type :float64 :data col-val}
+    (let [v (chunk/scan-validity col-val :float64 (alength ^doubles col-val))]
+      (cond-> {:type :float64 :data col-val}
+        v (assoc :validity v)))
 
     ;; String array — dictionary-encode to long[] for SIMD group-by
     ;; NULL strings (nil) are encoded as Long.MIN_VALUE sentinel (same as int64 NULL)
@@ -74,9 +82,13 @@
             (doseq [^java.util.Map$Entry e (.entrySet dict-map)]
               (when-let [k (.getKey e)]
                 (aset ^"[Ljava.lang.String;" reverse-dict (int (long (.getValue e))) k)))
-            {:type :int64 :data encoded :dict reverse-dict :dict-type :string
-             :dict-alpha-masks (ColumnOpsString/buildDictAlphaMasks reverse-dict)
-             :dict-bigram-masks (ColumnOpsString/buildDictBigramMasks reverse-dict)}))))
+            ;; nil strings became Long.MIN_VALUE sentinels above; derive
+            ;; validity so downstream Nullable kernels see the NULL set.
+            (let [v (chunk/scan-validity encoded :int64 n)]
+              (cond-> {:type :int64 :data encoded :dict reverse-dict :dict-type :string
+                       :dict-alpha-masks (ColumnOpsString/buildDictAlphaMasks reverse-dict)
+                       :dict-bigram-masks (ColumnOpsString/buildDictBigramMasks reverse-dict)}
+                v (assoc :validity v)))))))
 
     ;; Stratum index - preserve as index source for chunk-streaming
     (satisfies? index/IColumnIndex col-val)

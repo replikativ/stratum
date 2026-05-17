@@ -27,29 +27,17 @@
          (contains? simd-ops op)
          (contains? columns col))))
 
-(defn rewrite-null-preds
-  "Rewrite IS-NULL/IS-NOT-NULL on long columns to SIMD-native EQ/NEQ.
-   Long NULL sentinel is Long/MIN_VALUE, so is-not-null → neq MIN_VALUE.
-   Double columns stay on the compiled mask path (NaN != NaN in IEEE754)."
-  [preds columns]
-  (mapv (fn [pred]
-          (let [col (first pred)
-                op  (second pred)]
-            (if (and (keyword? col)
-                     (or (= op :is-null) (= op :is-not-null))
-                     (= :int64 (:type (get columns col))))
-              (if (= op :is-null)
-                [col :eq (double Long/MIN_VALUE)]
-                [col :neq (double Long/MIN_VALUE)])
-              pred)))
-        preds))
-
 (defn split-preds
   "Split predicates into [simd-preds non-simd-preds].
-   SIMD preds go to Java. Non-SIMD preds get compiled to a mask."
+   SIMD preds go to Java. Non-SIMD preds (including IS-NULL/IS-NOT-NULL)
+   get compiled to a mask. The IS-NULL → EQ-sentinel rewrite that
+   previously routed nulls through the SIMD path was removed for SQL
+   3VL correctness: with validity bitmaps as the source of truth,
+   `WHERE col = NULL_SENTINEL` is treated as UNKNOWN (false) — the
+   rewrite would silently zero the result. The compiled-mask path
+   emits a direct sentinel check at codegen time and stays correct."
   [preds columns]
-  (let [preds (rewrite-null-preds preds columns)
-        groups (group-by #(simd-pred? % columns) preds)]
+  (let [groups (group-by #(simd-pred? % columns) preds)]
     [(vec (get groups true []))
      (vec (get groups false []))]))
 

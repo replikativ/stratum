@@ -637,7 +637,12 @@
   "Evaluate a single predicate for a row.
    Handles standard comparisons, IN, NOT-IN, NOT-RANGE, and OR.
    Expects dict-column predicates to be preprocessed via preprocess-preds
-   (arguments already encoded to dict codes for long comparison)."
+   (arguments already encoded to dict codes for long comparison).
+
+   SQL 3VL: a comparison whose LHS or RHS is NULL yields UNKNOWN, which
+   `WHERE` treats as false. The sentinel check at the top short-circuits
+   every comparison/IN/RANGE op to false when the LHS value is NULL;
+   `:is-null` / `:is-not-null` keep their existing two-valued semantics."
   [col-arrays ^long i pred]
   (let [col-ref (first pred)
         op (second pred)]
@@ -657,9 +662,13 @@
       ;; like `[:_valid_from :lt :_valid_to]` then evaluate correctly
       ;; in SELECT WHERE clauses, not just DML.
       (let [col-data (if (keyword? col-ref) (get col-arrays col-ref) col-ref)
-            v (if (expr/long-array? col-data)
+            is-long? (expr/long-array? col-data)
+            v (if is-long?
                 (aget ^longs col-data i)
                 (aget ^doubles col-data i))
+            lhs-null? (if is-long?
+                        (== (long v) Long/MIN_VALUE)
+                        (Double/isNaN (double v)))
             args (subvec pred 2)
             resolve-arg (fn [a]
                           (if (keyword? a)
@@ -667,34 +676,59 @@
                               (if (expr/long-array? other)
                                 (aget ^longs other i)
                                 (aget ^doubles other i)))
-                            a))]
-        (case op
-          :lt    (< (double v) (double (resolve-arg (first args))))
-          :gt    (> (double v) (double (resolve-arg (first args))))
-          :lte   (<= (double v) (double (resolve-arg (first args))))
-          :gte   (>= (double v) (double (resolve-arg (first args))))
-          :eq    (== (double v) (double (resolve-arg (first args))))
-          :neq   (not (== (double v) (double (resolve-arg (first args)))))
-          :range (let [lo (double (resolve-arg (first args)))
-                       hi (double (resolve-arg (second args)))]
-                   (and (>= (double v) lo) (<= (double v) hi)))
-          :not-range (let [lo (double (resolve-arg (first args)))
-                           hi (double (resolve-arg (second args)))]
-                       (or (< (double v) lo) (> (double v) hi)))
-          :in    (let [s (first args)]
-                   (if (every? number? s)
-                     (contains? s (double v))
-                     (contains? s v)))
-          :not-in (let [s (first args)]
-                    (if (every? number? s)
-                      (not (contains? s (double v)))
-                      (not (contains? s v))))
-          :is-null (if (expr/long-array? col-data)
-                     (== (long v) Long/MIN_VALUE)
-                     (Double/isNaN (double v)))
-          :is-not-null (if (expr/long-array? col-data)
-                         (not= (long v) Long/MIN_VALUE)
-                         (not (Double/isNaN (double v)))))))))
+                            a))
+            ;; For col-vs-col preds, the RHS is also a column ref; check
+            ;; whether it resolves to NULL too. Literal RHS args are
+            ;; never NULL (we don't allow `nil` literals in normalised
+            ;; preds — IS-NULL handles that path).
+            rhs-null? (and (#{:lt :gt :lte :gte :eq :neq :range :not-range} op)
+                           (let [arg (first args)]
+                             (and (keyword? arg)
+                                  (let [other (get col-arrays arg)
+                                        ov (if (expr/long-array? other)
+                                             (aget ^longs other i)
+                                             (aget ^doubles other i))]
+                                    (if (expr/long-array? other)
+                                      (== (long ov) Long/MIN_VALUE)
+                                      (Double/isNaN (double ov)))))))]
+        (cond
+          ;; IS-NULL / IS-NOT-NULL keep their two-valued semantics.
+          (= op :is-null)
+          (if is-long?
+            (== (long v) Long/MIN_VALUE)
+            (Double/isNaN (double v)))
+
+          (= op :is-not-null)
+          (if is-long?
+            (not= (long v) Long/MIN_VALUE)
+            (not (Double/isNaN (double v))))
+
+          ;; Any other op against a NULL operand → UNKNOWN → false (WHERE 3VL).
+          (or lhs-null? rhs-null?)
+          false
+
+          :else
+          (case op
+            :lt    (< (double v) (double (resolve-arg (first args))))
+            :gt    (> (double v) (double (resolve-arg (first args))))
+            :lte   (<= (double v) (double (resolve-arg (first args))))
+            :gte   (>= (double v) (double (resolve-arg (first args))))
+            :eq    (== (double v) (double (resolve-arg (first args))))
+            :neq   (not (== (double v) (double (resolve-arg (first args)))))
+            :range (let [lo (double (resolve-arg (first args)))
+                         hi (double (resolve-arg (second args)))]
+                     (and (>= (double v) lo) (<= (double v) hi)))
+            :not-range (let [lo (double (resolve-arg (first args)))
+                             hi (double (resolve-arg (second args)))]
+                         (or (< (double v) lo) (> (double v) hi)))
+            :in    (let [s (first args)]
+                     (if (every? number? s)
+                       (contains? s (double v))
+                       (contains? s v)))
+            :not-in (let [s (first args)]
+                      (if (every? number? s)
+                        (not (contains? s (double v)))
+                        (not (contains? s v))))))))))
 
 (defn execute-scalar-aggs
   "Execute aggregations over matching rows using scalar loop."

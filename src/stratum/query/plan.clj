@@ -976,14 +976,16 @@
   (double Long/MIN_VALUE))
 
 (defn- pred-targets-null-sentinel?
-  "True if `pred` compares against the long-null sentinel (the form
-   produced by `rewrite-null-preds` when an `IS-NULL`/`IS-NOT-NULL`
-   on a long column was rewritten into `:eq`/`:neq`).  ChunkStats
-   ignore nulls, so any zone-map classification of these preds is
-   wrong: an all-null chunk has min/max set to non-null sentinels
-   and `zone-may-contain` says \"no\", but every row matches IS-NULL.
-   F20 must skip promotion in this case (cf. parquet null-column
-   tests where stats-only returned 0 instead of the null count)."
+  "True if `pred` compares against the long-null sentinel. Defensive
+   guard for user-supplied predicates like `[:col :eq Long/MIN_VALUE]`:
+   ChunkStats omit nulls, so any zone-map classification of such a pred
+   is wrong (an all-null chunk has min/max set to non-null sentinels and
+   `zone-may-contain` says \"no\", but every row matches the sentinel).
+   F20 skips stats-only promotion in this case.
+
+   Internal IS-NULL/IS-NOT-NULL no longer emit this shape — the
+   `rewrite-null-preds` pass was removed for SQL 3VL correctness and
+   IS-NULL now routes through the compiled-mask path."
   [pred]
   (and (vector? pred) (>= (count pred) 3)
        (#{:eq :neq} (second pred))
