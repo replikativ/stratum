@@ -1362,6 +1362,89 @@
           (vreset! offset (+ off chunk-len)))))
     result))
 
+(defn- copy-bits-into!
+  "Copy `bit-count` bits from `src` (packed long[]) starting at
+   source-bit 0 into `dst` starting at `dst-bit-offset`. Bits are
+   LSB-first within each long entry. Used by
+   `idx-materialize-to-array-with-validity` to splice per-chunk
+   validity bitmaps into a flat per-row bitmap.
+
+   Fast path: when `dst-bit-offset` is a multiple of 64 (the common
+   case — default chunk size 8192 is 128 × 64-row-aligned), copies
+   whole long entries via `System/arraycopy`.
+
+   Slow path: bit-by-bit when the offset isn't 64-aligned (e.g.
+   Parquet row groups whose chunk sizes differ from the default).
+   Cost: O(bit-count) longs of work per chunk; only invoked when
+   the chunk *and* its predecessors don't happen to align — and
+   only when the chunk has non-nil validity (no-NULL chunks
+   bypass this entirely)."
+  [^longs dst ^long dst-bit-offset ^longs src ^long bit-count]
+  (if (zero? (rem dst-bit-offset 64))
+    ;; Aligned: whole-entry arraycopy
+    (let [src-entries (alength src)
+          dst-entry-off (quot dst-bit-offset 64)]
+      (System/arraycopy src 0 dst dst-entry-off src-entries))
+    ;; Unaligned: read each src bit, set/clear the corresponding dst bit
+    (dotimes [i bit-count]
+      (let [src-entry-idx (quot i 64)
+            src-bit-pos   (rem i 64)
+            src-bit       (bit-and (bit-shift-right (aget src src-entry-idx) src-bit-pos) 1)
+            dst-idx       (+ dst-bit-offset i)
+            dst-entry-idx (quot dst-idx 64)
+            dst-bit-pos   (rem dst-idx 64)
+            mask          (bit-shift-left 1 dst-bit-pos)]
+        (aset dst dst-entry-idx
+              (if (zero? src-bit)
+                (bit-and (aget dst dst-entry-idx) (bit-not mask))
+                (bit-or  (aget dst dst-entry-idx) mask)))))))
+
+(defn idx-materialize-to-array-with-validity
+  "Materialize index to a `{:data flat-array :validity bm-or-nil}`
+   map. Sister of `idx-materialize-to-array` that also concatenates
+   per-chunk validity bitmaps into a flat per-row bitmap.
+
+   `:validity` is nil when every chunk's `chunk-validity` is nil
+   (all-valid fast path) — the common case for dense data (TPC-H,
+   H2O, NYC Taxi). When *any* chunk has nulls, we lazily allocate
+   a flat bitmap initialised to all-1s, then splice each null-bearing
+   chunk's bitmap into the appropriate range via `copy-bits-into!`.
+
+   Cost: zero bitmap allocation + no extra work vs the existing
+   `idx-materialize-to-array` when fully all-valid. When NULLs
+   exist: per-chunk arraycopy (8192-aligned chunks) or bit-by-bit
+   splice (non-aligned chunks like Parquet row groups)."
+  [index]
+  (let [n (idx-length index)
+        dt (idx-datatype index)
+        result (case dt :int64 (long-array n) :float64 (double-array n))
+        bitmap-size (chunk/bitmap-entry-count n)
+        tree (idx-tree index)
+        flat-validity-vol (volatile! nil)
+        offset (volatile! 0)]
+    (doseq [^ChunkEntry entry (pss/slice tree nil nil)]
+      (let [chk (.chunk entry)
+            off (long @offset)
+            chunk-len (long (chunk/chunk-length chk))
+            chunk-validity (chunk/chunk-validity chk)]
+        ;; Data copy — same path as idx-materialize-to-array
+        (if (chunk/chunk-constant? chk)
+          (let [cv (chunk/chunk-constant-val chk)]
+            (case dt
+              :float64 (java.util.Arrays/fill ^doubles result (int off) (int (+ off chunk-len)) (double cv))
+              :int64   (java.util.Arrays/fill ^longs   result (int off) (int (+ off chunk-len)) (long cv))))
+          (let [chunk-arr (chunk/chunk-data chk)]
+            (System/arraycopy chunk-arr 0 result off chunk-len)))
+        ;; Validity copy (lazy; only allocate when first non-nil chunk is encountered)
+        (when chunk-validity
+          (when (nil? @flat-validity-vol)
+            (let [v (long-array bitmap-size)]
+              (java.util.Arrays/fill v -1)
+              (vreset! flat-validity-vol v)))
+          (copy-bits-into! ^longs @flat-validity-vol off ^longs chunk-validity chunk-len))
+        (vreset! offset (+ off chunk-len))))
+    {:data result :validity @flat-validity-vol}))
+
 (defn idx-materialize-to-array-prefix
   "Materialize the FIRST `n` rows of `index` into a heap array. Walks
    chunks in order and stops once `n` values have been copied — for

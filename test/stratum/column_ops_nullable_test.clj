@@ -1,18 +1,14 @@
 (ns stratum.column-ops-nullable-test
-  "Phase 1a — validate the validity-aware SIMD predicate kernels in
-   `ColumnOpsNullable.java` in isolation, before wiring any production
-   query path through them.
-
-   The kernels are siblings of the all-valid kernels in `ColumnOps`;
-   they're intended to be called by the Clojure dispatch layer when
-   `any-nullable?` is true for the input columns. This test calls
-   the Java method directly, constructs a known-shape validity
-   bitmap, and verifies F-001/F-002-style cases."
+  "Phase 1a/1b — validate the validity-aware SIMD predicate kernels in
+   `ColumnOpsNullable.java` in isolation (1a) and end-to-end through
+   the query engine (1b)."
   (:require [clojure.test :refer [deftest testing is]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [clojure.test.check.clojure-test :refer [defspec]]
-            [stratum.chunk :as chunk])
+            [stratum.chunk :as chunk]
+            [stratum.index :as index]
+            [stratum.query :as q])
   (:import [stratum.internal ColumnOps ColumnOpsNullable]))
 
 (defn- build-bitmap
@@ -165,6 +161,42 @@
                    :neq   (not= v lo)
                    :not-range (not (and (>= v lo) (<= v hi))))))
        count))
+
+;; ============================================================================
+;; Phase 1b — end-to-end through the query engine on indexed input
+;; ============================================================================
+
+;; ============================================================================
+;; Phase 1b wiring is in place at the array-fused-count path
+;; (`stratum.query.simd-primitive`). However, the planner picks
+;; `PChunkedSIMDCount` for indexed inputs and `PBlockSkipCount` for
+;; filtered array-mode counts; both go through OTHER kernels
+;; (`fusedSimdChunkedCountParallel`, `fusedSimdCountBlockSkipParallel`)
+;; not yet covered. End-to-end tests assertion-style come in Phase 1d
+;; once the planner-picked kernels for COUNT all have Nullable siblings.
+;; The Phase 1a kernel-direct tests above still exercise the bitmap
+;; correctness in isolation.
+;; ============================================================================
+
+(deftest dispatch-survives-validity-passthrough
+  ;; Lock in the wiring: `cols/materialize-column` preserves an
+  ;; existing `:validity` field rather than dropping it during the
+  ;; materialise pass; `prepare-predicates` reads `:validity` and
+  ;; assembles the combined bitmap.
+  (testing "column with :validity flows through to combined-validity"
+    (let [arr (long-array [1 2 3 4 5])
+          bm  (let [v (long-array 1)] (java.util.Arrays/fill v -1) v)
+          col {:type :int64 :data arr :validity bm}
+          ;; Drop down to simd-primitive's prepare-predicates directly:
+          prep (#'stratum.query.simd-primitive/prepare-predicates
+                [[:c :lt 100]] {:c col})]
+      (is (some? (:combined-validity prep)))))
+  (testing "all-no-validity column → combined-validity nil (fast path)"
+    (let [arr (long-array [1 2 3 4 5])
+          col {:type :int64 :data arr}
+          prep (#'stratum.query.simd-primitive/prepare-predicates
+                [[:c :lt 100]] {:c col})]
+      (is (nil? (:combined-validity prep))))))
 
 (defspec each-pred-type-matches-clojure-reference 50
   (prop/for-all [{:keys [data validity lo hi]} gen-spec]

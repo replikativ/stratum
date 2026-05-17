@@ -137,14 +137,16 @@
           (aset v last-idx (bit-and (aget v last-idx) live-mask)))))
     v))
 
-(defn- scan-validity
+(defn scan-validity
   "Scan a primitive data array for NULL sentinels. Returns nil if all
    `n-rows` values are non-NULL (all-valid fast path), else returns a
    long[] bitmap with the bits for null rows cleared.
 
    This is the authoritative bitmap builder. Called from
-   `col-persistent!`, `chunk-from-array`, `chunk-from-bytes`, and the
-   constant-chunk lazy-allocation path."
+   `col-persistent!`, `chunk-from-array`, `chunk-from-bytes`, the
+   constant-chunk lazy-allocation path, AND from external chunk
+   implementations like `stratum.parquet.ParquetRowGroupChunk` to
+   derive a bitmap from already-decoded data."
   ^longs [data datatype ^long n-rows]
   (case datatype
     :int64

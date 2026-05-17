@@ -21,7 +21,7 @@
                  [:quantity :lt 24]]
     :aggregate  [:sum-product :price :discount]
     :length     6000000}"
-  (:import [stratum.internal ColumnOps ColumnOpsLong]))
+  (:import [stratum.internal ColumnOps ColumnOpsLong ColumnOpsNullable]))
 
 (set! *warn-on-reflection* true)
 
@@ -69,12 +69,34 @@
 ;; Java array packing
 ;; ============================================================================
 
+(defn- combine-validity
+  "Combine per-predicate-column validity bitmaps into a single
+   AND'd bitmap. Returns nil if every input is nil (the all-valid
+   fast path — caller dispatches to the no-bitmap kernel). Length
+   is `(quot (+ n-rows 63) 64)` longs."
+  ^longs [validities ^long n-rows]
+  (let [non-nil (filter some? validities)]
+    (cond
+      (empty? non-nil) nil
+      (= 1 (count non-nil)) (first non-nil)
+      :else
+      (let [bm-len (quot (+ n-rows 63) 64)
+            out (long-array bm-len)]
+        ;; Initialise from first; AND each subsequent in.
+        (System/arraycopy ^longs (first non-nil) 0 out 0 bm-len)
+        (doseq [^longs v (rest non-nil)]
+          (dotimes [i bm-len]
+            (aset out i (bit-and (aget out i) (aget v i)))))
+        out))))
+
 (defn- prepare-predicates
   "Separate predicates into long and double groups and prepare Java arrays.
 
    Returns a map with:
      :num-long-preds, :long-pred-types, :long-cols, :long-lo, :long-hi
-     :num-dbl-preds,  :dbl-pred-types,  :dbl-cols,  :dbl-lo,  :dbl-hi"
+     :num-dbl-preds,  :dbl-pred-types,  :dbl-cols,  :dbl-lo,  :dbl-hi
+     :combined-validity — long[] AND of per-pred-column validity bitmaps,
+                          nil for the all-valid fast path"
   [predicates columns]
   (let [long-preds (filterv #(= :int64  (:type (get columns (first %)))) predicates)
         dbl-preds  (filterv #(= :float64 (:type (get columns (first %)))) predicates)
@@ -119,7 +141,22 @@
      :dbl-pred-types dbl-pred-types
      :dbl-cols dbl-cols
      :dbl-lo dbl-lo
-     :dbl-hi dbl-hi}))
+     :dbl-hi dbl-hi
+     ;; Combined validity bitmap across all predicate cols, AND'd together.
+     ;; nil → no predicate column carries nulls → dispatch to the no-bitmap
+     ;; kernel (ColumnOps/...). Non-nil → at least one column is nullable;
+     ;; dispatch to ColumnOpsNullable/... so NULL rows are excluded *before*
+     ;; the SIMD comparisons run (audit findings F-001/F-002).
+     :combined-validity
+     (combine-validity
+      (concat (mapv #(:validity (get columns (first %))) long-preds)
+              (mapv #(:validity (get columns (first %))) dbl-preds))
+      (long (or (some #(when-let [d (:data (get columns (first %)))]
+                         (cond
+                           (instance? (Class/forName "[J") d) (alength ^longs d)
+                           (instance? (Class/forName "[D") d) (alength ^doubles d)))
+                      (concat long-preds dbl-preds))
+                0)))}))
 
 (defn- ensure-doubles
   "Ensure column data is double[], converting long[] if needed."
@@ -215,18 +252,37 @@
         [agg-type agg-col1 agg-col2 long-agg?] (prepare-aggregation aggregate columns length)
         ^doubles result
         (if (= (int agg-type) (int ColumnOps/AGG_COUNT))
-          (ColumnOps/fusedSimdCountParallel
-           (int (:num-long-preds pp))
-           ^ints (:long-pred-types pp)
-           ^"[[J" (:long-cols pp)
-           ^longs (:long-lo pp)
-           ^longs (:long-hi pp)
-           (int (:num-dbl-preds pp))
-           ^ints (:dbl-pred-types pp)
-           ^"[[D" (:dbl-cols pp)
-           ^doubles (:dbl-lo pp)
-           ^doubles (:dbl-hi pp)
-           (int length))
+          (if-let [validity (:combined-validity pp)]
+            ;; Nullable path: at least one pred col carries nulls.
+            ;; Routes to ColumnOpsNullable so the SIMD comparison runs
+            ;; only on valid rows (NULL data slots otherwise leak past
+            ;; LT/NEQ/NOT_RANGE — audit F-001).
+            (ColumnOpsNullable/fusedSimdCountParallel
+             (int (:num-long-preds pp))
+             ^ints (:long-pred-types pp)
+             ^"[[J" (:long-cols pp)
+             ^longs (:long-lo pp)
+             ^longs (:long-hi pp)
+             (int (:num-dbl-preds pp))
+             ^ints (:dbl-pred-types pp)
+             ^"[[D" (:dbl-cols pp)
+             ^doubles (:dbl-lo pp)
+             ^doubles (:dbl-hi pp)
+             ^longs validity
+             (int length))
+            ;; All-valid fast path: no bitmap work at all.
+            (ColumnOps/fusedSimdCountParallel
+             (int (:num-long-preds pp))
+             ^ints (:long-pred-types pp)
+             ^"[[J" (:long-cols pp)
+             ^longs (:long-lo pp)
+             ^longs (:long-hi pp)
+             (int (:num-dbl-preds pp))
+             ^ints (:dbl-pred-types pp)
+             ^"[[D" (:dbl-cols pp)
+             ^doubles (:dbl-lo pp)
+             ^doubles (:dbl-hi pp)
+             (int length)))
           (if (and long-agg? (zero? (:num-dbl-preds pp)))
             ;; Long path: LongVector accumulators, no longToDouble allocation
             ;; Only when no double preds — mask transfer cost outweighs benefit

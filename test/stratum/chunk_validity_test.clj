@@ -1,11 +1,13 @@
 (ns stratum.chunk-validity-test
-  "Phase 0 — round-trip + invariant tests for the per-row validity
-   bitmap on `stratum.chunk/PersistentColChunk`."
+  "Phase 0 + 1b — round-trip + invariant tests for the per-row validity
+   bitmap on `stratum.chunk/PersistentColChunk` and for the
+   chunk→flat concatenation in `idx-materialize-to-array-with-validity`."
   (:require [clojure.test :refer [deftest testing is]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [clojure.test.check.clojure-test :refer [defspec]]
-            [stratum.chunk :as chunk]))
+            [stratum.chunk :as chunk]
+            [stratum.index :as index]))
 
 ;; ============================================================================
 ;; Generators
@@ -168,3 +170,69 @@
     (is (= [true false true]
            (let [v (chunk/chunk-validity s2)]
              (mapv #(chunk/validity-row-valid? v %) (range 3)))))))
+
+;; ============================================================================
+;; Phase 1b — idx-materialize-to-array-with-validity (concat chunk bitmaps)
+;; ============================================================================
+
+(deftest materialize-with-validity-all-valid-returns-nil-bitmap
+  (testing "long index built from sentinel-free data → :validity nil"
+    (let [data (vec (range 20000))   ;; spans 3 chunks at default size 8192
+          idx (index/index-from-seq :int64 data)
+          {:keys [data validity]} (index/idx-materialize-to-array-with-validity idx)]
+      (is (nil? validity))
+      (is (= 20000 (alength ^longs data)))
+      (is (= 0     (aget ^longs data 0)))
+      (is (= 19999 (aget ^longs data 19999))))))
+
+(deftest materialize-with-validity-flags-nulls-spanning-chunks
+  (testing "NULLs in multiple chunks land at the right flat-bitmap positions"
+    (let [;; NULLs at rows 5 (chunk 0), 8500 (chunk 1), 18000 (chunk 2)
+          ;; Use Long/MIN_VALUE directly — index-from-seq doesn't translate
+          ;; nil today, that's the sentinel convention.
+          data (->> (range 20000)
+                    (map (fn [i] (case i
+                                   5     Long/MIN_VALUE
+                                   8500  Long/MIN_VALUE
+                                   18000 Long/MIN_VALUE
+                                   i)))
+                    vec)
+          idx (index/index-from-seq :int64 data)
+          {:keys [validity]} (index/idx-materialize-to-array-with-validity idx)]
+      (is (some? validity))
+      (testing "exact NULL positions"
+        (is (false? (chunk/validity-row-valid? validity 5)))
+        (is (false? (chunk/validity-row-valid? validity 8500)))
+        (is (false? (chunk/validity-row-valid? validity 18000))))
+      (testing "neighbouring positions stay valid"
+        (is (true? (chunk/validity-row-valid? validity 4)))
+        (is (true? (chunk/validity-row-valid? validity 6)))
+        (is (true? (chunk/validity-row-valid? validity 8499)))
+        (is (true? (chunk/validity-row-valid? validity 8501)))
+        (is (true? (chunk/validity-row-valid? validity 17999)))
+        (is (true? (chunk/validity-row-valid? validity 18001)))))))
+
+(deftest materialize-with-validity-handles-partial-last-chunk
+  (testing "last chunk smaller than default chunk-size; bitmap entries copied correctly"
+    (let [;; 8200 rows: chunk 0 = 8192 (all valid), chunk 1 = 8 rows with NULL at idx 8195
+          data (->> (range 8200)
+                    (map (fn [i] (if (= i 8195) Long/MIN_VALUE i)))
+                    vec)
+          idx (index/index-from-seq :int64 data)
+          {:keys [validity]} (index/idx-materialize-to-array-with-validity idx)]
+      (is (some? validity))
+      (is (false? (chunk/validity-row-valid? validity 8195)))
+      (is (true?  (chunk/validity-row-valid? validity 8194)))
+      (is (true?  (chunk/validity-row-valid? validity 8199))))))
+
+(deftest materialize-with-validity-double-col
+  (testing "float64 path via NaN sentinel"
+    (let [data [1.0 2.0 Double/NaN 4.0 Double/NaN]
+          idx (index/index-from-seq :float64 data)
+          {:keys [validity]} (index/idx-materialize-to-array-with-validity idx)]
+      (is (some? validity))
+      (is (true?  (chunk/validity-row-valid? validity 0)))
+      (is (true?  (chunk/validity-row-valid? validity 1)))
+      (is (false? (chunk/validity-row-valid? validity 2)))
+      (is (true?  (chunk/validity-row-valid? validity 3)))
+      (is (false? (chunk/validity-row-valid? validity 4))))))
