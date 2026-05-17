@@ -178,6 +178,34 @@
 ;; correctness in isolation.
 ;; ============================================================================
 
+(deftest end-to-end-block-skip-count-with-nulls
+  ;; Phase 1d-blockskip — array-mode filtered COUNT on column with
+  ;; validity bypasses block-skip and routes to ColumnOpsNullable.
+  ;; Block-skip's min/max-based block classification is broken by
+  ;; sentinel-as-data: a block containing Long/MIN_VALUE rows has
+  ;; min = Long/MIN_VALUE which fails the "fully matches > x" check
+  ;; for any positive x. Rather than re-derive block stats excluding
+  ;; the sentinel (the proper but invasive fix), Phase 1d-blockskip
+  ;; routes to ColumnOpsNullable/fusedSimdCountParallel when validity
+  ;; is present.
+  (testing "WHERE col < 100 on long col with NULLs, large enough for block-skip threshold"
+    (let [n 10000   ;; > BLOCK_SIZE * 2 (BLOCK_SIZE typically 1024 or so)
+          data (vec (for [i (range n)]
+                      (if (zero? (mod i 7)) Long/MIN_VALUE
+                          (mod (* i 13) 1000))))
+          arr (long-array data)
+          bm  (let [v (long-array (chunk/bitmap-entry-count n))]
+                (dotimes [i n]
+                  (when (not= (nth data i) Long/MIN_VALUE)
+                    (let [eidx (quot i 64), bit (rem i 64)]
+                      (aset v eidx (bit-or (aget v eidx) (bit-shift-left 1 bit))))))
+                v)
+          result (q/q {:from {:c {:type :int64 :data arr :validity bm}}
+                       :where [[:< :c 100]]
+                       :agg [[:count]]})
+          expected (count (filter (fn [v] (and (not= v Long/MIN_VALUE) (< v 100))) data))]
+      (is (= expected (:_count (first result)))))))
+
 (deftest end-to-end-indexed-sum-with-nulls
   ;; Phase 1d-agg — end-to-end SUM with NULLs on indexed input.
   ;; PChunkedSIMDAgg path. Predicate-side NULL rows must not

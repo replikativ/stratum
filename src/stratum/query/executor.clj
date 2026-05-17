@@ -35,7 +35,7 @@
             PPerfectHashJoin PAsofJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
             PProject PWindow PHaving PSort PDistinct PLimit
             PMaterializeExpr PRecompose LTopN LHead LSetOp LAnomaly LStringMaterialize]
-           [stratum.internal ColumnOps ColumnOpsExt ColumnOpsAnalytics]))
+           [stratum.internal ColumnOps ColumnOpsExt ColumnOpsAnalytics ColumnOpsNullable]))
 
 (set! *warn-on-reflection* true)
 
@@ -461,23 +461,62 @@
      (x/execute-chunked-fused-count preds columns length)
      agg)))
 
+(defn- block-skip-combined-validity
+  "AND the per-predicate-column validity bitmaps for the block-skip
+   path. Returns nil for the all-valid fast path (route to the
+   existing block-skip kernel)."
+  ^longs [preds mat-cols ^long length]
+  (let [bms (->> preds
+                 (keep #(:validity (get mat-cols (first %))))
+                 vec)]
+    (when (seq bms)
+      (let [bm-len (quot (+ length 63) 64)
+            combined (long-array bm-len)]
+        (System/arraycopy ^longs (first bms) 0 combined 0 bm-len)
+        (doseq [^longs v (rest bms)]
+          (dotimes [i bm-len]
+            (aset combined i (bit-and (aget combined i) (aget v i)))))
+        combined))))
+
 (defn- execute-block-skip-count [node columnar?]
   (let [ctx (execute-node (:input node))
         [preds columns length] (prepare-node-preds (:predicates node) ctx)
         mat-cols (cols/materialize-columns columns)
         pp (gb/prepare-pred-arrays preds mat-cols)
-        ^doubles r (ColumnOpsExt/fusedSimdCountBlockSkipParallel
-                    (int (:n-long pp))
-                    ^ints (:long-pred-types pp)
-                    ^"[[J" (:long-cols pp)
-                    ^longs (:long-lo pp)
-                    ^longs (:long-hi pp)
-                    (int (:n-dbl pp))
-                    ^ints (:dbl-pred-types pp)
-                    ^"[[D" (:dbl-cols pp)
-                    ^doubles (:dbl-lo pp)
-                    ^doubles (:dbl-hi pp)
-                    (int length))
+        validity (block-skip-combined-validity preds mat-cols length)
+        ^doubles r
+        (if validity
+          ;; Validity present: bypass block-skip and use the flat-array
+          ;; Nullable count kernel. Block-skip optimisation assumes
+          ;; predicate min/max bounds determine match status; with
+          ;; nulls present those bounds include the sentinel, breaking
+          ;; the analysis. The Nullable kernel ANDs validity into the
+          ;; per-row mask at every SIMD step instead.
+          (ColumnOpsNullable/fusedSimdCountParallel
+           (int (:n-long pp))
+           ^ints (:long-pred-types pp)
+           ^"[[J" (:long-cols pp)
+           ^longs (:long-lo pp)
+           ^longs (:long-hi pp)
+           (int (:n-dbl pp))
+           ^ints (:dbl-pred-types pp)
+           ^"[[D" (:dbl-cols pp)
+           ^doubles (:dbl-lo pp)
+           ^doubles (:dbl-hi pp)
+           ^longs validity
+           (int length))
+          (ColumnOpsExt/fusedSimdCountBlockSkipParallel
+           (int (:n-long pp))
+           ^ints (:long-pred-types pp)
+           ^"[[J" (:long-cols pp)
+           ^longs (:long-lo pp)
+           ^longs (:long-hi pp)
+           (int (:n-dbl pp))
+           ^ints (:dbl-pred-types pp)
+           ^"[[D" (:dbl-cols pp)
+           ^doubles (:dbl-lo pp)
+           ^doubles (:dbl-hi pp)
+           (int length)))
         agg (or (:agg node) {:op :count :as nil})]
     (post/format-fused-result {:result 0.0 :count (long (aget r 1))} agg)))
 
