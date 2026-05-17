@@ -578,45 +578,84 @@
     (let [counter   (volatile! 0)
           extra-reg (volatile! {})
           result    (volatile! sql)]
+      ;; Pre-fix (round-4 agent P1 #4.3): each pattern only ran
+      ;; `re-find` ONCE — a query with two `read_csv` calls had
+      ;; the second left as raw SQL → JSqlParser confusion. Loop
+      ;; while any occurrence remains.
       ;; read_csv/read_parquet function syntax
-      (let [m (re-find #"(?i)\b(read_csv|read_parquet)\s*\(\s*'([^']+)'\s*\)" @result)]
-        (when m
+      (loop []
+        (when-let [m (re-find #"(?i)\b(read_csv|read_parquet)\s*\(\s*'([^']+)'\s*\)" @result)]
           (let [[full-match _func path] m
                 _         (validate-file-path path data-dir)
                 synthetic (str "__file_" (vswap! counter inc) "__")
                 ds        (files/load-or-index-file! path data-dir)]
             (vswap! extra-reg assoc synthetic (encode-table-columns (dataset/columns ds)))
-            (vreset! result (str/replace @result full-match synthetic)))))
+            (vreset! result (str/replace-first @result full-match synthetic))
+            (recur))))
       ;; FROM 'path.csv' (single-quoted)
-      (let [m (re-find #"(?i)\bFROM\s+'([^']+\.(?:csv|parquet))'" @result)]
-        (when m
+      (loop []
+        (when-let [m (re-find #"(?i)\bFROM\s+'([^']+\.(?:csv|parquet))'" @result)]
           (let [[full-match path] m
                 _         (validate-file-path path data-dir)
                 synthetic (str "__file_" (vswap! counter inc) "__")
                 ds        (files/load-or-index-file! path data-dir)]
             (vswap! extra-reg assoc synthetic (encode-table-columns (dataset/columns ds)))
-            (vreset! result (str/replace @result full-match
-                                         (str "FROM " synthetic))))))
+            (vreset! result (str/replace-first @result full-match
+                                               (str "FROM " synthetic)))
+            (recur))))
       ;; FROM "path.csv" (double-quoted — JSqlParser strips quotes, becomes table name)
-      (let [m (re-find #"(?i)\bFROM\s+\"([^\"]+\.(?:csv|parquet))\"" @result)]
-        (when m
+      (loop []
+        (when-let [m (re-find #"(?i)\bFROM\s+\"([^\"]+\.(?:csv|parquet))\"" @result)]
           (let [[full-match path] m
                 _         (validate-file-path path data-dir)
                 synthetic (str "__file_" (vswap! counter inc) "__")
                 ds        (files/load-or-index-file! path data-dir)]
             (vswap! extra-reg assoc synthetic (encode-table-columns (dataset/columns ds)))
-            (vreset! result (str/replace @result full-match
-                                         (str "FROM " synthetic))))))
+            (vreset! result (str/replace-first @result full-match
+                                               (str "FROM " synthetic)))
+            (recur))))
       [@result @extra-reg])))
+
+(def ^:dynamic *session-settings*
+  "Per-handler session-state atom. Bound by `make-handler-factory`
+   to a fresh atom for each PgWire connection, so
+   `SET datahike.clock_time = …` from one client doesn't leak into
+   another client's session. Falls back to the global registry
+   `__settings__` map when not bound (REPL / single-session use).
+   Round-4 agent P1 #1.2."
+  nil)
+
+(defn- session-clock-time-millis
+  "Read the clock-time pin from per-session atom (if bound) or the
+   global registry. Per-session shadows global."
+  [table-registry-atom]
+  (or (when *session-settings*
+        (get @*session-settings* :clock-time-millis))
+      (get-in @table-registry-atom ["__settings__" :clock-time-millis])))
+
+(defn- store-clock-time-millis!
+  "Write the clock-time pin to per-session atom (if bound) — keeps
+   the setting scoped to one PgWire connection. Falls back to
+   global registry for non-handler invocations (REPL)."
+  [table-registry-atom value]
+  (if *session-settings*
+    (if (= value :clear)
+      (swap! *session-settings* dissoc :clock-time-millis)
+      (swap! *session-settings* assoc :clock-time-millis value))
+    (if (= value :clear)
+      (swap! table-registry-atom update "__settings__" dissoc :clock-time-millis)
+      (swap! table-registry-atom assoc-in
+             ["__settings__" :clock-time-millis] value))))
 
 (defn- execute-sql
   "Execute a SQL statement against the registry and return a QueryResult.
 
    `SET datahike.clock_time = …` is honored as a session-scoped
-   binding by writing the parsed millis to
-   `(get @table-registry-atom \"__settings__\" :clock-time-millis)`;
-   every subsequent execute-sql call runs inside a `binding` form
-   that pins `dataset/*clock-time-millis*` to that value, so DML
+   binding via the dynamic `*session-settings*` atom (bound per
+   PgWire connection by the handler factory) — falls back to the
+   shared registry `__settings__` map when not bound. Every
+   subsequent execute-sql call runs inside a `binding` form that
+   pins `dataset/*clock-time-millis*` to that value, so DML
    defaults (`:valid-from` / `:system-from` when omitted) become
    repeatable. `SET datahike.clock_time = DEFAULT` clears the
    binding."
@@ -627,19 +666,15 @@
           [sql extra]  (resolve-file-refs sql @data-dir-atom)
           registry     (merge registry extra)
           parsed       (sql/parse-sql sql registry)
-          ;; If parse surfaced a SET datahike.clock_time setting,
-          ;; merge it into the registry's `__settings__` map.
           settings (:settings parsed)]
       (when settings
         (cond
           (= :clear (:clock-time-millis settings))
-          (swap! table-registry-atom update "__settings__" dissoc :clock-time-millis)
+          (store-clock-time-millis! table-registry-atom :clear)
           (number? (:clock-time-millis settings))
-          (swap! table-registry-atom assoc-in
-                 ["__settings__" :clock-time-millis]
-                 (:clock-time-millis settings))))
+          (store-clock-time-millis! table-registry-atom (:clock-time-millis settings))))
       (binding [dataset/*clock-time-millis*
-                (or (get-in @table-registry-atom ["__settings__" :clock-time-millis])
+                (or (session-clock-time-millis table-registry-atom)
                     dataset/*clock-time-millis*)]
       (cond
             ;; EXPLAIN [(ANALYZE)] [(FORMAT JSON)] query
@@ -1267,9 +1302,19 @@
   [table-registry-atom data-dir-atom]
   (reify PgWireServer$QueryHandlerFactory
     (create [_]
-      (let [tx-state (atom {:in-tx false :aborted false})]
+      ;; Per-handler atoms: tx-state for transaction status (in-tx /
+      ;; aborted) and session-settings for `SET datahike.clock_time`
+      ;; — both scoped to ONE PgWire connection so cross-session
+      ;; leakage can't happen. Round-4 agent P1 #1.2 lifted
+      ;; `__settings__` from the shared registry to a per-connection
+      ;; atom; the dynamic var `*session-settings*` is bound around
+      ;; every `execute-sql` so the SET handler writes here, not the
+      ;; global.
+      (let [tx-state (atom {:in-tx false :aborted false})
+            session-settings (atom {})]
         (reify PgWireServer$QueryHandler
           (execute [_ sql]
+            (binding [*session-settings* session-settings]
             (let [{:keys [in-tx aborted]} @tx-state]
               (cond
                 ;; Reject non-tx commands when transaction is in error state
@@ -1301,7 +1346,7 @@
                     in-tx
                     (.withTxStatus qr \T)
                     :else
-                    qr))))))))))
+                    qr)))))))))))  ;; one extra `)` for the per-handler (binding [*session-settings* …] …)
 
 ;; ============================================================================
 ;; Public API
@@ -1332,10 +1377,25 @@
       :port     port})))
 
 (defn stop
-  "Stop a PgWire server."
-  [{:keys [^PgWireServer server]}]
+  "Stop a PgWire server and release the registry so the GC can
+   reclaim any konserve stores held under `:__live` entries.
+
+   Pre-fix (round-4 agent P1 #5.2), `stop` only called
+   `(.stop server)` on the underlying Java PgWire server; the
+   `:registry` atom kept references to every live store + every
+   `__file_*__` synthetic entry, pinning konserve handles until
+   the next GC cycle (or never, in tests that hold onto the
+   server map). Now: clear the registry to drop those refs.
+
+   konserve doesn't expose an explicit `close` for the common
+   file/memory backends, so we don't actively close handles;
+   dropping the references is sufficient for the JVM to reclaim
+   the underlying file descriptors via finalizer / phantom-ref."
+  [{:keys [^PgWireServer server registry]}]
   (when server
-    (.stop server)))
+    (.stop server))
+  (when registry
+    (reset! registry {})))
 
 (defn register-table!
   "Register a table with the server.

@@ -286,15 +286,23 @@
                     (validate-period! (long vf) (long vt) axis-kw))))]
         (check-axis :valid (:valid bt-cfg))
         (check-axis :system (:system bt-cfg)))
+      ;; Two-pass append for crash-atomicity. Pre-fix (round-4
+      ;; agent P1 #3.1): the nil check was inline in the mutation
+      ;; loop, so column K-1 had already appended when column K
+      ;; failed → permanently skewed per-column lengths. Now: pass
+      ;; 1 validates every value; pass 2 mutates (and is expected
+      ;; not to throw if pass 1 passed — type mismatches in
+      ;; idx-append! would still skew, but those are bugs upstream
+      ;; of the writer, not user-error).
+      (doseq [[col-name _] columns-field]
+        (when (nil? (get row col-name))
+          (throw (ex-info "append! requires values for all columns"
+                          {:missing col-name
+                           :columns (keys columns-field)
+                           :hint (when bt-cfg
+                                   "configured bitemporal axis columns are auto-stamped from tx-meta or now() — supply them in row-map or pass tx-meta")}))))
       (doseq [[col-name col-data] columns-field]
-        (let [val (get row col-name)]
-          (when (nil? val)
-            (throw (ex-info "append! requires values for all columns"
-                            {:missing col-name
-                             :columns (keys columns-field)
-                             :hint (when bt-cfg
-                                     "configured bitemporal axis columns are auto-stamped from tx-meta or now() — supply them in row-map or pass tx-meta")})))
-          (idx/idx-append! (:index col-data) val)))
+        (idx/idx-append! (:index col-data) (get row col-name)))
       (set! row-count-val (unchecked-inc row-count-val))
       this))
 

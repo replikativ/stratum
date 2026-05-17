@@ -25,16 +25,43 @@
 ;; GC / Sync Coordination Lock
 ;; ============================================================================
 
-(def ^:private gc-lock
-  "Lock to serialize GC with sync operations. Prevents concurrent ds-sync!
-   and ds-gc! from racing (sync writes chunks that GC hasn't yet seen)."
-  (Object.))
+(def ^:private store-locks
+  "Per-store GC/sync coordination locks. Pre-fix (round-4 agent
+   P2 #5.1), `gc-lock` was a single process-global Object —
+   concurrent sync/gc on UNRELATED stores serialized
+   unnecessarily, and a hung sync on one store blocked every
+   other store. Per-store locks let unrelated work proceed in
+   parallel. Keyed by store identity via a ConcurrentHashMap so
+   the map itself doesn't need external locking."
+  (java.util.concurrent.ConcurrentHashMap.))
+
+(defn- store-lock
+  "Lazily-allocate a per-store Object lock keyed by store
+   identity (using IdentityHashMap-style equality via
+   `System/identityHashCode` + an extra hop). Returns the same
+   Object for the same store across calls."
+  [store]
+  (let [k (System/identityHashCode store)]
+    (or (.get ^java.util.concurrent.ConcurrentHashMap store-locks k)
+        (let [o (Object.)
+              existing (.putIfAbsent ^java.util.concurrent.ConcurrentHashMap store-locks k o)]
+          (or existing o)))))
 
 (defn with-storage-lock
-  "Execute f while holding the GC/sync coordination lock.
-   Used by ds-sync! to prevent concurrent GC from deleting freshly written chunks."
-  [f]
-  (locking gc-lock (f)))
+  "Execute f while holding the per-store GC/sync coordination
+   lock. Used by ds-sync! to prevent concurrent GC on the same
+   store from deleting freshly written chunks. Different stores
+   never block each other.
+
+   Arity-2 takes the store; arity-1 falls back to a process-global
+   lock for backward compatibility (callers that don't have a
+   store handle handy)."
+  ([f]
+   ;; Backward-compat: process-global lock for callers without
+   ;; a store handle.
+   (locking store-locks (f)))
+  ([store f]
+   (locking (store-lock store) (f))))
 
 ;; ============================================================================
 ;; Commit ID Generation
@@ -189,7 +216,7 @@
 
    Returns: map with :deleted-pss-nodes, :deleted-index-commits, :deleted-dataset-commits counts."
   [store]
-  (locking gc-lock
+  (locking (store-lock store)
     (let [;; 1. Find all branches and their HEAD commits
           branches (or (list-dataset-branches store) #{})
 

@@ -112,11 +112,18 @@
                   `(let [~'v (aget ~sym (int ~'i))]
                      (and ~@(mapv (fn [v] `(not= ~'v ~v)) code-vals)))
                   `true))
+              ;; Pre-fix (round-4 agent P1 #4.1): a NULL row passed
+              ;; `NOT IN (1, 2)` because `(not= Long/MIN_VALUE 1)`
+              ;; is true. PG 3VL says `NULL NOT IN (...)` is NULL
+              ;; (falsy). Gate on the sentinel before the
+              ;; conjunction so NULL rows are excluded.
               (if long-col?
                 `(let [~'v (aget ~sym (int ~'i))]
-                   (and ~@(mapv (fn [v] `(not= ~'v ~(long v))) (sort vals))))
+                   (and (not= ~'v Long/MIN_VALUE)
+                        ~@(mapv (fn [v] `(not= ~'v ~(long v))) (sort vals))))
                 `(let [~'v (aget ~sym (int ~'i))]
-                   (and ~@(mapv (fn [v] `(not= ~'v ~(double v))) (sort vals)))))))))
+                   (and (not (Double/isNaN ~'v))
+                        ~@(mapv (fn [v] `(not= ~'v ~(double v))) (sort vals)))))))))
 
       ;; Simple comparison ops (fallback for preds on missing columns etc.)
       (:lt :gt :lte :gte :eq :neq :range :not-range)
