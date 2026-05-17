@@ -2599,6 +2599,44 @@
                 "_system_to must be MAX (open) for a fresh insertion")))
         (finally (server/stop srv))))))
 
+(deftest sql-concurrent-inserts-do-not-lose-writes
+  ;; Regression lock for round-4 agent P0 #1.1: every DML branch
+  ;; did `(let [existing (get @reg table)] ... (swap! reg assoc
+  ;; table new-cols))`. Two concurrent INSERTs on the same table
+  ;; each captured the same `existing`, computed disjoint
+  ;; `new-cols`, and the second swap! clobbered the first → silent
+  ;; lost writes under multi-connection PgWire.
+  ;;
+  ;; Reproducer: N threads each insert one row; expect all N rows
+  ;; to land in the registry. Pre-fix: a fraction of writes are
+  ;; lost on every run. Post-fix (server-scoped coarse lock):
+  ;; every write visible.
+  (testing "N concurrent INSERTs all land in the registry"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)
+          n 100
+          ids (atom [])]
+      (try
+        (exec "CREATE TABLE t (id BIGINT, v BIGINT)"
+              (:registry srv) (:data-dir srv))
+        (let [threads (doall
+                       (for [i (range n)]
+                         (future
+                           (let [^PgWireServer$QueryResult r
+                                 (exec (str "INSERT INTO t (id, v) VALUES (" i ", " (* i 10) ")")
+                                       (:registry srv) (:data-dir srv))]
+                             (when (nil? (.error r))
+                               (swap! ids conj i))))))]
+          (doseq [f threads] @f))
+        (let [cols (get @(:registry srv) "t")
+              n-actual (alength ^longs (:id cols))]
+          (is (= n n-actual)
+              (str "expected " n " rows, got " n-actual
+                   " — " (- n n-actual) " writes were lost to the race"))
+          (is (= n (count @ids))
+              "every thread reported success"))
+        (finally (server/stop srv))))))
+
 (deftest sql-insert-for-portion-of-rejects-axis-cols-in-col-list
   ;; Regression lock for copilot review-3 P1
   ;; (server.clj `insert-portion-via-index-backend`): if the

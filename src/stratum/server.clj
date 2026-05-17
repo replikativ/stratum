@@ -651,7 +651,19 @@
         (sql/format-results parsed)
 
             ;; DDL (CREATE TABLE, INSERT INTO, UPDATE, DELETE)
+            ;; Coarse server-scoped lock on the registry atom for
+            ;; the whole DDL/DML dispatch. Pre-fix (round-4 agent
+            ;; P0), every DML branch did
+            ;; `(let [existing (get @reg table)] ... (swap! reg
+            ;; assoc table new-cols))` — two concurrent writes on
+            ;; the same table each captured the same `existing`,
+            ;; computed disjoint `new-cols`, and the second swap!
+            ;; clobbered the first → silent lost writes under
+            ;; multi-connection PgWire. Coarse lock is the
+            ;; conservative-correct fix; per-table lock map is a
+            ;; future perf optimization.
         (:ddl parsed)
+        (locking table-registry-atom
         (let [{:keys [op table columns rows assignments where
                       conflict-cols action from table-alias] :as ddl} (:ddl parsed)]
           (case op
@@ -1224,7 +1236,7 @@
                                col-keys))]
                 (swap! table-registry-atom assoc table
                        (with-meta new-cols (meta existing)))
-                (PgWireServer$QueryResult/empty (str "DELETE " n-deleted)))))))
+                (PgWireServer$QueryResult/empty (str "DELETE " n-deleted))))))))  ;; end locking DDL/DML dispatch
 
             ;; Parse/translation error
         (:error parsed)
