@@ -1271,6 +1271,23 @@
                 (dataset/bounded-update! {:where [[:= :eid 1]] :set {:salary 999}}
                                          {:valid-from 5000 :valid-to 3000})))))))
 
+(deftest bounded-update!-requires-explicit-valid-from
+  ;; Regression lock for copilot review-2 #3: `bounded-update!`
+  ;; previously checked `:valid-to` is non-nil but not `:valid-from`.
+  ;; A nil `:valid-from` propagated to `(long new-vf)` and threw a
+  ;; bare NullPointerException instead of a clear `ex-info` —
+  ;; misleading both for diagnosis and for any caller that tried
+  ;; to `(catch ExceptionInfo …)` the bad-input case.
+  (testing "bounded-update! with :valid-to but missing :valid-from throws a clear ex-info"
+    (let [ds (vt-only-ds [{:eid 1 :salary 100
+                           :_valid_from 1000 :_valid_to Long/MAX_VALUE}])]
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo
+            #"bounded-update! requires tx-meta :valid-from"
+            (-> ds transient
+                (dataset/bounded-update! {:where [[:= :eid 1]] :set {:salary 999}}
+                                         {:valid-to 3000})))))))
+
 ;; ============================================================================
 ;; SCD2-on-both-axes — system-time symmetry on every vt mutation
 ;;

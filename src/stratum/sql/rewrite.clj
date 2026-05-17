@@ -541,10 +541,18 @@
 ;;   FOR VALID_TIME FROM <expr> TO <expr>
 ;;   FOR (ALL VALID_TIME | VALID_TIME ALL)
 ;;
-;; Multi-table support: each table-ref can carry its own temporal
-;; spec; predicates are qualified with the table-name (or alias if
-;; the user provided one). Joins work as long as each FOR
-;; VALID_TIME follows its table reference.
+;; Multi-table limitation: only **one** `FOR VALID_TIME` clause per
+;; SELECT is supported today. The emitted predicate uses unqualified
+;; column names (`_valid_from`/`_valid_to`); two clauses on a joined
+;; SELECT would both refer to the same unqualified columns and the
+;; planner cannot disambiguate them across joined tables. A second
+;; clause therefore throws `:sql/multi-for-valid-time-unsupported`
+;; at preprocess time. The proper fix is qualifier-aware predicate
+;; emission in `spec->predicate-sql`; until then, callers needing
+;; per-table temporal filters on a join should write the WHERE
+;; predicates explicitly with `<table>._valid_from` / `<table>._valid_to`
+;; refs (which the planner DOES handle because the qualifier is part
+;; of the column identifier the parser sees).
 ;; ============================================================================
 
 (def ^:private select-temporal-tail-keywords
@@ -792,7 +800,24 @@
   (loop [sql sql, preds []]
     (if-let [[start end spec] (find-for-valid-time-clause sql)]
       (let [qualifier (table-qualifier-before sql start)
-            new-pred (when qualifier (spec->predicate-sql qualifier spec))
+            ;; Always emit the predicate. `spec->predicate-sql`
+            ;; currently emits unqualified `_valid_from` /
+            ;; `_valid_to` (the `qualifier` arg is reserved for
+            ;; future qualifier-aware emission), so it doesn't
+            ;; actually depend on the qualifier value — but the
+            ;; previous gate `(when qualifier ...)` would silently
+            ;; STRIP the FOR VALID_TIME clause and emit NO
+            ;; predicate when `table-qualifier-before` couldn't
+            ;; resolve a name (e.g. tables starting with `_`,
+            ;; quoted identifiers, or subqueries). Result: the
+            ;; query ran with no temporal filter, silently
+            ;; returning unfiltered rows.
+            ;;
+            ;; `:all` (FOR ALL VALID_TIME) returns nil from
+            ;; `spec->predicate-sql` and is intentional: strip the
+            ;; clause, don't add a predicate (no filter).
+            ;; (Copilot review #2 suppressed comment.)
+            new-pred (spec->predicate-sql qualifier spec)
             ;; Strip the FOR VALID_TIME clause from start..end.
             stripped (str (subs sql 0 start) (subs sql end))]
         (when (and new-pred (seq preds))

@@ -1266,6 +1266,13 @@
         _ (when (nil? (:valid-to tx-meta))
             (throw (ex-info "bounded-update! requires tx-meta :valid-to (bounded-window only)"
                             {:tx-meta tx-meta})))
+        ;; `:valid-from` was previously unchecked — a nil value
+        ;; passed through to `(long new-vf)` below and threw a
+        ;; bare NullPointerException instead of a clear
+        ;; `ex-info`. (Copilot review-2 #3.)
+        _ (when (nil? (:valid-from tx-meta))
+            (throw (ex-info "bounded-update! requires tx-meta :valid-from (bounded-window only)"
+                            {:tx-meta tx-meta})))
         {vf-col :from-col vt-col :to-col vt-unit :unit} valid
         new-vf (coerce-temporal-value (:valid-from tx-meta) vt-unit)
         new-vt (coerce-temporal-value (:valid-to tx-meta) vt-unit)

@@ -3349,6 +3349,41 @@
           (is (= [1 3] eids)))
         (finally (server/stop srv))))))
 
+(deftest sql-select-for-valid-time-emits-predicate-when-qualifier-unresolved
+  ;; Regression lock for copilot review-2 suppressed comment
+  ;; (rewrite.clj:704 / preprocess-select-temporal): when
+  ;; `table-qualifier-before` returned nil (e.g. table name
+  ;; starting with `_`, quoted identifier, subquery), the rewriter
+  ;; silently STRIPPED the FOR VALID_TIME clause without emitting
+  ;; any predicate. The query then ran unfiltered — a silent
+  ;; wrong-answer bug, worst possible severity for a query
+  ;; surface.
+  ;;
+  ;; Reproducer: a SELECT against a table named `_t` (underscore
+  ;; prefix → `Character/isLetter` returns false → qualifier nil
+  ;; → predicate gated off pre-fix). Compare row counts AS OF a
+  ;; cut where only one row is valid.
+  (testing "FOR VALID_TIME AS OF emits the predicate even when table-qualifier-before returns nil"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        ;; `_t` qualifier returns nil from the heuristic.
+        (exec "CREATE TABLE _t (id BIGINT, _valid_from BIGINT, _valid_to BIGINT)"
+              (:registry srv) (:data-dir srv))
+        (exec (str "INSERT INTO _t (id, _valid_from, _valid_to) VALUES "
+                   "(1, 100, 200), "  ; valid at t=150
+                   "(2, 300, 400)")   ; not valid at t=150
+              (:registry srv) (:data-dir srv))
+        (let [^PgWireServer$QueryResult r
+              (exec (str "SELECT id FROM _t "
+                         "FOR VALID_TIME AS OF 150 "
+                         "ORDER BY id")
+                    (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r)) (str "execute-sql error: " (.error r)))
+          (is (= [["1"]] (mapv vec (.rows r)))
+              "only row 1 (window [100, 200)) valid at t=150 — pre-fix returned BOTH rows because the FOR VALID_TIME clause was silently stripped without a predicate"))
+        (finally (server/stop srv))))))
+
 (deftest sql-select-for-valid-time-survives-leading-comment-with-phrase
   ;; Regression lock for pattern-hunt P2-B (rewrite.clj:629
   ;; find-for-valid-time-clause): the SELECT-side scanner
