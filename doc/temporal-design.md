@@ -634,6 +634,31 @@ out over the underlying Konserve store (tiered backends — S3 +
 their own latency-shaped view, each pointing at the latest commit
 root).
 
+**Bitemporality is per-dataset opt-in.** The `:bitemporal` field in
+dataset metadata is what tells write primitives to do SCD2 surgery
+and the SQL rewriter which columns the `FOR VALID_TIME` clause should
+emit predicates against. A dataset configured without it is just a
+flat columnar dataset; system-time history is still available via the
+Konserve commit graph (each `sync!` is an audit-grade checkpoint of
+the dataset), but there's no per-row `_system_to`. The four shapes —
+no bitemporality, valid-time only, system-time only, full bitemporal
+— all use the same storage and query engine; only the write
+primitives and SQL rewriter behave differently.
+
+**Heterogeneous tables compose freely.** Because the bitemporal
+columns are just `int64` columns, a Parquet file loaded as a flat
+dataset can be joined against a bitemporally-configured dataset in
+the same query, and `FOR VALID_TIME AS OF t` applies to the side
+that has those columns. Verified with both the Clojure DSL and the
+SQL surface:
+
+```sql
+SELECT o.order_id, o.amount, c.name
+FROM orders o                            -- flat (e.g. from Parquet)
+JOIN customers c FOR VALID_TIME AS OF 150  -- bitemporal
+  ON o.customer_id = c.customer_id;
+```
+
 The bet: most read workloads are "as-of-now" or "as-of-recent" on a
 wide table, where one materialised row per logical entity is
 dramatically more cache- and SIMD-friendly than reconstructing
