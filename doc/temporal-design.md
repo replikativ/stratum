@@ -378,6 +378,59 @@ parsed `:ddl` for the translator.
   PORTION OF` + `INSERT FOR PORTION OF` (or `INSERT FOR PORTION OF`
   + `UPDATE FOR PORTION OF`) instead.
 
+#### Design choice: `FOR (ALL | PORTION OF) SYSTEM_TIME` DML is not exposed via SQL
+
+`FOR PORTION OF SYSTEM_TIME` and `FOR ALL SYSTEM_TIME` on
+`INSERT` / `UPDATE` / `DELETE` are **rejected with a clear error**
+(`:sql/for-portion-of-system-time-unsupported`) rather than
+silently dropped. This is a deliberate design choice, not a
+deferred feature.
+
+Rationale: system-time is the auto-stamped recording-fact axis.
+The whole audit story stratum's closed-period SCD2 preserves
+(superseded rows kept in storage with `_system_to` shifted to
+sys-now; queryable via the SELECT-side `FOR SYSTEM_TIME AS OF`
+grammar above) depends on the engine being the **sole authority**
+on what the DB recorded and when. Allowing SQL clients to rewrite
+past system-time slices would turn the audit trail into
+mutable storage, undermining its evidentiary value.
+
+This matches the posture of every major SQL system that
+implements `WITH SYSTEM VERSIONING`:
+
+| System | `FOR PORTION OF SYSTEM_TIME` DML? | Stance |
+|---|---|---|
+| **SQL Server** | ✗ Rejected | System-time is engine-controlled |
+| **MariaDB**    | ✗ Rejected | Same |
+| **PostgreSQL** (17/18 syntax landing) | ✗ Not exposed | Same |
+| **Oracle Flashback** | ✗ N/A | Undo-log replay; not user-writable |
+| **IBM Db2**, **Teradata**, **XTDB v2** | ✓ Supported | Allow regulated tampering |
+
+Stratum takes the audit-integrity stance.
+
+**Escape hatch for legitimate historical-import use cases**:
+the Clojure DSL exposes the underlying primitive directly —
+
+```clojure
+;; Append a row with a user-pinned past system-from (e.g. for
+;; migrating data we *knew* on 2020-03-15 but are only now
+;; recording in stratum):
+(-> ds
+    transient
+    (dataset/append! {:eid 42 :salary 100000
+                      :_valid_from <inst> :_valid_to <inst>}
+                     {:system-from #inst "2020-03-15"})
+    persistent!)
+```
+
+`upsert!` / `retract!` / `bounded-update!` all honor
+`:system-from` in tx-meta via `system-now-from-tx-meta`. This is
+appropriate for trusted internal tooling (data migrations,
+regulator replay) — code that's already running with full
+authority over the dataset. SQL is the line where untrusted /
+external write paths cross, and that's where the rejection
+applies.
+
 Plain `DELETE WHERE` / `INSERT VALUES` / `UPDATE WHERE` (without
 `FOR PORTION OF`) on an index-backed table also route through
 `ds-delete-rows!` / `append!` / array-rebuild appropriately.

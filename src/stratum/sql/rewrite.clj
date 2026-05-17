@@ -474,9 +474,38 @@
   ;; safe because mask preserves length. Agent-discovered pattern,
   ;; same shape as copilot review #4 (ERASE) but in a different
   ;; preprocessor.
-  (let [masked (mask-non-code-spans sql)]
+  (let [masked (mask-non-code-spans sql)
+        ;; **Design choice**: stratum rejects user-controlled
+        ;; system-time DML (`FOR (ALL | PORTION OF) SYSTEM_TIME`)
+        ;; rather than silently dropping the clause. System-time
+        ;; is the auto-stamped recording-fact axis; allowing SQL
+        ;; clients to rewrite past system-time slices would
+        ;; undermine the audit story stratum's closed-period SCD2
+        ;; preserves. Matches SQL Server / MariaDB / Postgres
+        ;; (which all support `FOR SYSTEM_TIME AS OF` reads but
+        ;; not `FOR PORTION OF SYSTEM_TIME` writes). Db2 / XTDB v2
+        ;; / Teradata do support it; consumers needing
+        ;; historical-import should use the Clojure DSL
+        ;; (`(dataset/append! … {:system-from <past-inst>})`)
+        ;; which already exposes the underlying primitive.
+        reject-system-axis!
+        (fn [axis-str]
+          (when (.equalsIgnoreCase ^String axis-str "SYSTEM_TIME")
+            (throw (ex-info
+                     (str "FOR (ALL | PORTION OF) SYSTEM_TIME DML is not "
+                          "supported via SQL — system-time is the auto-"
+                          "stamped recording-fact axis; user-controlled "
+                          "writes to it would compromise the audit story "
+                          "stratum's closed-period SCD2 preserves. For "
+                          "historical-import / regulator-replay use cases, "
+                          "use the Clojure DSL `(dataset/append! ds row "
+                          "{:system-from <past-inst>})` which exposes the "
+                          "underlying primitive directly.")
+                     {:error :sql/for-portion-of-system-time-unsupported
+                      :axis :system}))))]
     (if-let [all-m (re-find #"(?is)\bFOR\s+(?:ALL\s+(VALID_TIME|SYSTEM_TIME)|(VALID_TIME|SYSTEM_TIME)\s+ALL)\b" masked)]
       (let [axis (or (nth all-m 1) (nth all-m 2))
+            _ (reject-system-axis! axis)
             full ^String (first all-m)
             start (.indexOf masked full)
             rewritten (str (subs sql 0 start) (subs sql (+ start (.length full))))]
@@ -494,6 +523,7 @@
         (if-not m
           {:sql sql :period nil}
           (let [[full-prefix axis] m
+                _ (reject-system-axis! axis)
                 start (.indexOf masked ^String full-prefix)
                 after-from (long (skip-ws-and-comments sql (+ start (.length ^String full-prefix))))
             ;; Walk forward to either a literal TO keyword or to the

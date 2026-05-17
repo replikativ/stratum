@@ -3368,6 +3368,62 @@
 ;; axis-aware.
 ;; ============================================================================
 
+;; ============================================================================
+;; FOR (ALL | PORTION OF) SYSTEM_TIME DML — explicit rejection (design choice)
+;;
+;; SELECT-side FOR SYSTEM_TIME works (see tests below). DML side is
+;; rejected with a clear error explaining why: system-time is the
+;; auto-stamped recording-fact axis; allowing user-controlled writes
+;; would compromise the audit story. Matches SQL Server / MariaDB /
+;; Postgres semantics. Consumers needing historical-import use the
+;; Clojure DSL `(dataset/append! ds row {:system-from <past-inst>})`.
+;; ============================================================================
+
+(deftest preprocess-rejects-for-portion-of-system-time-dml
+  (testing "FOR PORTION OF SYSTEM_TIME FROM x TO y on DML throws with design-choice message"
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo
+          #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
+          (stratum.sql.rewrite/preprocess-sql
+            (str "DELETE FROM t FOR PORTION OF SYSTEM_TIME "
+                 "FROM '2020-01-01' TO '2020-07-01' WHERE id = 1"))))
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo
+          #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
+          (stratum.sql.rewrite/preprocess-sql
+            (str "UPDATE t FOR PORTION OF SYSTEM_TIME "
+                 "FROM '2020-01-01' TO '2020-07-01' SET x = 1 WHERE id = 1"))))
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo
+          #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
+          (stratum.sql.rewrite/preprocess-sql
+            (str "INSERT INTO t (id) VALUES (1) "
+                 "FOR PORTION OF SYSTEM_TIME FROM '2020-01-01' TO '2020-07-01'"))))))
+
+(deftest preprocess-rejects-for-all-system-time-dml
+  (testing "FOR ALL SYSTEM_TIME on DML also throws (same design choice)"
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo
+          #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
+          (stratum.sql.rewrite/preprocess-sql
+            "DELETE FROM t FOR ALL SYSTEM_TIME WHERE id = 1")))
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo
+          #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
+          (stratum.sql.rewrite/preprocess-sql
+            "UPDATE t FOR SYSTEM_TIME ALL SET x = 1 WHERE id = 1")))))
+
+(deftest preprocess-allows-for-portion-of-valid-time-dml
+  ;; Regression guard: the SYSTEM_TIME rejection must NOT affect
+  ;; VALID_TIME DML (the supported case).
+  (testing "FOR PORTION OF VALID_TIME DML still works after the SYSTEM_TIME rejection"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              (str "DELETE FROM t FOR PORTION OF VALID_TIME "
+                   "FROM '2020-01-01' TO '2020-07-01' WHERE id = 1"))]
+      (is (= :valid_time (:axis (:period r))))
+      (is (= 1577836800000000 (:from (:period r))))
+      (is (= 1593561600000000 (:to (:period r)))))))
+
 (deftest preprocess-select-system-time-as-of-injects-where
   (testing "FOR SYSTEM_TIME AS OF rewrites to WHERE predicates on _system_from / _system_to"
     (let [r (stratum.sql.rewrite/preprocess-sql
