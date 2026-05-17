@@ -114,31 +114,41 @@
                         ~@(mapv (fn [v] `(not= ~'v ~(double v))) (sort vals)))))))))
 
       ;; Simple comparison ops (fallback for preds on missing columns etc.)
+      ;; SQL 3VL: every op short-circuits to false when LHS is NULL.
+      ;; Long.MIN_VALUE < literal is true at IEEE level → would over-count
+      ;; NULL rows for :lt; (not= Long.MIN_VALUE literal) is true → same
+      ;; for :neq. NaN against any double literal is false at IEEE except
+      ;; :neq (which returns true and over-fires). One bind + null-guard
+      ;; on top covers all eight ops uniformly. Closes F-003 (long-NEQ /
+      ;; long-comparison mask leak) and F-004 (double-NEQ mask leak).
       (:lt :gt :lte :gte :eq :neq :range :not-range)
       (let [sym (get col-syms col)
             long-col? (= :int64 (:type (get columns col)))
-            args (subvec pred 2)]
-        (if long-col?
-          (let [v-expr `(aget ~sym (int ~'i))]
-            (case op
-              :lt        `(< ~v-expr ~(long (first args)))
-              :gt        `(> ~v-expr ~(long (first args)))
-              :lte       `(<= ~v-expr ~(long (first args)))
-              :gte       `(>= ~v-expr ~(long (first args)))
-              :eq        `(== ~v-expr ~(long (first args)))
-              :neq       `(not= ~v-expr ~(long (first args)))
-              :range     `(let [~'v ~v-expr] (and (>= ~'v ~(long (first args))) (<= ~'v ~(long (second args)))))
-              :not-range `(let [~'v ~v-expr] (or (< ~'v ~(long (first args))) (> ~'v ~(long (second args)))))))
-          (let [v-expr `(aget ~sym (int ~'i))]
-            (case op
-              :lt        `(< ~v-expr ~(double (first args)))
-              :gt        `(> ~v-expr ~(double (first args)))
-              :lte       `(<= ~v-expr ~(double (first args)))
-              :gte       `(>= ~v-expr ~(double (first args)))
-              :eq        `(== ~v-expr ~(double (first args)))
-              :neq       `(not= ~v-expr ~(double (first args)))
-              :range     `(let [~'v ~v-expr] (and (>= ~'v ~(double (first args))) (<= ~'v ~(double (second args)))))
-              :not-range `(let [~'v ~v-expr] (or (< ~'v ~(double (first args))) (> ~'v ~(double (second args)))))))))
+            args (subvec pred 2)
+            cmp (if long-col?
+                  (case op
+                    :lt        `(< ~'v ~(long (first args)))
+                    :gt        `(> ~'v ~(long (first args)))
+                    :lte       `(<= ~'v ~(long (first args)))
+                    :gte       `(>= ~'v ~(long (first args)))
+                    :eq        `(== ~'v ~(long (first args)))
+                    :neq       `(not= ~'v ~(long (first args)))
+                    :range     `(and (>= ~'v ~(long (first args))) (<= ~'v ~(long (second args))))
+                    :not-range `(or (< ~'v ~(long (first args))) (> ~'v ~(long (second args)))))
+                  (case op
+                    :lt        `(< ~'v ~(double (first args)))
+                    :gt        `(> ~'v ~(double (first args)))
+                    :lte       `(<= ~'v ~(double (first args)))
+                    :gte       `(>= ~'v ~(double (first args)))
+                    :eq        `(== ~'v ~(double (first args)))
+                    :neq       `(not= ~'v ~(double (first args)))
+                    :range     `(and (>= ~'v ~(double (first args))) (<= ~'v ~(double (second args))))
+                    :not-range `(or (< ~'v ~(double (first args))) (> ~'v ~(double (second args))))))
+            null-guard (if long-col?
+                         `(not= ~'v Long/MIN_VALUE)
+                         `(not (Double/isNaN ~'v)))]
+        `(let [~'v (aget ~sym (int ~'i))]
+           (and ~null-guard ~cmp)))
 
       ;; NULL predicates
       :is-null
