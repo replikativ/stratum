@@ -2668,7 +2668,17 @@
 
                   ;; Check for table functions (read_csv, read_parquet)
                   ;; Note: JSqlParser parses read_csv('path') as a table name string,
-                  ;; so we check the raw SQL for the pattern instead
+                  ;; so we check the raw SQL for the pattern instead.
+                  ;; TODO (round-3 agent P2): the regex runs on raw
+                  ;; SQL, so a comment containing
+                  ;; `/* FROM read_csv('foo') */` would match and
+                  ;; trigger unwanted file IO. Standard
+                  ;; `mask-non-code-spans` defeats the legitimate
+                  ;; match too (it spaces out the quoted path).
+                  ;; Proper fix needs a scanner that masks comments
+                  ;; but preserves string literals — deferred until
+                  ;; we have another preprocessor with the same
+                  ;; need (single-use edge case in practice).
                  (let [table-func (when-let [[_ func path]
                                              (re-find #"(?i)\bFROM\s+(read_csv|read_parquet)\s*\(\s*'([^']+)'\s*\)" sql)]
                                     (validate-file-path path)

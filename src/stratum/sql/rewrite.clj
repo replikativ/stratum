@@ -82,7 +82,7 @@
 (defn- word-char? [^Character c]
   (or (Character/isLetterOrDigit c) (= \_ c)))
 
-(defn- mask-non-code-spans
+(defn mask-non-code-spans
   "Return a length-preserved copy of `sql` with every character
    inside a SQL line comment (`-- … \\n`), block comment (`/* …
    */`), single-quoted string (`'…'` with `''` escape), or
@@ -625,14 +625,24 @@
    `qualifier` is captured for the future extension but unused today.
 
    The half-open inclusion test is `vf <= at AND vt > at` for
-   AS OF, and the half-open range overlap is `vf <= to AND vt >
-   from` for BETWEEN / FROM-TO. Returns nil for `:all` (no filter)."
+   AS OF. Returns nil for `:all` (no filter).
+
+   `:between` (SQL `BETWEEN x AND y`) uses closed-closed
+   semantics: `vf <= y AND vt > x` includes any row whose vt-
+   window overlaps `[x, y]`.
+
+   `:from-to` (SQL:2011 `FROM x TO y`) uses half-open semantics
+   per the spec — `[x, y)`. Two half-open intervals `[vf, vt)`
+   and `[x, y)` overlap iff `vf < y AND x < vt`. A row whose `vf`
+   equals `y` starts exactly at the period's exclusive upper bound
+   and must NOT be included. Round-3 agent P2: pre-fix used
+   `vf <= y`, over-including the boundary row."
   [_qualifier {:keys [kind at from to]}]
   (case kind
     :all     nil
     :as-of   (str "_valid_from <= " at " AND _valid_to > " at)
     :between (str "_valid_from <= " to " AND _valid_to > " from)
-    :from-to (str "_valid_from <= " to " AND _valid_to > " from)))
+    :from-to (str "_valid_from < "  to " AND _valid_to > " from)))
 
 (defn- find-for-valid-time-clause
   "Scan `sql` for the next `FOR VALID_TIME <spec>` or `FOR ALL

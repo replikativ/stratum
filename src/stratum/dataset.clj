@@ -954,10 +954,26 @@
    read a bitemporal dataset. Metadata is the source of truth since
    per-column commit payloads don't persist `:temporal-unit`."
   [cols metadata]
-  (let [bt (:bitemporal metadata)]
+  (let [bt (:bitemporal metadata)
+        v  (:valid bt)
+        s  (:system bt)
+        ;; Reject overlapping column sets across the two axes. A
+        ;; shared column means SCD2 surgery would update one
+        ;; logical column thinking it's two distinct axes —
+        ;; corrupting both the valid- and system-time views.
+        ;; Round-3 agent P2.
+        _ (when (and v s)
+            (let [v-cols #{(:from-col v) (:to-col v)}
+                  s-cols #{(:from-col s) (:to-col s)}
+                  overlap (filterv v-cols s-cols)]
+              (when (seq overlap)
+                (throw (ex-info ":bitemporal :valid and :system axes must reference distinct columns"
+                                {:valid-axis v
+                                 :system-axis s
+                                 :overlapping-columns (set overlap)})))))]
     (cond-> cols
-      (:valid  bt) (apply-axis-config :valid  (:valid  bt))
-      (:system bt) (apply-axis-config :system (:system bt)))))
+      v (apply-axis-config :valid v)
+      s (apply-axis-config :system s))))
 
 (defn bitemporal-config
   "Return the validated `:bitemporal` config map from a dataset's

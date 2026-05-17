@@ -3224,11 +3224,19 @@
                    (:sql r))))))
 
 (deftest preprocess-select-temporal-from-to-form
-  (testing "FOR VALID_TIME FROM x TO y has same semantic as BETWEEN"
+  ;; SQL:2011 `FROM x TO y` is half-open `[x, y)`, distinct from
+  ;; SQL `BETWEEN x AND y` which is closed-closed `[x, y]`. Two
+  ;; half-open intervals `[vf, vt)` and `[x, y)` overlap iff
+  ;; `vf < y AND x < vt`. A row whose `vf = y` starts exactly at
+  ;; the exclusive upper bound and must NOT be included.
+  ;; Round-3 agent P2: pre-fix used `vf <= y`, over-including the
+  ;; boundary row (and matching `:between`'s closed semantics).
+  (testing "FOR VALID_TIME FROM x TO y emits the half-open overlap predicate (vf < y AND vt > x)"
     (let [r (stratum.sql.rewrite/preprocess-sql
               "SELECT eid FROM salaries FOR VALID_TIME FROM '2024-01-01' TO '2024-07-01'")]
-      (is (re-find #"_valid_from\s+<=\s+1719792000000000"
-                   (:sql r)))
+      (is (re-find #"_valid_from\s+<\s+1719792000000000"
+                   (:sql r))
+          "vf < to (strict, half-open); pre-fix used <= which over-included rows starting at to")
       (is (re-find #"_valid_to\s+>\s+1704067200000000"
                    (:sql r))))))
 
