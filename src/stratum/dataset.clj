@@ -966,7 +966,28 @@
                                    :column col-name
                                    :existing-unit (:temporal-unit c)
                                    :config-unit unit})))
-                (assoc c :temporal-unit unit)))]
+                ;; `:nullable? false` is the load-bearing marker that
+                ;; bitemporal axis columns cannot carry NULL. Today this
+                ;; matches the runtime contract enforced at every write
+                ;; site (`append!` rejects nil row-map entries for axis
+                ;; cols, `INSERT FOR PORTION OF` rejects NULL period
+                ;; bounds, etc.). With axes non-NULLable, the int64 NULL
+                ;; sentinel value `Long/MIN_VALUE` is freed up to mean
+                ;; `START_OF_TIME` unambiguously (and `Long/MAX_VALUE`
+                ;; means `END_OF_TIME`), which is what the SQL
+                ;; preprocessor relies on when lowering
+                ;; `FROM START_OF_TIME` to a literal.
+                ;;
+                ;; The bitmap-migration in the null-handling branch
+                ;; uses this flag to skip validity-bitmap allocation
+                ;; on axis columns — a constant-factor win on every
+                ;; bitemporal table.
+                (assoc c :temporal-unit unit
+                       :nullable? false
+                       :axis-kw axis-kw
+                       :axis-role (cond
+                                    (= col-name from-col) :from
+                                    (= col-name to-col)   :to))))]
     (assoc cols
            from-col (tag from-col)
            to-col   (tag to-col))))
