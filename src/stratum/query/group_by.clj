@@ -3448,28 +3448,59 @@
                                              (= (aget ^longs col-data (int i)) Long/MIN_VALUE)))]
                         (when-not is-null
                           (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
+                      ;; SUM/MIN/MAX/AVG previously used only the
+                      ;; `(== v v)` NaN guard. But `aget-col` on a
+                      ;; long column returns `(double Long/MIN_VALUE)`
+                      ;; = -9.22e18 for the NULL sentinel — a real
+                      ;; number, not NaN. So long-NULLs slipped in:
+                      ;; SUM was dragged by ~9e18 per NULL row, MIN
+                      ;; read it as the minimum, AVG corrupted both
+                      ;; numerator and denominator. Match the dual
+                      ;; check `count-non-null` (above) already uses.
+                      ;; (Round-3 agent P0; narrow fix at the
+                      ;; parallel-grouped sites — sequential
+                      ;; aggregators at 740+ already had the dual
+                      ;; check.)
                       :sum
-                      (let [v (if-let [expr (:expr agg)]
+                      (let [col-data (when (:col agg) (get col-arrays (:col agg)))
+                            v (if-let [expr (:expr agg)]
                                 (eval-agg-expr expr col-arrays i)
-                                (aget-col (get col-arrays (:col agg)) i))]
-                        (when (== v v) ;; skip NaN (SQL NULL)
+                                (aget-col col-data i))
+                            is-null (or (Double/isNaN v)
+                                        (and col-data
+                                             (expr/long-array? col-data)
+                                             (= (aget ^longs col-data (int i)) Long/MIN_VALUE)))]
+                        (when-not is-null
                           (aset accs base (+ (aget accs base) v))
                           (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                       :min
-                      (let [v (aget-col (get col-arrays (:col agg)) i)]
-                        (when (== v v)
+                      (let [col-data (get col-arrays (:col agg))
+                            v (aget-col col-data i)
+                            is-null (or (Double/isNaN v)
+                                        (and (expr/long-array? col-data)
+                                             (= (aget ^longs col-data (int i)) Long/MIN_VALUE)))]
+                        (when-not is-null
                           (aset accs base (Math/min (aget accs base) v))
                           (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                       :max
-                      (let [v (aget-col (get col-arrays (:col agg)) i)]
-                        (when (== v v)
+                      (let [col-data (get col-arrays (:col agg))
+                            v (aget-col col-data i)
+                            is-null (or (Double/isNaN v)
+                                        (and (expr/long-array? col-data)
+                                             (= (aget ^longs col-data (int i)) Long/MIN_VALUE)))]
+                        (when-not is-null
                           (aset accs base (Math/max (aget accs base) v))
                           (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                       :avg
-                      (let [v (if-let [expr (:expr agg)]
+                      (let [col-data (when (:col agg) (get col-arrays (:col agg)))
+                            v (if-let [expr (:expr agg)]
                                 (eval-agg-expr expr col-arrays i)
-                                (aget-col (get col-arrays (:col agg)) i))]
-                        (when (== v v)
+                                (aget-col col-data i))
+                            is-null (or (Double/isNaN v)
+                                        (and col-data
+                                             (expr/long-array? col-data)
+                                             (= (aget ^longs col-data (int i)) Long/MIN_VALUE)))]
+                        (when-not is-null
                           (aset accs base (+ (aget accs base) v))
                           (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                       :sum-product
