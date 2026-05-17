@@ -178,6 +178,39 @@
 ;; correctness in isolation.
 ;; ============================================================================
 
+(deftest end-to-end-multi-sum-with-nulls
+  ;; Phase 1e — multi-sum kernel routes to ColumnOpsExtNullable
+  ;; when any predicate column has nulls. Used by B2-shape queries:
+  ;; multiple SUM aggs in one pass.
+  (testing "two SUMs in one pass, predicate col with NULLs"
+    (let [n 5000
+          pred-data (vec (for [i (range n)]
+                           (if (zero? (mod i 7)) Long/MIN_VALUE
+                               (mod i 1000))))
+          agg1-data (vec (for [i (range n)] (* 1.0 i)))
+          agg2-data (vec (for [i (range n)] (* 0.5 i)))
+          pred-idx (index/index-from-seq :int64 pred-data)
+          agg1-idx (index/index-from-seq :float64 agg1-data)
+          agg2-idx (index/index-from-seq :float64 agg2-data)
+          ;; Force the multi-sum path by requesting > 1 SUM
+          result (q/q {:from {:p pred-idx :v1 agg1-idx :v2 agg2-idx}
+                       :where [[:< :p 500]]
+                       :agg [[:sum :v1] [:sum :v2]]})
+          expected-v1 (->> (range n)
+                           (filter (fn [i] (and (not= (nth pred-data i) Long/MIN_VALUE)
+                                                (< (nth pred-data i) 500))))
+                           (map #(nth agg1-data %))
+                           (reduce + 0.0))
+          expected-v2 (->> (range n)
+                           (filter (fn [i] (and (not= (nth pred-data i) Long/MIN_VALUE)
+                                                (< (nth pred-data i) 500))))
+                           (map #(nth agg2-data %))
+                           (reduce + 0.0))]
+      (is (= (Math/round (* 100.0 expected-v1))
+             (Math/round (* 100.0 (:sum_v1 (first result))))))
+      (is (= (Math/round (* 100.0 expected-v2))
+             (Math/round (* 100.0 (:sum_v2 (first result)))))))))
+
 (deftest end-to-end-block-skip-count-with-nulls
   ;; Phase 1d-blockskip — array-mode filtered COUNT on column with
   ;; validity bypasses block-skip and routes to ColumnOpsNullable.

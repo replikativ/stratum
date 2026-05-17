@@ -12,7 +12,7 @@
             [stratum.query.postprocess :as post]
             [stratum.index :as index]
             [stratum.chunk :as chunk])
-  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsChunked ColumnOpsChunkedSimd ColumnOpsChunkedSimdNullable ColumnOpsChunkedLong ColumnOpsAnalytics]
+  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsExtNullable ColumnOpsLong ColumnOpsChunked ColumnOpsChunkedSimd ColumnOpsChunkedSimdNullable ColumnOpsChunkedLong ColumnOpsAnalytics]
            [stratum.index ChunkEntry]))
 
 (set! *warn-on-reflection* true)
@@ -145,8 +145,14 @@
    All aggs must be :sum, :sum-product, :count, or :avg (no :min/:max).
    Evaluates predicates once, accumulates all SUM values simultaneously."
   [preds aggs columns length]
-  (let [{:keys [n-long long-pred-types long-cols long-lo long-hi
-                n-dbl dbl-pred-types dbl-cols dbl-lo dbl-hi]} (gb/prepare-pred-arrays preds columns)
+  (let [{:keys [n-long long-pred-types long-cols long-lo long-hi long-preds
+                n-dbl dbl-pred-types dbl-cols dbl-lo dbl-hi dbl-preds]} (gb/prepare-pred-arrays preds columns)
+        ;; Phase 1e: any predicate column with nulls forces the
+        ;; Nullable double path (the all-long fast path doesn't have
+        ;; a Nullable variant — would be a follow-up).
+        any-nullable-pred? (boolean
+                            (some (fn [p] (some? (:validity (get columns (first p)))))
+                                  (concat long-preds dbl-preds)))
 
         ;; Collect SUM columns (skip COUNT-only aggs)
         sum-aggs (filterv #(not= :count (:op %)) aggs)
@@ -170,9 +176,10 @@
                           sum-aggs)
         ;; For SUM_PRODUCT in long path: pre-multiply with overflow check
         ;; Returns nil on overflow → falls back to double path
-        ;; Call Java single-pass — try long path first, fall back to double on overflow
+        ;; Call Java single-pass — try long path first, fall back to double on overflow.
+        ;; When any pred col has nulls, force double path (no Nullable for all-long yet).
         ^doubles result (or
-                         (when all-long?
+                         (when (and all-long? (not any-nullable-pred?))
                             ;; All-long path: LongVector accumulators, no conversion
                            (let [overflow? (volatile! false)
                                  sum-long-cols
@@ -213,19 +220,52 @@
                                                              (case (:op a)
                                                                :sum-product (ensure-doubles (get columns (second (:cols a))) length)
                                                                nil))
-                                                           sum-aggs))]
+                                                           sum-aggs))
+                               ;; Phase 1e: per-predicate-column combined validity.
+                               ;; Nil → existing all-valid kernel; non-nil →
+                               ;; ColumnOpsExtNullable. The all-long path above
+                               ;; doesn't yet have a Nullable variant, so a query
+                               ;; that would otherwise take it falls through here
+                               ;; only when validity is present (handled below
+                               ;; via `(when-not @overflow?)` of the long-attempt
+                               ;; — but we should pre-empt that). For correctness,
+                               ;; we route ALL nullable queries through the double
+                               ;; path; the long fast path only fires when
+                               ;; validity is nil.
+                               pred-validity
+                               (let [bms (->> (concat (map first long-preds)
+                                                      (map first dbl-preds))
+                                              (keep #(:validity (get columns %)))
+                                              vec)]
+                                 (when (seq bms)
+                                   (let [bm-len (quot (+ ^long length 63) 64)
+                                         combined (long-array bm-len)]
+                                     (System/arraycopy ^longs (first bms) 0 combined 0 bm-len)
+                                     (doseq [^longs v (rest bms)]
+                                       (dotimes [i bm-len]
+                                         (aset combined i (bit-and (aget combined i) (aget v i)))))
+                                     combined)))]
                            (let [nan-safe (boolean
                                            (or (some #(ColumnOps/arrayHasNaN ^doubles % (alength ^doubles %))
                                                      sum-cols1)
                                                (some #(when % (ColumnOps/arrayHasNaN ^doubles % (alength ^doubles %)))
                                                      sum-cols2)))]
-                             (ColumnOpsExt/fusedSimdMultiSumParallel
-                              (int n-long) long-pred-types
-                              ^"[[J" long-cols ^longs long-lo ^longs long-hi
-                              (int n-dbl) dbl-pred-types
-                              ^"[[D" dbl-cols ^doubles dbl-lo ^doubles dbl-hi
-                              (int n-sum) ^"[[D" sum-cols1 ^"[[D" sum-cols2
-                              (int length) nan-safe))))
+                             (if pred-validity
+                               (ColumnOpsExtNullable/fusedSimdMultiSumParallel
+                                (int n-long) long-pred-types
+                                ^"[[J" long-cols ^longs long-lo ^longs long-hi
+                                (int n-dbl) dbl-pred-types
+                                ^"[[D" dbl-cols ^doubles dbl-lo ^doubles dbl-hi
+                                (int n-sum) ^"[[D" sum-cols1 ^"[[D" sum-cols2
+                                ^longs pred-validity
+                                (int length) nan-safe)
+                               (ColumnOpsExt/fusedSimdMultiSumParallel
+                                (int n-long) long-pred-types
+                                ^"[[J" long-cols ^longs long-lo ^longs long-hi
+                                (int n-dbl) dbl-pred-types
+                                ^"[[D" dbl-cols ^doubles dbl-lo ^doubles dbl-hi
+                                (int n-sum) ^"[[D" sum-cols1 ^"[[D" sum-cols2
+                                (int length) nan-safe)))))
         cnt (long (aget result n-sum))
         ;; Map sum-agg index for each agg
         sum-idx (volatile! 0)]
