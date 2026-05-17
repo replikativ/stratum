@@ -1073,8 +1073,11 @@
         ;; After expr-materialization, agg :col may reference temp columns
         ;; that don't exist in the scan. Stats-only and chunked paths need
         ;; real index-backed columns.
-        agg-cols-in-scan? (every? #(or (= :count (:op %))
-                                       (contains? columns (:col %)))
+        agg-cols-in-scan? (every? (fn [a]
+                                    (or (= :count (:op a))
+                                        (and (:col a) (contains? columns (:col a)))
+                                        (and (:cols a)
+                                             (every? #(contains? columns %) (:cols a)))))
                                   aggs)
         ;; Cost-aware: estimate predicate selectivity
         selectivity (when (seq preds)
