@@ -512,34 +512,61 @@
                         pct (double (case (:op agg)
                                       :median 0.5
                                       (:percentile :approx-quantile) (:param agg)))
+                        ;; Compact-with-null-skip helper for the
+                        ;; copy paths below. Round-3 agent P1: the
+                        ;; old `(double (aget la i))` plain-cast
+                        ;; bled `Long/MIN_VALUE` into the working
+                        ;; buffer as -9.22e18, dragging percentile
+                        ;; / median / approx-quantile output to a
+                        ;; meaningless extreme.
+                        compact-skip-nulls
+                        (fn ^doubles []
+                          (if is-long?
+                            (let [la ^longs col-data
+                                  n (alength la)
+                                  d (double-array n)
+                                  k (int-array 1)]
+                              (dotimes [i n]
+                                (let [v (aget la i)]
+                                  (when-not (= v Long/MIN_VALUE)
+                                    (aset d (aget k 0) (double v))
+                                    (aset k 0 (inc (aget k 0))))))
+                              (java.util.Arrays/copyOf d (aget k 0)))
+                            (let [da ^doubles col-data
+                                  n (alength da)
+                                  d (double-array n)
+                                  k (int-array 1)]
+                              (dotimes [i n]
+                                (let [v (aget da i)]
+                                  (when-not (Double/isNaN v)
+                                    (aset d (aget k 0) v)
+                                    (aset k 0 (inc (aget k 0))))))
+                              (java.util.Arrays/copyOf d (aget k 0)))))
                         result (case (:op agg)
                                  (:median :percentile)
                                  (if mask
                                    (if is-long?
                                      (ColumnOps/percentileFilteredLong ^longs col-data ^longs mask (int length) pct)
                                      (ColumnOps/percentileFiltered ^doubles col-data ^longs mask (int length) pct))
-                                   (ColumnOps/percentile
-                                    (if is-long?
-                                      (let [la ^longs col-data da (double-array (alength la))]
-                                        (dotimes [i (alength la)] (aset da i (double (aget la i)))) da)
-                                      ^doubles col-data)
-                                    (int length) pct))
+                                   (let [^doubles compacted (compact-skip-nulls)]
+                                     (ColumnOps/percentile compacted (alength compacted) pct)))
                                  :approx-quantile
                                  (if mask
                                    (let [work (double-array cnt)
                                          pos (int-array 1)]
                                      (dotimes [i length]
                                        (when (== 1 (aget ^longs mask i))
-                                         (aset work (aget pos 0)
-                                               (if is-long? (double (aget ^longs col-data i))
-                                                   (aget ^doubles col-data i)))
-                                         (aset pos 0 (inc (aget pos 0)))))
-                                     (ColumnOpsAnalytics/tdigestApproxQuantileParallel work (int cnt) pct 200.0))
-                                   (let [da (if is-long?
-                                              (let [la ^longs col-data d (double-array (alength la))]
-                                                (dotimes [i (alength la)] (aset d i (double (aget la i)))) d)
-                                              ^doubles col-data)]
-                                     (ColumnOpsAnalytics/tdigestApproxQuantileParallel da (int length) pct 200.0))))]
+                                         (let [v (if is-long?
+                                                   (let [lv (aget ^longs col-data i)]
+                                                     (when-not (= lv Long/MIN_VALUE) (double lv)))
+                                                   (let [dv (aget ^doubles col-data i)]
+                                                     (when-not (Double/isNaN dv) dv)))]
+                                           (when (some? v)
+                                             (aset work (aget pos 0) (double v))
+                                             (aset pos 0 (inc (aget pos 0)))))))
+                                     (ColumnOpsAnalytics/tdigestApproxQuantileParallel work (aget pos 0) pct 200.0))
+                                   (let [^doubles compacted (compact-skip-nulls)]
+                                     (ColumnOpsAnalytics/tdigestApproxQuantileParallel compacted (alength compacted) pct 200.0))))]
                     [alias result]))
                 aggs))]))
 
