@@ -734,6 +734,56 @@
     (instance? Parenthesis expr)
     (translate-predicate (.getExpression ^Parenthesis expr))
 
+    ;; Allen interval predicates (SQL:2011 temporal stdlib).
+    ;; Each takes 4 args — `(a_from, a_to, b_from, b_to)` —
+    ;; representing two half-open intervals `[a_from, a_to)` and
+    ;; `[b_from, b_to)`. Generic over any orderable int64 columns
+    ;; (application-domain dates, the bitemporal axis, or arbitrary
+    ;; ranges). PERIOD value type and `LOWER`/`UPPER` accessors are
+    ;; deferred — the 4-arg form covers the same use cases without
+    ;; requiring a new value type to thread through the planner.
+    ;; Handled here (translate-predicate) rather than translate-function
+    ;; because the lowering is a compound boolean predicate, not a
+    ;; scalar expression.
+    (and (instance? Function expr)
+         (#{"OVERLAPS"
+            "EQUALS_PERIOD"
+            "CONTAINS_PERIOD"
+            "PRECEDES" "STRICTLY_PRECEDES" "IMMEDIATELY_PRECEDES"
+            "SUCCEEDS" "STRICTLY_SUCCEEDS" "IMMEDIATELY_SUCCEEDS"
+            "MEETS"}
+          (-> (.getName ^Function expr) .toUpperCase)))
+    (let [^Function func expr
+          pname (.toUpperCase (.getName func))
+          params (when-let [p (.getParameters func)] (mapv translate-expr p))
+          n-params (count params)]
+      (when-not (= 4 n-params)
+        (throw (ex-info (str pname " requires 4 args: (a_from, a_to, b_from, b_to)")
+                        {:function pname :params params})))
+      (let [[af at bf bt] params]
+        (case pname
+          ;; Half-open OVERLAPS: a starts before b ends AND b starts before a ends.
+          ;; Returns predicates as a flat vector — the WHERE pred-list
+          ;; semantic ANDs them implicitly. (`[:and ...]` as a single
+          ;; pred would need normalization support that stratum's
+          ;; planner doesn't yet have.)
+          "OVERLAPS"             [[:< af bt] [:< bf at]]
+          ;; Strict equality of bounds.
+          "EQUALS_PERIOD"        [[:= af bf] [:= at bt]]
+          ;; A contains B: A's start <= B's start AND A's end >= B's end.
+          "CONTAINS_PERIOD"      [[:<= af bf] [:>= at bt]]
+          ;; A precedes B: A's end <= B's start (touching allowed).
+          "PRECEDES"             [[:<= at bf]]
+          "STRICTLY_PRECEDES"    [[:< at bf]]
+          ;; A immediately precedes B: A's end == B's start.
+          "IMMEDIATELY_PRECEDES" [[:= at bf]]
+          ;; A succeeds B: A's start >= B's end (touching allowed).
+          "SUCCEEDS"             [[:>= af bt]]
+          "STRICTLY_SUCCEEDS"    [[:> af bt]]
+          "IMMEDIATELY_SUCCEEDS" [[:= af bt]]
+          ;; A meets B: A immediately precedes B (alias).
+          "MEETS"                [[:= at bf]])))
+
     ;; Fallback — might be a boolean column or expression
     :else
     [[:= (translate-expr expr) 1]]))
@@ -1838,7 +1888,18 @@
 
 (defn- eval-post-expr
   "Evaluate a post-aggregate expression against a result row.
-   Returns double for arithmetic, or any value for CASE-post (strings, etc.)."
+   Returns double for arithmetic, or any value for CASE-post (strings, etc.).
+
+   TODO (pattern-hunt P2, agent report 2026-05-17): the `0`
+   default below silently coerces missing/NULL aggregate values
+   (e.g. SUM over an empty group) to 0, which is wrong per SQL
+   3VL (`NULL + 1 = NULL`). A correct fix would change the
+   default to nil and propagate nil through arithmetic /
+   comparisons. Deferred because the change ripples into many
+   CASE-post and arithmetic call sites and risks behavioral
+   regression in tests that depend on the current
+   missing-key-as-0 contract. Track as kontor research-note 67
+   ST-PR27-AGENT-P2-A."
   [expr row]
   (cond
     (keyword? expr) (let [v (get row expr 0)] (if (number? v) (double v) v))
@@ -2019,6 +2080,52 @@
                    {:error (str "Model not found: " model-name)})))}
 
    ;; --- Standard system queries ---
+   ;; `SET datahike.clock_time = <expr>` pins the wall-clock-time
+   ;; source for downstream DML / append! defaults. Returns the
+   ;; parsed millis as a side-channel so the server can update its
+   ;; session-settings atom. `SET datahike.clock_time = DEFAULT`
+   ;; clears the binding. Other SET statements are accepted as
+   ;; no-ops (Postgres compatibility).
+   {:pattern #"(?i)^\s*SET\s+datahike\.clock_time\s*(?:=|TO)\s+(.+?)\s*;?\s*$"
+    :handler (fn [sql _reg]
+               (let [[_ value-str]
+                     (re-find #"(?is)^\s*SET\s+datahike\.clock_time\s*(?:=|TO)\s+(.+?)\s*;?\s*$"
+                              sql)
+                     trimmed (when value-str (.trim ^String value-str))
+                     clear? (and trimmed
+                                 (or (.equalsIgnoreCase ^String trimmed "DEFAULT")
+                                     (.equalsIgnoreCase ^String trimmed "NULL")))
+                     ;; Surface parse failure as a user-visible
+                     ;; error instead of a silent no-op. Pre-fix,
+                     ;; `SET datahike.clock_time = 'whatever'` with
+                     ;; an unparseable value returned a successful
+                     ;; `SET` tag but didn't update the session
+                     ;; clock — typos passed unnoticed. (Copilot
+                     ;; review-3 P2.)
+                     parse-result (when-not clear?
+                                    (try
+                                      ;; Reuse rewrite/parse-temporal-literal —
+                                      ;; it returns micros so divide by 1000 to
+                                      ;; get the millis we store.
+                                      {:millis (quot ^long (rewrite/parse-temporal-literal trimmed) 1000)}
+                                      (catch Exception e
+                                        {:error (str "SET datahike.clock_time: "
+                                                     "unparseable value `" trimmed "`. "
+                                                     "Accepted forms: 'YYYY-MM-DD', "
+                                                     "DATE/TIMESTAMP 'YYYY-MM-DD…', a numeric epoch-micros, "
+                                                     "CURRENT_TIMESTAMP / NOW / END_OF_TIME / START_OF_TIME, "
+                                                     "or DEFAULT / NULL to clear. (" (.getMessage e) ")")})))]
+                 (cond
+                   clear?
+                   {:system true :tag "SET" :settings {:clock-time-millis :clear}}
+
+                   (:millis parse-result)
+                   {:system true :tag "SET"
+                    :settings {:clock-time-millis (:millis parse-result)}}
+
+                   :else
+                   {:error (:error parse-result)})))}
+
    {:pattern #"(?i)^\s*SET\s+"
     :handler (fn [_sql _reg] {:system true :tag "SET"})}
    {:pattern #"(?i)^\s*SHOW\s+"
@@ -2355,6 +2462,12 @@
    Supports INSERT ... ON CONFLICT (UPSERT)."
   [^Insert stmt]
   (let [table-name (.toString (.getTable stmt))
+        ;; Explicit column list `INSERT INTO t (a, b) VALUES (…)` is
+        ;; optional in SQL but required for FOR PORTION OF VALID_TIME
+        ;; on bitemporal tables (so we know which user values go
+        ;; where). Nil when omitted.
+        col-list (when-let [cols (.getColumns stmt)]
+                   (mapv (fn [^Column c] (keyword (.getColumnName c))) cols))
         ^Values vals (.getValues stmt)
         exprs (.getExpressions vals)
         ;; Single-row inserts have flat expressions, multi-row have PELs
@@ -2374,15 +2487,17 @@
                                         expr (translate-expr (first (.getValues us)))]
                                     {:col col :expr expr}))
                                 (.getUpdateSets ^InsertConflictAction conflict-action)))]
-        {:ddl {:op            :upsert
-               :table         table-name
-               :rows          rows
-               :conflict-cols conflict-cols
-               :action        (if is-update? :do-update :do-nothing)
-               :assignments   (or update-sets [])}})
-      {:ddl {:op     :insert
-             :table  table-name
-             :rows   rows}})))
+        {:ddl (cond-> {:op            :upsert
+                       :table         table-name
+                       :rows          rows
+                       :conflict-cols conflict-cols
+                       :action        (if is-update? :do-update :do-nothing)
+                       :assignments   (or update-sets [])}
+                col-list (assoc :columns col-list))})
+      {:ddl (cond-> {:op     :insert
+                     :table  table-name
+                     :rows   rows}
+              col-list (assoc :columns col-list))})))
 
 (defn- translate-update
   "Translate a JSqlParser Update into a DDL descriptor.
@@ -2524,10 +2639,22 @@
 
         ;; Pre-parse rewrite for non-standard syntax (ASOF JOIN, ...) and
         ;; parse with JSqlParser.
-       (let [{rewritten-sql :sql asof-markers :asof-markers}
+       (let [{rewritten-sql :sql asof-markers :asof-markers
+              period :period erase? :erase?}
              (rewrite/preprocess-sql sql)
              sql rewritten-sql  ;; shadow: downstream uses rewritten form
-             stmt (CCJSqlParserUtil/parse ^String sql)]
+             stmt (CCJSqlParserUtil/parse ^String sql)
+             ;; FOR PORTION OF VALID_TIME (SQL:2011) lowers to a temporal
+             ;; slice attached to the DDL map; INSERT/UPDATE/DELETE
+             ;; translators below pick it up via `assoc-period`. ERASE
+             ;; flag is attached to DELETE so server.clj routes it as a
+             ;; physical purge regardless of bitemporal status.
+             assoc-period (fn [result]
+                            (cond-> result
+                              (and period (:ddl result))
+                              (assoc-in [:ddl :period] period)
+                              (and erase? (:ddl result))
+                              (assoc-in [:ddl :erase?] true)))]
          (cond
            (instance? PlainSelect stmt)
            (let [^PlainSelect select stmt
@@ -2558,7 +2685,17 @@
 
                   ;; Check for table functions (read_csv, read_parquet)
                   ;; Note: JSqlParser parses read_csv('path') as a table name string,
-                  ;; so we check the raw SQL for the pattern instead
+                  ;; so we check the raw SQL for the pattern instead.
+                  ;; TODO (round-3 agent P2): the regex runs on raw
+                  ;; SQL, so a comment containing
+                  ;; `/* FROM read_csv('foo') */` would match and
+                  ;; trigger unwanted file IO. Standard
+                  ;; `mask-non-code-spans` defeats the legitimate
+                  ;; match too (it spaces out the quoted path).
+                  ;; Proper fix needs a scanner that masks comments
+                  ;; but preserves string literals — deferred until
+                  ;; we have another preprocessor with the same
+                  ;; need (single-use edge case in practice).
                  (let [table-func (when-let [[_ func path]
                                              (re-find #"(?i)\bFROM\s+(read_csv|read_parquet)\s*\(\s*'([^']+)'\s*\)" sql)]
                                     (validate-file-path path)
@@ -2608,15 +2745,15 @@
 
            ;; INSERT INTO
            (instance? Insert stmt)
-           (translate-insert stmt)
+           (assoc-period (translate-insert stmt))
 
            ;; UPDATE
            (instance? Update stmt)
-           (translate-update stmt)
+           (assoc-period (translate-update stmt))
 
            ;; DELETE
            (instance? Delete stmt)
-           (translate-delete stmt)
+           (assoc-period (translate-delete stmt))
 
            ;; DROP TABLE
            (instance? Drop stmt)

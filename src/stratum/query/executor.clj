@@ -34,7 +34,7 @@
             PFusedExtractCount PBitmapSemiJoin PHashJoin
             PPerfectHashJoin PAsofJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
             PProject PWindow PHaving PSort PDistinct PLimit
-            PMaterializeExpr LTopN LHead LSetOp LAnomaly LStringMaterialize]
+            PMaterializeExpr PRecompose LTopN LHead LSetOp LAnomaly LStringMaterialize]
            [stratum.internal ColumnOps ColumnOpsExt ColumnOpsAnalytics]))
 
 (set! *warn-on-reflection* true)
@@ -90,10 +90,19 @@
         ;; 4. Non-SIMD → mask compilation
         [simd-preds non-simd-preds] (pred/split-preds preds columns)
         [preds columns] (if (seq non-simd-preds)
-                          (let [pred-col-keys (into #{} (keep (fn [p]
-                                                                (let [c (first p)]
-                                                                  (when (keyword? c) c))))
-                                                    non-simd-preds)
+                          (let [;; Collect both LHS (`first p`) and any
+                                ;; keyword RHS args (col-vs-col). Same
+                                ;; shape fix as plan/pred-columns
+                                ;; (copilot review #3) — round-3 agent
+                                ;; found this duplicate walker still
+                                ;; LHS-only.
+                                pred-col-keys
+                                (into #{}
+                                      (mapcat (fn [p]
+                                                (let [lhs (first p)]
+                                                  (concat (when (keyword? lhs) [lhs])
+                                                          (filter keyword? (subvec p 2))))))
+                                      non-simd-preds)
                                 partial-mat (reduce (fn [cs k]
                                                       (if-let [c (get cs k)]
                                                         (assoc cs k (cols/materialize-column c))
@@ -503,34 +512,61 @@
                         pct (double (case (:op agg)
                                       :median 0.5
                                       (:percentile :approx-quantile) (:param agg)))
+                        ;; Compact-with-null-skip helper for the
+                        ;; copy paths below. Round-3 agent P1: the
+                        ;; old `(double (aget la i))` plain-cast
+                        ;; bled `Long/MIN_VALUE` into the working
+                        ;; buffer as -9.22e18, dragging percentile
+                        ;; / median / approx-quantile output to a
+                        ;; meaningless extreme.
+                        compact-skip-nulls
+                        (fn ^doubles []
+                          (if is-long?
+                            (let [la ^longs col-data
+                                  n (alength la)
+                                  d (double-array n)
+                                  k (int-array 1)]
+                              (dotimes [i n]
+                                (let [v (aget la i)]
+                                  (when-not (= v Long/MIN_VALUE)
+                                    (aset d (aget k 0) (double v))
+                                    (aset k 0 (inc (aget k 0))))))
+                              (java.util.Arrays/copyOf d (aget k 0)))
+                            (let [da ^doubles col-data
+                                  n (alength da)
+                                  d (double-array n)
+                                  k (int-array 1)]
+                              (dotimes [i n]
+                                (let [v (aget da i)]
+                                  (when-not (Double/isNaN v)
+                                    (aset d (aget k 0) v)
+                                    (aset k 0 (inc (aget k 0))))))
+                              (java.util.Arrays/copyOf d (aget k 0)))))
                         result (case (:op agg)
                                  (:median :percentile)
                                  (if mask
                                    (if is-long?
                                      (ColumnOps/percentileFilteredLong ^longs col-data ^longs mask (int length) pct)
                                      (ColumnOps/percentileFiltered ^doubles col-data ^longs mask (int length) pct))
-                                   (ColumnOps/percentile
-                                    (if is-long?
-                                      (let [la ^longs col-data da (double-array (alength la))]
-                                        (dotimes [i (alength la)] (aset da i (double (aget la i)))) da)
-                                      ^doubles col-data)
-                                    (int length) pct))
+                                   (let [^doubles compacted (compact-skip-nulls)]
+                                     (ColumnOps/percentile compacted (alength compacted) pct)))
                                  :approx-quantile
                                  (if mask
                                    (let [work (double-array cnt)
                                          pos (int-array 1)]
                                      (dotimes [i length]
                                        (when (== 1 (aget ^longs mask i))
-                                         (aset work (aget pos 0)
-                                               (if is-long? (double (aget ^longs col-data i))
-                                                   (aget ^doubles col-data i)))
-                                         (aset pos 0 (inc (aget pos 0)))))
-                                     (ColumnOpsAnalytics/tdigestApproxQuantileParallel work (int cnt) pct 200.0))
-                                   (let [da (if is-long?
-                                              (let [la ^longs col-data d (double-array (alength la))]
-                                                (dotimes [i (alength la)] (aset d i (double (aget la i)))) d)
-                                              ^doubles col-data)]
-                                     (ColumnOpsAnalytics/tdigestApproxQuantileParallel da (int length) pct 200.0))))]
+                                         (let [v (if is-long?
+                                                   (let [lv (aget ^longs col-data i)]
+                                                     (when-not (= lv Long/MIN_VALUE) (double lv)))
+                                                   (let [dv (aget ^doubles col-data i)]
+                                                     (when-not (Double/isNaN dv) dv)))]
+                                           (when (some? v)
+                                             (aset work (aget pos 0) (double v))
+                                             (aset pos 0 (inc (aget pos 0)))))))
+                                     (ColumnOpsAnalytics/tdigestApproxQuantileParallel work (aget pos 0) pct 200.0))
+                                   (let [^doubles compacted (compact-skip-nulls)]
+                                     (ColumnOpsAnalytics/tdigestApproxQuantileParallel compacted (alength compacted) pct 200.0))))]
                     [alias result]))
                 aggs))]))
 
@@ -999,6 +1035,24 @@
 
       :else results)))
 
+;; --- SMCS recompose ----------------------------------------------------------
+
+(defn- execute-recompose
+  "Run the child aggregator and reassemble user-visible aggs from
+   the SMCS-decomposed result. The mapping was produced by
+   `smcs-decomposition` (planner pass); for each original-agg index
+   it specifies either `:passthrough` (no work) or `:sum-mul-const-sub`
+   (apply `c·SUM(a) − SUM_PRODUCT(a,b)` and drop the synthetic
+   __sp_ alias). Columnar output keeps the per-row arrays intact and
+   transforms in-place; row output remaps each row."
+  [node columnar?]
+  (let [child-result (execute-node (:input node) columnar?)
+        mapping  (:mapping node)
+        orig-aggs (:orig-aggs node)]
+    (if columnar?
+      (gb/recompose-columnar-results child-result orig-aggs mapping)
+      (mapv #(gb/recompose-row-results % orig-aggs mapping) child-result))))
+
 ;; --- Expression materialization ----------------------------------------------
 
 (defn- execute-materialize-expr [node]
@@ -1300,6 +1354,9 @@
 
      ;; Expression materialization
     (instance? PMaterializeExpr node) (execute-materialize-expr node)
+
+     ;; SMCS post-aggregation recompose (planner-inserted wrapper)
+    (instance? PRecompose node) (execute-recompose node columnar?)
 
      ;; Top-N pushdown — LTopN is recognized directly (no separate
      ;; physical record) and dispatched to the streaming primitive.

@@ -15,7 +15,7 @@
      eval-expr-to-long    — eval returning long[] directly (avoids round-trip)
      materialize-string-exprs — pre-materialize string expressions to temp columns"
   (:require [stratum.query.normalization :as norm])
-  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong]))
+  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsTemporal]))
 
 (set! *warn-on-reflection* true)
 
@@ -323,13 +323,13 @@
     (case tu
       :micros
       (case unit
-        :year        (ColumnOps/arrayDateTruncYearMicros   long-data (int length))
-        :month       (ColumnOps/arrayDateTruncMonthMicros  long-data (int length))
-        :day         (ColumnOps/arrayDateTruncDayMicros    long-data (int length))
-        :hour        (ColumnOps/arrayDateTruncHourMicros   long-data (int length))
-        :minute      (ColumnOps/arrayDateTruncMinuteMicros long-data (int length))
-        :second      (ColumnOps/arrayDateTruncSecondMicros long-data (int length))
-        :millisecond (ColumnOps/arrayDateTruncMilliMicros  long-data (int length))
+        :year        (ColumnOpsTemporal/arrayDateTruncYearMicros   long-data (int length))
+        :month       (ColumnOpsTemporal/arrayDateTruncMonthMicros  long-data (int length))
+        :day         (ColumnOpsTemporal/arrayDateTruncDayMicros    long-data (int length))
+        :hour        (ColumnOpsTemporal/arrayDateTruncHourMicros   long-data (int length))
+        :minute      (ColumnOpsTemporal/arrayDateTruncMinuteMicros long-data (int length))
+        :second      (ColumnOpsTemporal/arrayDateTruncSecondMicros long-data (int length))
+        :millisecond (ColumnOpsTemporal/arrayDateTruncMilliMicros  long-data (int length))
         :microsecond long-data)
       :seconds
       (case unit
@@ -352,14 +352,14 @@
     (case tu
       :micros
       (case unit
-        :microseconds (ColumnOps/arrayDateAddMicrosMicros long-data (long n) (int length))
-        :milliseconds (ColumnOps/arrayDateAddMicrosMicros long-data (long (* n 1000)) (int length))
-        :seconds      (ColumnOps/arrayDateAddMicrosMicros long-data (long (* n 1000000)) (int length))
-        :minutes      (ColumnOps/arrayDateAddMicrosMicros long-data (long (* n 60000000)) (int length))
-        :hours        (ColumnOps/arrayDateAddMicrosMicros long-data (long (* n 3600000000)) (int length))
-        :days         (ColumnOps/arrayDateAddMicrosMicros long-data (long (* n 86400000000)) (int length))
-        :months       (ColumnOps/arrayDateAddMonthsMicros long-data (int n) (int length))
-        :years        (ColumnOps/arrayDateAddMonthsMicros long-data (int (* n 12)) (int length)))
+        :microseconds (ColumnOpsTemporal/arrayDateAddMicrosMicros long-data (long n) (int length))
+        :milliseconds (ColumnOpsTemporal/arrayDateAddMicrosMicros long-data (long (* n 1000)) (int length))
+        :seconds      (ColumnOpsTemporal/arrayDateAddMicrosMicros long-data (long (* n 1000000)) (int length))
+        :minutes      (ColumnOpsTemporal/arrayDateAddMicrosMicros long-data (long (* n 60000000)) (int length))
+        :hours        (ColumnOpsTemporal/arrayDateAddMicrosMicros long-data (long (* n 3600000000)) (int length))
+        :days         (ColumnOpsTemporal/arrayDateAddMicrosMicros long-data (long (* n 86400000000)) (int length))
+        :months       (ColumnOpsTemporal/arrayDateAddMonthsMicros long-data (int n) (int length))
+        :years        (ColumnOpsTemporal/arrayDateAddMonthsMicros long-data (int (* n 12)) (int length)))
       :seconds
       (case unit
         :days    (ColumnOps/arrayDateAddDays    long-data (long n) (int length))
@@ -440,19 +440,19 @@
        (case tu
          :micros
          (case op
-           :year         (ColumnOps/arrayExtractYear  (ColumnOps/arrayDateTruncDayMicros long-data (int length))
+           :year         (ColumnOps/arrayExtractYear  (ColumnOpsTemporal/arrayDateTruncDayMicros long-data (int length))
                                                       (int length))
-           :month        (ColumnOps/arrayExtractMonth (ColumnOps/arrayDateTruncDayMicros long-data (int length))
+           :month        (ColumnOps/arrayExtractMonth (ColumnOpsTemporal/arrayDateTruncDayMicros long-data (int length))
                                                       (int length))
-           :day          (ColumnOps/arrayExtractDay   (ColumnOps/arrayDateTruncDayMicros long-data (int length))
+           :day          (ColumnOps/arrayExtractDay   (ColumnOpsTemporal/arrayDateTruncDayMicros long-data (int length))
                                                       (int length))
-           :hour         (ColumnOps/arrayExtractHourMicros        long-data (int length))
-           :minute       (ColumnOps/arrayExtractMinuteMicros      long-data (int length))
-           :second       (ColumnOps/arrayExtractSecondMicros      long-data (int length))
-           :millisecond  (ColumnOps/arrayExtractMillisecondMicros long-data (int length))
-           :microsecond  (ColumnOps/arrayExtractMicrosecondMicros long-data (int length))
+           :hour         (ColumnOpsTemporal/arrayExtractHourMicros        long-data (int length))
+           :minute       (ColumnOpsTemporal/arrayExtractMinuteMicros      long-data (int length))
+           :second       (ColumnOpsTemporal/arrayExtractSecondMicros      long-data (int length))
+           :millisecond  (ColumnOpsTemporal/arrayExtractMillisecondMicros long-data (int length))
+           :microsecond  (ColumnOpsTemporal/arrayExtractMicrosecondMicros long-data (int length))
            :day-of-week  (let [r (double-array length)
-                               ed-arr (ColumnOps/arrayDateTruncDayMicros long-data (int length))]
+                               ed-arr (ColumnOpsTemporal/arrayDateTruncDayMicros long-data (int length))]
                            (dotimes [i length]
                              (aset r i (let [ed (quot (aget ed-arr i) 86400000000)
                                              d (mod (+ (mod ed 7) 10) 7)]
@@ -507,25 +507,25 @@
            (case tu
              :micros
              (case unit
-               :microseconds (ColumnOps/arrayDateDiffMicros l1 l2 (int length))
+               :microseconds (ColumnOpsTemporal/arrayDateDiffMicros l1 l2 (int length))
                :milliseconds (let [r (double-array length)
-                                   d (ColumnOps/arrayDateDiffMicros l1 l2 (int length))]
+                                   d (ColumnOpsTemporal/arrayDateDiffMicros l1 l2 (int length))]
                                (dotimes [i length] (aset r i (/ (aget ^doubles d i) 1000.0)))
                                r)
                :seconds      (let [r (double-array length)
-                                   d (ColumnOps/arrayDateDiffMicros l1 l2 (int length))]
+                                   d (ColumnOpsTemporal/arrayDateDiffMicros l1 l2 (int length))]
                                (dotimes [i length] (aset r i (/ (aget ^doubles d i) 1000000.0)))
                                r)
                :minutes      (let [r (double-array length)
-                                   d (ColumnOps/arrayDateDiffMicros l1 l2 (int length))]
+                                   d (ColumnOpsTemporal/arrayDateDiffMicros l1 l2 (int length))]
                                (dotimes [i length] (aset r i (/ (aget ^doubles d i) 60000000.0)))
                                r)
                :hours        (let [r (double-array length)
-                                   d (ColumnOps/arrayDateDiffMicros l1 l2 (int length))]
+                                   d (ColumnOpsTemporal/arrayDateDiffMicros l1 l2 (int length))]
                                (dotimes [i length] (aset r i (/ (aget ^doubles d i) 3600000000.0)))
                                r)
                :days         (let [r (double-array length)
-                                   d (ColumnOps/arrayDateDiffMicros l1 l2 (int length))]
+                                   d (ColumnOpsTemporal/arrayDateDiffMicros l1 l2 (int length))]
                                (dotimes [i length] (aset r i (/ (aget ^doubles d i) 86400000000.0)))
                                r))
              :seconds
@@ -570,8 +570,8 @@
                               :hours        (* width 3600000000)
                               :days         (* width 86400000000))]
                (if (zero? origin)
-                 (ColumnOps/arrayTimeBucketMicros long-data (long w-micros) (int length))
-                 (ColumnOps/arrayTimeBucketMicrosOrigin long-data (long w-micros) (long origin) (int length))))
+                 (ColumnOpsTemporal/arrayTimeBucketMicros long-data (long w-micros) (int length))
+                 (ColumnOpsTemporal/arrayTimeBucketMicrosOrigin long-data (long w-micros) (long origin) (int length))))
              :seconds
              (let [w-secs (case unit
                             :seconds width
@@ -580,13 +580,13 @@
                             :days    (* width 86400))]
                ;; Re-use micros kernel with secs-as-micros — same arithmetic.
                (if (zero? origin)
-                 (ColumnOps/arrayTimeBucketMicros long-data (long w-secs) (int length))
-                 (ColumnOps/arrayTimeBucketMicrosOrigin long-data (long w-secs) (long origin) (int length))))
+                 (ColumnOpsTemporal/arrayTimeBucketMicros long-data (long w-secs) (int length))
+                 (ColumnOpsTemporal/arrayTimeBucketMicrosOrigin long-data (long w-secs) (long origin) (int length))))
              :days
              (case unit
-               :days   (ColumnOps/arrayTimeBucketDays   long-data (long width) (int length))
-               :weeks  (ColumnOps/arrayTimeBucketDays   long-data (long (* width 7)) (int length))
-               :months (ColumnOps/arrayTimeBucketMonths long-data (int width) (int length)))))))
+               :days   (ColumnOpsTemporal/arrayTimeBucketDays   long-data (long width) (int length))
+               :weeks  (ColumnOpsTemporal/arrayTimeBucketDays   long-data (long (* width 7)) (int length))
+               :months (ColumnOpsTemporal/arrayTimeBucketMonths long-data (int width) (int length)))))))
 
      ;; NULL handling expressions — stay in double domain (complex sentinel logic)
      (and (map? expr) (#{:greatest :least} (:op expr)))

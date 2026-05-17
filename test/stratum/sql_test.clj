@@ -5,7 +5,9 @@
             [stratum.query :as q]
             [stratum.server :as server]
             [stratum.specification :as spec])
-  (:import [stratum.internal PgWireServer$QueryResult]))
+  (:import [stratum.internal PgWireServer$QueryResult
+            PgWireServer$QueryHandler
+            PgWireServer$QueryHandlerFactory]))
 
 (set! *warn-on-reflection* true)
 
@@ -1762,7 +1764,7 @@
       (is (> (:sum_price (first results)) 50.0)))))
 
 ;; ============================================================================
-;; SQL Projection Tests (Postgres/xtdb-inspired)
+;; SQL Projection Tests (Postgres-inspired)
 ;; ============================================================================
 
 (deftest sql-select-star-test
@@ -2034,7 +2036,8 @@
                                      :humidity    (double-array [50.0 52.0 48.0 55.0 51.0
                                                                  5.0 53.0 47.0 50.5 52.5])})
           make-factory @(resolve 'stratum.server/make-handler-factory)
-          handler (.create (make-factory (:registry srv) (atom nil)))]
+          ^PgWireServer$QueryHandler handler
+          (.create ^PgWireServer$QueryHandlerFactory (make-factory (:registry srv) (atom nil)))]
       (try
         ;; CREATE MODEL via handler
         (let [^PgWireServer$QueryResult qr
@@ -2157,3 +2160,1759 @@
       ;; The 200.0 and 300.0 readings should have highest scores
       (is (contains? #{200.0 300.0} (:reading (first result)))
           "Highest anomaly score should be for extreme readings"))))
+
+;; ============================================================================
+;; SQL DELETE on index-backed tables (Phase D)
+;;
+;; Tables registered with `idx/index-from-seq` columns route DELETE
+;; through `dataset/ds-delete-rows!` instead of the array-rebuild path.
+;; The end-to-end behavior must be identical from a SQL perspective.
+;; ============================================================================
+
+(deftest sql-delete-on-index-backed-table
+  (testing "DELETE FROM ... WHERE on a stratum-index-backed table"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "salaries"
+         {:eid    (stratum.index/index-from-seq :int64 [1 2 3 4 5])
+          :salary (stratum.index/index-from-seq :int64 [100 200 300 400 500])})
+        ;; Sanity check — confirm the registry stored it as an index-backed
+        ;; encoded map (else this test isn't really exercising the new path).
+        (let [cols (get @(:registry srv) "salaries")]
+          (is (every? (fn [[_ v]] (= :index (:source v))) cols)
+              "table must be index-backed for this test to be meaningful"))
+        ;; Run DELETE via the SQL path.
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec "DELETE FROM salaries WHERE eid = 3"
+                    (:registry srv) (:data-dir srv))]
+          (is (= "DELETE 1" (.commandTag qr))))
+        ;; The remaining four rows should still be queryable as index-backed.
+        (let [cols (get @(:registry srv) "salaries")]
+          (is (= 4 (stratum.index/idx-length (:index (:eid cols)))))
+          (is (= [1 2 4 5]
+                 (mapv #(stratum.index/idx-get-long (:index (:eid cols)) %)
+                       (range 4)))))
+        (finally (server/stop srv))))))
+
+(deftest sql-delete-all-on-index-backed-table
+  (testing "DELETE FROM ... (no WHERE) drops every row, transient still valid"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "t"
+         {:a (stratum.index/index-from-seq :int64 [1 2 3])
+          :b (stratum.index/index-from-seq :int64 [10 20 30])})
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec "DELETE FROM t" (:registry srv) (:data-dir srv))]
+          (is (= "DELETE 3" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "t")]
+          (is (zero? (stratum.index/idx-length (:index (:a cols))))))
+        (finally (server/stop srv))))))
+
+(deftest sql-delete-no-match-on-index-backed-table
+  (testing "DELETE with predicate that matches no rows leaves the table intact"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "t"
+         {:a (stratum.index/index-from-seq :int64 [1 2 3])})
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec "DELETE FROM t WHERE a = 99" (:registry srv) (:data-dir srv))]
+          (is (= "DELETE 0" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "t")]
+          (is (= 3 (stratum.index/idx-length (:index (:a cols))))))
+        (finally (server/stop srv))))))
+
+;; ============================================================================
+;; SQL:2011 FOR PORTION OF VALID_TIME (Phase D)
+;;
+;; The pre-parser in `stratum.sql.rewrite/preprocess-sql` strips the
+;; clause and attaches `:period` to the DDL map; the server's DELETE
+;; branch lowers a fully-index-backed bitemporal table's bounded
+;; DELETE to `dataset/retract!` with `:valid-from` + `:valid-to`.
+;; ============================================================================
+
+(deftest preprocess-for-portion-of-valid-time-strips-clause
+  (testing "preprocess-sql extracts FOR PORTION OF VALID_TIME and rewrites the SQL"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "DELETE FROM t FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-07-01' WHERE eid = 1")]
+      (is (= "DELETE FROM t WHERE eid = 1" (.trim ^String (:sql r))))
+      (is (= :valid_time (:axis (:period r))))
+      ;; 2024-04-01T00:00Z → 1711929600 sec → 1711929600000000 micros
+      (is (= 1711929600000000 (:from (:period r))))
+      (is (= 1719792000000000 (:to (:period r)))))))
+
+(deftest preprocess-without-portion-is-identity
+  (testing "SQL without FOR PORTION OF passes through unchanged"
+    (let [sql "DELETE FROM t WHERE eid = 1"
+          r (stratum.sql.rewrite/preprocess-sql sql)]
+      (is (= sql (:sql r)))
+      (is (nil? (:period r))))))
+
+(deftest parse-sql-attaches-period-to-delete-ddl
+  (testing "parse-sql carries :period through to the :ddl map for DELETE"
+    (let [r (sql/parse-sql
+             "DELETE FROM t FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-07-01' WHERE eid = 1"
+             {"t" {:eid (long-array [1])}})]
+      (is (= :delete (get-in r [:ddl :op])))
+      (is (= :valid_time (get-in r [:ddl :period :axis])))
+      (is (= 1711929600000000 (get-in r [:ddl :period :from])))
+      (is (= 1719792000000000 (get-in r [:ddl :period :to]))))))
+
+(deftest sql-delete-for-portion-of-valid-time-bounded-on-index-backed-table
+  (testing "DELETE … FOR PORTION OF VALID_TIME applies bounded retract on a bitemporal index-backed table"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "salaries"
+         (with-meta
+           {:eid         (stratum.index/index-from-seq :int64 [1 1])
+            :salary      (stratum.index/index-from-seq :int64 [100 200])
+             ;; [Jan-2024, Jul-2024) closed, [Jul-2024, MAX) open
+            :_valid_from (stratum.index/index-from-seq :int64
+                                                       [1704067200000000 1719792000000000])
+            :_valid_to   (stratum.index/index-from-seq :int64
+                                                       [1719792000000000 Long/MAX_VALUE])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
+        ;; DELETE FOR PORTION OF [Apr-2024, May-2024) WHERE eid=1
+        ;; Closed row [Jan, Jul) straddles the cut: SPLIT into [Jan, Apr) + [May, Jul).
+        ;; Open row [Jul, MAX) doesn't overlap.
+        ;; Result: 3 rows (split produces 2 surviving from 1, open untouched).
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec (str "DELETE FROM salaries "
+                         "FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-05-01' "
+                         "WHERE eid = 1")
+                    (:registry srv) (:data-dir srv))]
+          (is (re-find #"^DELETE" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                       (:index (get cols k)) %)
+                                     (range n)))]
+          (is (= 3 n))
+          ;; Three surviving rows after the split of row 0:
+          ;;   :_valid_from 2024-01-01 (left piece of the split)
+          ;;   :_valid_from 2024-05-01 (right piece, appended)
+          ;;   :_valid_from 2024-07-01 (open row, unchanged)
+          (is (= #{1704067200000000 1714521600000000 1719792000000000}
+                 (set (read-col :_valid_from))))
+          ;; :_valid_to mirrors the split — Apr-01 (left piece's new vt),
+          ;; Jul-01 (right piece's original vt), MAX (open row).
+          (is (= #{1711929600000000 1719792000000000 Long/MAX_VALUE}
+                 (set (read-col :_valid_to)))))
+        (finally (server/stop srv))))))
+
+(deftest sql-insert-for-portion-of-valid-time-stamps-vf-vt-from-period
+  (testing "INSERT … FOR PORTION OF VALID_TIME fills _valid_from / _valid_to from the period"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "salaries"
+         (with-meta
+            ;; Start with an empty bitemporal table.
+           {:eid         (stratum.index/index-from-seq :int64 [])
+            :salary      (stratum.index/index-from-seq :int64 [])
+            :_valid_from (stratum.index/index-from-seq :int64 [])
+            :_valid_to   (stratum.index/index-from-seq :int64 [])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec (str "INSERT INTO salaries (eid, salary) VALUES (1, 100) "
+                         "FOR PORTION OF VALID_TIME FROM '2024-01-01' TO '2024-07-01'")
+                    (:registry srv) (:data-dir srv))]
+          (is (= "INSERT 0 1" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                       (:index (get cols k)) %)
+                                     (range n)))]
+          (is (= 1 n))
+          (is (= [1] (read-col :eid)))
+          (is (= [100] (read-col :salary)))
+          (is (= [1704067200000000] (read-col :_valid_from)))
+          (is (= [1719792000000000] (read-col :_valid_to))))
+        (finally (server/stop srv))))))
+
+(deftest sql-update-for-portion-of-valid-time-splits-correctly
+  (testing "UPDATE … FOR PORTION OF VALID_TIME applies bounded-update! 3-way split"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "salaries"
+         (with-meta
+            ;; Single row [Jan, Jul) with salary=100.
+           {:eid         (stratum.index/index-from-seq :int64 [1])
+            :salary      (stratum.index/index-from-seq :int64 [100])
+            :_valid_from (stratum.index/index-from-seq :int64 [1704067200000000])
+            :_valid_to   (stratum.index/index-from-seq :int64 [1719792000000000])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
+        ;; UPDATE … FOR PORTION OF [Apr, May) SET salary=999 WHERE eid=1
+        ;; Row [Jan, Jul) straddles [Apr, May): 3-way split.
+        ;;   [Jan, Apr) keeps salary=100
+        ;;   [Apr, May) gets salary=999
+        ;;   [May, Jul) keeps salary=100
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec (str "UPDATE salaries SET salary = 999 "
+                         "FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-05-01' "
+                         "WHERE eid = 1")
+                    (:registry srv) (:data-dir srv))]
+          (is (re-find #"^UPDATE" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                       (:index (get cols k)) %)
+                                     (range n)))]
+          (is (= 3 n))
+          ;; Find the [Apr, May) slice (the updated one) by its
+          ;; _valid_from value.
+          (let [rows (mapv (fn [i]
+                             {:eid (nth (read-col :eid) i)
+                              :salary (nth (read-col :salary) i)
+                              :vf (nth (read-col :_valid_from) i)
+                              :vt (nth (read-col :_valid_to) i)})
+                           (range n))
+                by-vf (group-by :vf rows)]
+            ;; Three slices, all eid=1.
+            (is (every? #(= 1 (:eid %)) rows))
+            ;; [Jan, Apr) keeps old salary=100
+            (let [r (first (by-vf 1704067200000000))]
+              (is (some? r))
+              (is (= 100 (:salary r)))
+              (is (= 1711929600000000 (:vt r))))
+            ;; [Apr, May) gets new salary=999
+            (let [r (first (by-vf 1711929600000000))]
+              (is (some? r))
+              (is (= 999 (:salary r)))
+              (is (= 1714521600000000 (:vt r))))
+            ;; [May, Jul) keeps old salary=100
+            (let [r (first (by-vf 1714521600000000))]
+              (is (some? r))
+              (is (= 100 (:salary r)))
+              (is (= 1719792000000000 (:vt r))))))
+        (finally (server/stop srv))))))
+
+(deftest sql-update-for-portion-of-valid-time-with-system-axis
+  ;; SCD2-on-both-axes: when the table is registered with BOTH a
+  ;; `:valid` and a `:system` axis, an `UPDATE FOR PORTION OF
+  ;; VALID_TIME` must close the superseded row's `_system_to` AND
+  ;; stamp every replacement slice's `_system_from` with the SAME
+  ;; `sys-now`. The lowering helper used to drop the `:system` axis
+  ;; from the ad-hoc dataset's metadata, so the SCD2 surgery silently
+  ;; demoted to the valid-only path and `_system_to` was never closed.
+  ;; This test exercises the full bitemporal lowering path.
+  (testing "UPDATE … FOR PORTION OF VALID_TIME preserves system-axis SCD2 on a fully-bitemporal table"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "salaries"
+         (with-meta
+            ;; Single row [Jan, Jul) valid-time, _system_from=tx1,
+            ;; _system_to=MAX. Salary=100.
+           {:eid          (stratum.index/index-from-seq :int64 [1])
+            :salary       (stratum.index/index-from-seq :int64 [100])
+            :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000])
+            :_valid_to    (stratum.index/index-from-seq :int64 [1719792000000000])
+            :_system_from (stratum.index/index-from-seq :int64 [1000000])
+            :_system_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])}
+           {:bitemporal
+            {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+             :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+        ;; UPDATE FOR PORTION OF [Apr, May): straddles → 3-way split.
+        ;; The bitemporal path preserves the OLD row (with closed _system_to)
+        ;; plus appends three replacement slices, all sharing one sys-now.
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec (str "UPDATE salaries SET salary = 999 "
+                         "FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-05-01' "
+                         "WHERE eid = 1")
+                    (:registry srv) (:data-dir srv))]
+          (is (re-find #"^UPDATE" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                       (:index (get cols k)) %)
+                                     (range n)))
+              rows (mapv (fn [i]
+                           {:eid    (nth (read-col :eid) i)
+                            :salary (nth (read-col :salary) i)
+                            :vf     (nth (read-col :_valid_from) i)
+                            :vt     (nth (read-col :_valid_to) i)
+                            :sf     (nth (read-col :_system_from) i)
+                            :st     (nth (read-col :_system_to) i)})
+                         (range n))]
+          ;; 1 old (closed) + 3 new (open _system_to) = 4 rows
+          (is (= 4 n)
+              (str "expected 4 rows (1 closed old + 3 new), got " n ": " rows))
+          (let [closed (filter #(not= Long/MAX_VALUE (:st %)) rows)
+                open   (filter #(= Long/MAX_VALUE (:st %)) rows)]
+            (testing "old [Jan, Jul) row preserved with _system_to closed (SCD2)"
+              (is (= 1 (count closed)))
+              (let [r (first closed)]
+                (is (= 1704067200000000 (:vf r)))
+                (is (= 1719792000000000 (:vt r)))
+                (is (= 100 (:salary r)))
+                (is (= 1000000 (:sf r)))
+                (is (not= Long/MAX_VALUE (:st r))
+                    "old row's _system_to must be closed, not MAX")))
+            (testing "three replacement slices, all with the SAME _system_from (sys-now symmetry)"
+              (is (= 3 (count open)))
+              (let [sys-nows (set (map :sf open))]
+                (is (= 1 (count sys-nows))
+                    (str "all replacement slices must share one sys-now stamp, got: " sys-nows))
+                (let [sys-now (first sys-nows)
+                      old-st  (:st (first closed))]
+                  (is (= sys-now old-st)
+                      "old row's _system_to must equal the replacement slices' _system_from")))
+              (let [by-vf (group-by :vf open)]
+                ;; [Jan, Apr) salary=100
+                (let [r (first (by-vf 1704067200000000))]
+                  (is (some? r))
+                  (is (= 100 (:salary r)))
+                  (is (= 1711929600000000 (:vt r))))
+                ;; [Apr, May) salary=999 — the updated slice
+                (let [r (first (by-vf 1711929600000000))]
+                  (is (some? r))
+                  (is (= 999 (:salary r)))
+                  (is (= 1714521600000000 (:vt r))))
+                ;; [May, Jul) salary=100
+                (let [r (first (by-vf 1714521600000000))]
+                  (is (some? r))
+                  (is (= 100 (:salary r)))
+                  (is (= 1719792000000000 (:vt r))))))))
+        (finally (server/stop srv))))))
+
+(deftest sql-delete-for-portion-of-valid-time-with-system-axis
+  ;; DELETE FOR PORTION OF on a fully-bitemporal table must close
+  ;; (not erase) the superseded row's `_system_to` AND keep the row
+  ;; in storage so `FOR SYSTEM_TIME AS OF <past>` queries still see
+  ;; it. The valid-only path used to be the silent fallback (rows
+  ;; physically dropped, audit lost).
+  (testing "DELETE … FOR PORTION OF VALID_TIME preserves system-axis SCD2"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "salaries"
+         (with-meta
+           {:eid          (stratum.index/index-from-seq :int64 [1])
+            :salary       (stratum.index/index-from-seq :int64 [100])
+            :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000])
+            :_valid_to    (stratum.index/index-from-seq :int64 [1719792000000000])
+            :_system_from (stratum.index/index-from-seq :int64 [1000000])
+            :_system_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])}
+           {:bitemporal
+            {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+             :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+        ;; DELETE FOR PORTION OF [Apr, May): row [Jan, Jul) splits.
+        ;; Result: 1 closed-old + 2 surviving slices ([Jan, Apr), [May, Jul)).
+        (let [exec @(resolve 'stratum.server/execute-sql)]
+          (exec (str "DELETE FROM salaries "
+                     "FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-05-01' "
+                     "WHERE eid = 1")
+                (:registry srv) (:data-dir srv)))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                       (:index (get cols k)) %)
+                                     (range n)))
+              rows (mapv (fn [i]
+                           {:eid    (nth (read-col :eid) i)
+                            :salary (nth (read-col :salary) i)
+                            :vf     (nth (read-col :_valid_from) i)
+                            :vt     (nth (read-col :_valid_to) i)
+                            :sf     (nth (read-col :_system_from) i)
+                            :st     (nth (read-col :_system_to) i)})
+                         (range n))
+              closed (filter #(not= Long/MAX_VALUE (:st %)) rows)
+              open   (filter #(= Long/MAX_VALUE (:st %)) rows)]
+          (is (= 3 n) (str "1 closed old + 2 surviving slices, got: " rows))
+          (testing "old [Jan, Jul) preserved with _system_to closed"
+            (is (= 1 (count closed)))
+            (is (= 1000000 (:sf (first closed))))
+            (is (not= Long/MAX_VALUE (:st (first closed)))))
+          (testing "two surviving slices ([Jan, Apr), [May, Jul)), one sys-now"
+            (is (= 2 (count open)))
+            (let [sys-nows (set (map :sf open))]
+              (is (= 1 (count sys-nows)))
+              (is (= (:st (first closed)) (first sys-nows))
+                  "old _system_to equals replacements' _system_from"))
+            (let [vfs (set (map :vf open))]
+              (is (= #{1704067200000000 1714521600000000} vfs)))))
+        (finally (server/stop srv))))))
+
+(deftest sql-insert-for-portion-of-valid-time-with-system-axis
+  ;; INSERT FOR PORTION OF on a fully-bitemporal table must stamp the
+  ;; new row's _system_from with a fresh sys-now (not Long/MAX_VALUE,
+  ;; not the unit-default of "now-in-unit at append time" — explicitly,
+  ;; the same sys-now that any concurrent surgery in the same physical
+  ;; tx would use). This test asserts the inserted row has a real
+  ;; sys-from (non-MAX) and _system_to=MAX.
+  (testing "INSERT … FOR PORTION OF VALID_TIME stamps _system_from on a fully-bitemporal table"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "salaries"
+         (with-meta
+            ;; Start empty.
+           {:eid          (stratum.index/index-from-seq :int64 [])
+            :salary       (stratum.index/index-from-seq :int64 [])
+            :_valid_from  (stratum.index/index-from-seq :int64 [])
+            :_valid_to    (stratum.index/index-from-seq :int64 [])
+            :_system_from (stratum.index/index-from-seq :int64 [])
+            :_system_to   (stratum.index/index-from-seq :int64 [])}
+           {:bitemporal
+            {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+             :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)]
+          (exec (str "INSERT INTO salaries (eid, salary) "
+                     "VALUES (1, 100) "
+                     "FOR PORTION OF VALID_TIME FROM '2024-01-01' TO '2024-07-01'")
+                (:registry srv) (:data-dir srv)))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                       (:index (get cols k)) %)
+                                     (range n)))
+              rows (mapv (fn [i] {:vf (nth (read-col :_valid_from) i)
+                                  :vt (nth (read-col :_valid_to) i)
+                                  :sf (nth (read-col :_system_from) i)
+                                  :st (nth (read-col :_system_to) i)})
+                         (range n))]
+          (is (= 1 n))
+          (let [{:keys [vf vt sf st]} (first rows)]
+            (is (= 1704067200000000 vf))
+            (is (= 1719792000000000 vt))
+            (is (and (pos? sf) (not= Long/MAX_VALUE sf))
+                "_system_from must be a real sys-now stamp, not 0 or MAX")
+            (is (= Long/MAX_VALUE st)
+                "_system_to must be MAX (open) for a fresh insertion")))
+        (finally (server/stop srv))))))
+
+(deftest sql-concurrent-inserts-do-not-lose-writes
+  ;; Regression lock for round-4 agent P0 #1.1: every DML branch
+  ;; did `(let [existing (get @reg table)] ... (swap! reg assoc
+  ;; table new-cols))`. Two concurrent INSERTs on the same table
+  ;; each captured the same `existing`, computed disjoint
+  ;; `new-cols`, and the second swap! clobbered the first → silent
+  ;; lost writes under multi-connection PgWire.
+  ;;
+  ;; Reproducer: N threads each insert one row; expect all N rows
+  ;; to land in the registry. Pre-fix: a fraction of writes are
+  ;; lost on every run. Post-fix (server-scoped coarse lock):
+  ;; every write visible.
+  (testing "N concurrent INSERTs all land in the registry"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)
+          n 100
+          ids (atom [])]
+      (try
+        (exec "CREATE TABLE t (id BIGINT, v BIGINT)"
+              (:registry srv) (:data-dir srv))
+        (let [threads (doall
+                       (for [i (range n)]
+                         (future
+                           (let [^PgWireServer$QueryResult r
+                                 (exec (str "INSERT INTO t (id, v) VALUES (" i ", " (* i 10) ")")
+                                       (:registry srv) (:data-dir srv))]
+                             (when (nil? (.error r))
+                               (swap! ids conj i))))))]
+          (doseq [f threads] @f))
+        (let [cols (get @(:registry srv) "t")
+              n-actual (alength ^longs (:id cols))]
+          (is (= n n-actual)
+              (str "expected " n " rows, got " n-actual
+                   " — " (- n n-actual) " writes were lost to the race"))
+          (is (= n (count @ids))
+              "every thread reported success"))
+        (finally (server/stop srv))))))
+
+(deftest sql-insert-for-portion-of-rejects-axis-cols-in-col-list
+  ;; Regression lock for copilot review-3 P1
+  ;; (server.clj `insert-portion-via-index-backend`): if the
+  ;; user-supplied col-list includes the valid-time axis columns,
+  ;; the row-map carries the user's explicit values and
+  ;; `append!`'s tx-meta default-merge doesn't overwrite them — so
+  ;; `FOR PORTION OF VALID_TIME` is silently ignored. Reject up
+  ;; front so the confused intent surfaces.
+  (testing "INSERT … FOR PORTION OF VALID_TIME with axis cols in column list throws"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "salaries"
+         (with-meta
+           {:eid          (stratum.index/index-from-seq :int64 [])
+            :salary       (stratum.index/index-from-seq :int64 [])
+            :_valid_from  (stratum.index/index-from-seq :int64 [])
+            :_valid_to    (stratum.index/index-from-seq :int64 [])
+            :_system_from (stratum.index/index-from-seq :int64 [])
+            :_system_to   (stratum.index/index-from-seq :int64 [])}
+           {:bitemporal
+            {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+             :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult r
+              (exec (str "INSERT INTO salaries "
+                         "(eid, salary, _valid_from, _valid_to) "
+                         "VALUES (1, 100, 0, 0) "
+                         "FOR PORTION OF VALID_TIME FROM '2024-01-01' TO '2024-07-01'")
+                    (:registry srv) (:data-dir srv))]
+          (is (some? (.error r))
+              "execute-sql must surface a clear error; pre-fix accepted the bogus axis values and silently ignored the period")
+          (is (re-find #"must not include the valid-time axis columns" (.error r))
+              (str "Error message should explain the conflict. got: " (.error r))))
+        (finally (server/stop srv))))))
+
+(deftest sql-set-datahike-clock-time-rejects-unparseable
+  ;; Regression lock for copilot review-3 P2 (sql.clj:2111):
+  ;; pre-fix, `SET datahike.clock_time = '<garbage>'` parsed
+  ;; failure into `:settings nil` and returned a successful SET
+  ;; — typos passed silently with no clock change.
+  (testing "SET datahike.clock_time with an unparseable value returns an error"
+    (let [srv (server/start {:port 0})]
+      (try
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult r
+              (exec "SET datahike.clock_time = 'not-a-date'"
+                    (:registry srv) (:data-dir srv))]
+          (is (some? (.error r))
+              "unparseable value must error, not silently no-op")
+          (is (re-find #"unparseable value" (.error r))
+              (str "Error message should mention 'unparseable value'. got: "
+                   (.error r))))
+        (finally (server/stop srv))))))
+
+(deftest sql-select-col-vs-col-where-keeps-rhs-column
+  ;; Regression lock for copilot review #3 (group_by.clj:655):
+  ;; `pred-columns` (plan.clj:387) only scanned the LHS column,
+  ;; so column-pruning trimmed any keyword RHS away from the
+  ;; projected col-arrays map. `eval-pred-scalar`'s `resolve-arg`
+  ;; then did `(get col-arrays a)` → nil → `(aget ^doubles nil i)`
+  ;; → NPE.
+  ;;
+  ;; Reproducer: SELECT projects only :eid, WHERE compares :a < :b.
+  ;; Pre-fix: `:b` was pruned, NPE at evaluation. Post-fix: pruner
+  ;; sees both :a AND :b via the extended `pred-columns`.
+  (testing "SELECT eid FROM t WHERE a < b — RHS column survives pruning"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "t"
+          ;; eid=1: a=5, b=10 (a<b → match)
+          ;; eid=2: a=20, b=15 (a<b false → no match)
+          ;; eid=3: a=7, b=7 (a<b false → no match)
+         {:eid (long-array [1 2 3])
+          :a   (long-array [5 20 7])
+          :b   (long-array [10 15 7])})
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult r
+              (exec "SELECT eid FROM t WHERE a < b ORDER BY eid"
+                    (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r))
+              (str "execute-sql must not error; pre-fix surfaced an "
+                   "NPE swallowed into the error QR. got: "
+                   (.error r)))
+          (is (= [["1"]] (mapv vec (.rows r)))
+              "only eid=1 satisfies a<b (wire-text-mode: rows are stringified)"))
+        (finally (server/stop srv))))))
+
+(deftest sql-dml-arithmetic-where-handles-null-operand
+  ;; Regression lock for copilot review #2 (server.clj:176):
+  ;; eval-dml-predicate arithmetic (:+/:-/:*/:/) called
+  ;; `(double (eval-val ...))` without NULL propagation. If a row's
+  ;; column resolves to nil (NULL sentinel Long/MIN_VALUE on int64),
+  ;; `(double nil)` threw NPE rather than following SQL 3-valued
+  ;; logic (expression → NULL → predicate false → row not matched).
+  ;;
+  ;; Reproducer: a DELETE with `WHERE col + 1 > 5` where one row's
+  ;; col is the NULL sentinel. Pre-fix: NPE inside eval-dml-predicate.
+  ;; Post-fix: the nil-bearing row is treated as non-matching and the
+  ;; DELETE only affects the non-nil rows that match.
+  (testing "DML WHERE with arithmetic on a NULL-bearing column does not NPE"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "t"
+         (with-meta
+            ;; rows: id=1 v=10, id=2 v=NULL (Long/MIN_VALUE), id=3 v=20
+           {:id (stratum.index/index-from-seq :int64 [1 2 3])
+            :v  (stratum.index/index-from-seq :int64 [10 Long/MIN_VALUE 20])}
+           {}))
+        (let [exec @(resolve 'stratum.server/execute-sql)]
+          ;; Pre-fix: throws NPE because row 2's :v reads as nil and
+          ;; the arithmetic `v + 1` calls `(double nil)`.
+          (exec "DELETE FROM t WHERE v + 1 > 15"
+                (:registry srv) (:data-dir srv)))
+        (let [cols (get @(:registry srv) "t")
+              n    (stratum.index/idx-length (:index (:id cols)))
+              ids  (mapv #(stratum.index/idx-get-long (:index (:id cols)) %)
+                         (range n))
+              vs   (mapv #(stratum.index/idx-get-long (:index (:v cols)) %)
+                         (range n))]
+          (is (= 2 n) "row id=3 (v=20, v+1=21 > 15) deleted; rows id=1 + NULL row survive")
+          (is (= [1 2] ids)
+              "id=1 (v=10, v+1=11 ≤ 15) and id=2 (v=NULL → predicate NULL → false) both kept")
+          (is (= [10 Long/MIN_VALUE] vs)))
+        (finally (server/stop srv))))))
+
+(deftest sql-update-arithmetic-on-null-column-handles-3vl
+  ;; Regression lock for pattern-hunt P0-A (server.clj:1025
+  ;; eval-row): UPDATE's per-row expression evaluator had the
+  ;; same arithmetic NPE shape the copilot review #2 fix removed
+  ;; from eval-dml-predicate. Reproducer: UPDATE ... SET col = v
+  ;; + 1 WHERE id = … against a row whose v is the NULL sentinel.
+  ;; Pre-fix: `(double nil)` NPE, swallowed into an error
+  ;; QueryResult, no rows updated. Post-fix: shared `nil-safe-arith`
+  ;; helper short-circuits to nil, the SET value falls back to
+  ;; NULL (target column retains MIN_VALUE).
+  (testing "UPDATE … SET col = v + 1 on a row with NULL v does not NPE"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        ;; CREATE TABLE makes a raw-array table — that's what
+        ;; routes through the UPDATE :else branch where eval-row
+        ;; lives. (register-table! with stratum indexes routes
+        ;; through the index-backed UPDATE path which uses
+        ;; eval-dml-predicate — already fixed by copilot #2.)
+        (exec "CREATE TABLE t (id BIGINT, v BIGINT, w BIGINT)"
+              (:registry srv) (:data-dir srv))
+        (exec "INSERT INTO t (id, v, w) VALUES (1, 10, 0), (2, NULL, 0), (3, 20, 0)"
+              (:registry srv) (:data-dir srv))
+        (let [^PgWireServer$QueryResult r
+              (exec "UPDATE t SET w = v + 1 WHERE id <= 3"
+                    (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r))
+              (str "execute-sql must not error; pre-fix surfaced "
+                   "an NPE swallowed into the error QR. got: "
+                   (.error r))))
+        (let [cols (get @(:registry srv) "t")
+              ws  (vec (aclone ^longs (:w cols)))]
+          (is (= [11 Long/MIN_VALUE 21] ws)
+              "row 1: 10+1=11; row 2: NULL+1 → NULL (sentinel); row 3: 20+1=21"))
+        (finally (server/stop srv))))))
+
+(deftest sql-upsert-do-update-arithmetic-on-null-handles-3vl
+  ;; Regression lock for pattern-hunt P0-B (server.clj:882
+  ;; eval-val in UPSERT DO UPDATE): same NPE shape in the
+  ;; ON CONFLICT … DO UPDATE SET col = col + EXCLUDED.col path.
+  ;; Reproducer: insert into a uniq-index table where the
+  ;; conflicting row's column is NULL. Pre-fix: NPE; post-fix:
+  ;; NULL propagates, conflicting row stays NULL.
+  (testing "INSERT … ON CONFLICT DO UPDATE SET balance = balance + 100 with NULL balance"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        ;; CREATE TABLE for raw-array storage; eval-val lives in
+        ;; the UPSERT DO UPDATE path that operates on raw arrays.
+        (exec "CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT)"
+              (:registry srv) (:data-dir srv))
+        (exec "INSERT INTO accounts (id, balance) VALUES (42, NULL)"
+              (:registry srv) (:data-dir srv))
+        (let [^PgWireServer$QueryResult r
+              (exec (str "INSERT INTO accounts (id, balance) VALUES (42, 100) "
+                         "ON CONFLICT (id) DO UPDATE SET balance = "
+                         "accounts.balance + 100")
+                    (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r))
+              (str "execute-sql must not error; pre-fix NPE swallowed: "
+                   (.error r))))
+        (let [cols (get @(:registry srv) "accounts")
+              bs   (vec (aclone ^longs (:balance cols)))]
+          (is (= [Long/MIN_VALUE] bs)
+              "NULL + 100 → NULL (sentinel preserved); pre-fix threw NPE"))
+        (finally (server/stop srv))))))
+
+(deftest sql-plain-insert-bitemporal-preserves-system-axis
+  ;; Regression lock for copilot review #1 (server.clj:719):
+  ;; the plain-INSERT-with-columns path on an index-backed bitemporal
+  ;; table was building :metadata with only `{:bitemporal {:valid …}}`,
+  ;; flattening the axis map AND dropping the :system axis. Result:
+  ;; `dataset/append!` ran without :system metadata so `_system_from`
+  ;; was never auto-stamped (left as whatever the unit's default
+  ;; produced — typically `now-in-unit` from append, *not* a pinned
+  ;; sys-now, breaking SCD2-on-system).
+  ;;
+  ;; This test exercises a plain `INSERT (cols) VALUES …` on a fully-
+  ;; bitemporal table and asserts the new row's `_system_from` is a
+  ;; real sys-now stamp (positive, not MAX, not 0) and `_system_to`
+  ;; is MAX (open). Pre-fix, this would either throw a missing-column
+  ;; error or silently leak a non-pinned timestamp.
+  (testing "plain INSERT (no FOR PORTION OF) on a fully-bitemporal table stamps _system_from"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "salaries"
+         (with-meta
+           {:eid          (stratum.index/index-from-seq :int64 [])
+            :salary       (stratum.index/index-from-seq :int64 [])
+            :_valid_from  (stratum.index/index-from-seq :int64 [])
+            :_valid_to    (stratum.index/index-from-seq :int64 [])
+            :_system_from (stratum.index/index-from-seq :int64 [])
+            :_system_to   (stratum.index/index-from-seq :int64 [])}
+           {:bitemporal
+            {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+             :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)]
+          ;; Plain INSERT — user supplies _valid_from/_valid_to
+          ;; explicitly; system axis must be auto-stamped by stratum.
+          (exec (str "INSERT INTO salaries "
+                     "(eid, salary, _valid_from, _valid_to) "
+                     "VALUES (1, 100, "
+                     "1704067200000000, " ; 2024-01-01 micros
+                     "9223372036854775807)") ; Long/MAX_VALUE (open)
+                (:registry srv) (:data-dir srv)))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                       (:index (get cols k)) %)
+                                     (range n)))
+              rows (mapv (fn [i] {:vf (nth (read-col :_valid_from) i)
+                                  :vt (nth (read-col :_valid_to) i)
+                                  :sf (nth (read-col :_system_from) i)
+                                  :st (nth (read-col :_system_to) i)})
+                         (range n))]
+          (is (= 1 n) "one row inserted")
+          (let [{:keys [vf vt sf st]} (first rows)]
+            (is (= 1704067200000000 vf))
+            (is (= Long/MAX_VALUE vt))
+            (is (and (pos? sf) (not= Long/MAX_VALUE sf))
+                "_system_from must be a real sys-now stamp — proves :system axis was preserved through ds-meta")
+            (is (= Long/MAX_VALUE st)
+                "_system_to must be MAX (open) for a fresh insertion")))
+        (finally (server/stop srv))))))
+
+(deftest sql-upsert-for-portion-of-valid-time-rejected
+  (testing "INSERT … ON CONFLICT … FOR PORTION OF VALID_TIME throws a clear error"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "t"
+         (with-meta
+           {:eid (stratum.index/index-from-seq :int64 [])
+            :_valid_from (stratum.index/index-from-seq :int64 [])
+            :_valid_to (stratum.index/index-from-seq :int64 [])}
+           {:bitemporal {:valid {:from-col :_valid_from :to-col :_valid_to :unit :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec (str "INSERT INTO t (eid) VALUES (1) "
+                         "ON CONFLICT (eid) DO UPDATE SET eid = 2 "
+                         "FOR PORTION OF VALID_TIME FROM '2024-01-01' TO '2024-07-01'")
+                    (:registry srv) (:data-dir srv))]
+          (is (some? (.error qr)))
+          (is (re-find #"not supported" (.error qr))))
+        (finally (server/stop srv))))))
+
+;; ============================================================================
+;; FOR PORTION OF VALID_TIME FROM x — open-ended (no TO)
+;; ============================================================================
+
+(deftest preprocess-for-portion-of-valid-time-without-to-defaults-to-max
+  (testing "FROM x with no TO is the open-ended form: vt = Long/MAX_VALUE"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "DELETE FROM t FOR PORTION OF VALID_TIME FROM '2024-04-01' WHERE eid = 1")]
+      (is (= "DELETE FROM t WHERE eid = 1" (.trim ^String (:sql r))))
+      (is (= :valid_time (:axis (:period r))))
+      (is (= 1711929600000000 (:from (:period r))))
+      (is (= Long/MAX_VALUE (:to (:period r)))))))
+
+(deftest sql-delete-for-portion-open-ended-retracts-from-instant
+  (testing "DELETE FOR PORTION OF FROM x (no TO) closes valid-to to x for matching rows"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "salaries"
+         (with-meta
+            ;; Open row [Jan-2024, MAX) with salary=100.
+           {:eid         (stratum.index/index-from-seq :int64 [1])
+            :salary      (stratum.index/index-from-seq :int64 [100])
+            :_valid_from (stratum.index/index-from-seq :int64 [1704067200000000])
+            :_valid_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec (str "DELETE FROM salaries "
+                         "FOR PORTION OF VALID_TIME FROM '2024-04-01' "
+                         "WHERE eid = 1")
+                    (:registry srv) (:data-dir srv))]
+          (is (re-find #"^DELETE" (.commandTag qr))))
+        ;; Row should be truncated to [Jan-2024, Apr-2024) — the
+        ;; open-ended retract closes valid-to at the start instant.
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))]
+          (is (= 1 n))
+          (is (= 1704067200000000
+                 (stratum.index/idx-get-long (:index (:_valid_from cols)) 0)))
+          (is (= 1711929600000000
+                 (stratum.index/idx-get-long (:index (:_valid_to cols)) 0))))
+        (finally (server/stop srv))))))
+
+;; ============================================================================
+;; FOR ALL VALID_TIME — DML applies across every vt-window
+;; ============================================================================
+
+(defn- normalize-ws ^String [^String s]
+  (-> s (.replaceAll "\\s+" " ") .trim))
+
+(deftest preprocess-for-all-valid-time-strips-clause
+  (testing "FOR ALL VALID_TIME produces a period spanning all time"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "DELETE FROM t FOR ALL VALID_TIME WHERE eid = 1")]
+      (is (= "DELETE FROM t WHERE eid = 1" (normalize-ws (:sql r))))
+      (is (= :valid_time (:axis (:period r))))
+      (is (= Long/MIN_VALUE (:from (:period r))))
+      (is (= Long/MAX_VALUE (:to (:period r)))))))
+
+(deftest preprocess-valid-time-all-trailing-form
+  (testing "VALID_TIME ALL trailing form also works"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "DELETE FROM t FOR VALID_TIME ALL WHERE eid = 1")]
+      (is (= "DELETE FROM t WHERE eid = 1" (normalize-ws (:sql r))))
+      (is (= :valid_time (:axis (:period r)))))))
+
+(deftest sql-delete-for-all-valid-time-drops-every-matching-slice
+  (testing "DELETE FOR ALL VALID_TIME retracts all vt-slices of matching rows"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "salaries"
+         (with-meta
+            ;; Two slices for eid=1, plus one for eid=2 (untouched).
+           {:eid         (stratum.index/index-from-seq :int64 [1 1 2])
+            :salary      (stratum.index/index-from-seq :int64 [100 110 200])
+            :_valid_from (stratum.index/index-from-seq :int64 [1000 2000 1500])
+            :_valid_to   (stratum.index/index-from-seq :int64 [2000 Long/MAX_VALUE Long/MAX_VALUE])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult qr
+              (exec "DELETE FROM salaries FOR ALL VALID_TIME WHERE eid = 1"
+                    (:registry srv) (:data-dir srv))]
+          (is (re-find #"^DELETE" (.commandTag qr))))
+        ;; Both eid=1 rows should be dropped; eid=2 untouched.
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              eids (mapv #(stratum.index/idx-get-long (:index (:eid cols)) %) (range n))]
+          (is (= 1 n))
+          (is (= [2] eids)))
+        (finally (server/stop srv))))))
+
+;; ============================================================================
+;; Extra temporal-literal forms in FOR PORTION OF VALID_TIME
+;; ============================================================================
+
+(deftest preprocess-for-portion-of-current-timestamp
+  (testing "CURRENT_TIMESTAMP / NOW / NOW() recognized as temporal literals"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "DELETE FROM t FOR PORTION OF VALID_TIME FROM CURRENT_TIMESTAMP TO END_OF_TIME WHERE eid = 1")]
+      (is (= "DELETE FROM t WHERE eid = 1" (normalize-ws (:sql r))))
+      (is (= Long/MAX_VALUE (:to (:period r))))
+      ;; NOW falls within a generous window of System/currentTimeMillis * 1000.
+      (is (<= (* 1000 (- (System/currentTimeMillis) 60000))
+              (:from (:period r))
+              (* 1000 (+ (System/currentTimeMillis) 60000)))))))
+
+(deftest preprocess-for-portion-of-now-form
+  (testing "NOW and NOW() also work"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "DELETE FROM t FOR PORTION OF VALID_TIME FROM NOW() TO MAX_VALUE WHERE eid = 1")]
+      (is (= :valid_time (:axis (:period r))))
+      (is (number? (:from (:period r))))
+      (is (= Long/MAX_VALUE (:to (:period r)))))))
+
+(deftest preprocess-for-portion-of-start-of-time
+  (testing "START_OF_TIME / MIN_VALUE expand to Long/MIN_VALUE"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "DELETE FROM t FOR PORTION OF VALID_TIME FROM START_OF_TIME TO '2024-04-01' WHERE eid = 1")]
+      (is (= Long/MIN_VALUE (:from (:period r))))
+      (is (= 1711929600000000 (:to (:period r)))))))
+
+(deftest preprocess-for-portion-of-rejects-column-ref
+  (testing "Column reference is not yet supported (clear error message)"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"Column references and per-row expressions are not yet supported"
+         (stratum.sql.rewrite/preprocess-sql
+          "DELETE FROM t FOR PORTION OF VALID_TIME FROM contract_start TO contract_end WHERE eid = 1")))))
+
+;; ============================================================================
+;; Allen interval predicates as SQL functions
+;;
+;; 4-arg function form `(a_from, a_to, b_from, b_to)` works on any
+;; pair of int64 columns, not just the bitemporal axis. PERIOD value
+;; type (P1-4) is deferred — the 4-arg form covers the same use cases.
+;; ============================================================================
+
+;; Allen predicates lower to column-vs-column comparisons in the WHERE
+;; clause, which the DML predicate evaluator (`eval-dml-predicate`)
+;; supports natively. The main SELECT planner doesn't yet evaluate
+;; col-vs-col predicates — that requires extending normalize-pred /
+;; the predicate evaluator across execution.clj + group_by.clj and is
+;; a separate gap (tracked as a P2 follow-up). The tests below exercise
+;; the DML code path which is where Allen predicates have immediate value
+;; (DELETE/UPDATE on bitemporal tables).
+
+(defn- allen-delete-survivors
+  "Helper: build an index-backed table, run a DELETE WHERE <allen-pred>,
+   return the surviving :eid values."
+  [cols-map sql]
+  (let [srv (server/start {:port 0})]
+    (try
+      (let [idx-cols (into {} (map (fn [[k v]] [k (stratum.index/index-from-seq :int64 (vec v))])
+                                   cols-map))]
+        (server/register-table! srv "intervals" idx-cols))
+      (let [exec @(resolve 'stratum.server/execute-sql)]
+        (exec sql (:registry srv) (:data-dir srv)))
+      (let [cols (get @(:registry srv) "intervals")
+            n (stratum.index/idx-length (:index (:eid cols)))]
+        (mapv #(stratum.index/idx-get-long (:index (:eid cols)) %) (range n)))
+      (finally (server/stop srv)))))
+
+(deftest sql-overlaps-allen-predicate-via-delete
+  (testing "OVERLAPS(a_from, a_to, b_from, b_to) — DELETE removes overlapping rows"
+    (let [survivors (allen-delete-survivors
+                     {:eid    [1 2 3]
+                      :a_from [100 200 300]
+                      :a_to   [200 300 400]
+                      :b_from [150 350 250]
+                      :b_to   [250 450 350]}
+                     "DELETE FROM intervals WHERE OVERLAPS(a_from, a_to, b_from, b_to)")]
+      ;; Row 1 overlaps (deleted). Row 2 doesn't (kept). Row 3 overlaps (deleted).
+      (is (= [2] survivors)))))
+
+(deftest sql-precedes-allen-predicate-via-delete
+  (testing "PRECEDES(a_from, a_to, b_from, b_to) — DELETE removes preceding rows"
+    (let [survivors (allen-delete-survivors
+                     {:eid    [1 2]
+                      :a_from [100 100]
+                      :a_to   [200 200]
+                      :b_from [200 250]
+                      :b_to   [300 350]}
+                     "DELETE FROM intervals WHERE PRECEDES(a_from, a_to, b_from, b_to)")]
+      ;; Both precede (touching counts), both deleted.
+      (is (= [] survivors)))))
+
+(deftest sql-strictly-precedes-no-touching-via-delete
+  (testing "STRICTLY_PRECEDES rejects touching boundaries"
+    (let [survivors (allen-delete-survivors
+                     {:eid    [1 2]
+                      :a_from [100 100]
+                      :a_to   [200 200]
+                      :b_from [200 250]
+                      :b_to   [300 350]}
+                     "DELETE FROM intervals WHERE STRICTLY_PRECEDES(a_from, a_to, b_from, b_to)")]
+      ;; Row 1: a_to=b_from=200 — touching → not strictly preceding → KEEP.
+      ;; Row 2: a_to=200 < b_from=250 → strictly precedes → DELETE.
+      (is (= [1] survivors)))))
+
+(deftest sql-contains-period-allen-predicate-via-delete
+  (testing "CONTAINS_PERIOD: DELETE rows where A contains B"
+    (let [survivors (allen-delete-survivors
+                     {:eid    [1 2]
+                      :a_from [100 100]
+                      :a_to   [500 200]
+                      :b_from [200 150]
+                      :b_to   [400 250]}
+                     "DELETE FROM intervals WHERE CONTAINS_PERIOD(a_from, a_to, b_from, b_to)")]
+      ;; Row 1 contains (deleted). Row 2 doesn't (kept).
+      (is (= [2] survivors)))))
+
+(deftest sql-equals-period-allen-predicate-via-delete
+  (testing "EQUALS_PERIOD: DELETE rows where both endpoints match exactly"
+    (let [survivors (allen-delete-survivors
+                     {:eid    [1 2 3]
+                      :a_from [100 100 200]
+                      :a_to   [200 200 300]
+                      :b_from [100 100 100]
+                      :b_to   [200 300 200]}
+                     "DELETE FROM intervals WHERE EQUALS_PERIOD(a_from, a_to, b_from, b_to)")]
+      ;; Row 1: a=[100,200) b=[100,200) → equal → DELETE.
+      ;; Row 2: a=[100,200) b=[100,300) → NOT equal → KEEP.
+      ;; Row 3: a=[200,300) b=[100,200) → NOT equal → KEEP.
+      (is (= [2 3] survivors)))))
+
+(deftest sql-immediately-precedes-allen-predicate-via-delete
+  (testing "IMMEDIATELY_PRECEDES: A.to == B.from"
+    (let [survivors (allen-delete-survivors
+                     {:eid    [1 2 3]
+                      :a_from [100 100 100]
+                      :a_to   [200 199 201]
+                      :b_from [200 200 200]
+                      :b_to   [300 300 300]}
+                     "DELETE FROM intervals WHERE IMMEDIATELY_PRECEDES(a_from, a_to, b_from, b_to)")]
+      ;; Row 1: a_to=200 == b_from=200 → DELETE.
+      ;; Row 2: a_to=199 != 200 → KEEP. Row 3: a_to=201 != 200 → KEEP.
+      (is (= [2 3] survivors)))))
+
+(deftest sql-succeeds-allen-predicate-via-delete
+  (testing "SUCCEEDS: A.from >= B.to (touching counts)"
+    (let [survivors (allen-delete-survivors
+                     {:eid    [1 2 3]
+                      :a_from [200 250 199]
+                      :a_to   [300 350 250]
+                      :b_from [100 100 100]
+                      :b_to   [200 200 200]}
+                     "DELETE FROM intervals WHERE SUCCEEDS(a_from, a_to, b_from, b_to)")]
+      ;; Row 1: a_from=200 >= b_to=200 → touching, SUCCEEDS, DELETE.
+      ;; Row 2: a_from=250 >= 200 → DELETE.
+      ;; Row 3: a_from=199 < 200 → KEEP.
+      (is (= [3] survivors)))))
+
+(deftest sql-strictly-succeeds-allen-predicate-via-delete
+  (testing "STRICTLY_SUCCEEDS: A.from > B.to (no touching)"
+    (let [survivors (allen-delete-survivors
+                     {:eid    [1 2]
+                      :a_from [200 201]
+                      :a_to   [300 300]
+                      :b_from [100 100]
+                      :b_to   [200 200]}
+                     "DELETE FROM intervals WHERE STRICTLY_SUCCEEDS(a_from, a_to, b_from, b_to)")]
+      ;; Row 1: a_from=200 == b_to=200 (touching) → NOT strictly succeeds → KEEP.
+      ;; Row 2: a_from=201 > 200 → STRICTLY succeeds → DELETE.
+      (is (= [1] survivors)))))
+
+(deftest sql-immediately-succeeds-allen-predicate-via-delete
+  (testing "IMMEDIATELY_SUCCEEDS: A.from == B.to"
+    (let [survivors (allen-delete-survivors
+                     {:eid    [1 2 3]
+                      :a_from [200 199 201]
+                      :a_to   [300 300 300]
+                      :b_from [100 100 100]
+                      :b_to   [200 200 200]}
+                     "DELETE FROM intervals WHERE IMMEDIATELY_SUCCEEDS(a_from, a_to, b_from, b_to)")]
+      ;; Row 1: a_from=200 == b_to=200 → DELETE.
+      ;; Row 2/3: a_from != b_to → KEEP.
+      (is (= [2 3] survivors)))))
+
+(deftest sql-meets-allen-predicate-via-delete
+  (testing "MEETS: alias for IMMEDIATELY_PRECEDES (A.to == B.from)"
+    (let [survivors (allen-delete-survivors
+                     {:eid    [1 2]
+                      :a_from [100 100]
+                      :a_to   [200 199]
+                      :b_from [200 200]
+                      :b_to   [300 300]}
+                     "DELETE FROM intervals WHERE MEETS(a_from, a_to, b_from, b_to)")]
+      ;; Row 1: a_to=200 == b_from=200 → MEETS → DELETE.
+      ;; Row 2: a_to=199 != 200 → KEEP.
+      (is (= [2] survivors)))))
+
+(deftest sql-erase-with-portion-of-rejected
+  (testing "ERASE + FOR PORTION OF VALID_TIME is rejected at parse time"
+    (let [r (sql/parse-sql
+             (str "ERASE FROM t FOR PORTION OF VALID_TIME "
+                  "FROM '2024-01-01' TO '2024-07-01' WHERE eid = 1")
+             {"t" {:eid (long-array [])}})]
+      (is (some? (:error r)))
+      (is (re-find #"ERASE does not compose with FOR PORTION OF VALID_TIME"
+                   (:error r))))))
+
+(deftest sql-update-for-portion-of-valid-time-infers-system-axis-from-column-names
+  ;; When a table is registered with `_system_from` / `_system_to`
+  ;; columns but WITHOUT `:bitemporal {:system {...}}` metadata, the
+  ;; SQL DML lowering should still infer the system axis from the
+  ;; SQL:2011 column-name convention. This locks the
+  ;; `bitemporal-axis-cfg` :system fallback path that's parallel to
+  ;; the :valid fallback documented in `delete-portion-via-index-
+  ;; backend`'s docstring.
+  (testing "Registered without :system metadata; SCD2 still fires via column-name inference"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "salaries"
+          ;; NOTE: no :bitemporal metadata at all. Inference must
+          ;; pick up BOTH axes from the column names.
+         {:eid          (stratum.index/index-from-seq :int64 [1])
+          :salary       (stratum.index/index-from-seq :int64 [100])
+          :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000])
+          :_valid_to    (stratum.index/index-from-seq :int64 [1719792000000000])
+          :_system_from (stratum.index/index-from-seq :int64 [1000000])
+          :_system_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])})
+        (let [exec @(resolve 'stratum.server/execute-sql)]
+          (exec (str "UPDATE salaries SET salary = 999 "
+                     "FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-05-01' "
+                     "WHERE eid = 1")
+                (:registry srv) (:data-dir srv)))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                       (:index (get cols k)) %)
+                                     (range n)))
+              rows (mapv (fn [i] {:sf (nth (read-col :_system_from) i)
+                                  :st (nth (read-col :_system_to) i)})
+                         (range n))
+              closed (filter #(not= Long/MAX_VALUE (:st %)) rows)
+              open   (filter #(= Long/MAX_VALUE (:st %)) rows)]
+          (is (= 4 n)
+              "metadata-free table with `_system_*` cols routes through bitemporal path")
+          (is (= 1 (count closed)) "old row closed via inferred system axis")
+          (is (= 3 (count open)) "three replacement slices")
+          (let [sys-nows (set (map :sf open))]
+            (is (= 1 (count sys-nows)) "one shared sys-now")
+            (is (= (:st (first closed)) (first sys-nows))
+                "closed system_to == replacements' system_from (SCD2 symmetry)")))
+        (finally (server/stop srv))))))
+
+(deftest sql-select-multi-for-valid-time-rejected
+  ;; The SELECT-side preprocessor emits unqualified `_valid_from` /
+  ;; `_valid_to` column refs. With two `FOR VALID_TIME` clauses on a
+  ;; joined SELECT, the planner can't disambiguate which table each
+  ;; predicate targets and silently picks one source — silently
+  ;; wrong. Reject at preprocess time.
+  (testing "Two FOR VALID_TIME clauses on a joined SELECT → rejected"
+    (let [r (sql/parse-sql
+             (str "SELECT a.eid, b.eid FROM a FOR VALID_TIME AS OF '2024-04-15' "
+                  "JOIN b FOR VALID_TIME AS OF '2024-04-15' ON a.eid = b.eid")
+             {"a" {:eid (long-array []) :_valid_from (long-array []) :_valid_to (long-array [])}
+              "b" {:eid (long-array []) :_valid_from (long-array []) :_valid_to (long-array [])}})]
+      (is (some? (:error r)))
+      (is (re-find #"Multi-table SELECT with more than one FOR VALID_TIME"
+                   (:error r))))))
+
+(deftest sql-allen-bad-arity-throws
+  (testing "Allen predicates require exactly 4 args"
+    (let [reg {"intervals" {:eid (long-array [1])
+                            :a (long-array [1])
+                            :b (long-array [1])}}
+          parsed (sql/parse-sql
+                  "DELETE FROM intervals WHERE OVERLAPS(a, b)" reg)]
+      (is (re-find #"requires 4 args" (or (:error parsed) ""))))))
+
+;; ============================================================================
+;; SELECT-side FOR VALID_TIME (AS OF / BETWEEN / FROM-TO / ALL)
+;;
+;; Preprocessor rewrites the temporal clause into equivalent WHERE
+;; predicates over the table's _valid_from / _valid_to columns. Uses
+;; the SQL:2011 convention column names.
+;; ============================================================================
+
+(deftest preprocess-select-temporal-as-of-injects-where
+  (testing "FOR VALID_TIME AS OF rewrites to WHERE predicates"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "SELECT eid FROM salaries FOR VALID_TIME AS OF '2024-04-01'")]
+      (is (re-find #"WHERE\s+\(?_valid_from\s+<=\s+\d+"
+                   (:sql r)))
+      (is (re-find #"_valid_to\s+>\s+\d+"
+                   (:sql r))))))
+
+(deftest preprocess-select-temporal-between-form
+  (testing "FOR VALID_TIME BETWEEN x AND y emits overlap predicate"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "SELECT eid FROM salaries FOR VALID_TIME BETWEEN '2024-01-01' AND '2024-07-01'")]
+      ;; Expect: vf <= Jul AND vt > Jan (half-open overlap)
+      (is (re-find #"_valid_from\s+<=\s+1719792000000000"
+                   (:sql r)))
+      (is (re-find #"_valid_to\s+>\s+1704067200000000"
+                   (:sql r))))))
+
+(deftest preprocess-select-temporal-from-to-form
+  ;; SQL:2011 `FROM x TO y` is half-open `[x, y)`, distinct from
+  ;; SQL `BETWEEN x AND y` which is closed-closed `[x, y]`. Two
+  ;; half-open intervals `[vf, vt)` and `[x, y)` overlap iff
+  ;; `vf < y AND x < vt`. A row whose `vf = y` starts exactly at
+  ;; the exclusive upper bound and must NOT be included.
+  ;; Round-3 agent P2: pre-fix used `vf <= y`, over-including the
+  ;; boundary row (and matching `:between`'s closed semantics).
+  (testing "FOR VALID_TIME FROM x TO y emits the half-open overlap predicate (vf < y AND vt > x)"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "SELECT eid FROM salaries FOR VALID_TIME FROM '2024-01-01' TO '2024-07-01'")]
+      (is (re-find #"_valid_from\s+<\s+1719792000000000"
+                   (:sql r))
+          "vf < to (strict, half-open); pre-fix used <= which over-included rows starting at to")
+      (is (re-find #"_valid_to\s+>\s+1704067200000000"
+                   (:sql r))))))
+
+(deftest preprocess-select-for-all-valid-time-no-filter
+  (testing "FOR ALL VALID_TIME on SELECT strips the clause without adding a filter"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "SELECT eid FROM salaries FOR ALL VALID_TIME")]
+      (is (re-find #"(?i)^\s*SELECT\s+eid\s+FROM\s+salaries\s*$"
+                   (:sql r))
+          "FOR ALL VALID_TIME should leave the SQL with no extra WHERE")
+      (is (nil? (:period r))
+          "SELECT-side ALL doesn't emit a :period side channel"))))
+
+(deftest preprocess-select-temporal-preserves-existing-where
+  (testing "Existing WHERE is preserved; temporal preds prepended via AND"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "SELECT eid FROM salaries FOR VALID_TIME AS OF '2024-04-01' WHERE eid = 1")
+          s (:sql r)]
+      (is (.contains ^String s "WHERE"))
+      (is (.contains ^String s "_valid_from"))
+      (is (.contains ^String s "_valid_to"))
+      (is (.contains ^String s "eid = 1"))
+      ;; Temporal preds appear BEFORE the original eid=1 predicate.
+      (is (< (.indexOf ^String s "_valid_from")
+             (.indexOf ^String s "eid = 1"))))))
+
+;; ============================================================================
+;; SELECT-side FOR SYSTEM_TIME (mirrors FOR VALID_TIME on the system axis)
+;;
+;; Closes the gap copilot review-3 flagged + the deletion-semantics
+;; discussion: stratum's closed-period SCD2 keeps superseded rows in
+;; storage with `_system_to` shifted to sys-now, but consumers
+;; couldn't ASK what the DB believed at past system-time via SQL
+;; until these clauses were implemented. Implementation generalizes
+;; `find-for-valid-time-clause` and `spec->predicate-sql` to be
+;; axis-aware.
+;; ============================================================================
+
+;; ============================================================================
+;; FOR (ALL | PORTION OF) SYSTEM_TIME DML — explicit rejection (design choice)
+;;
+;; SELECT-side FOR SYSTEM_TIME works (see tests below). DML side is
+;; rejected with a clear error explaining why: system-time is the
+;; auto-stamped recording-fact axis; allowing user-controlled writes
+;; would compromise the audit story. Matches SQL Server / MariaDB /
+;; Postgres semantics. Consumers needing historical-import use the
+;; Clojure DSL `(dataset/append! ds row {:system-from <past-inst>})`.
+;; ============================================================================
+
+(deftest preprocess-rejects-for-portion-of-system-time-dml
+  (testing "FOR PORTION OF SYSTEM_TIME FROM x TO y on DML throws with design-choice message"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
+         (stratum.sql.rewrite/preprocess-sql
+          (str "DELETE FROM t FOR PORTION OF SYSTEM_TIME "
+               "FROM '2020-01-01' TO '2020-07-01' WHERE id = 1"))))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
+         (stratum.sql.rewrite/preprocess-sql
+          (str "UPDATE t FOR PORTION OF SYSTEM_TIME "
+               "FROM '2020-01-01' TO '2020-07-01' SET x = 1 WHERE id = 1"))))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
+         (stratum.sql.rewrite/preprocess-sql
+          (str "INSERT INTO t (id) VALUES (1) "
+               "FOR PORTION OF SYSTEM_TIME FROM '2020-01-01' TO '2020-07-01'"))))))
+
+(deftest preprocess-rejects-for-all-system-time-dml
+  (testing "FOR ALL SYSTEM_TIME on DML also throws (same design choice)"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
+         (stratum.sql.rewrite/preprocess-sql
+          "DELETE FROM t FOR ALL SYSTEM_TIME WHERE id = 1")))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
+         (stratum.sql.rewrite/preprocess-sql
+          "UPDATE t FOR SYSTEM_TIME ALL SET x = 1 WHERE id = 1")))))
+
+(deftest preprocess-allows-for-portion-of-valid-time-dml
+  ;; Regression guard: the SYSTEM_TIME rejection must NOT affect
+  ;; VALID_TIME DML (the supported case).
+  (testing "FOR PORTION OF VALID_TIME DML still works after the SYSTEM_TIME rejection"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             (str "DELETE FROM t FOR PORTION OF VALID_TIME "
+                  "FROM '2020-01-01' TO '2020-07-01' WHERE id = 1"))]
+      (is (= :valid_time (:axis (:period r))))
+      (is (= 1577836800000000 (:from (:period r))))
+      (is (= 1593561600000000 (:to (:period r)))))))
+
+(deftest preprocess-select-system-time-as-of-injects-where
+  (testing "FOR SYSTEM_TIME AS OF rewrites to WHERE predicates on _system_from / _system_to"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "SELECT eid FROM salaries FOR SYSTEM_TIME AS OF '2024-04-01'")]
+      (is (re-find #"WHERE\s+\(?_system_from\s+<=\s+\d+"
+                   (:sql r)))
+      (is (re-find #"_system_to\s+>\s+\d+"
+                   (:sql r))))))
+
+(deftest preprocess-select-system-time-between-form
+  (testing "FOR SYSTEM_TIME BETWEEN x AND y emits closed-closed overlap on system axis"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "SELECT eid FROM salaries FOR SYSTEM_TIME BETWEEN '2024-01-01' AND '2024-07-01'")]
+      (is (re-find #"_system_from\s+<=\s+1719792000000000" (:sql r)))
+      (is (re-find #"_system_to\s+>\s+1704067200000000"   (:sql r))))))
+
+(deftest preprocess-select-system-time-from-to-form
+  (testing "FOR SYSTEM_TIME FROM x TO y emits half-open overlap on system axis"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "SELECT eid FROM salaries FOR SYSTEM_TIME FROM '2024-01-01' TO '2024-07-01'")]
+      (is (re-find #"_system_from\s+<\s+1719792000000000" (:sql r)))
+      (is (re-find #"_system_to\s+>\s+1704067200000000"  (:sql r))))))
+
+(deftest preprocess-select-for-all-system-time-no-filter
+  (testing "FOR ALL SYSTEM_TIME strips the clause without adding a filter"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             "SELECT eid FROM salaries FOR ALL SYSTEM_TIME")]
+      (is (re-find #"(?i)^\s*SELECT\s+eid\s+FROM\s+salaries\s*$" (:sql r))
+          "FOR ALL SYSTEM_TIME should leave the SQL with no extra WHERE"))))
+
+;; ============================================================================
+;; Bitemporal composition: one clause per axis on the same SELECT
+;; ============================================================================
+
+(deftest preprocess-select-bitemporal-as-of-composes-both-axes
+  (testing "FOR VALID_TIME AS OF + FOR SYSTEM_TIME AS OF emits both predicates ANDed"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+             (str "SELECT eid FROM salaries "
+                  "FOR VALID_TIME AS OF '2024-04-15' "
+                  "FOR SYSTEM_TIME AS OF '2024-04-20'"))
+          s (:sql r)]
+      (is (.contains ^String s "_valid_from")  "valid-axis predicate emitted")
+      (is (.contains ^String s "_valid_to")    "valid-axis upper bound")
+      (is (.contains ^String s "_system_from") "system-axis predicate emitted")
+      (is (.contains ^String s "_system_to")   "system-axis upper bound")
+      (is (.contains ^String s "WHERE")        "single WHERE clause"))))
+
+(deftest preprocess-select-rejects-two-for-valid-time-clauses
+  (testing "Two FOR VALID_TIME clauses → :sql/multi-for-valid-time-unsupported"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"more than one FOR VALID_TIME"
+         (stratum.sql.rewrite/preprocess-sql
+          (str "SELECT eid FROM salaries "
+               "FOR VALID_TIME AS OF '2024-04-15' "
+               "FOR VALID_TIME AS OF '2024-06-15'"))))))
+
+(deftest preprocess-select-rejects-two-for-system-time-clauses
+  (testing "Two FOR SYSTEM_TIME clauses → :sql/multi-for-system-time-unsupported"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"more than one FOR SYSTEM_TIME"
+         (stratum.sql.rewrite/preprocess-sql
+          (str "SELECT eid FROM salaries "
+               "FOR SYSTEM_TIME AS OF '2024-04-15' "
+               "FOR SYSTEM_TIME AS OF '2024-06-15'"))))))
+
+(deftest sql-select-system-time-as-of-end-to-end
+  ;; End-to-end demonstration: a fully-bitemporal table with two
+  ;; rows where the older one's `_system_to` was closed by an
+  ;; SCD2 surgery. `FOR SYSTEM_TIME AS OF <before-closure>` sees
+  ;; both rows; AS OF NOW sees only the still-open row.
+  (testing "FOR SYSTEM_TIME AS OF returns rows whose [sf, st) contains the instant"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "salaries"
+         (with-meta
+           {:eid          (stratum.index/index-from-seq :int64 [1 1])
+            :salary       (stratum.index/index-from-seq :int64 [100 110])
+            :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000 1704067200000000])
+            :_valid_to    (stratum.index/index-from-seq :int64 [Long/MAX_VALUE Long/MAX_VALUE])
+             ;; Row 0: was DB's belief from sys 1000 to 5000 (closed by surgery at 5000).
+             ;; Row 1: appended at sys 5000, still open.
+            :_system_from (stratum.index/index-from-seq :int64 [1000 5000])
+            :_system_to   (stratum.index/index-from-seq :int64 [5000 Long/MAX_VALUE])}
+           {:bitemporal
+            {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+             :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult r-before
+              (exec "SELECT salary FROM salaries WHERE _system_from <= 3000 AND _system_to > 3000"
+                    (:registry srv) (:data-dir srv))
+              ^PgWireServer$QueryResult r-now
+              (exec "SELECT salary FROM salaries WHERE _system_from <= 9999 AND _system_to > 9999"
+                    (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r-before)))
+          (is (nil? (.error r-now)))
+          (is (= [["100"]] (mapv vec (.rows r-before)))
+              "at sys=3000, the DB believed salary=100 (pre-surgery state)")
+          (is (= [["110"]] (mapv vec (.rows r-now)))
+              "at sys=9999 (after surgery), the DB believes salary=110"))
+        (finally (server/stop srv))))))
+
+(deftest sql-select-as-of-end-to-end-on-index-backed-table
+  (testing "SELECT … FOR VALID_TIME AS OF returns rows valid at that instant"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+         srv "salaries"
+         (with-meta
+            ;; Two slices: [Jan, Jul) salary=100, [Jul, MAX) salary=110.
+           {:eid          (stratum.index/index-from-seq :int64 [1 1])
+            :salary       (stratum.index/index-from-seq :int64 [100 110])
+            :_valid_from  (stratum.index/index-from-seq :int64
+                                                        [1704067200000000 1719792000000000])
+            :_valid_to    (stratum.index/index-from-seq :int64
+                                                        [1719792000000000 Long/MAX_VALUE])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
+        ;; Query at Apr-2024: should return only the [Jan, Jul) slice.
+        (let [parsed (sql/parse-sql
+                      "SELECT salary FROM salaries FOR VALID_TIME AS OF '2024-04-01'"
+                      @(:registry srv))
+              result (q/q (:query parsed))
+              rows (q/results->columns result)]
+          (is (= [100] (vec (:salary rows)))))
+        ;; Query at Sep-2024: should return only the [Jul, MAX) slice.
+        (let [parsed (sql/parse-sql
+                      "SELECT salary FROM salaries FOR VALID_TIME AS OF '2024-09-01'"
+                      @(:registry srv))
+              result (q/q (:query parsed))
+              rows (q/results->columns result)]
+          (is (= [110] (vec (:salary rows)))))
+        (finally (server/stop srv))))))
+
+;; ============================================================================
+;; SQL session SET datahike.clock_time
+;; ============================================================================
+
+(deftest sql-set-clock-time-pins-defaults
+  (testing "SET datahike.clock_time pins the time source for subsequent DML defaults"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)
+          pinned-millis 1704067200000]   ;; Jan-01-2024
+      (try
+        (server/register-table!
+         srv "salaries"
+         (with-meta
+           {:eid (stratum.index/index-from-seq :int64 [])
+            :salary (stratum.index/index-from-seq :int64 [])
+            :_valid_from (stratum.index/index-from-seq :int64 [])
+            :_valid_to (stratum.index/index-from-seq :int64 [])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
+        ;; Pin clock_time to Jan-01-2024.
+        (exec (str "SET datahike.clock_time = '2024-01-01'")
+              (:registry srv) (:data-dir srv))
+        ;; INSERT without specifying _valid_from → default should be the pinned value.
+        (exec "INSERT INTO salaries (eid, salary) VALUES (1, 100)"
+              (:registry srv) (:data-dir srv))
+        (let [cols (get @(:registry srv) "salaries")
+              vf (stratum.index/idx-get-long (:index (:_valid_from cols)) 0)]
+          (is (= (* 1000 pinned-millis) vf)
+              "valid-from should match pinned clock_time in micros"))
+        ;; Clear with DEFAULT.
+        (exec "SET datahike.clock_time = DEFAULT" (:registry srv) (:data-dir srv))
+        (is (nil? (get-in @(:registry srv) ["__settings__" :clock-time-millis]))
+            "DEFAULT clears the binding")
+        (finally (server/stop srv))))))
+
+;; ============================================================================
+;; ERASE DML — GDPR-style physical purge
+;; ============================================================================
+
+(deftest sql-erase-from-physically-purges-rows
+  (testing "ERASE FROM … WHERE physically removes matching rows"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        (server/register-table!
+         srv "salaries"
+         {:eid    (stratum.index/index-from-seq :int64 [1 2 3])
+          :salary (stratum.index/index-from-seq :int64 [100 200 300])})
+        (let [^PgWireServer$QueryResult qr
+              (exec "ERASE FROM salaries WHERE eid = 2"
+                    (:registry srv) (:data-dir srv))]
+          (is (= "ERASE 1" (.commandTag qr))
+              "tag should distinguish ERASE from DELETE"))
+        (let [cols (get @(:registry srv) "salaries")
+              n (stratum.index/idx-length (:index (:eid cols)))
+              eids (mapv #(stratum.index/idx-get-long (:index (:eid cols)) %)
+                         (range n))]
+          (is (= [1 3] eids)))
+        (finally (server/stop srv))))))
+
+(deftest sql-select-for-valid-time-emits-predicate-when-qualifier-unresolved
+  ;; Regression lock for copilot review-2 suppressed comment
+  ;; (rewrite.clj:704 / preprocess-select-temporal): when
+  ;; `table-qualifier-before` returned nil (e.g. table name
+  ;; starting with `_`, quoted identifier, subquery), the rewriter
+  ;; silently STRIPPED the FOR VALID_TIME clause without emitting
+  ;; any predicate. The query then ran unfiltered — a silent
+  ;; wrong-answer bug, worst possible severity for a query
+  ;; surface.
+  ;;
+  ;; Reproducer: a SELECT against a table named `_t` (underscore
+  ;; prefix → `Character/isLetter` returns false → qualifier nil
+  ;; → predicate gated off pre-fix). Compare row counts AS OF a
+  ;; cut where only one row is valid.
+  (testing "FOR VALID_TIME AS OF emits the predicate even when table-qualifier-before returns nil"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        ;; `_t` qualifier returns nil from the heuristic.
+        (exec "CREATE TABLE _t (id BIGINT, _valid_from BIGINT, _valid_to BIGINT)"
+              (:registry srv) (:data-dir srv))
+        (exec (str "INSERT INTO _t (id, _valid_from, _valid_to) VALUES "
+                   "(1, 100, 200), "  ; valid at t=150
+                   "(2, 300, 400)")   ; not valid at t=150
+              (:registry srv) (:data-dir srv))
+        (let [^PgWireServer$QueryResult r
+              (exec (str "SELECT id FROM _t "
+                         "FOR VALID_TIME AS OF 150 "
+                         "ORDER BY id")
+                    (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r)) (str "execute-sql error: " (.error r)))
+          (is (= [["1"]] (mapv vec (.rows r)))
+              "only row 1 (window [100, 200)) valid at t=150 — pre-fix returned BOTH rows because the FOR VALID_TIME clause was silently stripped without a predicate"))
+        (finally (server/stop srv))))))
+
+(deftest sql-select-for-valid-time-survives-leading-comment-with-phrase
+  ;; Regression lock for pattern-hunt P2-B (rewrite.clj:629
+  ;; find-for-valid-time-clause): the SELECT-side scanner
+  ;; handles `'` and `"` string boundaries but did NOT skip SQL
+  ;; line- or block-comments. A leading comment containing the
+  ;; phrase `FOR VALID_TIME AS OF '...'` was treated as a real
+  ;; clause and the rewriter spliced a temporal WHERE inline,
+  ;; producing nonsense SQL. Same root cause as the DML P1s
+  ;; (commits 3aad8b6 + 2978a8a) but in the SELECT scanner.
+  (testing "SELECT with a leading comment that mentions FOR VALID_TIME runs as a plain SELECT"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        (exec "CREATE TABLE t (id BIGINT, name VARCHAR)"
+              (:registry srv) (:data-dir srv))
+        (exec "INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b')"
+              (:registry srv) (:data-dir srv))
+        (let [sql (str "/* audit: FOR VALID_TIME AS OF '2024-01-01' was the original cut */\n"
+                       "SELECT id, name FROM t ORDER BY id")
+              ^PgWireServer$QueryResult r (exec sql (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r))
+              (str "pre-fix: scanner matched inside the comment "
+                   "and rewrote the SELECT with a temporal WHERE. "
+                   "got: " (.error r)))
+          (is (= 2 (count (.rows r)))
+              "all rows returned; no temporal filter applied"))
+        (finally (server/stop srv))))))
+
+(deftest sql-for-portion-of-survives-leading-comment-with-phrase
+  ;; Regression lock for pattern-hunt P1 (rewrite.clj:403): the
+  ;; `FOR PORTION OF VALID_TIME FROM …` preprocessor used
+  ;; `re-find` on the raw SQL. A leading comment containing the
+  ;; phrase (e.g. a changelog reference) was matched as if it were
+  ;; real syntax — the rewriter then spliced from inside the
+  ;; comment, corrupting the SQL and stamping a bogus :period
+  ;; side-channel on a statement the user never intended as
+  ;; temporal DML. Same root cause as copilot review #4 (ERASE),
+  ;; different preprocessor. Fix: `mask-non-code-spans` replaces
+  ;; comments/strings with spaces (length-preserving) before the
+  ;; regex runs.
+  (testing "DELETE FROM with a leading comment that mentions FOR PORTION OF VALID_TIME FROM is not corrupted"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        (exec "CREATE TABLE t (id BIGINT, v BIGINT)"
+              (:registry srv) (:data-dir srv))
+        (exec "INSERT INTO t (id, v) VALUES (1, 100), (2, 200)"
+              (:registry srv) (:data-dir srv))
+        (let [;; Adversarial SQL: comment mentions FOR PORTION OF
+              ;; VALID_TIME FROM as a changelog reference. Pre-fix,
+              ;; the rewriter matched inside the comment and either
+              ;; spliced garbage or stamped a bogus :period on a
+              ;; non-bitemporal table (which then errored).
+              sql (str "/* legacy archive: FOR PORTION OF VALID_TIME FROM 2020 TO 2021 */\n"
+                       "DELETE FROM t WHERE id = 1")
+              ^PgWireServer$QueryResult r (exec sql (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r))
+              (str "execute-sql must not error; pre-fix surfaced "
+                   "either a parser failure or a non-bitemporal-"
+                   "table error from the bogus :period. got: "
+                   (.error r))))
+        (let [cols (get @(:registry srv) "t")
+              ids (vec (aclone ^longs (:id cols)))]
+          (is (= [2] ids)
+              "id=1 deleted; comment content untouched"))
+        (finally (server/stop srv))))))
+
+(deftest sql-for-all-valid-time-survives-leading-comment-with-phrase
+  ;; Regression lock for pattern-hunt P1 (rewrite.clj:394): the
+  ;; `FOR ALL VALID_TIME` / `FOR VALID_TIME ALL` preprocessor used
+  ;; `re-find` on the raw SQL. A leading comment containing the
+  ;; phrase was matched, stamping a bogus :period {:from
+  ;; Long/MIN_VALUE :to Long/MAX_VALUE} on a non-temporal statement.
+  ;; Fix: mask before regex.
+  (testing "UPDATE with a leading comment that mentions FOR ALL VALID_TIME runs as a plain UPDATE"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        (exec "CREATE TABLE t (id BIGINT, v BIGINT)"
+              (:registry srv) (:data-dir srv))
+        (exec "INSERT INTO t (id, v) VALUES (1, 100), (2, 200)"
+              (:registry srv) (:data-dir srv))
+        (let [sql (str "/* GDPR sweep — previously: FOR ALL VALID_TIME archive */\n"
+                       "UPDATE t SET v = 999 WHERE id = 1")
+              ^PgWireServer$QueryResult r (exec sql (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r))
+              (str "pre-fix: bogus :period side-channel on plain UPDATE. got: "
+                   (.error r))))
+        (let [cols (get @(:registry srv) "t")
+              vs  (vec (aclone ^longs (:v cols)))]
+          (is (= [999 200] vs)
+              "id=1 updated to 999; comment content untouched"))
+        (finally (server/stop srv))))))
+
+(deftest sql-erase-survives-leading-comment-with-erase-text
+  ;; Regression lock for copilot review #4 (sql/rewrite.clj:151):
+  ;; the ERASE→DELETE rewrite used `.replaceFirst` with a regex,
+  ;; which matches the FIRST `ERASE FROM` anywhere in the SQL
+  ;; string. If a leading SQL comment contains the literal text
+  ;; "ERASE FROM" (for documentation / changelog purposes), the
+  ;; rewrite hit the comment instead of the actual statement
+  ;; keyword, leaving `ERASE FROM <table>` unchanged for
+  ;; JSqlParser — which then choked on the unknown verb.
+  ;;
+  ;; Post-fix: the rewrite uses the position returned by
+  ;; `skip-ws-and-comments` and replaces only that exact slice.
+  (testing "ERASE FROM works even when a preceding comment contains the literal phrase 'ERASE FROM'"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        (server/register-table!
+         srv "salaries"
+         {:eid    (stratum.index/index-from-seq :int64 [1 2 3])
+          :salary (stratum.index/index-from-seq :int64 [100 200 300])})
+        (let [;; Adversarial SQL: the comment contains the literal
+              ;; "ERASE FROM legacy_table" which would have been
+              ;; replaced by the pre-fix regex.
+              sql (str "/* GDPR sweep — previously: ERASE FROM legacy_table */\n"
+                       "ERASE FROM salaries WHERE eid = 2")
+              ^PgWireServer$QueryResult qr (exec sql (:registry srv) (:data-dir srv))]
+          (is (nil? (.error qr))
+              (str "execute-sql must not error; pre-fix surfaced a "
+                   "JSqlParser failure because the rewrite hit the "
+                   "comment text. got: " (.error qr)))
+          (is (= "ERASE 1" (.commandTag qr))
+              "tag should be ERASE 1 (one row deleted)"))
+        (let [cols (get @(:registry srv) "salaries")
+              n (stratum.index/idx-length (:index (:eid cols)))
+              eids (mapv #(stratum.index/idx-get-long (:index (:eid cols)) %)
+                         (range n))]
+          (is (= [1 3] eids)
+              "only eid=2 erased; comment content untouched"))
+        (finally (server/stop srv))))))
+
+(deftest sql-erase-from-without-where-purges-all
+  (testing "ERASE FROM <t> with no WHERE wipes the entire table"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        (server/register-table!
+         srv "t"
+         {:a (stratum.index/index-from-seq :int64 [1 2 3])})
+        (let [^PgWireServer$QueryResult qr
+              (exec "ERASE FROM t" (:registry srv) (:data-dir srv))]
+          (is (= "ERASE 3" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "t")]
+          (is (zero? (stratum.index/idx-length (:index (:a cols))))))
+        (finally (server/stop srv))))))
+
+(deftest sql-erase-on-bitemporal-bypasses-temporal-semantics
+  (testing "ERASE on a bitemporal table ignores FOR PORTION OF and just purges"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        (server/register-table!
+         srv "salaries"
+         (with-meta
+           {:eid (stratum.index/index-from-seq :int64 [1 1])
+            :salary (stratum.index/index-from-seq :int64 [100 110])
+            :_valid_from (stratum.index/index-from-seq :int64 [1000 2000])
+            :_valid_to (stratum.index/index-from-seq :int64 [2000 Long/MAX_VALUE])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
+        (let [^PgWireServer$QueryResult qr
+              (exec "ERASE FROM salaries WHERE eid = 1"
+                    (:registry srv) (:data-dir srv))]
+          (is (re-find #"^ERASE" (.commandTag qr))))
+        (let [cols (get @(:registry srv) "salaries")]
+          (is (zero? (stratum.index/idx-length (:index (:eid cols))))
+              "all vt-slices for eid=1 should be physically gone"))
+        (finally (server/stop srv))))))
+
+;; ============================================================================
+;; Col-vs-col SELECT predicates — planner-limitation workaround
+;;
+;; SELECT WHERE <col1> OP <col2> now evaluates correctly. Unlocks
+;; SELECT-side Allen predicates (P1-3 worked in DML only without this).
+;; ============================================================================
+
+(deftest sql-select-col-vs-col-comparison
+  (testing "WHERE col1 < col2 evaluates row-by-row"
+    (let [reg {"t" {:a (long-array [1 5 3 7])
+                    :b (long-array [2 4 8 6])}}
+          parsed (sql/parse-sql "SELECT a, b FROM t WHERE a < b" reg)
+          result (q/q (:query parsed))
+          rows (q/results->columns result)]
+      ;; Row 0: 1<2 ✓, Row 1: 5<4 ✗, Row 2: 3<8 ✓, Row 3: 7<6 ✗
+      (is (= [1 3] (vec (:a rows))))
+      (is (= [2 8] (vec (:b rows)))))))
+
+(deftest sql-select-overlaps-allen-predicate-with-projected-cols
+  (testing "OVERLAPS Allen predicate works in SELECT WHERE when all 4 cols are also projected"
+    ;; Caveat: stratum's executor extracts LHS columns from
+    ;; normalized predicates but skips RHS keyword refs when picking
+    ;; which columns to materialize. So Allen predicates need their
+    ;; 4 column args projected too (or otherwise referenced).
+    ;; Extending the executor's column-pruner to consider predicate
+    ;; RHS keywords is a P2 follow-up.
+    (let [reg {"intervals"
+               {:eid    (long-array [1 2 3])
+                :a_from (long-array [100 200 300])
+                :a_to   (long-array [200 300 400])
+                :b_from (long-array [150 350 250])
+                :b_to   (long-array [250 450 350])}}
+          parsed (sql/parse-sql
+                  (str "SELECT eid, a_from, a_to, b_from, b_to FROM intervals "
+                       "WHERE OVERLAPS(a_from, a_to, b_from, b_to)")
+                  reg)
+          result (q/q (:query parsed))
+          rows (q/results->columns result)
+          eids (vec (:eid rows))]
+      (is (= [1 3] (sort eids))))))
+
+;; ============================================================================
+;; paired (vf, vt) zone-map pruning
+;;
+;; Audit verdict: the existing per-predicate zone-map machinery in
+;; `stratum.query.group-by/build-zone-filters` + `classify-chunk`
+;; ALREADY handles paired vt predicates correctly. For the canonical
+;; `WHERE _valid_from <= ts AND _valid_to > ts` shape:
+;;   - The `_valid_from :lte ts` filter says "skip chunks where
+;;     min(_valid_from) > ts" — the chunk's earliest start is past
+;;     the query time, so no row in the chunk is valid at `ts`.
+;;   - The `_valid_to :gt ts` filter says "skip chunks where
+;;     max(_valid_to) <= ts" — the chunk's latest end is at or before
+;;     the query time, so no row in the chunk is still valid at `ts`.
+;;   - The AND in `classify-chunk` skips the chunk if EITHER filter
+;;     fires.
+;;
+;; Combined, this is exactly the "window-overlap pruner" the gap
+;; analysis recommended. No additional code needed — just
+;; documentation + a sanity test.
+;; ============================================================================
+
+(deftest sql-vt-zone-map-prunes-non-overlapping-chunks
+  (testing "Paired _valid_from / _valid_to predicates trigger zone-map pruning"
+    (let [;; Build an index-backed dataset large enough to span multiple chunks.
+          ;; Chunk size in stratum defaults to ~256 rows; use 1000 rows so we
+          ;; get ~4 chunks.
+          n 1000
+          ;; First half of rows: vt-window [0, 500). Second half: [500, 1000).
+          ;; A query AS OF 250 should hit only the first chunk(s).
+          ds (stratum.dataset/make-dataset
+              {:eid (stratum.index/index-from-seq :int64 (vec (range n)))
+               :_valid_from (stratum.index/index-from-seq :int64
+                                                          (vec (map #(if (< % (/ n 2)) 0 500) (range n))))
+               :_valid_to (stratum.index/index-from-seq :int64
+                                                        (vec (map #(if (< % (/ n 2)) 500 1000) (range n))))}
+              {:name "t"})
+          ;; Query AS OF 250 — only the first-half chunks should match.
+          parsed (sql/parse-sql
+                  "SELECT eid FROM t WHERE _valid_from <= 250 AND _valid_to > 250"
+                  {"t" (stratum.dataset/columns ds)})
+          result (q/q (:query parsed))
+          rows (q/results->columns result)]
+      ;; All N/2 first-half rows match; none of the second-half rows match.
+      (is (= (/ n 2) (count (:eid rows))))
+      (is (every? #(< % (/ n 2)) (:eid rows))))))

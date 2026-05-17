@@ -25,16 +25,57 @@
 ;; GC / Sync Coordination Lock
 ;; ============================================================================
 
-(def ^:private gc-lock
-  "Lock to serialize GC with sync operations. Prevents concurrent ds-sync!
-   and ds-gc! from racing (sync writes chunks that GC hasn't yet seen)."
-  (Object.))
+(def ^:private store-locks
+  "Per-store GC/sync coordination locks, keyed by the store
+   reference itself. Map identity follows the store's `.equals`
+   semantics:
+
+   - Konserve memory store / typical deftypes: default Object
+     equality (identity) → distinct instances get distinct locks.
+   - File-store / S3-store records with content-based equality:
+     two instances configured against the same backing storage
+     share a lock — which is what we want (they protect the same
+     physical data).
+
+   Worst case for an oddly-implemented backend is two locks
+   collapsed into one (over-locking, safe). Under-locking is
+   impossible: distinct keys always get distinct locks.
+
+   Stratum apps typically run with a small bounded set of stores
+   per JVM (often one), so we don't worry about cleanup. Inspect
+   the current set via `(locked-stores)`."
+  (java.util.concurrent.ConcurrentHashMap.))
+
+(defn- store-lock
+  "Lazily allocate (or return) the Object monitor associated with
+   `store`. Same store across calls → same Object. The
+   `putIfAbsent` cycle resolves the racy double-allocation."
+  [store]
+  (or (.get ^java.util.concurrent.ConcurrentHashMap store-locks store)
+      (let [o (Object.)
+            existing (.putIfAbsent ^java.util.concurrent.ConcurrentHashMap store-locks store o)]
+        (or existing o))))
 
 (defn with-storage-lock
-  "Execute f while holding the GC/sync coordination lock.
-   Used by ds-sync! to prevent concurrent GC from deleting freshly written chunks."
-  [f]
-  (locking gc-lock (f)))
+  "Execute f while holding the per-store GC/sync coordination
+   lock. Used by `ds-sync!` and `gc!` so that on a single store
+   the two cannot interleave: `gc!`'s mark phase walks branch
+   heads to determine reachability, then sweeps unreachable PSS
+   nodes. If `ds-sync!` writes a fresh chunk between mark and
+   sweep, the sweep would otherwise delete a node referenced by
+   the just-updated branch head, corrupting the dataset.
+
+   Different stores never block each other."
+  [store f]
+  (locking (store-lock store) (f)))
+
+(defn locked-stores
+  "Returns the set of stores that have an allocated coordination
+   lock (i.e. have ever been passed to `with-storage-lock` in
+   this JVM). For introspection / debugging — the keys are the
+   actual store references."
+  []
+  (set (.keySet ^java.util.concurrent.ConcurrentHashMap store-locks)))
 
 ;; ============================================================================
 ;; Commit ID Generation
@@ -189,7 +230,8 @@
 
    Returns: map with :deleted-pss-nodes, :deleted-index-commits, :deleted-dataset-commits counts."
   [store]
-  (locking gc-lock
+  (with-storage-lock store
+    (fn []
     (let [;; 1. Find all branches and their HEAD commits
           branches (or (list-dataset-branches store) #{})
 
@@ -236,7 +278,7 @@
        :deleted-dataset-commits (count dead-ds-commits)
        :kept-pss-nodes (count reachable-pss-addrs)
        :kept-index-commits (count reachable-idx-commits)
-       :kept-dataset-commits (count reachable-ds-commits)})))
+       :kept-dataset-commits (count reachable-ds-commits)}))))
 
 ;; ============================================================================
 ;; Temporal Lookups

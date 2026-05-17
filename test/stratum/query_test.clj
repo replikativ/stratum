@@ -2585,6 +2585,42 @@
                        :agg [[:count]]})]
       (is (= 3 (long (:count (first result))))))))
 
+(deftest grouped-sum-min-max-avg-excludes-long-null-sentinel
+  ;; Regression lock for round-3 agent P0: the parallel-grouped
+  ;; aggregator path (group_by.clj :sum/:min/:max/:avg in the
+  ;; HashMap-based grouped reducer) used only `(when (== v v))`
+  ;; NaN-guard. But `aget-col` on a long col returns `(double
+  ;; Long/MIN_VALUE) = -9.22e18` for the NULL sentinel — a real
+  ;; double, not NaN — so NULLs slipped past the guard. SUM was
+  ;; dragged by ~9e18 per NULL, MIN read it as the minimum, AVG
+  ;; corrupted both numerator and denominator. Fix added the same
+  ;; dual check `count-non-null` already used (NaN OR long-sentinel).
+  ;;
+  ;; Reproducer: GROUP BY a key column, aggregate a long column
+  ;; containing Long/MIN_VALUE sentinels. Expected: NULLs skipped.
+  (testing "grouped SUM/MIN/MAX/AVG over a long col with NULL sentinels skip the NULL rows"
+    (let [data {:g (long-array [1 1 1 2 2 2])
+                :v (long-array [10 Long/MIN_VALUE 20 100 Long/MIN_VALUE 200])}
+          result (q/q {:from data
+                       :group [:g]
+                       :agg [[:sum :v] [:min :v] [:max :v] [:avg :v]
+                             [:count-non-null :v]]
+                       :order [[:g :asc]]})
+          g1 (first result)
+          g2 (second result)]
+      (testing "group g=1: rows v=10, NULL, 20 — non-null sum=30 min=10 max=20 avg=15 count=2"
+        (is (= 30.0 (double (:sum g1))))
+        (is (= 10.0 (double (:min g1))))
+        (is (= 20.0 (double (:max g1))))
+        (is (= 15.0 (double (:avg g1))))
+        (is (= 2 (long (:count-non-null g1)))))
+      (testing "group g=2: rows v=100, NULL, 200 — non-null sum=300 min=100 max=200 avg=150 count=2"
+        (is (= 300.0 (double (:sum g2))))
+        (is (= 100.0 (double (:min g2))))
+        (is (= 200.0 (double (:max g2))))
+        (is (= 150.0 (double (:avg g2))))
+        (is (= 2 (long (:count-non-null g2))))))))
+
 (deftest is-null-with-filter-test
   (testing "IS NULL combined with other predicates"
     (let [data {:a (double-array [1.0 Double/NaN 3.0 Double/NaN 5.0])

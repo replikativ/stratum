@@ -112,11 +112,18 @@
                   `(let [~'v (aget ~sym (int ~'i))]
                      (and ~@(mapv (fn [v] `(not= ~'v ~v)) code-vals)))
                   `true))
+              ;; Pre-fix (round-4 agent P1 #4.1): a NULL row passed
+              ;; `NOT IN (1, 2)` because `(not= Long/MIN_VALUE 1)`
+              ;; is true. PG 3VL says `NULL NOT IN (...)` is NULL
+              ;; (falsy). Gate on the sentinel before the
+              ;; conjunction so NULL rows are excluded.
               (if long-col?
                 `(let [~'v (aget ~sym (int ~'i))]
-                   (and ~@(mapv (fn [v] `(not= ~'v ~(long v))) (sort vals))))
+                   (and (not= ~'v Long/MIN_VALUE)
+                        ~@(mapv (fn [v] `(not= ~'v ~(long v))) (sort vals))))
                 `(let [~'v (aget ~sym (int ~'i))]
-                   (and ~@(mapv (fn [v] `(not= ~'v ~(double v))) (sort vals)))))))))
+                   (and (not (Double/isNaN ~'v))
+                        ~@(mapv (fn [v] `(not= ~'v ~(double v))) (sort vals)))))))))
 
       ;; Simple comparison ops (fallback for preds on missing columns etc.)
       (:lt :gt :lte :gte :eq :neq :range :not-range)
@@ -200,7 +207,21 @@
                           :or (doseq [sub (subvec p 2)] (walk-pred sub))
                           :fn (swap! all-cols conj (first p))
                           (:in :not-in) (swap! all-cols conj (first p))
-                          (when (keyword? (first p)) (swap! all-cols conj (first p))))))]
+                          (do
+                            (when (keyword? (first p))
+                              (swap! all-cols conj (first p)))
+                            ;; Scan RHS args for keyword col-vs-col
+                            ;; refs — `[:_valid_from :lt :_valid_to]`
+                            ;; references BOTH cols. Pre-fix only LHS
+                            ;; was tracked; pruning trimmed RHS and
+                            ;; the compiled mask hit a missing col-sym
+                            ;; at compile time. Same shape as the
+                            ;; `pred-columns` fix in plan.clj (copilot
+                            ;; review #3); round-3 agent found this
+                            ;; duplicate walker still buggy.
+                            (doseq [a (subvec p 2)]
+                              (when (keyword? a)
+                                (swap! all-cols conj a)))))))]
               (doseq [p non-simd-preds] (walk-pred p)))
           needed-cols (vec (filterv #(contains? columns %) @all-cols))
 

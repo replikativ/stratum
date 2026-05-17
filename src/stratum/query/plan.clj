@@ -35,7 +35,7 @@
             PFusedExtractCount PBitmapSemiJoin PHashJoin
             PPerfectHashJoin PAsofJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
             PProject PWindow PHaving PSort PDistinct PLimit
-            PMaterializeExpr]))
+            PMaterializeExpr PRecompose]))
 
 (set! *warn-on-reflection* true)
 
@@ -385,17 +385,30 @@
 ;; ============================================================================
 
 (defn- pred-columns
-  "Set of column keywords referenced by a normalized predicate (recursive)."
+  "Set of column keywords referenced by a normalized predicate (recursive).
+
+   Includes both the LHS column (`first pred`) and any keyword RHS
+   args (col-vs-col predicates like `[:_valid_from :lt :_valid_to]`).
+   Without scanning RHS args, column-pruning trims the RHS column
+   from the projected col-arrays map, and `eval-pred-scalar`'s
+   `resolve-arg` then NPEs on `(aget ^doubles other i)` because
+   `(get col-arrays :_valid_to)` returned nil. Copilot review #3."
   [pred]
   (let [op (second pred)]
     (case op
       :or (into #{} (mapcat pred-columns) (subvec pred 2))
       (:in :not-in :fn) (let [c (first pred)] (if (keyword? c) #{c} #{}))
-      (let [col (first pred)]
-        (if (map? col)
-          ;; Expression predicate like [:> {:op :mul :args [:a :b]} 1000]
-          (into #{} (filter keyword?) (:args col))
-          (if (keyword? col) #{col} #{}))))))
+      (let [col (first pred)
+            base (cond
+                   (map? col)     (into #{} (filter keyword?) (:args col))
+                   (keyword? col) #{col}
+                   :else          #{})
+            ;; Scan RHS args (everything from index 2 onward) for
+            ;; keyword column refs — `:lt`/`:gt`/`:eq`/etc accept
+            ;; a literal OR a column ref on the RHS; `:range` and
+            ;; `:not-range` accept two such args.
+            args (subvec pred 2)]
+        (into base (filter keyword?) args)))))
 
 (defn- classify-pred-by-side
   "Classify a predicate as :left, :right, or :cross based on which join side
@@ -868,6 +881,31 @@
                   {:linear-recipe recipe})))))
         agg)))
 
+(defn smcs-decomposition
+  "Rewrite `LGlobalAgg` and `LGroupBy` aggs of the form `SUM(a*(c-b))`
+   into `c*SUM(a) - SUM_PRODUCT(a,b)` and wrap the node in `PRecompose`.
+
+   Runs BEFORE `expr-materialization` so the compound expression never
+   gets materialized as a temp column — the decomposed aggs reference
+   `a` and `b` directly, which on indexed inputs keeps the L2-resident
+   chunked group-by streaming path eligible. `execute-chunked-group-by`
+   would do the same rewrite itself, but only sees aggs after the
+   planner has replaced their `:expr` with `:col` refs to the
+   materialized temp column — too late for the rewrite to fire."
+  [plan]
+  (ir/walk-plan plan
+                (fn [node]
+                  (cond
+                    (or (instance? LGlobalAgg node)
+                        (instance? LGroupBy node))
+                    (if-let [decomp (gb/decompose-smcs-aggs (:aggs node))]
+                      (ir/->PRecompose
+                       (:mapping decomp)
+                       (:aggs node)
+                       (assoc node :aggs (:aggs decomp)))
+                      node)
+                    :else node))))
+
 (defn linear-agg-rewrite
   "Rewrite `LGlobalAgg` and `LGroupBy` aggs of the form
    `SUM/AVG/MIN/MAX(s·x + o)` into the base agg on `x` plus a recipe
@@ -1060,8 +1098,11 @@
         ;; After expr-materialization, agg :col may reference temp columns
         ;; that don't exist in the scan. Stats-only and chunked paths need
         ;; real index-backed columns.
-        agg-cols-in-scan? (every? #(or (= :count (:op %))
-                                       (contains? columns (:col %)))
+        agg-cols-in-scan? (every? (fn [a]
+                                    (or (= :count (:op a))
+                                        (and (:col a) (contains? columns (:col a)))
+                                        (and (:cols a)
+                                             (every? #(contains? columns %) (:cols a)))))
                                   aggs)
         ;; Cost-aware: estimate predicate selectivity
         selectivity (when (seq preds)
@@ -2146,6 +2187,13 @@
                 ;; so the rewritten `LHaving (LWindow ...)` shape is the
                 ;; one strategy-selection sees.
                 window-having-pushdown
+                ;; Algebraic rewrite of `SUM(a·(c−b))` → `c·SUM(a) −
+                ;; SUM_PRODUCT(a,b)`, wrapped in PRecompose for output
+                ;; reassembly. Runs BEFORE expr-materialization so the
+                ;; SMCS pattern matches its `:expr` shape (after that
+                ;; pass, exprs are gone). Disjoint from linear-agg-rewrite:
+                ;; linear matches `s·x + o`, SMCS matches `a·(c−b)`.
+                smcs-decomposition
                 ;; Algebraic rewrite of `SUM/AVG/MIN/MAX(s·col + o)` → base
                 ;; agg on `col` + decode-time recipe. Runs BEFORE
                 ;; expr-materialization so the temp-column shim is
@@ -2459,6 +2507,12 @@
      [["Column" (name (:col-name node))]
       ["Expr"   (format-col-or-expr (:expr node))]
       (when (:target node) ["Target" (name (:target node))])]
+
+     (instance? PRecompose node)
+     [["SMCS Recompose"
+       (let [n (count (filter #(= :sum-mul-const-sub (:type (val %)))
+                              (:mapping node)))]
+         (str n " agg(s)"))]]
 
      (instance? LScan node)
      [(d-columns (:columns node))

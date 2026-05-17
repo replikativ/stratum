@@ -8,7 +8,7 @@
             [stratum.chunk :as chunk]
             [stratum.stats :as stats]
             [org.replikativ.persistent-sorted-set :as pss])
-  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsChunked ColumnOpsAnalytics ColumnOpsVar]
+  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsChunked ColumnOpsAnalytics ColumnOpsVar ColumnOpsTemporal]
            [stratum.index ChunkEntry]))
 
 (set! *warn-on-reflection* true)
@@ -369,8 +369,8 @@
                       :minute      (* (Math/floorDiv v 60000000) 60000000)
                       :hour        (* (Math/floorDiv v 3600000000) 3600000000)
                       :day         (* (Math/floorDiv v 86400000000) 86400000000)
-                      :year        (let [^longs r (ColumnOps/arrayDateTruncYearMicros (long-array [v]) 1)] (aget r 0))
-                      :month       (let [^longs r (ColumnOps/arrayDateTruncMonthMicros (long-array [v]) 1)] (aget r 0)))
+                      :year        (let [^longs r (ColumnOpsTemporal/arrayDateTruncYearMicros (long-array [v]) 1)] (aget r 0))
+                      :month       (let [^longs r (ColumnOpsTemporal/arrayDateTruncMonthMicros (long-array [v]) 1)] (aget r 0)))
                     :seconds
                     (case unit
                       :second v
@@ -399,8 +399,8 @@
                       :minutes      (+ v (* (long n) 60000000))
                       :hours        (+ v (* (long n) 3600000000))
                       :days         (+ v (* (long n) 86400000000))
-                      :months       (let [^longs r (ColumnOps/arrayDateAddMonthsMicros (long-array [v]) (int n) 1)] (aget r 0))
-                      :years        (let [^longs r (ColumnOps/arrayDateAddMonthsMicros (long-array [v]) (int (* n 12)) 1)] (aget r 0)))
+                      :months       (let [^longs r (ColumnOpsTemporal/arrayDateAddMonthsMicros (long-array [v]) (int n) 1)] (aget r 0))
+                      :years        (let [^longs r (ColumnOpsTemporal/arrayDateAddMonthsMicros (long-array [v]) (int (* n 12)) 1)] (aget r 0)))
                     :seconds
                     (case unit
                       :days    (+ v (* (long n) 86400))
@@ -444,7 +444,7 @@
                     (case unit
                       :days   (* (Math/floorDiv v width) width)
                       :weeks  (* (Math/floorDiv v (* width 7)) (* width 7))
-                      :months (let [^longs r (ColumnOps/arrayTimeBucketMonths (long-array [v]) (int width) 1)]
+                      :months (let [^longs r (ColumnOpsTemporal/arrayTimeBucketMonths (long-array [v]) (int width) 1)]
                                 (aget r 0))))))
 
         :date-diff
@@ -633,24 +633,38 @@
                 (let [sub-col (first sub-pred)]
                   (eval-pred-scalar col-arrays i sub-pred)))
               sub-preds))
-      ;; Standard predicate — all arguments are numeric (dict args pre-encoded)
+      ;; Standard predicate. The LHS is either a column ref (keyword
+      ;; or pre-resolved column-data) or an expression result; each
+      ;; RHS arg is either a numeric literal, a string, a set (for
+      ;; `:in`), or — when the predicate compares two columns —
+      ;; another keyword to be resolved per-row. The arg-resolver
+      ;; handles the col-vs-col case; column predicates
+      ;; like `[:_valid_from :lt :_valid_to]` then evaluate correctly
+      ;; in SELECT WHERE clauses, not just DML.
       (let [col-data (if (keyword? col-ref) (get col-arrays col-ref) col-ref)
             v (if (expr/long-array? col-data)
                 (aget ^longs col-data i)
                 (aget ^doubles col-data i))
-            args (subvec pred 2)]
+            args (subvec pred 2)
+            resolve-arg (fn [a]
+                          (if (keyword? a)
+                            (let [other (get col-arrays a)]
+                              (if (expr/long-array? other)
+                                (aget ^longs other i)
+                                (aget ^doubles other i)))
+                            a))]
         (case op
-          :lt    (< (double v) (double (first args)))
-          :gt    (> (double v) (double (first args)))
-          :lte   (<= (double v) (double (first args)))
-          :gte   (>= (double v) (double (first args)))
-          :eq    (== (double v) (double (first args)))
-          :neq   (not (== (double v) (double (first args))))
-          :range (let [lo (double (first args))
-                       hi (double (second args))]
+          :lt    (< (double v) (double (resolve-arg (first args))))
+          :gt    (> (double v) (double (resolve-arg (first args))))
+          :lte   (<= (double v) (double (resolve-arg (first args))))
+          :gte   (>= (double v) (double (resolve-arg (first args))))
+          :eq    (== (double v) (double (resolve-arg (first args))))
+          :neq   (not (== (double v) (double (resolve-arg (first args)))))
+          :range (let [lo (double (resolve-arg (first args)))
+                       hi (double (resolve-arg (second args)))]
                    (and (>= (double v) lo) (<= (double v) hi)))
-          :not-range (let [lo (double (first args))
-                           hi (double (second args))]
+          :not-range (let [lo (double (resolve-arg (first args)))
+                           hi (double (resolve-arg (second args)))]
                        (or (< (double v) lo) (> (double v) hi)))
           :in    (let [s (first args)]
                    (if (every? number? s)
@@ -3434,28 +3448,59 @@
                                              (= (aget ^longs col-data (int i)) Long/MIN_VALUE)))]
                         (when-not is-null
                           (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
+                      ;; SUM/MIN/MAX/AVG previously used only the
+                      ;; `(== v v)` NaN guard. But `aget-col` on a
+                      ;; long column returns `(double Long/MIN_VALUE)`
+                      ;; = -9.22e18 for the NULL sentinel — a real
+                      ;; number, not NaN. So long-NULLs slipped in:
+                      ;; SUM was dragged by ~9e18 per NULL row, MIN
+                      ;; read it as the minimum, AVG corrupted both
+                      ;; numerator and denominator. Match the dual
+                      ;; check `count-non-null` (above) already uses.
+                      ;; (Round-3 agent P0; narrow fix at the
+                      ;; parallel-grouped sites — sequential
+                      ;; aggregators at 740+ already had the dual
+                      ;; check.)
                       :sum
-                      (let [v (if-let [expr (:expr agg)]
+                      (let [col-data (when (:col agg) (get col-arrays (:col agg)))
+                            v (if-let [expr (:expr agg)]
                                 (eval-agg-expr expr col-arrays i)
-                                (aget-col (get col-arrays (:col agg)) i))]
-                        (when (== v v) ;; skip NaN (SQL NULL)
+                                (aget-col col-data i))
+                            is-null (or (Double/isNaN v)
+                                        (and col-data
+                                             (expr/long-array? col-data)
+                                             (= (aget ^longs col-data (int i)) Long/MIN_VALUE)))]
+                        (when-not is-null
                           (aset accs base (+ (aget accs base) v))
                           (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                       :min
-                      (let [v (aget-col (get col-arrays (:col agg)) i)]
-                        (when (== v v)
+                      (let [col-data (get col-arrays (:col agg))
+                            v (aget-col col-data i)
+                            is-null (or (Double/isNaN v)
+                                        (and (expr/long-array? col-data)
+                                             (= (aget ^longs col-data (int i)) Long/MIN_VALUE)))]
+                        (when-not is-null
                           (aset accs base (Math/min (aget accs base) v))
                           (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                       :max
-                      (let [v (aget-col (get col-arrays (:col agg)) i)]
-                        (when (== v v)
+                      (let [col-data (get col-arrays (:col agg))
+                            v (aget-col col-data i)
+                            is-null (or (Double/isNaN v)
+                                        (and (expr/long-array? col-data)
+                                             (= (aget ^longs col-data (int i)) Long/MIN_VALUE)))]
+                        (when-not is-null
                           (aset accs base (Math/max (aget accs base) v))
                           (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                       :avg
-                      (let [v (if-let [expr (:expr agg)]
+                      (let [col-data (when (:col agg) (get col-arrays (:col agg)))
+                            v (if-let [expr (:expr agg)]
                                 (eval-agg-expr expr col-arrays i)
-                                (aget-col (get col-arrays (:col agg)) i))]
-                        (when (== v v)
+                                (aget-col col-data i))
+                            is-null (or (Double/isNaN v)
+                                        (and col-data
+                                             (expr/long-array? col-data)
+                                             (= (aget ^longs col-data (int i)) Long/MIN_VALUE)))]
+                        (when-not is-null
                           (aset accs base (+ (aget accs base) v))
                           (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                       :sum-product

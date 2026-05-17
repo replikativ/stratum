@@ -341,6 +341,19 @@
   ;; target   — :int64 | :float64 | :dict-string
            [col-name expr target input])
 
+(defrecord PRecompose
+  ;; Inserted by the `smcs-decomposition` planner pass to wrap an aggregator
+  ;; whose aggs were algebraically rewritten — e.g. `SUM(a*(c-b))` →
+  ;; `c*SUM(a) − SUM_PRODUCT(a,b)`. The wrapper holds the per-original-agg
+  ;; mapping produced by `stratum.query.group-by/decompose-smcs-aggs` and the
+  ;; user's original agg list; the executor runs the child and then applies
+  ;; `recompose-row-results` / `recompose-columnar-results` to project the
+  ;; user-visible columns.
+  ;; mapping   — map of original-agg-index → recipe (see decompose-smcs-aggs)
+  ;; orig-aggs — the user's original aggs (output-keying source of truth)
+  ;; input     — child aggregator whose result will be recomposed
+           [mapping orig-aggs input])
+
 ;; ============================================================================
 ;; Utilities
 ;; ============================================================================
