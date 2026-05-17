@@ -492,17 +492,17 @@
         (fn [axis-str]
           (when (.equalsIgnoreCase ^String axis-str "SYSTEM_TIME")
             (throw (ex-info
-                     (str "FOR (ALL | PORTION OF) SYSTEM_TIME DML is not "
-                          "supported via SQL — system-time is the auto-"
-                          "stamped recording-fact axis; user-controlled "
-                          "writes to it would compromise the audit story "
-                          "stratum's closed-period SCD2 preserves. For "
-                          "historical-import / regulator-replay use cases, "
-                          "use the Clojure DSL `(dataset/append! ds row "
-                          "{:system-from <past-inst>})` which exposes the "
-                          "underlying primitive directly.")
-                     {:error :sql/for-portion-of-system-time-unsupported
-                      :axis :system}))))]
+                    (str "FOR (ALL | PORTION OF) SYSTEM_TIME DML is not "
+                         "supported via SQL — system-time is the auto-"
+                         "stamped recording-fact axis; user-controlled "
+                         "writes to it would compromise the audit story "
+                         "stratum's closed-period SCD2 preserves. For "
+                         "historical-import / regulator-replay use cases, "
+                         "use the Clojure DSL `(dataset/append! ds row "
+                         "{:system-from <past-inst>})` which exposes the "
+                         "underlying primitive directly.")
+                    {:error :sql/for-portion-of-system-time-unsupported
+                     :axis :system}))))]
     (if-let [all-m (re-find #"(?is)\bFOR\s+(?:ALL\s+(VALID_TIME|SYSTEM_TIME)|(VALID_TIME|SYSTEM_TIME)\s+ALL)\b" masked)]
       (let [axis (or (nth all-m 1) (nth all-m 2))
             _ (reject-system-axis! axis)
@@ -529,29 +529,29 @@
             ;; Walk forward to either a literal TO keyword or to the
             ;; next DML tail keyword (WHERE/SET/...) — that's where
             ;; the FROM expression ends.
-            from-end-pos (long (find-balanced-end sql after-from dml-tail-keywords))
-            from-expr (subs sql after-from from-end-pos)
+                from-end-pos (long (find-balanced-end sql after-from dml-tail-keywords))
+                from-expr (subs sql after-from from-end-pos)
             ;; Peek: is the terminator a TO keyword (open-bounded
             ;; form) or a tail keyword (open-ended form)?
-            [_ first-kw] (read-word sql (long (skip-ws-and-comments sql from-end-pos)))
-            has-to? (= "to" first-kw)
-            [tail-pos to-expr]
-            (if has-to?
-              (let [after-to-kw (long (->> (skip-ws-and-comments sql from-end-pos)
-                                           (read-word sql)
-                                           first))
-                    tp (long (find-balanced-end sql after-to-kw dml-tail-keywords-no-to))]
-                [tp (subs sql after-to-kw tp)])
-              [from-end-pos nil])
-            vf-val (parse-temporal-literal from-expr)
-            vt-val (if has-to?
-                     (parse-temporal-literal to-expr)
-                     Long/MAX_VALUE)
-            rewritten (str (subs sql 0 start) (subs sql tail-pos))]
-        {:sql rewritten
-         :period {:axis (keyword (.toLowerCase ^String axis))
-                  :from vf-val
-                  :to vt-val}}))))))
+                [_ first-kw] (read-word sql (long (skip-ws-and-comments sql from-end-pos)))
+                has-to? (= "to" first-kw)
+                [tail-pos to-expr]
+                (if has-to?
+                  (let [after-to-kw (long (->> (skip-ws-and-comments sql from-end-pos)
+                                               (read-word sql)
+                                               first))
+                        tp (long (find-balanced-end sql after-to-kw dml-tail-keywords-no-to))]
+                    [tp (subs sql after-to-kw tp)])
+                  [from-end-pos nil])
+                vf-val (parse-temporal-literal from-expr)
+                vt-val (if has-to?
+                         (parse-temporal-literal to-expr)
+                         Long/MAX_VALUE)
+                rewritten (str (subs sql 0 start) (subs sql tail-pos))]
+            {:sql rewritten
+             :period {:axis (keyword (.toLowerCase ^String axis))
+                      :from vf-val
+                      :to vt-val}}))))))
 
 ;; ============================================================================
 ;; Public: SQL:2011 SELECT-side `FOR VALID_TIME (AS OF | BETWEEN |
@@ -885,14 +885,14 @@
         (when (and new-pred (contains? seen-axes axis))
           (throw (ex-info (str "Multi-table SELECT with more than one "
                                "FOR " (case axis :valid "VALID_TIME"
-                                                 :system "SYSTEM_TIME")
+                                            :system "SYSTEM_TIME")
                                " clause is not yet supported "
                                "— the rewriter emits unqualified column "
                                "refs which the planner cannot disambiguate "
                                "across joined tables. Write the predicates "
                                "explicitly with `<table>." (case axis
-                                                              :valid "_valid_from"
-                                                              :system "_system_from")
+                                                             :valid "_valid_from"
+                                                             :system "_system_from")
                                "` qualifiers, or split into separate queries.")
                           {:error (case axis
                                     :valid :sql/multi-for-valid-time-unsupported

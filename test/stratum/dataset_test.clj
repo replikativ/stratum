@@ -811,16 +811,16 @@
   ;; for any user passing a typo.
   (testing "make-dataset throws on unrecognized :bitemporal axis :unit"
     (is (thrown-with-msg?
-          clojure.lang.ExceptionInfo
-          #":bitemporal .* :unit must be one of"
-          (dataset/make-dataset
-            {:eid         (long-array [1])
-             :_valid_from (long-array [1000])
-             :_valid_to   (long-array [Long/MAX_VALUE])}
-            {:metadata
-             {:bitemporal {:valid {:from-col :_valid_from
-                                   :to-col   :_valid_to
-                                   :unit     :nanos}}}})))))
+         clojure.lang.ExceptionInfo
+         #":bitemporal .* :unit must be one of"
+         (dataset/make-dataset
+          {:eid         (long-array [1])
+           :_valid_from (long-array [1000])
+           :_valid_to   (long-array [Long/MAX_VALUE])}
+          {:metadata
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :nanos}}}})))))
 
 (deftest bitemporal-config-rejects-same-from-and-to-cols
   ;; Regression lock for round-3 agent P1: `apply-axis-config`
@@ -831,15 +831,15 @@
   ;; to [t, t) after first write.
   (testing "make-dataset throws when :from-col equals :to-col"
     (is (thrown-with-msg?
-          clojure.lang.ExceptionInfo
-          #":from-col and :to-col must differ"
-          (dataset/make-dataset
-            {:eid (long-array [1])
-             :ts  (long-array [1000])}
-            {:metadata
-             {:bitemporal {:valid {:from-col :ts
-                                   :to-col   :ts
-                                   :unit     :micros}}}})))))
+         clojure.lang.ExceptionInfo
+         #":from-col and :to-col must differ"
+         (dataset/make-dataset
+          {:eid (long-array [1])
+           :ts  (long-array [1000])}
+          {:metadata
+           {:bitemporal {:valid {:from-col :ts
+                                 :to-col   :ts
+                                 :unit     :micros}}}})))))
 
 ;; ============================================================================
 ;; Phase B — temporal write primitives (append! / upsert! / retract!)
@@ -1275,10 +1275,10 @@
   (testing "append! with vf == vt throws"
     (let [ds (vt-only-ds [])]
       (is (thrown-with-msg?
-            clojure.lang.ExceptionInfo #"Invalid valid window"
-            (-> ds transient
-                (dataset/append! {:eid 1 :salary 100
-                                  :_valid_from 1000 :_valid_to 1000})))))))
+           clojure.lang.ExceptionInfo #"Invalid valid window"
+           (-> ds transient
+               (dataset/append! {:eid 1 :salary 100
+                                 :_valid_from 1000 :_valid_to 1000})))))))
 
 (deftest append!-rejects-explicit-nil-axis-value
   ;; Regression lock for copilot review-3 P1: pre-fix,
@@ -1289,46 +1289,46 @@
   (testing "append! with explicit nil axis value throws clear ex-info, not NPE"
     (let [ds (vt-only-ds [])]
       (is (thrown-with-msg?
-            clojure.lang.ExceptionInfo
-            #"append! requires non-nil :valid axis :from-col"
-            (-> ds transient
-                (dataset/append! {:eid 1 :salary 100
-                                  :_valid_from nil :_valid_to 9999}))))
+           clojure.lang.ExceptionInfo
+           #"append! requires non-nil :valid axis :from-col"
+           (-> ds transient
+               (dataset/append! {:eid 1 :salary 100
+                                 :_valid_from nil :_valid_to 9999}))))
       (is (thrown-with-msg?
-            clojure.lang.ExceptionInfo
-            #"append! requires non-nil :valid axis :to-col"
-            (-> ds transient
-                (dataset/append! {:eid 1 :salary 100
-                                  :_valid_from 1000 :_valid_to nil})))))))
+           clojure.lang.ExceptionInfo
+           #"append! requires non-nil :valid axis :to-col"
+           (-> ds transient
+               (dataset/append! {:eid 1 :salary 100
+                                 :_valid_from 1000 :_valid_to nil})))))))
 
 (deftest append!-rejects-reverse-valid-window
   (testing "append! with vf > vt throws"
     (let [ds (vt-only-ds [])]
       (is (thrown-with-msg?
-            clojure.lang.ExceptionInfo #"Invalid valid window"
-            (-> ds transient
-                (dataset/append! {:eid 1 :salary 100
-                                  :_valid_from 2000 :_valid_to 1000})))))))
+           clojure.lang.ExceptionInfo #"Invalid valid window"
+           (-> ds transient
+               (dataset/append! {:eid 1 :salary 100
+                                 :_valid_from 2000 :_valid_to 1000})))))))
 
 (deftest bounded-retract!-rejects-zero-width-period
   (testing "retract! with :valid-to == :valid-from throws"
     (let [ds (vt-only-ds [{:eid 1 :salary 100
                            :_valid_from 1000 :_valid_to Long/MAX_VALUE}])]
       (is (thrown-with-msg?
-            clojure.lang.ExceptionInfo #"Invalid valid window"
-            (-> ds transient
-                (dataset/retract! {:where [[:= :eid 1]]}
-                                  {:valid-from 2000 :valid-to 2000})))))))
+           clojure.lang.ExceptionInfo #"Invalid valid window"
+           (-> ds transient
+               (dataset/retract! {:where [[:= :eid 1]]}
+                                 {:valid-from 2000 :valid-to 2000})))))))
 
 (deftest bounded-update!-rejects-reverse-period
   (testing "bounded-update! with reverse period throws"
     (let [ds (vt-only-ds [{:eid 1 :salary 100
                            :_valid_from 1000 :_valid_to Long/MAX_VALUE}])]
       (is (thrown-with-msg?
-            clojure.lang.ExceptionInfo #"Invalid valid window"
-            (-> ds transient
-                (dataset/bounded-update! {:where [[:= :eid 1]] :set {:salary 999}}
-                                         {:valid-from 5000 :valid-to 3000})))))))
+           clojure.lang.ExceptionInfo #"Invalid valid window"
+           (-> ds transient
+               (dataset/bounded-update! {:where [[:= :eid 1]] :set {:salary 999}}
+                                        {:valid-from 5000 :valid-to 3000})))))))
 
 (deftest bounded-update!-requires-explicit-valid-from
   ;; Regression lock for copilot review-2 #3: `bounded-update!`
@@ -1341,11 +1341,11 @@
     (let [ds (vt-only-ds [{:eid 1 :salary 100
                            :_valid_from 1000 :_valid_to Long/MAX_VALUE}])]
       (is (thrown-with-msg?
-            clojure.lang.ExceptionInfo
-            #"bounded-update! requires tx-meta :valid-from"
-            (-> ds transient
-                (dataset/bounded-update! {:where [[:= :eid 1]] :set {:salary 999}}
-                                         {:valid-to 3000})))))))
+           clojure.lang.ExceptionInfo
+           #"bounded-update! requires tx-meta :valid-from"
+           (-> ds transient
+               (dataset/bounded-update! {:where [[:= :eid 1]] :set {:salary 999}}
+                                        {:valid-to 3000})))))))
 
 ;; ============================================================================
 ;; SCD2-on-both-axes — system-time symmetry on every vt mutation

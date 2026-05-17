@@ -390,7 +390,7 @@
      ;; affected." Callers needing physical counts should diff
      ;; row-count(before) vs row-count(after).
      :n-updated (count (filter #(eval-dml-predicate existing where %)
-                                (range (col-row-count (val (first existing))))))}))
+                               (range (col-row-count (val (first existing))))))}))
 
 (defn- delete-portion-via-index-backend
   "Apply a SQL:2011 `DELETE … FOR PORTION OF VALID_TIME FROM x TO y`
@@ -676,14 +676,14 @@
       (binding [dataset/*clock-time-millis*
                 (or (session-clock-time-millis table-registry-atom)
                     dataset/*clock-time-millis*)]
-      (cond
+        (cond
             ;; EXPLAIN [(ANALYZE)] [(FORMAT JSON)] query
-        (:explain parsed)
-        (format-explain-result (:explain parsed) @table-registry-atom)
+          (:explain parsed)
+          (format-explain-result (:explain parsed) @table-registry-atom)
 
             ;; System query (SET, SHOW, VERSION, etc.)
-        (:system parsed)
-        (sql/format-results parsed)
+          (:system parsed)
+          (sql/format-results parsed)
 
             ;; DDL (CREATE TABLE, INSERT INTO, UPDATE, DELETE)
             ;; Coarse server-scoped lock on the registry atom for
@@ -697,90 +697,90 @@
             ;; multi-connection PgWire. Coarse lock is the
             ;; conservative-correct fix; per-table lock map is a
             ;; future perf optimization.
-        (:ddl parsed)
-        (locking table-registry-atom
-        (let [{:keys [op table columns rows assignments where
-                      conflict-cols action from table-alias] :as ddl} (:ddl parsed)]
-          (case op
-            :create-table
-            (do
-              (let [cols (into {}
-                               (map (fn [{:keys [name type]}]
-                                      [(keyword name)
-                                       (case type
-                                         :int64   (long-array 0)
-                                         :float64 (double-array 0)
-                                         :string  (make-array String 0))]))
-                               columns)
+          (:ddl parsed)
+          (locking table-registry-atom
+            (let [{:keys [op table columns rows assignments where
+                          conflict-cols action from table-alias] :as ddl} (:ddl parsed)]
+              (case op
+                :create-table
+                (do
+                  (let [cols (into {}
+                                   (map (fn [{:keys [name type]}]
+                                          [(keyword name)
+                                           (case type
+                                             :int64   (long-array 0)
+                                             :float64 (double-array 0)
+                                             :string  (make-array String 0))]))
+                                   columns)
                     ;; Side schema: column-kw → {:temporal-unit U}. Stored on
                     ;; the table value as Clojure metadata so the existing
                     ;; INSERT/UPSERT/UPDATE paths (which assume raw arrays)
                     ;; keep working unchanged.
-                    schema (into {}
-                                 (keep (fn [{:keys [name temporal-unit]}]
-                                         (when temporal-unit
-                                           [(keyword name) {:temporal-unit temporal-unit}])))
-                                 columns)
-                    cols (if (seq schema) (with-meta cols {:column-schema schema}) cols)]
-                (swap! table-registry-atom assoc table cols))
-              (PgWireServer$QueryResult/empty "CREATE TABLE"))
+                        schema (into {}
+                                     (keep (fn [{:keys [name temporal-unit]}]
+                                             (when temporal-unit
+                                               [(keyword name) {:temporal-unit temporal-unit}])))
+                                     columns)
+                        cols (if (seq schema) (with-meta cols {:column-schema schema}) cols)]
+                    (swap! table-registry-atom assoc table cols))
+                  (PgWireServer$QueryResult/empty "CREATE TABLE"))
 
-            :drop-table
-            (do (swap! table-registry-atom dissoc table)
-                (PgWireServer$QueryResult/empty "DROP TABLE"))
+                :drop-table
+                (do (swap! table-registry-atom dissoc table)
+                    (PgWireServer$QueryResult/empty "DROP TABLE"))
 
-            :create-model
-            (let [{:keys [model-name model-type options training-sql]} ddl
-                  type-config (get model-type-map model-type)]
-              (when-not type-config
-                (throw (ex-info (str "Unknown model type: " model-type
-                                     ". Available: " (str/join ", " (keys model-type-map)))
-                                {:model-type model-type})))
-              (let [;; Execute the training SELECT to get data
-                    parsed-training (sql/parse-sql training-sql registry)
-                    _ (when (:error parsed-training)
-                        (throw (ex-info (str "Error in training query: " (:error parsed-training))
-                                        {:sql training-sql})))
-                    training-result (q/q (:query parsed-training))
-                    training-cols (q/results->columns training-result)
+                :create-model
+                (let [{:keys [model-name model-type options training-sql]} ddl
+                      type-config (get model-type-map model-type)]
+                  (when-not type-config
+                    (throw (ex-info (str "Unknown model type: " model-type
+                                         ". Available: " (str/join ", " (keys model-type-map)))
+                                    {:model-type model-type})))
+                  (let [;; Execute the training SELECT to get data
+                        parsed-training (sql/parse-sql training-sql registry)
+                        _ (when (:error parsed-training)
+                            (throw (ex-info (str "Error in training query: " (:error parsed-training))
+                                            {:sql training-sql})))
+                        training-result (q/q (:query parsed-training))
+                        training-cols (q/results->columns training-result)
                         ;; Merge defaults with user options
-                    train-opts (merge (:default-opts type-config)
-                                      options
-                                      {:from training-cols})
+                        train-opts (merge (:default-opts type-config)
+                                          options
+                                          {:from training-cols})
                         ;; Train the model
-                    train-fn (:train-fn type-config)
-                    model (assoc (train-fn train-opts) :model-type model-type)]
-                (swap! table-registry-atom assoc-in ["__models__" model-name] model)
-                (println (str "Created model '" model-name "' (" model-type ") with "
-                              (:n-features model) " features"))
-                (PgWireServer$QueryResult/empty "CREATE MODEL")))
+                        train-fn (:train-fn type-config)
+                        model (assoc (train-fn train-opts) :model-type model-type)]
+                    (swap! table-registry-atom assoc-in ["__models__" model-name] model)
+                    (println (str "Created model '" model-name "' (" model-type ") with "
+                                  (:n-features model) " features"))
+                    (PgWireServer$QueryResult/empty "CREATE MODEL")))
 
-            :drop-model
-            (let [{:keys [model-name if-exists?]} ddl
-                  models (get @table-registry-atom "__models__")]
-              (when (and (not if-exists?) (not (get models model-name)))
-                (throw (ex-info (str "Model not found: " model-name)
-                                {:model model-name
-                                 :available (keys models)})))
-              (swap! table-registry-atom update "__models__" dissoc model-name)
-              (PgWireServer$QueryResult/empty "DROP MODEL"))
+                :drop-model
+                (let [{:keys [model-name if-exists?]} ddl
+                      models (get @table-registry-atom "__models__")]
+                  (when (and (not if-exists?) (not (get models model-name)))
+                    (throw (ex-info (str "Model not found: " model-name)
+                                    {:model model-name
+                                     :available (keys models)})))
+                  (swap! table-registry-atom update "__models__" dissoc model-name)
+                  (PgWireServer$QueryResult/empty "DROP MODEL"))
 
-            :insert
-            (let [existing (get @table-registry-atom table)]
-              (when-not existing
-                (throw (ex-info (str "Table not found: " table) {:table table})))
-              (cond
+                :insert
+                (let [existing (get @table-registry-atom table)]
+                  (when-not existing
+                    (throw (ex-info (str "Table not found: " table) {:table table})))
+                  (cond
                 ;; INSERT … FOR PORTION OF VALID_TIME on a fully
                 ;; index-backed bitemporal table lowers to append!
                 ;; with vf/vt stamped from the period.
-                (and (:period ddl)
-                     (= :valid_time (:axis (:period ddl)))
-                     (index-backed-cols? existing))
-                (let [{:keys [new-cols n-inserted]}
-                      (insert-portion-via-index-backend
-                        table existing (:columns ddl) rows (:period ddl) (meta existing))]
-                  (swap! table-registry-atom assoc table new-cols)
-                  (PgWireServer$QueryResult/empty (str "INSERT 0 " n-inserted)))
+                    (and (:period ddl)
+                         (= :valid_time (:axis (:period ddl)))
+                         (index-backed-cols? existing))
+                    (let [{:keys [new-cols n-inserted]}
+                          (insert-portion-via-index-backend
+                           table existing (:columns ddl) rows (:period ddl) (meta existing))]
+                      (swap! table-registry-atom assoc table new-cols)
+                      (PgWireServer$QueryResult/empty (str "INSERT 0 " n-inserted)))
 
                 ;; Plain INSERT on an index-backed bitemporal table
                 ;; with explicit column list lowers to append! so
@@ -790,253 +790,121 @@
                 ;; `dataset/append!` won't auto-stamp _system_from/_to
                 ;; and SCD2-on-system silently breaks (caught by
                 ;; copilot review #1 on PR #27).
-                (and (index-backed-cols? existing) (:columns ddl))
-                (let [valid (bitemporal-valid-cfg existing (meta existing))
-                      ds-meta (when valid
-                                (bitemporal-ds-meta existing (meta existing) valid))
-                      ds (dataset/make-dataset existing
-                                               (cond-> {:name table}
-                                                 ds-meta (assoc :metadata ds-meta)))
-                      mutated (reduce (fn [tds row-vals]
-                                        (dataset/append! tds (zipmap (:columns ddl) row-vals)))
-                                      (transient ds)
-                                      rows)
-                      sealed (persistent! mutated)
-                      new-cols (dataset/columns sealed)
-                      new-cols (if-let [m (meta existing)] (with-meta new-cols m) new-cols)]
-                  (swap! table-registry-atom assoc table new-cols)
-                  (PgWireServer$QueryResult/empty (str "INSERT 0 " (count rows))))
+                    (and (index-backed-cols? existing) (:columns ddl))
+                    (let [valid (bitemporal-valid-cfg existing (meta existing))
+                          ds-meta (when valid
+                                    (bitemporal-ds-meta existing (meta existing) valid))
+                          ds (dataset/make-dataset existing
+                                                   (cond-> {:name table}
+                                                     ds-meta (assoc :metadata ds-meta)))
+                          mutated (reduce (fn [tds row-vals]
+                                            (dataset/append! tds (zipmap (:columns ddl) row-vals)))
+                                          (transient ds)
+                                          rows)
+                          sealed (persistent! mutated)
+                          new-cols (dataset/columns sealed)
+                          new-cols (if-let [m (meta existing)] (with-meta new-cols m) new-cols)]
+                      (swap! table-registry-atom assoc table new-cols)
+                      (PgWireServer$QueryResult/empty (str "INSERT 0 " (count rows))))
 
                 ;; Index-backed table without explicit column list — reject
                 ;; rather than silently mismatch positions against an
                 ;; encoded column map (whose iteration order isn't guaranteed
                 ;; to match a SQL `CREATE TABLE` order).
-                (index-backed-cols? existing)
-                (throw (ex-info
-                         (str "INSERT on a stratum-index-backed table requires an explicit "
-                              "column list: `INSERT INTO " table " (col1, col2, ...) VALUES (...)`")
-                         {:table table}))
+                    (index-backed-cols? existing)
+                    (throw (ex-info
+                            (str "INSERT on a stratum-index-backed table requires an explicit "
+                                 "column list: `INSERT INTO " table " (col1, col2, ...) VALUES (...)`")
+                            {:table table}))
 
-                :else
-                (do
-              (let [col-keys (vec (keys existing))
-                    n-existing (if-let [first-col (get existing (first col-keys))]
-                                 (cond
-                                   (instance? (Class/forName "[J") first-col)
-                                   (alength ^longs first-col)
-                                   (instance? (Class/forName "[D") first-col)
-                                   (alength ^doubles first-col)
-                                   (instance? (Class/forName "[Ljava.lang.String;") first-col)
-                                   (alength ^"[Ljava.lang.String;" first-col)
-                                   :else 0)
-                                 0)
-                    n-new (count rows)
-                    n-total (+ n-existing n-new)
-                    new-cols
-                    (into {}
-                          (map-indexed
-                           (fn [ci col-key]
-                             (let [old-arr (get existing col-key)]
-                               [col-key
-                                (cond
-                                  (instance? (Class/forName "[J") old-arr)
-                                  (let [arr (long-array n-total)]
-                                    (System/arraycopy ^longs old-arr 0 arr 0 n-existing)
-                                    (dotimes [r n-new]
-                                      (let [v (nth (nth rows r) ci)]
-                                        (aset arr (+ n-existing r)
-                                              (long (if (nil? v) Long/MIN_VALUE v)))))
-                                    arr)
+                    :else
+                    (do
+                      (let [col-keys (vec (keys existing))
+                            n-existing (if-let [first-col (get existing (first col-keys))]
+                                         (cond
+                                           (instance? (Class/forName "[J") first-col)
+                                           (alength ^longs first-col)
+                                           (instance? (Class/forName "[D") first-col)
+                                           (alength ^doubles first-col)
+                                           (instance? (Class/forName "[Ljava.lang.String;") first-col)
+                                           (alength ^"[Ljava.lang.String;" first-col)
+                                           :else 0)
+                                         0)
+                            n-new (count rows)
+                            n-total (+ n-existing n-new)
+                            new-cols
+                            (into {}
+                                  (map-indexed
+                                   (fn [ci col-key]
+                                     (let [old-arr (get existing col-key)]
+                                       [col-key
+                                        (cond
+                                          (instance? (Class/forName "[J") old-arr)
+                                          (let [arr (long-array n-total)]
+                                            (System/arraycopy ^longs old-arr 0 arr 0 n-existing)
+                                            (dotimes [r n-new]
+                                              (let [v (nth (nth rows r) ci)]
+                                                (aset arr (+ n-existing r)
+                                                      (long (if (nil? v) Long/MIN_VALUE v)))))
+                                            arr)
 
-                                  (instance? (Class/forName "[D") old-arr)
-                                  (let [arr (double-array n-total)]
-                                    (System/arraycopy ^doubles old-arr 0 arr 0 n-existing)
-                                    (dotimes [r n-new]
-                                      (let [v (nth (nth rows r) ci)]
-                                        (aset arr (+ n-existing r)
-                                              (double (if (nil? v) Double/NaN v)))))
-                                    arr)
+                                          (instance? (Class/forName "[D") old-arr)
+                                          (let [arr (double-array n-total)]
+                                            (System/arraycopy ^doubles old-arr 0 arr 0 n-existing)
+                                            (dotimes [r n-new]
+                                              (let [v (nth (nth rows r) ci)]
+                                                (aset arr (+ n-existing r)
+                                                      (double (if (nil? v) Double/NaN v)))))
+                                            arr)
 
-                                  (instance? (Class/forName "[Ljava.lang.String;") old-arr)
-                                  (let [arr (make-array String n-total)]
-                                    (System/arraycopy ^"[Ljava.lang.String;" old-arr 0
-                                                      arr 0 n-existing)
-                                    (dotimes [r n-new]
-                                      (aset ^"[Ljava.lang.String;" arr (+ n-existing r)
-                                            (let [v (nth (nth rows r) ci)]
-                                              (when (some? v) (str v)))))
-                                    arr))]))
-                           col-keys))
-                    new-cols (with-meta new-cols (meta existing))]
-                (swap! table-registry-atom assoc table new-cols))
-              (PgWireServer$QueryResult/empty
-               (str "INSERT 0 " (count rows))))))
+                                          (instance? (Class/forName "[Ljava.lang.String;") old-arr)
+                                          (let [arr (make-array String n-total)]
+                                            (System/arraycopy ^"[Ljava.lang.String;" old-arr 0
+                                                              arr 0 n-existing)
+                                            (dotimes [r n-new]
+                                              (aset ^"[Ljava.lang.String;" arr (+ n-existing r)
+                                                    (let [v (nth (nth rows r) ci)]
+                                                      (when (some? v) (str v)))))
+                                            arr))]))
+                                   col-keys))
+                            new-cols (with-meta new-cols (meta existing))]
+                        (swap! table-registry-atom assoc table new-cols))
+                      (PgWireServer$QueryResult/empty
+                       (str "INSERT 0 " (count rows))))))
 
-            :upsert
-            (let [existing (get @table-registry-atom table)]
-              (when-not existing
-                (throw (ex-info (str "Table not found: " table) {:table table})))
+                :upsert
+                (let [existing (get @table-registry-atom table)]
+                  (when-not existing
+                    (throw (ex-info (str "Table not found: " table) {:table table})))
               ;; UPSERT (INSERT … ON CONFLICT) combined with FOR
               ;; PORTION OF VALID_TIME has subtle semantics — the
               ;; conflict target needs to be evaluated *per slice*,
               ;; not per (positional) row. Reject explicitly rather
               ;; than silently doing the wrong thing.
-              (when (:period ddl)
-                (throw (ex-info
-                         (str "INSERT … ON CONFLICT … FOR PORTION OF VALID_TIME "
-                              "is not supported. Use INSERT FOR PORTION OF + "
-                              "UPDATE FOR PORTION OF as separate statements, "
-                              "or DELETE FOR PORTION OF + INSERT FOR PORTION OF.")
-                         {:table table
-                          :period (:period ddl)})))
-              (when (and (index-backed-cols? existing) (nil? (:period ddl)))
-                (throw (ex-info
-                         (str "INSERT … ON CONFLICT on stratum-index-backed tables "
-                              "is not yet supported. Use plain INSERT + UPDATE separately.")
-                         {:table table})))
-              (let [col-keys (vec (keys existing))
-                    n-existing (let [first-col (get existing (first col-keys))]
-                                 (cond
-                                   (instance? (Class/forName "[J") first-col) (alength ^longs first-col)
-                                   (instance? (Class/forName "[D") first-col) (alength ^doubles first-col)
-                                   (instance? (Class/forName "[Ljava.lang.String;") first-col)
-                                   (alength ^"[Ljava.lang.String;" first-col)
-                                   :else 0))
+                  (when (:period ddl)
+                    (throw (ex-info
+                            (str "INSERT … ON CONFLICT … FOR PORTION OF VALID_TIME "
+                                 "is not supported. Use INSERT FOR PORTION OF + "
+                                 "UPDATE FOR PORTION OF as separate statements, "
+                                 "or DELETE FOR PORTION OF + INSERT FOR PORTION OF.")
+                            {:table table
+                             :period (:period ddl)})))
+                  (when (and (index-backed-cols? existing) (nil? (:period ddl)))
+                    (throw (ex-info
+                            (str "INSERT … ON CONFLICT on stratum-index-backed tables "
+                                 "is not yet supported. Use plain INSERT + UPDATE separately.")
+                            {:table table})))
+                  (let [col-keys (vec (keys existing))
+                        n-existing (let [first-col (get existing (first col-keys))]
+                                     (cond
+                                       (instance? (Class/forName "[J") first-col) (alength ^longs first-col)
+                                       (instance? (Class/forName "[D") first-col) (alength ^doubles first-col)
+                                       (instance? (Class/forName "[Ljava.lang.String;") first-col)
+                                       (alength ^"[Ljava.lang.String;" first-col)
+                                       :else 0))
                         ;; For each row, find if a conflicting row exists
-                    conflict-col-indices (mapv #(.indexOf ^java.util.List col-keys %) conflict-cols)
-                    get-val (fn [arr ^long i]
-                              (cond
-                                (instance? (Class/forName "[J") arr)
-                                (let [v (aget ^longs arr (int i))]
-                                  (when-not (= v Long/MIN_VALUE) v))
-                                (instance? (Class/forName "[D") arr)
-                                (let [v (aget ^doubles arr (int i))]
-                                  (when-not (Double/isNaN v) v))
-                                (instance? (Class/forName "[Ljava.lang.String;") arr)
-                                (aget ^"[Ljava.lang.String;" arr (int i))))
-                    set-val (fn [arr ^long i v]
-                              (cond
-                                (instance? (Class/forName "[J") arr)
-                                (aset ^longs arr (int i) (long (if (nil? v) Long/MIN_VALUE v)))
-                                (instance? (Class/forName "[D") arr)
-                                (aset ^doubles arr (int i) (double (if (nil? v) Double/NaN v)))
-                                (instance? (Class/forName "[Ljava.lang.String;") arr)
-                                (aset ^"[Ljava.lang.String;" arr (int i)
-                                      (when (some? v) (str v)))))
-                        ;; Process each row: find conflict or insert
-                    result (reduce
-                            (fn [{:keys [cols n-rows n-inserted n-updated]} row]
-                              (let [;; Extract conflict key values from this row
-                                    row-conflict-vals (mapv #(nth row (int %)) conflict-col-indices)
-                                        ;; Find matching existing row
-                                    match-idx (loop [i (int 0)]
-                                                (when (< i n-rows)
-                                                  (let [existing-vals
-                                                        (mapv (fn [cc]
-                                                                (get-val (get cols cc) i))
-                                                              conflict-cols)]
-                                                    (if (= row-conflict-vals existing-vals)
-                                                      i
-                                                      (recur (inc i))))))]
-                                (if match-idx
-                                      ;; Conflict found
-                                  (if (= action :do-update)
-                                        ;; Apply assignments with EXCLUDED = new row values
-                                    (let [excluded (zipmap col-keys row)]
-                                      (doseq [{:keys [col expr]} assignments]
-                                        (let [arr (get cols col)
-                                              eval-val (fn eval-val [e]
-                                                         (cond
-                                                           (keyword? e)
-                                                           (if (= "excluded" (namespace e))
-                                                             (get excluded (keyword (name e)))
-                                                             (get-val (get cols e) match-idx))
-                                                           (number? e) e
-                                                           (string? e) e
-                                                           (nil? e) nil
-                                                           (vector? e)
-                                                           (nil-safe-arith (first e)
-                                                                           (eval-val (nth e 1))
-                                                                           (eval-val (nth e 2)))))
-                                              v (eval-val expr)]
-                                          (set-val arr match-idx v)))
-                                      {:cols cols :n-rows n-rows
-                                       :n-inserted n-inserted :n-updated (inc n-updated)})
-                                        ;; DO NOTHING
-                                    {:cols cols :n-rows n-rows
-                                     :n-inserted n-inserted :n-updated n-updated})
-                                      ;; No conflict — append row
-                                  (let [new-n (inc n-rows)
-                                        new-cols
-                                        (into {}
-                                              (map-indexed
-                                               (fn [ci col-key]
-                                                 (let [old-arr (get cols col-key)
-                                                       new-arr
-                                                       (cond
-                                                         (instance? (Class/forName "[J") old-arr)
-                                                         (let [arr (long-array new-n)]
-                                                           (System/arraycopy ^longs old-arr 0 arr 0 n-rows)
-                                                           (aset arr n-rows
-                                                                 (long (let [v (nth row ci)]
-                                                                         (if (nil? v) Long/MIN_VALUE v))))
-                                                           arr)
-                                                         (instance? (Class/forName "[D") old-arr)
-                                                         (let [arr (double-array new-n)]
-                                                           (System/arraycopy ^doubles old-arr 0 arr 0 n-rows)
-                                                           (aset arr n-rows
-                                                                 (double (let [v (nth row ci)]
-                                                                           (if (nil? v) Double/NaN v))))
-                                                           arr)
-                                                         (instance? (Class/forName "[Ljava.lang.String;") old-arr)
-                                                         (let [arr (make-array String new-n)]
-                                                           (System/arraycopy ^"[Ljava.lang.String;" old-arr 0
-                                                                             arr 0 n-rows)
-                                                           (aset ^"[Ljava.lang.String;" arr n-rows
-                                                                 (let [v (nth row ci)]
-                                                                   (when (some? v) (str v))))
-                                                           arr))]
-                                                   [col-key new-arr]))
-                                               col-keys))]
-                                    {:cols new-cols :n-rows new-n
-                                     :n-inserted (inc n-inserted) :n-updated n-updated}))))
-                            {:cols existing :n-rows n-existing
-                             :n-inserted 0 :n-updated 0}
-                            rows)]
-                (swap! table-registry-atom assoc table
-                       (with-meta (:cols result) (meta existing)))
-                (PgWireServer$QueryResult/empty
-                 (str "INSERT 0 " (:n-inserted result)))))
-
-            :update
-            (let [existing (get @table-registry-atom table)]
-              (when-not existing
-                (throw (ex-info (str "Table not found: " table) {:table table})))
-              (cond
-                ;; UPDATE … FOR PORTION OF VALID_TIME on a fully
-                ;; index-backed bitemporal table lowers to
-                ;; dataset/bounded-update! (SQL:2011 non-sequenced UPDATE).
-                (and (:period ddl)
-                     (= :valid_time (:axis (:period ddl)))
-                     (index-backed-cols? existing))
-                (let [{:keys [new-cols n-updated]}
-                      (update-portion-via-index-backend
-                        table existing where assignments
-                        (:period ddl) (meta existing))]
-                  (swap! table-registry-atom assoc table new-cols)
-                  (PgWireServer$QueryResult/empty (str "UPDATE " n-updated)))
-
-                :else
-                (do
-              (let [;; FROM table for UPDATE FROM (joined updates)
-                    from-existing (when from
-                                    (let [ft (get @table-registry-atom (:table from))]
-                                      (when-not ft
-                                        (throw (ex-info (str "FROM table not found: " (:table from))
-                                                        {:table (:table from)})))
-                                      ft))
-                        ;; Helper to get value from a typed array at index i
-                    get-arr-val (fn [arr ^long i]
+                        conflict-col-indices (mapv #(.indexOf ^java.util.List col-keys %) conflict-cols)
+                        get-val (fn [arr ^long i]
                                   (cond
                                     (instance? (Class/forName "[J") arr)
                                     (let [v (aget ^longs arr (int i))]
@@ -1046,8 +914,7 @@
                                       (when-not (Double/isNaN v) v))
                                     (instance? (Class/forName "[Ljava.lang.String;") arr)
                                     (aget ^"[Ljava.lang.String;" arr (int i))))
-                        ;; Helper to set value in a typed array
-                    set-arr-val (fn [arr ^long i v]
+                        set-val (fn [arr ^long i v]
                                   (cond
                                     (instance? (Class/forName "[J") arr)
                                     (aset ^longs arr (int i) (long (if (nil? v) Long/MIN_VALUE v)))
@@ -1056,166 +923,299 @@
                                     (instance? (Class/forName "[Ljava.lang.String;") arr)
                                     (aset ^"[Ljava.lang.String;" arr (int i)
                                           (when (some? v) (str v)))))
+                        ;; Process each row: find conflict or insert
+                        result (reduce
+                                (fn [{:keys [cols n-rows n-inserted n-updated]} row]
+                                  (let [;; Extract conflict key values from this row
+                                        row-conflict-vals (mapv #(nth row (int %)) conflict-col-indices)
+                                        ;; Find matching existing row
+                                        match-idx (loop [i (int 0)]
+                                                    (when (< i n-rows)
+                                                      (let [existing-vals
+                                                            (mapv (fn [cc]
+                                                                    (get-val (get cols cc) i))
+                                                                  conflict-cols)]
+                                                        (if (= row-conflict-vals existing-vals)
+                                                          i
+                                                          (recur (inc i))))))]
+                                    (if match-idx
+                                      ;; Conflict found
+                                      (if (= action :do-update)
+                                        ;; Apply assignments with EXCLUDED = new row values
+                                        (let [excluded (zipmap col-keys row)]
+                                          (doseq [{:keys [col expr]} assignments]
+                                            (let [arr (get cols col)
+                                                  eval-val (fn eval-val [e]
+                                                             (cond
+                                                               (keyword? e)
+                                                               (if (= "excluded" (namespace e))
+                                                                 (get excluded (keyword (name e)))
+                                                                 (get-val (get cols e) match-idx))
+                                                               (number? e) e
+                                                               (string? e) e
+                                                               (nil? e) nil
+                                                               (vector? e)
+                                                               (nil-safe-arith (first e)
+                                                                               (eval-val (nth e 1))
+                                                                               (eval-val (nth e 2)))))
+                                                  v (eval-val expr)]
+                                              (set-val arr match-idx v)))
+                                          {:cols cols :n-rows n-rows
+                                           :n-inserted n-inserted :n-updated (inc n-updated)})
+                                        ;; DO NOTHING
+                                        {:cols cols :n-rows n-rows
+                                         :n-inserted n-inserted :n-updated n-updated})
+                                      ;; No conflict — append row
+                                      (let [new-n (inc n-rows)
+                                            new-cols
+                                            (into {}
+                                                  (map-indexed
+                                                   (fn [ci col-key]
+                                                     (let [old-arr (get cols col-key)
+                                                           new-arr
+                                                           (cond
+                                                             (instance? (Class/forName "[J") old-arr)
+                                                             (let [arr (long-array new-n)]
+                                                               (System/arraycopy ^longs old-arr 0 arr 0 n-rows)
+                                                               (aset arr n-rows
+                                                                     (long (let [v (nth row ci)]
+                                                                             (if (nil? v) Long/MIN_VALUE v))))
+                                                               arr)
+                                                             (instance? (Class/forName "[D") old-arr)
+                                                             (let [arr (double-array new-n)]
+                                                               (System/arraycopy ^doubles old-arr 0 arr 0 n-rows)
+                                                               (aset arr n-rows
+                                                                     (double (let [v (nth row ci)]
+                                                                               (if (nil? v) Double/NaN v))))
+                                                               arr)
+                                                             (instance? (Class/forName "[Ljava.lang.String;") old-arr)
+                                                             (let [arr (make-array String new-n)]
+                                                               (System/arraycopy ^"[Ljava.lang.String;" old-arr 0
+                                                                                 arr 0 n-rows)
+                                                               (aset ^"[Ljava.lang.String;" arr n-rows
+                                                                     (let [v (nth row ci)]
+                                                                       (when (some? v) (str v))))
+                                                               arr))]
+                                                       [col-key new-arr]))
+                                                   col-keys))]
+                                        {:cols new-cols :n-rows new-n
+                                         :n-inserted (inc n-inserted) :n-updated n-updated}))))
+                                {:cols existing :n-rows n-existing
+                                 :n-inserted 0 :n-updated 0}
+                                rows)]
+                    (swap! table-registry-atom assoc table
+                           (with-meta (:cols result) (meta existing)))
+                    (PgWireServer$QueryResult/empty
+                     (str "INSERT 0 " (:n-inserted result)))))
+
+                :update
+                (let [existing (get @table-registry-atom table)]
+                  (when-not existing
+                    (throw (ex-info (str "Table not found: " table) {:table table})))
+                  (cond
+                ;; UPDATE … FOR PORTION OF VALID_TIME on a fully
+                ;; index-backed bitemporal table lowers to
+                ;; dataset/bounded-update! (SQL:2011 non-sequenced UPDATE).
+                    (and (:period ddl)
+                         (= :valid_time (:axis (:period ddl)))
+                         (index-backed-cols? existing))
+                    (let [{:keys [new-cols n-updated]}
+                          (update-portion-via-index-backend
+                           table existing where assignments
+                           (:period ddl) (meta existing))]
+                      (swap! table-registry-atom assoc table new-cols)
+                      (PgWireServer$QueryResult/empty (str "UPDATE " n-updated)))
+
+                    :else
+                    (do
+                      (let [;; FROM table for UPDATE FROM (joined updates)
+                            from-existing (when from
+                                            (let [ft (get @table-registry-atom (:table from))]
+                                              (when-not ft
+                                                (throw (ex-info (str "FROM table not found: " (:table from))
+                                                                {:table (:table from)})))
+                                              ft))
+                        ;; Helper to get value from a typed array at index i
+                            get-arr-val (fn [arr ^long i]
+                                          (cond
+                                            (instance? (Class/forName "[J") arr)
+                                            (let [v (aget ^longs arr (int i))]
+                                              (when-not (= v Long/MIN_VALUE) v))
+                                            (instance? (Class/forName "[D") arr)
+                                            (let [v (aget ^doubles arr (int i))]
+                                              (when-not (Double/isNaN v) v))
+                                            (instance? (Class/forName "[Ljava.lang.String;") arr)
+                                            (aget ^"[Ljava.lang.String;" arr (int i))))
+                        ;; Helper to set value in a typed array
+                            set-arr-val (fn [arr ^long i v]
+                                          (cond
+                                            (instance? (Class/forName "[J") arr)
+                                            (aset ^longs arr (int i) (long (if (nil? v) Long/MIN_VALUE v)))
+                                            (instance? (Class/forName "[D") arr)
+                                            (aset ^doubles arr (int i) (double (if (nil? v) Double/NaN v)))
+                                            (instance? (Class/forName "[Ljava.lang.String;") arr)
+                                            (aset ^"[Ljava.lang.String;" arr (int i)
+                                                  (when (some? v) (str v)))))
                         ;; Resolve column from target table, then from FROM table
                         ;; Handles namespaced keywords: :table/col → specific table,
                         ;; :col → target first, then FROM
-                    from-table-name (when from (:table from))
-                    from-alias (when from (:alias from))
-                    resolve-col (fn [e target-table from-table target-i from-i]
-                                  (let [target-i (long target-i)
-                                        from-i (long from-i)
-                                        ns (namespace e)
-                                        col-kw (keyword (name e))]
-                                    (if ns
+                            from-table-name (when from (:table from))
+                            from-alias (when from (:alias from))
+                            resolve-col (fn [e target-table from-table target-i from-i]
+                                          (let [target-i (long target-i)
+                                                from-i (long from-i)
+                                                ns (namespace e)
+                                                col-kw (keyword (name e))]
+                                            (if ns
                                           ;; Qualified: resolve to specific table
-                                      (if (or (= ns table) (= ns table-alias))
-                                        (when-let [arr (get target-table col-kw)]
-                                          (get-arr-val arr target-i))
-                                        (when (and from-table (>= from-i 0))
-                                          (when-let [arr (get from-table col-kw)]
-                                            (get-arr-val arr from-i))))
+                                              (if (or (= ns table) (= ns table-alias))
+                                                (when-let [arr (get target-table col-kw)]
+                                                  (get-arr-val arr target-i))
+                                                (when (and from-table (>= from-i 0))
+                                                  (when-let [arr (get from-table col-kw)]
+                                                    (get-arr-val arr from-i))))
                                           ;; Unqualified: target first, then FROM
-                                      (or (when-let [arr (get target-table e)]
-                                            (get-arr-val arr target-i))
-                                          (when (and from-table (>= from-i 0))
-                                            (when-let [arr (get from-table e)]
-                                              (get-arr-val arr from-i)))))))
+                                              (or (when-let [arr (get target-table e)]
+                                                    (get-arr-val arr target-i))
+                                                  (when (and from-table (>= from-i 0))
+                                                    (when-let [arr (get from-table e)]
+                                                      (get-arr-val arr from-i)))))))
                         ;; Evaluate expression for a row pair (target-i, from-i)
-                    eval-row (fn eval-row [e target-table from-table target-i from-i]
-                               (cond
-                                 (keyword? e) (resolve-col e target-table from-table target-i from-i)
-                                 (number? e) e
-                                 (string? e) e
-                                 (nil? e) nil
-                                 (vector? e)
-                                 (nil-safe-arith (first e)
-                                                 (eval-row (nth e 1) target-table from-table target-i from-i)
-                                                 (eval-row (nth e 2) target-table from-table target-i from-i))))
+                            eval-row (fn eval-row [e target-table from-table target-i from-i]
+                                       (cond
+                                         (keyword? e) (resolve-col e target-table from-table target-i from-i)
+                                         (number? e) e
+                                         (string? e) e
+                                         (nil? e) nil
+                                         (vector? e)
+                                         (nil-safe-arith (first e)
+                                                         (eval-row (nth e 1) target-table from-table target-i from-i)
+                                                         (eval-row (nth e 2) target-table from-table target-i from-i))))
                         ;; Evaluate predicate for a row pair
-                    eval-pred-row (fn [pred target-table from-table target-i from-i]
-                                    (let [ev (fn [e] (eval-row e target-table from-table target-i from-i))]
-                                      (case (first pred)
-                                        := (let [l (ev (nth pred 1)) r (ev (nth pred 2))]
-                                             (and (some? l) (some? r) (= l r)))
-                                        (:!= :<>) (let [l (ev (nth pred 1)) r (ev (nth pred 2))]
-                                                    (and (some? l) (some? r) (not= l r)))
-                                        :> (let [l (ev (nth pred 1)) r (ev (nth pred 2))]
-                                             (and (some? l) (some? r) (> (double l) (double r))))
-                                        :< (let [l (ev (nth pred 1)) r (ev (nth pred 2))]
-                                             (and (some? l) (some? r) (< (double l) (double r))))
-                                        :>= (let [l (ev (nth pred 1)) r (ev (nth pred 2))]
-                                              (and (some? l) (some? r) (>= (double l) (double r))))
-                                        :<= (let [l (ev (nth pred 1)) r (ev (nth pred 2))]
-                                              (and (some? l) (some? r) (<= (double l) (double r))))
-                                        :is-null (nil? (ev (nth pred 1)))
-                                        :is-not-null (some? (ev (nth pred 1)))
-                                        false)))
-                    col-keys (vec (keys existing))
-                    n-rows (let [first-col (get existing (first col-keys))]
-                             (cond
-                               (instance? (Class/forName "[J") first-col) (alength ^longs first-col)
-                               (instance? (Class/forName "[D") first-col) (alength ^doubles first-col)
-                               (instance? (Class/forName "[Ljava.lang.String;") first-col)
-                               (alength ^"[Ljava.lang.String;" first-col)
-                               :else 0))
-                    n-from (when from-existing
-                             (let [first-col (val (first from-existing))]
-                               (cond
-                                 (instance? (Class/forName "[J") first-col) (alength ^longs first-col)
-                                 (instance? (Class/forName "[D") first-col) (alength ^doubles first-col)
-                                 (instance? (Class/forName "[Ljava.lang.String;") first-col)
-                                 (alength ^"[Ljava.lang.String;" first-col)
-                                 :else 0)))
+                            eval-pred-row (fn [pred target-table from-table target-i from-i]
+                                            (let [ev (fn [e] (eval-row e target-table from-table target-i from-i))]
+                                              (case (first pred)
+                                                := (let [l (ev (nth pred 1)) r (ev (nth pred 2))]
+                                                     (and (some? l) (some? r) (= l r)))
+                                                (:!= :<>) (let [l (ev (nth pred 1)) r (ev (nth pred 2))]
+                                                            (and (some? l) (some? r) (not= l r)))
+                                                :> (let [l (ev (nth pred 1)) r (ev (nth pred 2))]
+                                                     (and (some? l) (some? r) (> (double l) (double r))))
+                                                :< (let [l (ev (nth pred 1)) r (ev (nth pred 2))]
+                                                     (and (some? l) (some? r) (< (double l) (double r))))
+                                                :>= (let [l (ev (nth pred 1)) r (ev (nth pred 2))]
+                                                      (and (some? l) (some? r) (>= (double l) (double r))))
+                                                :<= (let [l (ev (nth pred 1)) r (ev (nth pred 2))]
+                                                      (and (some? l) (some? r) (<= (double l) (double r))))
+                                                :is-null (nil? (ev (nth pred 1)))
+                                                :is-not-null (some? (ev (nth pred 1)))
+                                                false)))
+                            col-keys (vec (keys existing))
+                            n-rows (let [first-col (get existing (first col-keys))]
+                                     (cond
+                                       (instance? (Class/forName "[J") first-col) (alength ^longs first-col)
+                                       (instance? (Class/forName "[D") first-col) (alength ^doubles first-col)
+                                       (instance? (Class/forName "[Ljava.lang.String;") first-col)
+                                       (alength ^"[Ljava.lang.String;" first-col)
+                                       :else 0))
+                            n-from (when from-existing
+                                     (let [first-col (val (first from-existing))]
+                                       (cond
+                                         (instance? (Class/forName "[J") first-col) (alength ^longs first-col)
+                                         (instance? (Class/forName "[D") first-col) (alength ^doubles first-col)
+                                         (instance? (Class/forName "[Ljava.lang.String;") first-col)
+                                         (alength ^"[Ljava.lang.String;" first-col)
+                                         :else 0)))
                         ;; Build match mask + from-row index for UPDATE FROM
-                    match (boolean-array n-rows)
-                    from-match (int-array n-rows -1) ;; index into FROM table, -1 = no match
-                    _ (if (nil? where)
-                        (java.util.Arrays/fill match true)
-                        (if from-existing
+                            match (boolean-array n-rows)
+                            from-match (int-array n-rows -1) ;; index into FROM table, -1 = no match
+                            _ (if (nil? where)
+                                (java.util.Arrays/fill match true)
+                                (if from-existing
                               ;; UPDATE FROM: for each target row, find first matching FROM row
-                          (dotimes [i n-rows]
-                            (loop [j (int 0)]
-                              (when (< j (int n-from))
-                                (if (every? #(eval-pred-row % existing from-existing (long i) (long j)) where)
-                                  (do (aset match i true)
-                                      (aset from-match i j))
-                                  (recur (inc j))))))
+                                  (dotimes [i n-rows]
+                                    (loop [j (int 0)]
+                                      (when (< j (int n-from))
+                                        (if (every? #(eval-pred-row % existing from-existing (long i) (long j)) where)
+                                          (do (aset match i true)
+                                              (aset from-match i j))
+                                          (recur (inc j))))))
                               ;; Simple UPDATE: evaluate predicates against target table only
-                          (dotimes [i n-rows]
-                            (aset match i
-                                  (boolean
-                                   (every? #(eval-pred-row % existing nil (long i) -1) where))))))
+                                  (dotimes [i n-rows]
+                                    (aset match i
+                                          (boolean
+                                           (every? #(eval-pred-row % existing nil (long i) -1) where))))))
                         ;; Count matches
-                    n-matched (loop [i (int 0) c (int 0)]
-                                (if (>= i n-rows) c
-                                    (recur (inc i) (if (aget match i) (inc c) c))))
+                            n-matched (loop [i (int 0) c (int 0)]
+                                        (if (>= i n-rows) c
+                                            (recur (inc i) (if (aget match i) (inc c) c))))
                         ;; Apply assignments to matching rows
-                    new-cols
-                    (reduce
-                     (fn [cols {:keys [col expr]}]
-                       (let [arr (get cols col)]
-                         (when-not arr
-                           (throw (ex-info (str "Column not found: " col)
-                                           {:column col :table table})))
-                         (dotimes [i n-rows]
-                           (when (aget match i)
-                             (let [from-i (long (aget from-match i))
-                                   v (eval-row expr existing from-existing (long i) from-i)]
-                               (set-arr-val arr i v))))
-                         (assoc cols col arr)))
-                     existing
-                     assignments)]
-                (swap! table-registry-atom assoc table
-                       (with-meta new-cols (meta existing)))
-                (PgWireServer$QueryResult/empty (str "UPDATE " n-matched))))))
+                            new-cols
+                            (reduce
+                             (fn [cols {:keys [col expr]}]
+                               (let [arr (get cols col)]
+                                 (when-not arr
+                                   (throw (ex-info (str "Column not found: " col)
+                                                   {:column col :table table})))
+                                 (dotimes [i n-rows]
+                                   (when (aget match i)
+                                     (let [from-i (long (aget from-match i))
+                                           v (eval-row expr existing from-existing (long i) from-i)]
+                                       (set-arr-val arr i v))))
+                                 (assoc cols col arr)))
+                             existing
+                             assignments)]
+                        (swap! table-registry-atom assoc table
+                               (with-meta new-cols (meta existing)))
+                        (PgWireServer$QueryResult/empty (str "UPDATE " n-matched))))))
 
-            :delete
-            (let [existing (get @table-registry-atom table)]
-              (when-not existing
-                (throw (ex-info (str "Table not found: " table) {:table table})))
+                :delete
+                (let [existing (get @table-registry-atom table)]
+                  (when-not existing
+                    (throw (ex-info (str "Table not found: " table) {:table table})))
               ;; Index-backed tables (registered via stratum's columnar
               ;; engine — `register-table!` with `idx/index-from-seq`
               ;; columns) route through `ds-delete-rows!` (no period)
               ;; or `retract!` (with FOR PORTION OF VALID_TIME period)
               ;; instead of the array rebuild path below. The arrays
               ;; path is preserved unchanged for CREATE TABLE statements.
-              (if (index-backed-cols? existing)
+                  (if (index-backed-cols? existing)
                 ;; `ERASE FROM …` bypasses
                 ;; the bounded-retract path and always physically purges
                 ;; via `ds-delete-rows!` — the distinct verb makes the
                 ;; "destroys across both axes" intent explicit. Plain
                 ;; DELETE today also routes to ds-delete-rows! on
                 ;; index-backed tables; ERASE just hardens the contract.
-                (let [period (:period ddl)
-                      erase? (:erase? ddl)
-                      {:keys [new-cols n-deleted]}
-                      (cond
-                        erase?
-                        (delete-via-index-backend
-                          table existing where (meta existing))
+                    (let [period (:period ddl)
+                          erase? (:erase? ddl)
+                          {:keys [new-cols n-deleted]}
+                          (cond
+                            erase?
+                            (delete-via-index-backend
+                             table existing where (meta existing))
 
-                        (and period (= :valid_time (:axis period)))
-                        (delete-portion-via-index-backend
-                          table existing where period (meta existing))
+                            (and period (= :valid_time (:axis period)))
+                            (delete-portion-via-index-backend
+                             table existing where period (meta existing))
 
-                        :else
-                        (delete-via-index-backend
-                          table existing where (meta existing)))
-                      tag (if erase? "ERASE" "DELETE")]
-                  (swap! table-registry-atom assoc table new-cols)
-                  (PgWireServer$QueryResult/empty (str tag " " n-deleted)))
-              (let [col-keys (vec (keys existing))
-                    n-rows (let [first-col (get existing (first col-keys))]
-                             (cond
-                               (instance? (Class/forName "[J") first-col) (alength ^longs first-col)
-                               (instance? (Class/forName "[D") first-col) (alength ^doubles first-col)
-                               (instance? (Class/forName "[Ljava.lang.String;") first-col)
-                               (alength ^"[Ljava.lang.String;" first-col)
-                               :else 0))
+                            :else
+                            (delete-via-index-backend
+                             table existing where (meta existing)))
+                          tag (if erase? "ERASE" "DELETE")]
+                      (swap! table-registry-atom assoc table new-cols)
+                      (PgWireServer$QueryResult/empty (str tag " " n-deleted)))
+                    (let [col-keys (vec (keys existing))
+                          n-rows (let [first-col (get existing (first col-keys))]
+                                   (cond
+                                     (instance? (Class/forName "[J") first-col) (alength ^longs first-col)
+                                     (instance? (Class/forName "[D") first-col) (alength ^doubles first-col)
+                                     (instance? (Class/forName "[Ljava.lang.String;") first-col)
+                                     (alength ^"[Ljava.lang.String;" first-col)
+                                     :else 0))
                         ;; Build delete mask (true = delete this row)
-                    delete-mask (boolean-array n-rows)
-                    _ (if (nil? where)
-                        (java.util.Arrays/fill delete-mask true)
+                          delete-mask (boolean-array n-rows)
+                          _ (if (nil? where)
+                              (java.util.Arrays/fill delete-mask true)
                         ;; `read-cell` (used by eval-dml-predicate)
                         ;; handles both raw arrays AND :source :index
                         ;; columns, so the inline duplicate that
@@ -1223,76 +1223,76 @@
                         ;; arrays and silently NPE'd on NULL
                         ;; arithmetic (copilot review #2). Route
                         ;; through the canonical evaluator.
-                        (dotimes [i n-rows]
-                          (aset delete-mask i
-                                (boolean (eval-dml-predicate existing where i)))))
+                              (dotimes [i n-rows]
+                                (aset delete-mask i
+                                      (boolean (eval-dml-predicate existing where i)))))
                         ;; Count deletes and gather surviving indices
-                    n-deleted (loop [i (int 0) c (int 0)]
-                                (if (>= i n-rows) c
-                                    (recur (inc i) (if (aget delete-mask i) (inc c) c))))
-                    n-surviving (- n-rows n-deleted)
+                          n-deleted (loop [i (int 0) c (int 0)]
+                                      (if (>= i n-rows) c
+                                          (recur (inc i) (if (aget delete-mask i) (inc c) c))))
+                          n-surviving (- n-rows n-deleted)
                         ;; Rebuild columns with surviving rows
-                    new-cols
-                    (into {}
-                          (map (fn [col-key]
-                                 (let [old-arr (get existing col-key)]
-                                   [col-key
-                                    (cond
-                                      (instance? (Class/forName "[J") old-arr)
-                                      (let [arr (long-array n-surviving)]
-                                        (loop [i (int 0) j (int 0)]
-                                          (when (< i n-rows)
-                                            (if (aget delete-mask i)
-                                              (recur (inc i) j)
-                                              (do (aset arr j (aget ^longs old-arr i))
-                                                  (recur (inc i) (inc j))))))
-                                        arr)
+                          new-cols
+                          (into {}
+                                (map (fn [col-key]
+                                       (let [old-arr (get existing col-key)]
+                                         [col-key
+                                          (cond
+                                            (instance? (Class/forName "[J") old-arr)
+                                            (let [arr (long-array n-surviving)]
+                                              (loop [i (int 0) j (int 0)]
+                                                (when (< i n-rows)
+                                                  (if (aget delete-mask i)
+                                                    (recur (inc i) j)
+                                                    (do (aset arr j (aget ^longs old-arr i))
+                                                        (recur (inc i) (inc j))))))
+                                              arr)
 
-                                      (instance? (Class/forName "[D") old-arr)
-                                      (let [arr (double-array n-surviving)]
-                                        (loop [i (int 0) j (int 0)]
-                                          (when (< i n-rows)
-                                            (if (aget delete-mask i)
-                                              (recur (inc i) j)
-                                              (do (aset arr j (aget ^doubles old-arr i))
-                                                  (recur (inc i) (inc j))))))
-                                        arr)
+                                            (instance? (Class/forName "[D") old-arr)
+                                            (let [arr (double-array n-surviving)]
+                                              (loop [i (int 0) j (int 0)]
+                                                (when (< i n-rows)
+                                                  (if (aget delete-mask i)
+                                                    (recur (inc i) j)
+                                                    (do (aset arr j (aget ^doubles old-arr i))
+                                                        (recur (inc i) (inc j))))))
+                                              arr)
 
-                                      (instance? (Class/forName "[Ljava.lang.String;") old-arr)
-                                      (let [arr (make-array String n-surviving)]
-                                        (loop [i (int 0) j (int 0)]
-                                          (when (< i n-rows)
-                                            (if (aget delete-mask i)
-                                              (recur (inc i) j)
-                                              (do (aset ^"[Ljava.lang.String;" arr j
-                                                        (aget ^"[Ljava.lang.String;" old-arr i))
-                                                  (recur (inc i) (inc j))))))
-                                        arr))]))
-                               col-keys))]
-                (swap! table-registry-atom assoc table
-                       (with-meta new-cols (meta existing)))
-                (PgWireServer$QueryResult/empty (str "DELETE " n-deleted))))))))  ;; end locking DDL/DML dispatch
+                                            (instance? (Class/forName "[Ljava.lang.String;") old-arr)
+                                            (let [arr (make-array String n-surviving)]
+                                              (loop [i (int 0) j (int 0)]
+                                                (when (< i n-rows)
+                                                  (if (aget delete-mask i)
+                                                    (recur (inc i) j)
+                                                    (do (aset ^"[Ljava.lang.String;" arr j
+                                                              (aget ^"[Ljava.lang.String;" old-arr i))
+                                                        (recur (inc i) (inc j))))))
+                                              arr))]))
+                                     col-keys))]
+                      (swap! table-registry-atom assoc table
+                             (with-meta new-cols (meta existing)))
+                      (PgWireServer$QueryResult/empty (str "DELETE " n-deleted))))))))  ;; end locking DDL/DML dispatch
 
             ;; Parse/translation error
-        (:error parsed)
-        (PgWireServer$QueryResult. ^String (:error parsed))
+          (:error parsed)
+          (PgWireServer$QueryResult. ^String (:error parsed))
 
             ;; Normal query — execute via Stratum engine
-        (:query parsed)
-        (let [query (:query parsed)
+          (:query parsed)
+          (let [query (:query parsed)
                   ;; Attach anomaly models to query map — scoring happens post-join in query.clj
-              query (attach-anomaly-models query registry)
-              result (q/q query)
-              result (if-let [post-aggs (:_post-aggs query)]
-                       (sql/apply-post-aggs result post-aggs)
-                       result)
-              result (if-let [sel-cols (:_select-columns query)]
-                       (sql/apply-select-columns result sel-cols)
-                       result)]
-          (sql/format-results result))
+                query (attach-anomaly-models query registry)
+                result (q/q query)
+                result (if-let [post-aggs (:_post-aggs query)]
+                         (sql/apply-post-aggs result post-aggs)
+                         result)
+                result (if-let [sel-cols (:_select-columns query)]
+                         (sql/apply-select-columns result sel-cols)
+                         result)]
+            (sql/format-results result))
 
-        :else
-        (PgWireServer$QueryResult. "Internal error: unexpected parse result"))))
+          :else
+          (PgWireServer$QueryResult. "Internal error: unexpected parse result"))))
     (catch Exception e
       (PgWireServer$QueryResult. (str (.getMessage e))))))
 
@@ -1315,38 +1315,38 @@
         (reify PgWireServer$QueryHandler
           (execute [_ sql]
             (binding [*session-settings* session-settings]
-            (let [{:keys [in-tx aborted]} @tx-state]
-              (cond
+              (let [{:keys [in-tx aborted]} @tx-state]
+                (cond
                 ;; Reject non-tx commands when transaction is in error state
-                (and aborted (not (re-find #"(?i)^\s*(ROLLBACK|COMMIT|END)" sql)))
-                (-> (PgWireServer$QueryResult. "current transaction is aborted, commands ignored until end of transaction block")
-                    (.withTxStatus \E))
+                  (and aborted (not (re-find #"(?i)^\s*(ROLLBACK|COMMIT|END)" sql)))
+                  (-> (PgWireServer$QueryResult. "current transaction is aborted, commands ignored until end of transaction block")
+                      (.withTxStatus \E))
                 ;; BEGIN — start transaction
-                (re-find #"(?i)^\s*BEGIN" sql)
-                (do (swap! tx-state assoc :in-tx true :aborted false)
-                    (-> ^PgWireServer$QueryResult (execute-sql sql table-registry-atom data-dir-atom)
-                        (.withTxStatus \T)))
+                  (re-find #"(?i)^\s*BEGIN" sql)
+                  (do (swap! tx-state assoc :in-tx true :aborted false)
+                      (-> ^PgWireServer$QueryResult (execute-sql sql table-registry-atom data-dir-atom)
+                          (.withTxStatus \T)))
                 ;; COMMIT / END — commit transaction
-                (re-find #"(?i)^\s*(COMMIT|END)\s*$" sql)
-                (do (reset! tx-state {:in-tx false :aborted false})
-                    (-> ^PgWireServer$QueryResult (execute-sql sql table-registry-atom data-dir-atom)
-                        (.withTxStatus \I)))
+                  (re-find #"(?i)^\s*(COMMIT|END)\s*$" sql)
+                  (do (reset! tx-state {:in-tx false :aborted false})
+                      (-> ^PgWireServer$QueryResult (execute-sql sql table-registry-atom data-dir-atom)
+                          (.withTxStatus \I)))
                 ;; ROLLBACK — roll back transaction
-                (re-find #"(?i)^\s*ROLLBACK" sql)
-                (do (reset! tx-state {:in-tx false :aborted false})
-                    (-> ^PgWireServer$QueryResult (execute-sql sql table-registry-atom data-dir-atom)
-                        (.withTxStatus \I)))
+                  (re-find #"(?i)^\s*ROLLBACK" sql)
+                  (do (reset! tx-state {:in-tx false :aborted false})
+                      (-> ^PgWireServer$QueryResult (execute-sql sql table-registry-atom data-dir-atom)
+                          (.withTxStatus \I)))
                 ;; Normal command — execute and propagate tx status
-                :else
-                (let [^PgWireServer$QueryResult qr (execute-sql sql table-registry-atom data-dir-atom)]
-                  (cond
-                    (and in-tx (.error qr))
-                    (do (swap! tx-state assoc :aborted true)
-                        (.withTxStatus qr \E))
-                    in-tx
-                    (.withTxStatus qr \T)
-                    :else
-                    qr)))))))))))  ;; one extra `)` for the per-handler (binding [*session-settings* …] …)
+                  :else
+                  (let [^PgWireServer$QueryResult qr (execute-sql sql table-registry-atom data-dir-atom)]
+                    (cond
+                      (and in-tx (.error qr))
+                      (do (swap! tx-state assoc :aborted true)
+                          (.withTxStatus qr \E))
+                      in-tx
+                      (.withTxStatus qr \T)
+                      :else
+                      qr)))))))))))  ;; one extra `)` for the per-handler (binding [*session-settings* …] …)
 
 ;; ============================================================================
 ;; Public API

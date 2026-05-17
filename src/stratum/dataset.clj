@@ -378,23 +378,23 @@
         ;; new-vt is always MAX in upsert!/retract!. They become
         ;; reachable once Phase D wires SQL `FOR PORTION OF
         ;; VALID_TIME FROM x TO y`.)
-        {auto-truncate :truncate auto-drop :drop}
-        (if (and (seq overlaps) auto-split?)
-          (group-by (fn [[_i r]]
-                      (if (< (long (get r vf-col)) close-vt-val)
-                        :truncate
-                        :drop))
-                    overlaps)
-          {:truncate [] :drop []})
+            {auto-truncate :truncate auto-drop :drop}
+            (if (and (seq overlaps) auto-split?)
+              (group-by (fn [[_i r]]
+                          (if (< (long (get r vf-col)) close-vt-val)
+                            :truncate
+                            :drop))
+                        overlaps)
+              {:truncate [] :drop []})
 
-        _ (when (and (seq overlaps) (not auto-split?))
-            (throw (ex-info "upsert! would overlap existing rows' vt-windows"
-                            {:where where
-                             :new-window [close-vt-val Long/MAX_VALUE]
-                             :overlaps (mapv (fn [[i r]]
-                                               (assoc (select-keys r [vf-col vt-col]) :row-idx i))
-                                             overlaps)
-                             :hint "pass :auto-split? true to split overlapping rows, or restructure the write"})))]
+            _ (when (and (seq overlaps) (not auto-split?))
+                (throw (ex-info "upsert! would overlap existing rows' vt-windows"
+                                {:where where
+                                 :new-window [close-vt-val Long/MAX_VALUE]
+                                 :overlaps (mapv (fn [[i r]]
+                                                   (assoc (select-keys r [vf-col vt-col]) :row-idx i))
+                                                 overlaps)
+                                 :hint "pass :auto-split? true to split overlapping rows, or restructure the write"})))]
         ;; Mutation order is load-bearing:
         ;;   1. set-at! everything (close-safe + truncate) — indices stay
         ;;      stable across set-at!.
@@ -414,21 +414,21 @@
             (doseq [[i prev-row] close-safe]
               (let [orig-vf (long (get prev-row vf-col))]
                 (replace-row-bitemporal!
-                  this prev-row i system-now valid-cfg system-cfg
-                  [{:vf orig-vf :vt close-vt-val}
-                   {:vf close-vt-val :vt Long/MAX_VALUE :data set}]
-                  tx-meta)))
+                 this prev-row i system-now valid-cfg system-cfg
+                 [{:vf orig-vf :vt close-vt-val}
+                  {:vf close-vt-val :vt Long/MAX_VALUE :data set}]
+                 tx-meta)))
             (doseq [[i prev-row] auto-truncate]
               (let [orig-vf (long (get prev-row vf-col))]
                 (replace-row-bitemporal!
-                  this prev-row i system-now valid-cfg system-cfg
-                  [{:vf orig-vf :vt close-vt-val}]
-                  tx-meta)))
+                 this prev-row i system-now valid-cfg system-cfg
+                 [{:vf orig-vf :vt close-vt-val}]
+                 tx-meta)))
             (doseq [[i prev-row] auto-drop]
               (replace-row-bitemporal!
-                this prev-row i system-now valid-cfg system-cfg
-                []
-                tx-meta))
+               this prev-row i system-now valid-cfg system-cfg
+               []
+               tx-meta))
             (when (empty? close-safe)
               (append! this set
                        (assoc tx-meta :valid-from close-vt-val
@@ -538,29 +538,29 @@
               (let [system-now (system-now-from-tx-meta system-cfg tx-meta)]
                 (doseq [[i prev-row] drops]
                   (replace-row-bitemporal!
-                    this prev-row i system-now valid-cfg system-cfg
-                    []
-                    tx-meta))
+                   this prev-row i system-now valid-cfg system-cfg
+                   []
+                   tx-meta))
                 (doseq [[i prev-row] trunc-vt]
                   (let [orig-vf (long (get prev-row vf-col))]
                     (replace-row-bitemporal!
-                      this prev-row i system-now valid-cfg system-cfg
-                      [{:vf orig-vf :vt close-vt-val}]
-                      tx-meta)))
+                     this prev-row i system-now valid-cfg system-cfg
+                     [{:vf orig-vf :vt close-vt-val}]
+                     tx-meta)))
                 (doseq [[i prev-row] trunc-vf]
                   (let [orig-vt (long (get prev-row vt-col))]
                     (replace-row-bitemporal!
-                      this prev-row i system-now valid-cfg system-cfg
-                      [{:vf close-vt-end :vt orig-vt}]
-                      tx-meta)))
+                     this prev-row i system-now valid-cfg system-cfg
+                     [{:vf close-vt-end :vt orig-vt}]
+                     tx-meta)))
                 (doseq [[i prev-row] splits]
                   (let [orig-vf (long (get prev-row vf-col))
                         orig-vt (long (get prev-row vt-col))]
                     (replace-row-bitemporal!
-                      this prev-row i system-now valid-cfg system-cfg
-                      [{:vf orig-vf :vt close-vt-val}
-                       {:vf close-vt-end :vt orig-vt}]
-                      tx-meta)))
+                     this prev-row i system-now valid-cfg system-cfg
+                     [{:vf orig-vf :vt close-vt-val}
+                      {:vf close-vt-end :vt orig-vt}]
+                     tx-meta)))
                 this)
               ;; ----- Valid-only bounded retract (existing in-place) -----
               (do
@@ -621,20 +621,20 @@
                 (doseq [[i prev-row] close-safe]
                   (let [orig-vf (long (get prev-row vf-col))]
                     (replace-row-bitemporal!
-                      this prev-row i system-now valid-cfg system-cfg
-                      [{:vf orig-vf :vt close-vt-val}]
-                      tx-meta)))
+                     this prev-row i system-now valid-cfg system-cfg
+                     [{:vf orig-vf :vt close-vt-val}]
+                     tx-meta)))
                 (doseq [[i prev-row] auto-truncate]
                   (let [orig-vf (long (get prev-row vf-col))]
                     (replace-row-bitemporal!
-                      this prev-row i system-now valid-cfg system-cfg
-                      [{:vf orig-vf :vt close-vt-val}]
-                      tx-meta)))
+                     this prev-row i system-now valid-cfg system-cfg
+                     [{:vf orig-vf :vt close-vt-val}]
+                     tx-meta)))
                 (doseq [[i prev-row] auto-drop]
                   (replace-row-bitemporal!
-                    this prev-row i system-now valid-cfg system-cfg
-                    []
-                    tx-meta))
+                   this prev-row i system-now valid-cfg system-cfg
+                   []
+                   tx-meta))
                 this)
               ;; ----- Valid-only open-window retract -----
               (do
@@ -1347,18 +1347,18 @@
         ;; shifts indices in step 2.
         overlapping
         (vec
-          (for [i (range n)
-                :let [row (materialize-row cols-snap i)]
-                :when (let [pred-ok? (eval-pred where row)
-                            row-vf  (long (get row vf-col))
-                            row-vt  (long (get row vt-col))]
-                        (and pred-ok?
-                             (not (or (<= row-vt new-vf) (>= row-vf new-vt)))))]
-            (let [row-vf (long (get row vf-col))
-                  row-vt (long (get row vt-col))]
-              {:row row
-               :slice-vf (max row-vf new-vf)
-               :slice-vt (min row-vt new-vt)})))]
+         (for [i (range n)
+               :let [row (materialize-row cols-snap i)]
+               :when (let [pred-ok? (eval-pred where row)
+                           row-vf  (long (get row vf-col))
+                           row-vt  (long (get row vt-col))]
+                       (and pred-ok?
+                            (not (or (<= row-vt new-vf) (>= row-vf new-vt)))))]
+           (let [row-vf (long (get row vf-col))
+                 row-vt (long (get row vt-col))]
+             {:row row
+              :slice-vf (max row-vf new-vf)
+              :slice-vt (min row-vt new-vt)})))]
     ;; Step 2 + 3 share ONE system-now stamp. `retract!` (bounded
     ;; branch) closes each affected row's `_system_to` to its own
     ;; `system-now`; `append!` stamps each replacement slice's

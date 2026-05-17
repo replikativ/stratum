@@ -6,8 +6,8 @@
             [stratum.server :as server]
             [stratum.specification :as spec])
   (:import [stratum.internal PgWireServer$QueryResult
-                              PgWireServer$QueryHandler
-                              PgWireServer$QueryHandlerFactory]))
+            PgWireServer$QueryHandler
+            PgWireServer$QueryHandlerFactory]))
 
 (set! *warn-on-reflection* true)
 
@@ -2174,9 +2174,9 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "salaries"
-          {:eid    (stratum.index/index-from-seq :int64 [1 2 3 4 5])
-           :salary (stratum.index/index-from-seq :int64 [100 200 300 400 500])})
+         srv "salaries"
+         {:eid    (stratum.index/index-from-seq :int64 [1 2 3 4 5])
+          :salary (stratum.index/index-from-seq :int64 [100 200 300 400 500])})
         ;; Sanity check — confirm the registry stored it as an index-backed
         ;; encoded map (else this test isn't really exercising the new path).
         (let [cols (get @(:registry srv) "salaries")]
@@ -2201,9 +2201,9 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "t"
-          {:a (stratum.index/index-from-seq :int64 [1 2 3])
-           :b (stratum.index/index-from-seq :int64 [10 20 30])})
+         srv "t"
+         {:a (stratum.index/index-from-seq :int64 [1 2 3])
+          :b (stratum.index/index-from-seq :int64 [10 20 30])})
         (let [exec @(resolve 'stratum.server/execute-sql)
               ^PgWireServer$QueryResult qr
               (exec "DELETE FROM t" (:registry srv) (:data-dir srv))]
@@ -2217,8 +2217,8 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "t"
-          {:a (stratum.index/index-from-seq :int64 [1 2 3])})
+         srv "t"
+         {:a (stratum.index/index-from-seq :int64 [1 2 3])})
         (let [exec @(resolve 'stratum.server/execute-sql)
               ^PgWireServer$QueryResult qr
               (exec "DELETE FROM t WHERE a = 99" (:registry srv) (:data-dir srv))]
@@ -2239,7 +2239,7 @@
 (deftest preprocess-for-portion-of-valid-time-strips-clause
   (testing "preprocess-sql extracts FOR PORTION OF VALID_TIME and rewrites the SQL"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "DELETE FROM t FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-07-01' WHERE eid = 1")]
+             "DELETE FROM t FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-07-01' WHERE eid = 1")]
       (is (= "DELETE FROM t WHERE eid = 1" (.trim ^String (:sql r))))
       (is (= :valid_time (:axis (:period r))))
       ;; 2024-04-01T00:00Z → 1711929600 sec → 1711929600000000 micros
@@ -2256,8 +2256,8 @@
 (deftest parse-sql-attaches-period-to-delete-ddl
   (testing "parse-sql carries :period through to the :ddl map for DELETE"
     (let [r (sql/parse-sql
-              "DELETE FROM t FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-07-01' WHERE eid = 1"
-              {"t" {:eid (long-array [1])}})]
+             "DELETE FROM t FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-07-01' WHERE eid = 1"
+             {"t" {:eid (long-array [1])}})]
       (is (= :delete (get-in r [:ddl :op])))
       (is (= :valid_time (get-in r [:ddl :period :axis])))
       (is (= 1711929600000000 (get-in r [:ddl :period :from])))
@@ -2268,18 +2268,18 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "salaries"
-          (with-meta
-            {:eid         (stratum.index/index-from-seq :int64 [1 1])
-             :salary      (stratum.index/index-from-seq :int64 [100 200])
+         srv "salaries"
+         (with-meta
+           {:eid         (stratum.index/index-from-seq :int64 [1 1])
+            :salary      (stratum.index/index-from-seq :int64 [100 200])
              ;; [Jan-2024, Jul-2024) closed, [Jul-2024, MAX) open
-             :_valid_from (stratum.index/index-from-seq :int64
-                            [1704067200000000 1719792000000000])
-             :_valid_to   (stratum.index/index-from-seq :int64
-                            [1719792000000000 Long/MAX_VALUE])}
-            {:bitemporal {:valid {:from-col :_valid_from
-                                  :to-col   :_valid_to
-                                  :unit     :micros}}}))
+            :_valid_from (stratum.index/index-from-seq :int64
+                                                       [1704067200000000 1719792000000000])
+            :_valid_to   (stratum.index/index-from-seq :int64
+                                                       [1719792000000000 Long/MAX_VALUE])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
         ;; DELETE FOR PORTION OF [Apr-2024, May-2024) WHERE eid=1
         ;; Closed row [Jan, Jul) straddles the cut: SPLIT into [Jan, Apr) + [May, Jul).
         ;; Open row [Jul, MAX) doesn't overlap.
@@ -2294,7 +2294,7 @@
         (let [cols (get @(:registry srv) "salaries")
               n    (stratum.index/idx-length (:index (:eid cols)))
               read-col (fn [k] (mapv #(stratum.index/idx-get-long
-                                        (:index (get cols k)) %)
+                                       (:index (get cols k)) %)
                                      (range n)))]
           (is (= 3 n))
           ;; Three surviving rows after the split of row 0:
@@ -2314,16 +2314,16 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "salaries"
-          (with-meta
+         srv "salaries"
+         (with-meta
             ;; Start with an empty bitemporal table.
-            {:eid         (stratum.index/index-from-seq :int64 [])
-             :salary      (stratum.index/index-from-seq :int64 [])
-             :_valid_from (stratum.index/index-from-seq :int64 [])
-             :_valid_to   (stratum.index/index-from-seq :int64 [])}
-            {:bitemporal {:valid {:from-col :_valid_from
-                                  :to-col   :_valid_to
-                                  :unit     :micros}}}))
+           {:eid         (stratum.index/index-from-seq :int64 [])
+            :salary      (stratum.index/index-from-seq :int64 [])
+            :_valid_from (stratum.index/index-from-seq :int64 [])
+            :_valid_to   (stratum.index/index-from-seq :int64 [])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
         (let [exec @(resolve 'stratum.server/execute-sql)
               ^PgWireServer$QueryResult qr
               (exec (str "INSERT INTO salaries (eid, salary) VALUES (1, 100) "
@@ -2333,7 +2333,7 @@
         (let [cols (get @(:registry srv) "salaries")
               n    (stratum.index/idx-length (:index (:eid cols)))
               read-col (fn [k] (mapv #(stratum.index/idx-get-long
-                                        (:index (get cols k)) %)
+                                       (:index (get cols k)) %)
                                      (range n)))]
           (is (= 1 n))
           (is (= [1] (read-col :eid)))
@@ -2347,16 +2347,16 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "salaries"
-          (with-meta
+         srv "salaries"
+         (with-meta
             ;; Single row [Jan, Jul) with salary=100.
-            {:eid         (stratum.index/index-from-seq :int64 [1])
-             :salary      (stratum.index/index-from-seq :int64 [100])
-             :_valid_from (stratum.index/index-from-seq :int64 [1704067200000000])
-             :_valid_to   (stratum.index/index-from-seq :int64 [1719792000000000])}
-            {:bitemporal {:valid {:from-col :_valid_from
-                                  :to-col   :_valid_to
-                                  :unit     :micros}}}))
+           {:eid         (stratum.index/index-from-seq :int64 [1])
+            :salary      (stratum.index/index-from-seq :int64 [100])
+            :_valid_from (stratum.index/index-from-seq :int64 [1704067200000000])
+            :_valid_to   (stratum.index/index-from-seq :int64 [1719792000000000])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
         ;; UPDATE … FOR PORTION OF [Apr, May) SET salary=999 WHERE eid=1
         ;; Row [Jan, Jul) straddles [Apr, May): 3-way split.
         ;;   [Jan, Apr) keeps salary=100
@@ -2372,7 +2372,7 @@
         (let [cols (get @(:registry srv) "salaries")
               n    (stratum.index/idx-length (:index (:eid cols)))
               read-col (fn [k] (mapv #(stratum.index/idx-get-long
-                                        (:index (get cols k)) %)
+                                       (:index (get cols k)) %)
                                      (range n)))]
           (is (= 3 n))
           ;; Find the [Apr, May) slice (the updated one) by its
@@ -2416,19 +2416,19 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "salaries"
-          (with-meta
+         srv "salaries"
+         (with-meta
             ;; Single row [Jan, Jul) valid-time, _system_from=tx1,
             ;; _system_to=MAX. Salary=100.
-            {:eid          (stratum.index/index-from-seq :int64 [1])
-             :salary       (stratum.index/index-from-seq :int64 [100])
-             :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000])
-             :_valid_to    (stratum.index/index-from-seq :int64 [1719792000000000])
-             :_system_from (stratum.index/index-from-seq :int64 [1000000])
-             :_system_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])}
-            {:bitemporal
-             {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
-              :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+           {:eid          (stratum.index/index-from-seq :int64 [1])
+            :salary       (stratum.index/index-from-seq :int64 [100])
+            :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000])
+            :_valid_to    (stratum.index/index-from-seq :int64 [1719792000000000])
+            :_system_from (stratum.index/index-from-seq :int64 [1000000])
+            :_system_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])}
+           {:bitemporal
+            {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+             :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
         ;; UPDATE FOR PORTION OF [Apr, May): straddles → 3-way split.
         ;; The bitemporal path preserves the OLD row (with closed _system_to)
         ;; plus appends three replacement slices, all sharing one sys-now.
@@ -2442,7 +2442,7 @@
         (let [cols (get @(:registry srv) "salaries")
               n    (stratum.index/idx-length (:index (:eid cols)))
               read-col (fn [k] (mapv #(stratum.index/idx-get-long
-                                        (:index (get cols k)) %)
+                                       (:index (get cols k)) %)
                                      (range n)))
               rows (mapv (fn [i]
                            {:eid    (nth (read-col :eid) i)
@@ -2503,17 +2503,17 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "salaries"
-          (with-meta
-            {:eid          (stratum.index/index-from-seq :int64 [1])
-             :salary       (stratum.index/index-from-seq :int64 [100])
-             :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000])
-             :_valid_to    (stratum.index/index-from-seq :int64 [1719792000000000])
-             :_system_from (stratum.index/index-from-seq :int64 [1000000])
-             :_system_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])}
-            {:bitemporal
-             {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
-              :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+         srv "salaries"
+         (with-meta
+           {:eid          (stratum.index/index-from-seq :int64 [1])
+            :salary       (stratum.index/index-from-seq :int64 [100])
+            :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000])
+            :_valid_to    (stratum.index/index-from-seq :int64 [1719792000000000])
+            :_system_from (stratum.index/index-from-seq :int64 [1000000])
+            :_system_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])}
+           {:bitemporal
+            {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+             :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
         ;; DELETE FOR PORTION OF [Apr, May): row [Jan, Jul) splits.
         ;; Result: 1 closed-old + 2 surviving slices ([Jan, Apr), [May, Jul)).
         (let [exec @(resolve 'stratum.server/execute-sql)]
@@ -2524,7 +2524,7 @@
         (let [cols (get @(:registry srv) "salaries")
               n    (stratum.index/idx-length (:index (:eid cols)))
               read-col (fn [k] (mapv #(stratum.index/idx-get-long
-                                        (:index (get cols k)) %)
+                                       (:index (get cols k)) %)
                                      (range n)))
               rows (mapv (fn [i]
                            {:eid    (nth (read-col :eid) i)
@@ -2562,18 +2562,18 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "salaries"
-          (with-meta
+         srv "salaries"
+         (with-meta
             ;; Start empty.
-            {:eid          (stratum.index/index-from-seq :int64 [])
-             :salary       (stratum.index/index-from-seq :int64 [])
-             :_valid_from  (stratum.index/index-from-seq :int64 [])
-             :_valid_to    (stratum.index/index-from-seq :int64 [])
-             :_system_from (stratum.index/index-from-seq :int64 [])
-             :_system_to   (stratum.index/index-from-seq :int64 [])}
-            {:bitemporal
-             {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
-              :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+           {:eid          (stratum.index/index-from-seq :int64 [])
+            :salary       (stratum.index/index-from-seq :int64 [])
+            :_valid_from  (stratum.index/index-from-seq :int64 [])
+            :_valid_to    (stratum.index/index-from-seq :int64 [])
+            :_system_from (stratum.index/index-from-seq :int64 [])
+            :_system_to   (stratum.index/index-from-seq :int64 [])}
+           {:bitemporal
+            {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+             :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
         (let [exec @(resolve 'stratum.server/execute-sql)]
           (exec (str "INSERT INTO salaries (eid, salary) "
                      "VALUES (1, 100) "
@@ -2582,7 +2582,7 @@
         (let [cols (get @(:registry srv) "salaries")
               n    (stratum.index/idx-length (:index (:eid cols)))
               read-col (fn [k] (mapv #(stratum.index/idx-get-long
-                                        (:index (get cols k)) %)
+                                       (:index (get cols k)) %)
                                      (range n)))
               rows (mapv (fn [i] {:vf (nth (read-col :_valid_from) i)
                                   :vt (nth (read-col :_valid_to) i)
@@ -2649,17 +2649,17 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "salaries"
-          (with-meta
-            {:eid          (stratum.index/index-from-seq :int64 [])
-             :salary       (stratum.index/index-from-seq :int64 [])
-             :_valid_from  (stratum.index/index-from-seq :int64 [])
-             :_valid_to    (stratum.index/index-from-seq :int64 [])
-             :_system_from (stratum.index/index-from-seq :int64 [])
-             :_system_to   (stratum.index/index-from-seq :int64 [])}
-            {:bitemporal
-             {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
-              :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+         srv "salaries"
+         (with-meta
+           {:eid          (stratum.index/index-from-seq :int64 [])
+            :salary       (stratum.index/index-from-seq :int64 [])
+            :_valid_from  (stratum.index/index-from-seq :int64 [])
+            :_valid_to    (stratum.index/index-from-seq :int64 [])
+            :_system_from (stratum.index/index-from-seq :int64 [])
+            :_system_to   (stratum.index/index-from-seq :int64 [])}
+           {:bitemporal
+            {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+             :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
         (let [exec @(resolve 'stratum.server/execute-sql)
               ^PgWireServer$QueryResult r
               (exec (str "INSERT INTO salaries "
@@ -2707,13 +2707,13 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "t"
+         srv "t"
           ;; eid=1: a=5, b=10 (a<b → match)
           ;; eid=2: a=20, b=15 (a<b false → no match)
           ;; eid=3: a=7, b=7 (a<b false → no match)
-          {:eid (long-array [1 2 3])
-           :a   (long-array [5 20 7])
-           :b   (long-array [10 15 7])})
+         {:eid (long-array [1 2 3])
+          :a   (long-array [5 20 7])
+          :b   (long-array [10 15 7])})
         (let [exec @(resolve 'stratum.server/execute-sql)
               ^PgWireServer$QueryResult r
               (exec "SELECT eid FROM t WHERE a < b ORDER BY eid"
@@ -2742,12 +2742,12 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "t"
-          (with-meta
+         srv "t"
+         (with-meta
             ;; rows: id=1 v=10, id=2 v=NULL (Long/MIN_VALUE), id=3 v=20
-            {:id (stratum.index/index-from-seq :int64 [1 2 3])
-             :v  (stratum.index/index-from-seq :int64 [10 Long/MIN_VALUE 20])}
-            {}))
+           {:id (stratum.index/index-from-seq :int64 [1 2 3])
+            :v  (stratum.index/index-from-seq :int64 [10 Long/MIN_VALUE 20])}
+           {}))
         (let [exec @(resolve 'stratum.server/execute-sql)]
           ;; Pre-fix: throws NPE because row 2's :v reads as nil and
           ;; the arithmetic `v + 1` calls `(double nil)`.
@@ -2851,17 +2851,17 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "salaries"
-          (with-meta
-            {:eid          (stratum.index/index-from-seq :int64 [])
-             :salary       (stratum.index/index-from-seq :int64 [])
-             :_valid_from  (stratum.index/index-from-seq :int64 [])
-             :_valid_to    (stratum.index/index-from-seq :int64 [])
-             :_system_from (stratum.index/index-from-seq :int64 [])
-             :_system_to   (stratum.index/index-from-seq :int64 [])}
-            {:bitemporal
-             {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
-              :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+         srv "salaries"
+         (with-meta
+           {:eid          (stratum.index/index-from-seq :int64 [])
+            :salary       (stratum.index/index-from-seq :int64 [])
+            :_valid_from  (stratum.index/index-from-seq :int64 [])
+            :_valid_to    (stratum.index/index-from-seq :int64 [])
+            :_system_from (stratum.index/index-from-seq :int64 [])
+            :_system_to   (stratum.index/index-from-seq :int64 [])}
+           {:bitemporal
+            {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+             :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
         (let [exec @(resolve 'stratum.server/execute-sql)]
           ;; Plain INSERT — user supplies _valid_from/_valid_to
           ;; explicitly; system axis must be auto-stamped by stratum.
@@ -2874,7 +2874,7 @@
         (let [cols (get @(:registry srv) "salaries")
               n    (stratum.index/idx-length (:index (:eid cols)))
               read-col (fn [k] (mapv #(stratum.index/idx-get-long
-                                        (:index (get cols k)) %)
+                                       (:index (get cols k)) %)
                                      (range n)))
               rows (mapv (fn [i] {:vf (nth (read-col :_valid_from) i)
                                   :vt (nth (read-col :_valid_to) i)
@@ -2896,12 +2896,12 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "t"
-          (with-meta
-            {:eid (stratum.index/index-from-seq :int64 [])
-             :_valid_from (stratum.index/index-from-seq :int64 [])
-             :_valid_to (stratum.index/index-from-seq :int64 [])}
-            {:bitemporal {:valid {:from-col :_valid_from :to-col :_valid_to :unit :micros}}}))
+         srv "t"
+         (with-meta
+           {:eid (stratum.index/index-from-seq :int64 [])
+            :_valid_from (stratum.index/index-from-seq :int64 [])
+            :_valid_to (stratum.index/index-from-seq :int64 [])}
+           {:bitemporal {:valid {:from-col :_valid_from :to-col :_valid_to :unit :micros}}}))
         (let [exec @(resolve 'stratum.server/execute-sql)
               ^PgWireServer$QueryResult qr
               (exec (str "INSERT INTO t (eid) VALUES (1) "
@@ -2919,7 +2919,7 @@
 (deftest preprocess-for-portion-of-valid-time-without-to-defaults-to-max
   (testing "FROM x with no TO is the open-ended form: vt = Long/MAX_VALUE"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "DELETE FROM t FOR PORTION OF VALID_TIME FROM '2024-04-01' WHERE eid = 1")]
+             "DELETE FROM t FOR PORTION OF VALID_TIME FROM '2024-04-01' WHERE eid = 1")]
       (is (= "DELETE FROM t WHERE eid = 1" (.trim ^String (:sql r))))
       (is (= :valid_time (:axis (:period r))))
       (is (= 1711929600000000 (:from (:period r))))
@@ -2930,16 +2930,16 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "salaries"
-          (with-meta
+         srv "salaries"
+         (with-meta
             ;; Open row [Jan-2024, MAX) with salary=100.
-            {:eid         (stratum.index/index-from-seq :int64 [1])
-             :salary      (stratum.index/index-from-seq :int64 [100])
-             :_valid_from (stratum.index/index-from-seq :int64 [1704067200000000])
-             :_valid_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])}
-            {:bitemporal {:valid {:from-col :_valid_from
-                                  :to-col   :_valid_to
-                                  :unit     :micros}}}))
+           {:eid         (stratum.index/index-from-seq :int64 [1])
+            :salary      (stratum.index/index-from-seq :int64 [100])
+            :_valid_from (stratum.index/index-from-seq :int64 [1704067200000000])
+            :_valid_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
         (let [exec @(resolve 'stratum.server/execute-sql)
               ^PgWireServer$QueryResult qr
               (exec (str "DELETE FROM salaries "
@@ -2968,7 +2968,7 @@
 (deftest preprocess-for-all-valid-time-strips-clause
   (testing "FOR ALL VALID_TIME produces a period spanning all time"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "DELETE FROM t FOR ALL VALID_TIME WHERE eid = 1")]
+             "DELETE FROM t FOR ALL VALID_TIME WHERE eid = 1")]
       (is (= "DELETE FROM t WHERE eid = 1" (normalize-ws (:sql r))))
       (is (= :valid_time (:axis (:period r))))
       (is (= Long/MIN_VALUE (:from (:period r))))
@@ -2977,7 +2977,7 @@
 (deftest preprocess-valid-time-all-trailing-form
   (testing "VALID_TIME ALL trailing form also works"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "DELETE FROM t FOR VALID_TIME ALL WHERE eid = 1")]
+             "DELETE FROM t FOR VALID_TIME ALL WHERE eid = 1")]
       (is (= "DELETE FROM t WHERE eid = 1" (normalize-ws (:sql r))))
       (is (= :valid_time (:axis (:period r)))))))
 
@@ -2986,16 +2986,16 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "salaries"
-          (with-meta
+         srv "salaries"
+         (with-meta
             ;; Two slices for eid=1, plus one for eid=2 (untouched).
-            {:eid         (stratum.index/index-from-seq :int64 [1 1 2])
-             :salary      (stratum.index/index-from-seq :int64 [100 110 200])
-             :_valid_from (stratum.index/index-from-seq :int64 [1000 2000 1500])
-             :_valid_to   (stratum.index/index-from-seq :int64 [2000 Long/MAX_VALUE Long/MAX_VALUE])}
-            {:bitemporal {:valid {:from-col :_valid_from
-                                  :to-col   :_valid_to
-                                  :unit     :micros}}}))
+           {:eid         (stratum.index/index-from-seq :int64 [1 1 2])
+            :salary      (stratum.index/index-from-seq :int64 [100 110 200])
+            :_valid_from (stratum.index/index-from-seq :int64 [1000 2000 1500])
+            :_valid_to   (stratum.index/index-from-seq :int64 [2000 Long/MAX_VALUE Long/MAX_VALUE])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
         (let [exec @(resolve 'stratum.server/execute-sql)
               ^PgWireServer$QueryResult qr
               (exec "DELETE FROM salaries FOR ALL VALID_TIME WHERE eid = 1"
@@ -3016,7 +3016,7 @@
 (deftest preprocess-for-portion-of-current-timestamp
   (testing "CURRENT_TIMESTAMP / NOW / NOW() recognized as temporal literals"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "DELETE FROM t FOR PORTION OF VALID_TIME FROM CURRENT_TIMESTAMP TO END_OF_TIME WHERE eid = 1")]
+             "DELETE FROM t FOR PORTION OF VALID_TIME FROM CURRENT_TIMESTAMP TO END_OF_TIME WHERE eid = 1")]
       (is (= "DELETE FROM t WHERE eid = 1" (normalize-ws (:sql r))))
       (is (= Long/MAX_VALUE (:to (:period r))))
       ;; NOW falls within a generous window of System/currentTimeMillis * 1000.
@@ -3027,7 +3027,7 @@
 (deftest preprocess-for-portion-of-now-form
   (testing "NOW and NOW() also work"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "DELETE FROM t FOR PORTION OF VALID_TIME FROM NOW() TO MAX_VALUE WHERE eid = 1")]
+             "DELETE FROM t FOR PORTION OF VALID_TIME FROM NOW() TO MAX_VALUE WHERE eid = 1")]
       (is (= :valid_time (:axis (:period r))))
       (is (number? (:from (:period r))))
       (is (= Long/MAX_VALUE (:to (:period r)))))))
@@ -3035,16 +3035,16 @@
 (deftest preprocess-for-portion-of-start-of-time
   (testing "START_OF_TIME / MIN_VALUE expand to Long/MIN_VALUE"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "DELETE FROM t FOR PORTION OF VALID_TIME FROM START_OF_TIME TO '2024-04-01' WHERE eid = 1")]
+             "DELETE FROM t FOR PORTION OF VALID_TIME FROM START_OF_TIME TO '2024-04-01' WHERE eid = 1")]
       (is (= Long/MIN_VALUE (:from (:period r))))
       (is (= 1711929600000000 (:to (:period r)))))))
 
 (deftest preprocess-for-portion-of-rejects-column-ref
   (testing "Column reference is not yet supported (clear error message)"
     (is (thrown-with-msg?
-          clojure.lang.ExceptionInfo #"Column references and per-row expressions are not yet supported"
-          (stratum.sql.rewrite/preprocess-sql
-            "DELETE FROM t FOR PORTION OF VALID_TIME FROM contract_start TO contract_end WHERE eid = 1")))))
+         clojure.lang.ExceptionInfo #"Column references and per-row expressions are not yet supported"
+         (stratum.sql.rewrite/preprocess-sql
+          "DELETE FROM t FOR PORTION OF VALID_TIME FROM contract_start TO contract_end WHERE eid = 1")))))
 
 ;; ============================================================================
 ;; Allen interval predicates as SQL functions
@@ -3082,36 +3082,36 @@
 (deftest sql-overlaps-allen-predicate-via-delete
   (testing "OVERLAPS(a_from, a_to, b_from, b_to) — DELETE removes overlapping rows"
     (let [survivors (allen-delete-survivors
-                      {:eid    [1 2 3]
-                       :a_from [100 200 300]
-                       :a_to   [200 300 400]
-                       :b_from [150 350 250]
-                       :b_to   [250 450 350]}
-                      "DELETE FROM intervals WHERE OVERLAPS(a_from, a_to, b_from, b_to)")]
+                     {:eid    [1 2 3]
+                      :a_from [100 200 300]
+                      :a_to   [200 300 400]
+                      :b_from [150 350 250]
+                      :b_to   [250 450 350]}
+                     "DELETE FROM intervals WHERE OVERLAPS(a_from, a_to, b_from, b_to)")]
       ;; Row 1 overlaps (deleted). Row 2 doesn't (kept). Row 3 overlaps (deleted).
       (is (= [2] survivors)))))
 
 (deftest sql-precedes-allen-predicate-via-delete
   (testing "PRECEDES(a_from, a_to, b_from, b_to) — DELETE removes preceding rows"
     (let [survivors (allen-delete-survivors
-                      {:eid    [1 2]
-                       :a_from [100 100]
-                       :a_to   [200 200]
-                       :b_from [200 250]
-                       :b_to   [300 350]}
-                      "DELETE FROM intervals WHERE PRECEDES(a_from, a_to, b_from, b_to)")]
+                     {:eid    [1 2]
+                      :a_from [100 100]
+                      :a_to   [200 200]
+                      :b_from [200 250]
+                      :b_to   [300 350]}
+                     "DELETE FROM intervals WHERE PRECEDES(a_from, a_to, b_from, b_to)")]
       ;; Both precede (touching counts), both deleted.
       (is (= [] survivors)))))
 
 (deftest sql-strictly-precedes-no-touching-via-delete
   (testing "STRICTLY_PRECEDES rejects touching boundaries"
     (let [survivors (allen-delete-survivors
-                      {:eid    [1 2]
-                       :a_from [100 100]
-                       :a_to   [200 200]
-                       :b_from [200 250]
-                       :b_to   [300 350]}
-                      "DELETE FROM intervals WHERE STRICTLY_PRECEDES(a_from, a_to, b_from, b_to)")]
+                     {:eid    [1 2]
+                      :a_from [100 100]
+                      :a_to   [200 200]
+                      :b_from [200 250]
+                      :b_to   [300 350]}
+                     "DELETE FROM intervals WHERE STRICTLY_PRECEDES(a_from, a_to, b_from, b_to)")]
       ;; Row 1: a_to=b_from=200 — touching → not strictly preceding → KEEP.
       ;; Row 2: a_to=200 < b_from=250 → strictly precedes → DELETE.
       (is (= [1] survivors)))))
@@ -3119,24 +3119,24 @@
 (deftest sql-contains-period-allen-predicate-via-delete
   (testing "CONTAINS_PERIOD: DELETE rows where A contains B"
     (let [survivors (allen-delete-survivors
-                      {:eid    [1 2]
-                       :a_from [100 100]
-                       :a_to   [500 200]
-                       :b_from [200 150]
-                       :b_to   [400 250]}
-                      "DELETE FROM intervals WHERE CONTAINS_PERIOD(a_from, a_to, b_from, b_to)")]
+                     {:eid    [1 2]
+                      :a_from [100 100]
+                      :a_to   [500 200]
+                      :b_from [200 150]
+                      :b_to   [400 250]}
+                     "DELETE FROM intervals WHERE CONTAINS_PERIOD(a_from, a_to, b_from, b_to)")]
       ;; Row 1 contains (deleted). Row 2 doesn't (kept).
       (is (= [2] survivors)))))
 
 (deftest sql-equals-period-allen-predicate-via-delete
   (testing "EQUALS_PERIOD: DELETE rows where both endpoints match exactly"
     (let [survivors (allen-delete-survivors
-                      {:eid    [1 2 3]
-                       :a_from [100 100 200]
-                       :a_to   [200 200 300]
-                       :b_from [100 100 100]
-                       :b_to   [200 300 200]}
-                      "DELETE FROM intervals WHERE EQUALS_PERIOD(a_from, a_to, b_from, b_to)")]
+                     {:eid    [1 2 3]
+                      :a_from [100 100 200]
+                      :a_to   [200 200 300]
+                      :b_from [100 100 100]
+                      :b_to   [200 300 200]}
+                     "DELETE FROM intervals WHERE EQUALS_PERIOD(a_from, a_to, b_from, b_to)")]
       ;; Row 1: a=[100,200) b=[100,200) → equal → DELETE.
       ;; Row 2: a=[100,200) b=[100,300) → NOT equal → KEEP.
       ;; Row 3: a=[200,300) b=[100,200) → NOT equal → KEEP.
@@ -3145,12 +3145,12 @@
 (deftest sql-immediately-precedes-allen-predicate-via-delete
   (testing "IMMEDIATELY_PRECEDES: A.to == B.from"
     (let [survivors (allen-delete-survivors
-                      {:eid    [1 2 3]
-                       :a_from [100 100 100]
-                       :a_to   [200 199 201]
-                       :b_from [200 200 200]
-                       :b_to   [300 300 300]}
-                      "DELETE FROM intervals WHERE IMMEDIATELY_PRECEDES(a_from, a_to, b_from, b_to)")]
+                     {:eid    [1 2 3]
+                      :a_from [100 100 100]
+                      :a_to   [200 199 201]
+                      :b_from [200 200 200]
+                      :b_to   [300 300 300]}
+                     "DELETE FROM intervals WHERE IMMEDIATELY_PRECEDES(a_from, a_to, b_from, b_to)")]
       ;; Row 1: a_to=200 == b_from=200 → DELETE.
       ;; Row 2: a_to=199 != 200 → KEEP. Row 3: a_to=201 != 200 → KEEP.
       (is (= [2 3] survivors)))))
@@ -3158,12 +3158,12 @@
 (deftest sql-succeeds-allen-predicate-via-delete
   (testing "SUCCEEDS: A.from >= B.to (touching counts)"
     (let [survivors (allen-delete-survivors
-                      {:eid    [1 2 3]
-                       :a_from [200 250 199]
-                       :a_to   [300 350 250]
-                       :b_from [100 100 100]
-                       :b_to   [200 200 200]}
-                      "DELETE FROM intervals WHERE SUCCEEDS(a_from, a_to, b_from, b_to)")]
+                     {:eid    [1 2 3]
+                      :a_from [200 250 199]
+                      :a_to   [300 350 250]
+                      :b_from [100 100 100]
+                      :b_to   [200 200 200]}
+                     "DELETE FROM intervals WHERE SUCCEEDS(a_from, a_to, b_from, b_to)")]
       ;; Row 1: a_from=200 >= b_to=200 → touching, SUCCEEDS, DELETE.
       ;; Row 2: a_from=250 >= 200 → DELETE.
       ;; Row 3: a_from=199 < 200 → KEEP.
@@ -3172,12 +3172,12 @@
 (deftest sql-strictly-succeeds-allen-predicate-via-delete
   (testing "STRICTLY_SUCCEEDS: A.from > B.to (no touching)"
     (let [survivors (allen-delete-survivors
-                      {:eid    [1 2]
-                       :a_from [200 201]
-                       :a_to   [300 300]
-                       :b_from [100 100]
-                       :b_to   [200 200]}
-                      "DELETE FROM intervals WHERE STRICTLY_SUCCEEDS(a_from, a_to, b_from, b_to)")]
+                     {:eid    [1 2]
+                      :a_from [200 201]
+                      :a_to   [300 300]
+                      :b_from [100 100]
+                      :b_to   [200 200]}
+                     "DELETE FROM intervals WHERE STRICTLY_SUCCEEDS(a_from, a_to, b_from, b_to)")]
       ;; Row 1: a_from=200 == b_to=200 (touching) → NOT strictly succeeds → KEEP.
       ;; Row 2: a_from=201 > 200 → STRICTLY succeeds → DELETE.
       (is (= [1] survivors)))))
@@ -3185,12 +3185,12 @@
 (deftest sql-immediately-succeeds-allen-predicate-via-delete
   (testing "IMMEDIATELY_SUCCEEDS: A.from == B.to"
     (let [survivors (allen-delete-survivors
-                      {:eid    [1 2 3]
-                       :a_from [200 199 201]
-                       :a_to   [300 300 300]
-                       :b_from [100 100 100]
-                       :b_to   [200 200 200]}
-                      "DELETE FROM intervals WHERE IMMEDIATELY_SUCCEEDS(a_from, a_to, b_from, b_to)")]
+                     {:eid    [1 2 3]
+                      :a_from [200 199 201]
+                      :a_to   [300 300 300]
+                      :b_from [100 100 100]
+                      :b_to   [200 200 200]}
+                     "DELETE FROM intervals WHERE IMMEDIATELY_SUCCEEDS(a_from, a_to, b_from, b_to)")]
       ;; Row 1: a_from=200 == b_to=200 → DELETE.
       ;; Row 2/3: a_from != b_to → KEEP.
       (is (= [2 3] survivors)))))
@@ -3198,12 +3198,12 @@
 (deftest sql-meets-allen-predicate-via-delete
   (testing "MEETS: alias for IMMEDIATELY_PRECEDES (A.to == B.from)"
     (let [survivors (allen-delete-survivors
-                      {:eid    [1 2]
-                       :a_from [100 100]
-                       :a_to   [200 199]
-                       :b_from [200 200]
-                       :b_to   [300 300]}
-                      "DELETE FROM intervals WHERE MEETS(a_from, a_to, b_from, b_to)")]
+                     {:eid    [1 2]
+                      :a_from [100 100]
+                      :a_to   [200 199]
+                      :b_from [200 200]
+                      :b_to   [300 300]}
+                     "DELETE FROM intervals WHERE MEETS(a_from, a_to, b_from, b_to)")]
       ;; Row 1: a_to=200 == b_from=200 → MEETS → DELETE.
       ;; Row 2: a_to=199 != 200 → KEEP.
       (is (= [2] survivors)))))
@@ -3211,9 +3211,9 @@
 (deftest sql-erase-with-portion-of-rejected
   (testing "ERASE + FOR PORTION OF VALID_TIME is rejected at parse time"
     (let [r (sql/parse-sql
-              (str "ERASE FROM t FOR PORTION OF VALID_TIME "
-                   "FROM '2024-01-01' TO '2024-07-01' WHERE eid = 1")
-              {"t" {:eid (long-array [])}})]
+             (str "ERASE FROM t FOR PORTION OF VALID_TIME "
+                  "FROM '2024-01-01' TO '2024-07-01' WHERE eid = 1")
+             {"t" {:eid (long-array [])}})]
       (is (some? (:error r)))
       (is (re-find #"ERASE does not compose with FOR PORTION OF VALID_TIME"
                    (:error r))))))
@@ -3230,15 +3230,15 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "salaries"
+         srv "salaries"
           ;; NOTE: no :bitemporal metadata at all. Inference must
           ;; pick up BOTH axes from the column names.
-          {:eid          (stratum.index/index-from-seq :int64 [1])
-           :salary       (stratum.index/index-from-seq :int64 [100])
-           :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000])
-           :_valid_to    (stratum.index/index-from-seq :int64 [1719792000000000])
-           :_system_from (stratum.index/index-from-seq :int64 [1000000])
-           :_system_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])})
+         {:eid          (stratum.index/index-from-seq :int64 [1])
+          :salary       (stratum.index/index-from-seq :int64 [100])
+          :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000])
+          :_valid_to    (stratum.index/index-from-seq :int64 [1719792000000000])
+          :_system_from (stratum.index/index-from-seq :int64 [1000000])
+          :_system_to   (stratum.index/index-from-seq :int64 [Long/MAX_VALUE])})
         (let [exec @(resolve 'stratum.server/execute-sql)]
           (exec (str "UPDATE salaries SET salary = 999 "
                      "FOR PORTION OF VALID_TIME FROM '2024-04-01' TO '2024-05-01' "
@@ -3247,7 +3247,7 @@
         (let [cols (get @(:registry srv) "salaries")
               n    (stratum.index/idx-length (:index (:eid cols)))
               read-col (fn [k] (mapv #(stratum.index/idx-get-long
-                                        (:index (get cols k)) %)
+                                       (:index (get cols k)) %)
                                      (range n)))
               rows (mapv (fn [i] {:sf (nth (read-col :_system_from) i)
                                   :st (nth (read-col :_system_to) i)})
@@ -3272,10 +3272,10 @@
   ;; wrong. Reject at preprocess time.
   (testing "Two FOR VALID_TIME clauses on a joined SELECT → rejected"
     (let [r (sql/parse-sql
-              (str "SELECT a.eid, b.eid FROM a FOR VALID_TIME AS OF '2024-04-15' "
-                   "JOIN b FOR VALID_TIME AS OF '2024-04-15' ON a.eid = b.eid")
-              {"a" {:eid (long-array []) :_valid_from (long-array []) :_valid_to (long-array [])}
-               "b" {:eid (long-array []) :_valid_from (long-array []) :_valid_to (long-array [])}})]
+             (str "SELECT a.eid, b.eid FROM a FOR VALID_TIME AS OF '2024-04-15' "
+                  "JOIN b FOR VALID_TIME AS OF '2024-04-15' ON a.eid = b.eid")
+             {"a" {:eid (long-array []) :_valid_from (long-array []) :_valid_to (long-array [])}
+              "b" {:eid (long-array []) :_valid_from (long-array []) :_valid_to (long-array [])}})]
       (is (some? (:error r)))
       (is (re-find #"Multi-table SELECT with more than one FOR VALID_TIME"
                    (:error r))))))
@@ -3286,7 +3286,7 @@
                             :a (long-array [1])
                             :b (long-array [1])}}
           parsed (sql/parse-sql
-                   "DELETE FROM intervals WHERE OVERLAPS(a, b)" reg)]
+                  "DELETE FROM intervals WHERE OVERLAPS(a, b)" reg)]
       (is (re-find #"requires 4 args" (or (:error parsed) ""))))))
 
 ;; ============================================================================
@@ -3300,7 +3300,7 @@
 (deftest preprocess-select-temporal-as-of-injects-where
   (testing "FOR VALID_TIME AS OF rewrites to WHERE predicates"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "SELECT eid FROM salaries FOR VALID_TIME AS OF '2024-04-01'")]
+             "SELECT eid FROM salaries FOR VALID_TIME AS OF '2024-04-01'")]
       (is (re-find #"WHERE\s+\(?_valid_from\s+<=\s+\d+"
                    (:sql r)))
       (is (re-find #"_valid_to\s+>\s+\d+"
@@ -3309,7 +3309,7 @@
 (deftest preprocess-select-temporal-between-form
   (testing "FOR VALID_TIME BETWEEN x AND y emits overlap predicate"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "SELECT eid FROM salaries FOR VALID_TIME BETWEEN '2024-01-01' AND '2024-07-01'")]
+             "SELECT eid FROM salaries FOR VALID_TIME BETWEEN '2024-01-01' AND '2024-07-01'")]
       ;; Expect: vf <= Jul AND vt > Jan (half-open overlap)
       (is (re-find #"_valid_from\s+<=\s+1719792000000000"
                    (:sql r)))
@@ -3326,7 +3326,7 @@
   ;; boundary row (and matching `:between`'s closed semantics).
   (testing "FOR VALID_TIME FROM x TO y emits the half-open overlap predicate (vf < y AND vt > x)"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "SELECT eid FROM salaries FOR VALID_TIME FROM '2024-01-01' TO '2024-07-01'")]
+             "SELECT eid FROM salaries FOR VALID_TIME FROM '2024-01-01' TO '2024-07-01'")]
       (is (re-find #"_valid_from\s+<\s+1719792000000000"
                    (:sql r))
           "vf < to (strict, half-open); pre-fix used <= which over-included rows starting at to")
@@ -3336,7 +3336,7 @@
 (deftest preprocess-select-for-all-valid-time-no-filter
   (testing "FOR ALL VALID_TIME on SELECT strips the clause without adding a filter"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "SELECT eid FROM salaries FOR ALL VALID_TIME")]
+             "SELECT eid FROM salaries FOR ALL VALID_TIME")]
       (is (re-find #"(?i)^\s*SELECT\s+eid\s+FROM\s+salaries\s*$"
                    (:sql r))
           "FOR ALL VALID_TIME should leave the SQL with no extra WHERE")
@@ -3346,7 +3346,7 @@
 (deftest preprocess-select-temporal-preserves-existing-where
   (testing "Existing WHERE is preserved; temporal preds prepended via AND"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "SELECT eid FROM salaries FOR VALID_TIME AS OF '2024-04-01' WHERE eid = 1")
+             "SELECT eid FROM salaries FOR VALID_TIME AS OF '2024-04-01' WHERE eid = 1")
           s (:sql r)]
       (is (.contains ^String s "WHERE"))
       (is (.contains ^String s "_valid_from"))
@@ -3382,44 +3382,44 @@
 (deftest preprocess-rejects-for-portion-of-system-time-dml
   (testing "FOR PORTION OF SYSTEM_TIME FROM x TO y on DML throws with design-choice message"
     (is (thrown-with-msg?
-          clojure.lang.ExceptionInfo
-          #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
-          (stratum.sql.rewrite/preprocess-sql
-            (str "DELETE FROM t FOR PORTION OF SYSTEM_TIME "
-                 "FROM '2020-01-01' TO '2020-07-01' WHERE id = 1"))))
+         clojure.lang.ExceptionInfo
+         #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
+         (stratum.sql.rewrite/preprocess-sql
+          (str "DELETE FROM t FOR PORTION OF SYSTEM_TIME "
+               "FROM '2020-01-01' TO '2020-07-01' WHERE id = 1"))))
     (is (thrown-with-msg?
-          clojure.lang.ExceptionInfo
-          #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
-          (stratum.sql.rewrite/preprocess-sql
-            (str "UPDATE t FOR PORTION OF SYSTEM_TIME "
-                 "FROM '2020-01-01' TO '2020-07-01' SET x = 1 WHERE id = 1"))))
+         clojure.lang.ExceptionInfo
+         #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
+         (stratum.sql.rewrite/preprocess-sql
+          (str "UPDATE t FOR PORTION OF SYSTEM_TIME "
+               "FROM '2020-01-01' TO '2020-07-01' SET x = 1 WHERE id = 1"))))
     (is (thrown-with-msg?
-          clojure.lang.ExceptionInfo
-          #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
-          (stratum.sql.rewrite/preprocess-sql
-            (str "INSERT INTO t (id) VALUES (1) "
-                 "FOR PORTION OF SYSTEM_TIME FROM '2020-01-01' TO '2020-07-01'"))))))
+         clojure.lang.ExceptionInfo
+         #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
+         (stratum.sql.rewrite/preprocess-sql
+          (str "INSERT INTO t (id) VALUES (1) "
+               "FOR PORTION OF SYSTEM_TIME FROM '2020-01-01' TO '2020-07-01'"))))))
 
 (deftest preprocess-rejects-for-all-system-time-dml
   (testing "FOR ALL SYSTEM_TIME on DML also throws (same design choice)"
     (is (thrown-with-msg?
-          clojure.lang.ExceptionInfo
-          #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
-          (stratum.sql.rewrite/preprocess-sql
-            "DELETE FROM t FOR ALL SYSTEM_TIME WHERE id = 1")))
+         clojure.lang.ExceptionInfo
+         #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
+         (stratum.sql.rewrite/preprocess-sql
+          "DELETE FROM t FOR ALL SYSTEM_TIME WHERE id = 1")))
     (is (thrown-with-msg?
-          clojure.lang.ExceptionInfo
-          #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
-          (stratum.sql.rewrite/preprocess-sql
-            "UPDATE t FOR SYSTEM_TIME ALL SET x = 1 WHERE id = 1")))))
+         clojure.lang.ExceptionInfo
+         #"FOR \(ALL \| PORTION OF\) SYSTEM_TIME DML is not supported"
+         (stratum.sql.rewrite/preprocess-sql
+          "UPDATE t FOR SYSTEM_TIME ALL SET x = 1 WHERE id = 1")))))
 
 (deftest preprocess-allows-for-portion-of-valid-time-dml
   ;; Regression guard: the SYSTEM_TIME rejection must NOT affect
   ;; VALID_TIME DML (the supported case).
   (testing "FOR PORTION OF VALID_TIME DML still works after the SYSTEM_TIME rejection"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              (str "DELETE FROM t FOR PORTION OF VALID_TIME "
-                   "FROM '2020-01-01' TO '2020-07-01' WHERE id = 1"))]
+             (str "DELETE FROM t FOR PORTION OF VALID_TIME "
+                  "FROM '2020-01-01' TO '2020-07-01' WHERE id = 1"))]
       (is (= :valid_time (:axis (:period r))))
       (is (= 1577836800000000 (:from (:period r))))
       (is (= 1593561600000000 (:to (:period r)))))))
@@ -3427,7 +3427,7 @@
 (deftest preprocess-select-system-time-as-of-injects-where
   (testing "FOR SYSTEM_TIME AS OF rewrites to WHERE predicates on _system_from / _system_to"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "SELECT eid FROM salaries FOR SYSTEM_TIME AS OF '2024-04-01'")]
+             "SELECT eid FROM salaries FOR SYSTEM_TIME AS OF '2024-04-01'")]
       (is (re-find #"WHERE\s+\(?_system_from\s+<=\s+\d+"
                    (:sql r)))
       (is (re-find #"_system_to\s+>\s+\d+"
@@ -3436,21 +3436,21 @@
 (deftest preprocess-select-system-time-between-form
   (testing "FOR SYSTEM_TIME BETWEEN x AND y emits closed-closed overlap on system axis"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "SELECT eid FROM salaries FOR SYSTEM_TIME BETWEEN '2024-01-01' AND '2024-07-01'")]
+             "SELECT eid FROM salaries FOR SYSTEM_TIME BETWEEN '2024-01-01' AND '2024-07-01'")]
       (is (re-find #"_system_from\s+<=\s+1719792000000000" (:sql r)))
       (is (re-find #"_system_to\s+>\s+1704067200000000"   (:sql r))))))
 
 (deftest preprocess-select-system-time-from-to-form
   (testing "FOR SYSTEM_TIME FROM x TO y emits half-open overlap on system axis"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "SELECT eid FROM salaries FOR SYSTEM_TIME FROM '2024-01-01' TO '2024-07-01'")]
+             "SELECT eid FROM salaries FOR SYSTEM_TIME FROM '2024-01-01' TO '2024-07-01'")]
       (is (re-find #"_system_from\s+<\s+1719792000000000" (:sql r)))
       (is (re-find #"_system_to\s+>\s+1704067200000000"  (:sql r))))))
 
 (deftest preprocess-select-for-all-system-time-no-filter
   (testing "FOR ALL SYSTEM_TIME strips the clause without adding a filter"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              "SELECT eid FROM salaries FOR ALL SYSTEM_TIME")]
+             "SELECT eid FROM salaries FOR ALL SYSTEM_TIME")]
       (is (re-find #"(?i)^\s*SELECT\s+eid\s+FROM\s+salaries\s*$" (:sql r))
           "FOR ALL SYSTEM_TIME should leave the SQL with no extra WHERE"))))
 
@@ -3461,9 +3461,9 @@
 (deftest preprocess-select-bitemporal-as-of-composes-both-axes
   (testing "FOR VALID_TIME AS OF + FOR SYSTEM_TIME AS OF emits both predicates ANDed"
     (let [r (stratum.sql.rewrite/preprocess-sql
-              (str "SELECT eid FROM salaries "
-                   "FOR VALID_TIME AS OF '2024-04-15' "
-                   "FOR SYSTEM_TIME AS OF '2024-04-20'"))
+             (str "SELECT eid FROM salaries "
+                  "FOR VALID_TIME AS OF '2024-04-15' "
+                  "FOR SYSTEM_TIME AS OF '2024-04-20'"))
           s (:sql r)]
       (is (.contains ^String s "_valid_from")  "valid-axis predicate emitted")
       (is (.contains ^String s "_valid_to")    "valid-axis upper bound")
@@ -3474,22 +3474,22 @@
 (deftest preprocess-select-rejects-two-for-valid-time-clauses
   (testing "Two FOR VALID_TIME clauses → :sql/multi-for-valid-time-unsupported"
     (is (thrown-with-msg?
-          clojure.lang.ExceptionInfo
-          #"more than one FOR VALID_TIME"
-          (stratum.sql.rewrite/preprocess-sql
-            (str "SELECT eid FROM salaries "
-                 "FOR VALID_TIME AS OF '2024-04-15' "
-                 "FOR VALID_TIME AS OF '2024-06-15'"))))))
+         clojure.lang.ExceptionInfo
+         #"more than one FOR VALID_TIME"
+         (stratum.sql.rewrite/preprocess-sql
+          (str "SELECT eid FROM salaries "
+               "FOR VALID_TIME AS OF '2024-04-15' "
+               "FOR VALID_TIME AS OF '2024-06-15'"))))))
 
 (deftest preprocess-select-rejects-two-for-system-time-clauses
   (testing "Two FOR SYSTEM_TIME clauses → :sql/multi-for-system-time-unsupported"
     (is (thrown-with-msg?
-          clojure.lang.ExceptionInfo
-          #"more than one FOR SYSTEM_TIME"
-          (stratum.sql.rewrite/preprocess-sql
-            (str "SELECT eid FROM salaries "
-                 "FOR SYSTEM_TIME AS OF '2024-04-15' "
-                 "FOR SYSTEM_TIME AS OF '2024-06-15'"))))))
+         clojure.lang.ExceptionInfo
+         #"more than one FOR SYSTEM_TIME"
+         (stratum.sql.rewrite/preprocess-sql
+          (str "SELECT eid FROM salaries "
+               "FOR SYSTEM_TIME AS OF '2024-04-15' "
+               "FOR SYSTEM_TIME AS OF '2024-06-15'"))))))
 
 (deftest sql-select-system-time-as-of-end-to-end
   ;; End-to-end demonstration: a fully-bitemporal table with two
@@ -3500,19 +3500,19 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "salaries"
-          (with-meta
-            {:eid          (stratum.index/index-from-seq :int64 [1 1])
-             :salary       (stratum.index/index-from-seq :int64 [100 110])
-             :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000 1704067200000000])
-             :_valid_to    (stratum.index/index-from-seq :int64 [Long/MAX_VALUE Long/MAX_VALUE])
+         srv "salaries"
+         (with-meta
+           {:eid          (stratum.index/index-from-seq :int64 [1 1])
+            :salary       (stratum.index/index-from-seq :int64 [100 110])
+            :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000 1704067200000000])
+            :_valid_to    (stratum.index/index-from-seq :int64 [Long/MAX_VALUE Long/MAX_VALUE])
              ;; Row 0: was DB's belief from sys 1000 to 5000 (closed by surgery at 5000).
              ;; Row 1: appended at sys 5000, still open.
-             :_system_from (stratum.index/index-from-seq :int64 [1000 5000])
-             :_system_to   (stratum.index/index-from-seq :int64 [5000 Long/MAX_VALUE])}
-            {:bitemporal
-             {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
-              :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+            :_system_from (stratum.index/index-from-seq :int64 [1000 5000])
+            :_system_to   (stratum.index/index-from-seq :int64 [5000 Long/MAX_VALUE])}
+           {:bitemporal
+            {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+             :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
         (let [exec @(resolve 'stratum.server/execute-sql)
               ^PgWireServer$QueryResult r-before
               (exec "SELECT salary FROM salaries WHERE _system_from <= 3000 AND _system_to > 3000"
@@ -3533,29 +3533,29 @@
     (let [srv (server/start {:port 0})]
       (try
         (server/register-table!
-          srv "salaries"
-          (with-meta
+         srv "salaries"
+         (with-meta
             ;; Two slices: [Jan, Jul) salary=100, [Jul, MAX) salary=110.
-            {:eid          (stratum.index/index-from-seq :int64 [1 1])
-             :salary       (stratum.index/index-from-seq :int64 [100 110])
-             :_valid_from  (stratum.index/index-from-seq :int64
-                             [1704067200000000 1719792000000000])
-             :_valid_to    (stratum.index/index-from-seq :int64
-                             [1719792000000000 Long/MAX_VALUE])}
-            {:bitemporal {:valid {:from-col :_valid_from
-                                  :to-col   :_valid_to
-                                  :unit     :micros}}}))
+           {:eid          (stratum.index/index-from-seq :int64 [1 1])
+            :salary       (stratum.index/index-from-seq :int64 [100 110])
+            :_valid_from  (stratum.index/index-from-seq :int64
+                                                        [1704067200000000 1719792000000000])
+            :_valid_to    (stratum.index/index-from-seq :int64
+                                                        [1719792000000000 Long/MAX_VALUE])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
         ;; Query at Apr-2024: should return only the [Jan, Jul) slice.
         (let [parsed (sql/parse-sql
-                       "SELECT salary FROM salaries FOR VALID_TIME AS OF '2024-04-01'"
-                       @(:registry srv))
+                      "SELECT salary FROM salaries FOR VALID_TIME AS OF '2024-04-01'"
+                      @(:registry srv))
               result (q/q (:query parsed))
               rows (q/results->columns result)]
           (is (= [100] (vec (:salary rows)))))
         ;; Query at Sep-2024: should return only the [Jul, MAX) slice.
         (let [parsed (sql/parse-sql
-                       "SELECT salary FROM salaries FOR VALID_TIME AS OF '2024-09-01'"
-                       @(:registry srv))
+                      "SELECT salary FROM salaries FOR VALID_TIME AS OF '2024-09-01'"
+                      @(:registry srv))
               result (q/q (:query parsed))
               rows (q/results->columns result)]
           (is (= [110] (vec (:salary rows)))))
@@ -3572,15 +3572,15 @@
           pinned-millis 1704067200000]   ;; Jan-01-2024
       (try
         (server/register-table!
-          srv "salaries"
-          (with-meta
-            {:eid (stratum.index/index-from-seq :int64 [])
-             :salary (stratum.index/index-from-seq :int64 [])
-             :_valid_from (stratum.index/index-from-seq :int64 [])
-             :_valid_to (stratum.index/index-from-seq :int64 [])}
-            {:bitemporal {:valid {:from-col :_valid_from
-                                  :to-col   :_valid_to
-                                  :unit     :micros}}}))
+         srv "salaries"
+         (with-meta
+           {:eid (stratum.index/index-from-seq :int64 [])
+            :salary (stratum.index/index-from-seq :int64 [])
+            :_valid_from (stratum.index/index-from-seq :int64 [])
+            :_valid_to (stratum.index/index-from-seq :int64 [])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
         ;; Pin clock_time to Jan-01-2024.
         (exec (str "SET datahike.clock_time = '2024-01-01'")
               (:registry srv) (:data-dir srv))
@@ -3607,9 +3607,9 @@
           exec @(resolve 'stratum.server/execute-sql)]
       (try
         (server/register-table!
-          srv "salaries"
-          {:eid    (stratum.index/index-from-seq :int64 [1 2 3])
-           :salary (stratum.index/index-from-seq :int64 [100 200 300])})
+         srv "salaries"
+         {:eid    (stratum.index/index-from-seq :int64 [1 2 3])
+          :salary (stratum.index/index-from-seq :int64 [100 200 300])})
         (let [^PgWireServer$QueryResult qr
               (exec "ERASE FROM salaries WHERE eid = 2"
                     (:registry srv) (:data-dir srv))]
@@ -3768,9 +3768,9 @@
           exec @(resolve 'stratum.server/execute-sql)]
       (try
         (server/register-table!
-          srv "salaries"
-          {:eid    (stratum.index/index-from-seq :int64 [1 2 3])
-           :salary (stratum.index/index-from-seq :int64 [100 200 300])})
+         srv "salaries"
+         {:eid    (stratum.index/index-from-seq :int64 [1 2 3])
+          :salary (stratum.index/index-from-seq :int64 [100 200 300])})
         (let [;; Adversarial SQL: the comment contains the literal
               ;; "ERASE FROM legacy_table" which would have been
               ;; replaced by the pre-fix regex.
@@ -3797,8 +3797,8 @@
           exec @(resolve 'stratum.server/execute-sql)]
       (try
         (server/register-table!
-          srv "t"
-          {:a (stratum.index/index-from-seq :int64 [1 2 3])})
+         srv "t"
+         {:a (stratum.index/index-from-seq :int64 [1 2 3])})
         (let [^PgWireServer$QueryResult qr
               (exec "ERASE FROM t" (:registry srv) (:data-dir srv))]
           (is (= "ERASE 3" (.commandTag qr))))
@@ -3812,15 +3812,15 @@
           exec @(resolve 'stratum.server/execute-sql)]
       (try
         (server/register-table!
-          srv "salaries"
-          (with-meta
-            {:eid (stratum.index/index-from-seq :int64 [1 1])
-             :salary (stratum.index/index-from-seq :int64 [100 110])
-             :_valid_from (stratum.index/index-from-seq :int64 [1000 2000])
-             :_valid_to (stratum.index/index-from-seq :int64 [2000 Long/MAX_VALUE])}
-            {:bitemporal {:valid {:from-col :_valid_from
-                                  :to-col   :_valid_to
-                                  :unit     :micros}}}))
+         srv "salaries"
+         (with-meta
+           {:eid (stratum.index/index-from-seq :int64 [1 1])
+            :salary (stratum.index/index-from-seq :int64 [100 110])
+            :_valid_from (stratum.index/index-from-seq :int64 [1000 2000])
+            :_valid_to (stratum.index/index-from-seq :int64 [2000 Long/MAX_VALUE])}
+           {:bitemporal {:valid {:from-col :_valid_from
+                                 :to-col   :_valid_to
+                                 :unit     :micros}}}))
         (let [^PgWireServer$QueryResult qr
               (exec "ERASE FROM salaries WHERE eid = 1"
                     (:registry srv) (:data-dir srv))]
@@ -3863,9 +3863,9 @@
                 :b_from (long-array [150 350 250])
                 :b_to   (long-array [250 450 350])}}
           parsed (sql/parse-sql
-                   (str "SELECT eid, a_from, a_to, b_from, b_to FROM intervals "
-                        "WHERE OVERLAPS(a_from, a_to, b_from, b_to)")
-                   reg)
+                  (str "SELECT eid, a_from, a_to, b_from, b_to FROM intervals "
+                       "WHERE OVERLAPS(a_from, a_to, b_from, b_to)")
+                  reg)
           result (q/q (:query parsed))
           rows (q/results->columns result)
           eids (vec (:eid rows))]
@@ -3901,16 +3901,16 @@
           ;; First half of rows: vt-window [0, 500). Second half: [500, 1000).
           ;; A query AS OF 250 should hit only the first chunk(s).
           ds (stratum.dataset/make-dataset
-               {:eid (stratum.index/index-from-seq :int64 (vec (range n)))
-                :_valid_from (stratum.index/index-from-seq :int64
-                              (vec (map #(if (< % (/ n 2)) 0 500) (range n))))
-                :_valid_to (stratum.index/index-from-seq :int64
-                            (vec (map #(if (< % (/ n 2)) 500 1000) (range n))))}
-               {:name "t"})
+              {:eid (stratum.index/index-from-seq :int64 (vec (range n)))
+               :_valid_from (stratum.index/index-from-seq :int64
+                                                          (vec (map #(if (< % (/ n 2)) 0 500) (range n))))
+               :_valid_to (stratum.index/index-from-seq :int64
+                                                        (vec (map #(if (< % (/ n 2)) 500 1000) (range n))))}
+              {:name "t"})
           ;; Query AS OF 250 — only the first-half chunks should match.
           parsed (sql/parse-sql
-                   "SELECT eid FROM t WHERE _valid_from <= 250 AND _valid_to > 250"
-                   {"t" (stratum.dataset/columns ds)})
+                  "SELECT eid FROM t WHERE _valid_from <= 250 AND _valid_to > 250"
+                  {"t" (stratum.dataset/columns ds)})
           result (q/q (:query parsed))
           rows (q/results->columns result)]
       ;; All N/2 first-half rows match; none of the second-half rows match.
