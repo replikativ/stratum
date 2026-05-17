@@ -376,6 +376,8 @@
                      :else val)]))
               decomposed))])))
 
+(declare combine-per-chunk-validity)
+
 (defn execute-chunked-fused
   "Execute fused filter+aggregate by streaming over aligned chunks.
 
@@ -500,7 +502,17 @@
                                [0.0 0 Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY]
                                (range n-chunks))
                        [0.0 0 Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY])
-          [stats-sum stats-count stats-min stats-max] stats-init]
+          [stats-sum stats-count stats-min stats-max] stats-init
+
+          ;; Phase 1d-agg: per-chunk combined validity across pred cols.
+          ;; nil → fast path; non-nil → ColumnOpsChunkedSimdNullable
+          ;; dispatch. (Forward-declared helper at line ~565 below.)
+          pred-col-entries-list
+          (concat (map #(get col-entries %) long-col-names)
+                  (map #(get col-entries %) dbl-col-names))
+          per-chunk-validity
+          (when (and (seq pred-col-entries-list) (pos? n-simd))
+            (combine-per-chunk-validity pred-col-entries-list simd-chunks chunk-lengths))]
 
       ;; SIMD processing for remaining chunks
       (if (zero? n-simd)
@@ -514,8 +526,11 @@
           {:result result-val :count (long stats-count)})
 
         ;; Process SIMD chunks via Java — long or double path
-        (if agg-col-long?
-          ;; Native long SIMD path — zero-copy from chunks, long arithmetic
+        (if (and agg-col-long? (nil? per-chunk-validity))
+          ;; Native long SIMD path — zero-copy from chunks, long arithmetic.
+          ;; Note: when validity is present, we fall through to the
+          ;; double path (no Nullable sibling for ColumnOpsChunkedLong
+          ;; yet — TBD if a real workload needs it).
           (let [^longs result
                 (ColumnOpsChunkedLong/fusedSimdChunkedLongParallel
                  (int n-long) ^ints long-pred-types
@@ -536,15 +551,40 @@
                          :max (if (zero? simd-count) (long stats-max) (Math/max simd-result (long stats-max)))
                          simd-result)
                :count total-count}))
-          ;; Double SIMD path (original)
-          (let [^doubles result
-                (ColumnOpsChunkedSimd/fusedSimdChunkedParallel
-                 (int n-long) ^ints long-pred-types
-                 ^"[[[J" long-pred-arrs ^longs long-lo ^longs long-hi
-                 (int n-dbl) ^ints dbl-pred-types
-                 ^"[[[D" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
-                 (int agg-type) ^"[[D" agg-arr1s ^"[[D" agg-arr2s
-                 ^ints chunk-lengths (int n-simd))
+          ;; Double SIMD path — Nullable dispatch when per-chunk
+          ;; validity is non-nil; else the existing path.
+          ;;
+          ;; When agg col is long but validity is present (the
+          ;; `or` branch above doesn't fire), we need double[] agg
+          ;; arrays. Allocate + convert here.
+          (let [agg-arr1s (or agg-arr1s
+                              (let [arr (make-array Double/TYPE n-simd 0)]
+                                (when agg-col1-name
+                                  (dotimes [s n-simd]
+                                    (let [^ChunkEntry entry (nth (get col-entries agg-col1-name) (nth simd-chunks s))
+                                          a (chunk/chunk-as-doubles (.chunk entry))]
+                                      (aset ^objects arr s
+                                            (if (expr/long-array? a)
+                                              (ColumnOps/longToDouble ^longs a (alength ^longs a))
+                                              a)))))
+                                arr))
+                ^doubles result
+                (if per-chunk-validity
+                  (ColumnOpsChunkedSimdNullable/fusedSimdChunkedParallel
+                   (int n-long) ^ints long-pred-types
+                   ^"[[[J" long-pred-arrs ^longs long-lo ^longs long-hi
+                   (int n-dbl) ^ints dbl-pred-types
+                   ^"[[[D" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
+                   (int agg-type) ^"[[D" agg-arr1s ^"[[D" agg-arr2s
+                   ^"[[J" per-chunk-validity
+                   ^ints chunk-lengths (int n-simd))
+                  (ColumnOpsChunkedSimd/fusedSimdChunkedParallel
+                   (int n-long) ^ints long-pred-types
+                   ^"[[[J" long-pred-arrs ^longs long-lo ^longs long-hi
+                   (int n-dbl) ^ints dbl-pred-types
+                   ^"[[[D" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
+                   (int agg-type) ^"[[D" agg-arr1s ^"[[D" agg-arr2s
+                   ^ints chunk-lengths (int n-simd)))
                 simd-result (aget result 0)
                 simd-count (long (aget result 1))
                 total-count (+ simd-count (long stats-count))]

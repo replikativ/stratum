@@ -123,6 +123,204 @@ public final class ColumnOpsChunkedSimdNullable {
     }
 
     // ============================================================================
+    // fusedSimdChunkedParallel — validity-aware sibling (filter + aggregate)
+    // ============================================================================
+
+    /**
+     * Validity-aware chunked filter + aggregate. Like
+     * {@link ColumnOpsChunkedSimd#fusedSimdChunkedParallel} but
+     * with per-chunk validity bitmaps applied to the predicate side
+     * before aggregation accumulates.
+     *
+     * <p>The aggregator side keeps its IEEE-NaN sentinel-skip
+     * (existing behavior, audit H.4); the bitmap fixes the
+     * *predicate* side (F-001/F-002).
+     */
+    public static double[] fusedSimdChunkedParallel(
+            int numLongPreds, int[] longPredTypes,
+            long[][][] longPredArrs, long[] longLo, long[] longHi,
+            int numDblPreds, int[] dblPredTypes,
+            double[][][] dblPredArrs, double[] dblLo, double[] dblHi,
+            int aggType, double[][] aggArr1s, double[][] aggArr2s,
+            long[][] validity,
+            int[] chunkLengths, int nChunks) {
+
+        if (nChunks <= 0) return new double[] { 0.0, 0.0 };
+        if (validity == null) {
+            throw new IllegalArgumentException(
+                "ColumnOpsChunkedSimdNullable methods require non-null validity.");
+        }
+
+        int totalRows = 0;
+        for (int i = 0; i < nChunks; i++) totalRows += chunkLengths[i];
+
+        int nThreads = (totalRows < ColumnOps.PARALLEL_THRESHOLD) ? 1
+            : Math.min(POOL.getParallelism(), Math.max(1, nChunks / 8));
+        if (nThreads <= 1) {
+            return chunkBatchAgg(numLongPreds, longPredTypes, longPredArrs, longLo, longHi,
+                    numDblPreds, dblPredTypes, dblPredArrs, dblLo, dblHi,
+                    aggType, aggArr1s, aggArr2s, validity, chunkLengths, 0, nChunks);
+        }
+
+        int batchSize = nChunks / nThreads;
+        @SuppressWarnings("unchecked")
+        Future<double[]>[] futures = new Future[nThreads];
+        for (int t = 0; t < nThreads; t++) {
+            final int startChunk = t * batchSize;
+            final int endChunk = (t == nThreads - 1) ? nChunks : startChunk + batchSize;
+            futures[t] = POOL.submit(() ->
+                chunkBatchAgg(numLongPreds, longPredTypes, longPredArrs, longLo, longHi,
+                        numDblPreds, dblPredTypes, dblPredArrs, dblLo, dblHi,
+                        aggType, aggArr1s, aggArr2s, validity, chunkLengths, startChunk, endChunk));
+        }
+
+        double result = (aggType == AGG_MIN) ? Double.POSITIVE_INFINITY
+                       : (aggType == AGG_MAX) ? Double.NEGATIVE_INFINITY : 0.0;
+        long count = 0;
+        try {
+            for (Future<double[]> f : futures) {
+                double[] partial = f.get();
+                count += (long) partial[1];
+                switch (aggType) {
+                    case AGG_SUM_PRODUCT: case AGG_SUM: result += partial[0]; break;
+                    case AGG_MIN: result = Math.min(result, partial[0]); break;
+                    case AGG_MAX: result = Math.max(result, partial[0]); break;
+                    case AGG_COUNT: break;
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Chunked nullable agg failed", e);
+        }
+        return new double[] { result, (double) count };
+    }
+
+    private static double[] chunkBatchAgg(
+            int numLongPreds, int[] longPredTypes,
+            long[][][] longPredArrs, long[] longLo, long[] longHi,
+            int numDblPreds, int[] dblPredTypes,
+            double[][][] dblPredArrs, double[] dblLo, double[] dblHi,
+            int aggType, double[][] aggArr1s, double[][] aggArr2s,
+            long[][] validity,
+            int[] chunkLengths, int startChunk, int endChunk) {
+
+        final int lt0 = numLongPreds > 0 ? longPredTypes[0] : -1;
+        final int lt1 = numLongPreds > 1 ? longPredTypes[1] : -1;
+        final int lt2 = numLongPreds > 2 ? longPredTypes[2] : -1;
+        final int lt3 = numLongPreds > 3 ? longPredTypes[3] : -1;
+        final int dt0 = numDblPreds > 0 ? dblPredTypes[0] : -1;
+        final int dt1 = numDblPreds > 1 ? dblPredTypes[1] : -1;
+        final int dt2 = numDblPreds > 2 ? dblPredTypes[2] : -1;
+        final int dt3 = numDblPreds > 3 ? dblPredTypes[3] : -1;
+
+        final LongVector llo0 = numLongPreds > 0 ? LongVector.broadcast(LONG_SPECIES, longLo[0]) : null;
+        final LongVector lhi0 = numLongPreds > 0 ? LongVector.broadcast(LONG_SPECIES, longHi[0]) : null;
+        final LongVector llo1 = numLongPreds > 1 ? LongVector.broadcast(LONG_SPECIES, longLo[1]) : null;
+        final LongVector lhi1 = numLongPreds > 1 ? LongVector.broadcast(LONG_SPECIES, longHi[1]) : null;
+        final LongVector llo2 = numLongPreds > 2 ? LongVector.broadcast(LONG_SPECIES, longLo[2]) : null;
+        final LongVector lhi2 = numLongPreds > 2 ? LongVector.broadcast(LONG_SPECIES, longHi[2]) : null;
+        final LongVector llo3 = numLongPreds > 3 ? LongVector.broadcast(LONG_SPECIES, longLo[3]) : null;
+        final LongVector lhi3 = numLongPreds > 3 ? LongVector.broadcast(LONG_SPECIES, longHi[3]) : null;
+
+        final DoubleVector dlo0 = numDblPreds > 0 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblLo[0]) : null;
+        final DoubleVector dhi0 = numDblPreds > 0 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblHi[0]) : null;
+        final DoubleVector dlo1 = numDblPreds > 1 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblLo[1]) : null;
+        final DoubleVector dhi1 = numDblPreds > 1 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblHi[1]) : null;
+        final DoubleVector dlo2 = numDblPreds > 2 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblLo[2]) : null;
+        final DoubleVector dhi2 = numDblPreds > 2 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblHi[2]) : null;
+        final DoubleVector dlo3 = numDblPreds > 3 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblLo[3]) : null;
+        final DoubleVector dhi3 = numDblPreds > 3 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblHi[3]) : null;
+
+        double revenue = (aggType == AGG_MIN) ? Double.POSITIVE_INFINITY
+                        : (aggType == AGG_MAX) ? Double.NEGATIVE_INFINITY : 0.0;
+        long matchCount = 0;
+        boolean[] maskBits = new boolean[DOUBLE_LANES];
+
+        for (int c = startChunk; c < endChunk; c++) {
+            int length = chunkLengths[c];
+            final long[] chunkValidity = validity[c];
+
+            final long[] la0 = numLongPreds > 0 ? longPredArrs[0][c] : null;
+            final long[] la1 = numLongPreds > 1 ? longPredArrs[1][c] : null;
+            final long[] la2 = numLongPreds > 2 ? longPredArrs[2][c] : null;
+            final long[] la3 = numLongPreds > 3 ? longPredArrs[3][c] : null;
+            final double[] da0 = numDblPreds > 0 ? dblPredArrs[0][c] : null;
+            final double[] da1 = numDblPreds > 1 ? dblPredArrs[1][c] : null;
+            final double[] da2 = numDblPreds > 2 ? dblPredArrs[2][c] : null;
+            final double[] da3 = numDblPreds > 3 ? dblPredArrs[3][c] : null;
+            final double[] aa1 = (aggType != AGG_COUNT) ? aggArr1s[c] : null;
+            final double[] aa2 = (aggType == AGG_SUM_PRODUCT) ? aggArr2s[c] : null;
+
+            int upperBound = length - (length % LONG_LANES);
+
+            DoubleVector revenueVec;
+            if (aggType == AGG_MIN) revenueVec = DoubleVector.broadcast(DOUBLE_SPECIES, Double.POSITIVE_INFINITY);
+            else if (aggType == AGG_MAX) revenueVec = DoubleVector.broadcast(DOUBLE_SPECIES, Double.NEGATIVE_INFINITY);
+            else revenueVec = DoubleVector.zero(DOUBLE_SPECIES);
+
+            for (int i = 0; i < upperBound; i += LONG_LANES) {
+                // Initial mask: validity if chunk has nulls, all-true otherwise
+                VectorMask<Long> lm = (chunkValidity == null)
+                    ? LONG_SPECIES.maskAll(true)
+                    : validityLaneMask(chunkValidity, i);
+                if (!lm.anyTrue()) continue;
+
+                if (numLongPreds > 0) { lm = applyLongPred(lm, LongVector.fromArray(LONG_SPECIES, la0, i), lt0, llo0, lhi0); if (!lm.anyTrue()) continue; }
+                if (numLongPreds > 1) { lm = applyLongPred(lm, LongVector.fromArray(LONG_SPECIES, la1, i), lt1, llo1, lhi1); if (!lm.anyTrue()) continue; }
+                if (numLongPreds > 2) { lm = applyLongPred(lm, LongVector.fromArray(LONG_SPECIES, la2, i), lt2, llo2, lhi2); if (!lm.anyTrue()) continue; }
+                if (numLongPreds > 3) { lm = applyLongPred(lm, LongVector.fromArray(LONG_SPECIES, la3, i), lt3, llo3, lhi3); if (!lm.anyTrue()) continue; }
+
+                VectorMask<Double> dm;
+                if (numDblPreds > 0 || aggType != AGG_COUNT) {
+                    for (int lane = 0; lane < LONG_LANES; lane++) maskBits[lane] = lm.laneIsSet(lane);
+                    dm = VectorMask.fromArray(DOUBLE_SPECIES, maskBits, 0);
+                } else { matchCount += lm.trueCount(); continue; }
+
+                if (numDblPreds > 0) { dm = applyDoublePred(dm, DoubleVector.fromArray(DOUBLE_SPECIES, da0, i), dt0, dlo0, dhi0); if (!dm.anyTrue()) continue; }
+                if (numDblPreds > 1) { dm = applyDoublePred(dm, DoubleVector.fromArray(DOUBLE_SPECIES, da1, i), dt1, dlo1, dhi1); if (!dm.anyTrue()) continue; }
+                if (numDblPreds > 2) { dm = applyDoublePred(dm, DoubleVector.fromArray(DOUBLE_SPECIES, da2, i), dt2, dlo2, dhi2); if (!dm.anyTrue()) continue; }
+                if (numDblPreds > 3) { dm = applyDoublePred(dm, DoubleVector.fromArray(DOUBLE_SPECIES, da3, i), dt3, dlo3, dhi3); if (!dm.anyTrue()) continue; }
+
+                matchCount += dm.trueCount();
+                if (aggType == AGG_SUM_PRODUCT) { DoubleVector a = DoubleVector.fromArray(DOUBLE_SPECIES, aa1, i); DoubleVector b = DoubleVector.fromArray(DOUBLE_SPECIES, aa2, i); revenueVec = revenueVec.add(a.mul(b), dm); }
+                else if (aggType == AGG_SUM) { revenueVec = revenueVec.add(DoubleVector.fromArray(DOUBLE_SPECIES, aa1, i), dm); }
+                else if (aggType == AGG_MIN) { DoubleVector a = DoubleVector.fromArray(DOUBLE_SPECIES, aa1, i); revenueVec = revenueVec.min(DoubleVector.broadcast(DOUBLE_SPECIES, Double.POSITIVE_INFINITY).blend(a, dm)); }
+                else if (aggType == AGG_MAX) { DoubleVector a = DoubleVector.fromArray(DOUBLE_SPECIES, aa1, i); revenueVec = revenueVec.max(DoubleVector.broadcast(DOUBLE_SPECIES, Double.NEGATIVE_INFINITY).blend(a, dm)); }
+            }
+
+            double chunkRev;
+            if (aggType == AGG_MIN) chunkRev = revenueVec.reduceLanes(VectorOperators.MIN);
+            else if (aggType == AGG_MAX) chunkRev = revenueVec.reduceLanes(VectorOperators.MAX);
+            else chunkRev = revenueVec.reduceLanes(VectorOperators.ADD);
+
+            // Scalar tail
+            for (int i = upperBound; i < length; i++) {
+                if (evalChunkScalar(chunkValidity,
+                        numLongPreds, longPredTypes, la0, la1, la2, la3, longLo, longHi,
+                        numDblPreds, dblPredTypes, da0, da1, da2, da3, dblLo, dblHi, i)) {
+                    if (aggType == AGG_COUNT) {
+                        matchCount++;
+                    } else {
+                        switch (aggType) {
+                            case AGG_SUM_PRODUCT: chunkRev += aa1[i] * aa2[i]; matchCount++; break;
+                            case AGG_SUM:         chunkRev += aa1[i]; matchCount++; break;
+                            case AGG_MIN:         chunkRev = Math.min(chunkRev, aa1[i]); matchCount++; break;
+                            case AGG_MAX:         chunkRev = Math.max(chunkRev, aa1[i]); matchCount++; break;
+                        }
+                    }
+                }
+            }
+
+            switch (aggType) {
+                case AGG_SUM_PRODUCT: case AGG_SUM: revenue += chunkRev; break;
+                case AGG_MIN: revenue = Math.min(revenue, chunkRev); break;
+                case AGG_MAX: revenue = Math.max(revenue, chunkRev); break;
+            }
+        }
+
+        return new double[] { revenue, (double) matchCount };
+    }
+
+    // ============================================================================
     // fusedSimdChunkedCountParallel — validity-aware sibling
     // ============================================================================
 

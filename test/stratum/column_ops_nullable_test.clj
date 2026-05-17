@@ -178,6 +178,29 @@
 ;; correctness in isolation.
 ;; ============================================================================
 
+(deftest end-to-end-indexed-sum-with-nulls
+  ;; Phase 1d-agg — end-to-end SUM with NULLs on indexed input.
+  ;; PChunkedSIMDAgg path. Predicate-side NULL rows must not
+  ;; contribute to the aggregate sum.
+  (testing "SUM(v) WHERE col < 100 with NULLs"
+    (let [n 10000
+          pred-data (vec (for [i (range n)]
+                           (if (zero? (mod i 7)) Long/MIN_VALUE
+                               (mod (* i 13) 1000))))
+          agg-data  (vec (for [i (range n)] (* 1.0 (mod i 50))))
+          pred-idx (index/index-from-seq :int64 pred-data)
+          agg-idx  (index/index-from-seq :float64 agg-data)
+          result (q/q {:from {:p pred-idx :v agg-idx}
+                       :where [[:< :p 100]]
+                       :agg [[:sum :v]]})
+          expected (->> (range n)
+                        (filter (fn [i] (and (not= (nth pred-data i) Long/MIN_VALUE)
+                                             (< (nth pred-data i) 100))))
+                        (map #(nth agg-data %))
+                        (reduce + 0.0))]
+      (is (= (Math/round (* 100.0 expected))
+             (Math/round (* 100.0 (:sum (first result)))))))))
+
 (deftest end-to-end-indexed-count-with-nulls
   ;; Phase 1d-count — end-to-end through the planner's PChunkedSIMDCount
   ;; path on an indexed column with NULLs. The dispatch routes to
