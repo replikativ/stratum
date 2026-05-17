@@ -3282,6 +3282,46 @@
           (is (= [1 3] eids)))
         (finally (server/stop srv))))))
 
+(deftest sql-erase-survives-leading-comment-with-erase-text
+  ;; Regression lock for copilot review #4 (sql/rewrite.clj:151):
+  ;; the ERASE→DELETE rewrite used `.replaceFirst` with a regex,
+  ;; which matches the FIRST `ERASE FROM` anywhere in the SQL
+  ;; string. If a leading SQL comment contains the literal text
+  ;; "ERASE FROM" (for documentation / changelog purposes), the
+  ;; rewrite hit the comment instead of the actual statement
+  ;; keyword, leaving `ERASE FROM <table>` unchanged for
+  ;; JSqlParser — which then choked on the unknown verb.
+  ;;
+  ;; Post-fix: the rewrite uses the position returned by
+  ;; `skip-ws-and-comments` and replaces only that exact slice.
+  (testing "ERASE FROM works even when a preceding comment contains the literal phrase 'ERASE FROM'"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        (server/register-table!
+          srv "salaries"
+          {:eid    (stratum.index/index-from-seq :int64 [1 2 3])
+           :salary (stratum.index/index-from-seq :int64 [100 200 300])})
+        (let [;; Adversarial SQL: the comment contains the literal
+              ;; "ERASE FROM legacy_table" which would have been
+              ;; replaced by the pre-fix regex.
+              sql (str "/* GDPR sweep — previously: ERASE FROM legacy_table */\n"
+                       "ERASE FROM salaries WHERE eid = 2")
+              ^PgWireServer$QueryResult qr (exec sql (:registry srv) (:data-dir srv))]
+          (is (nil? (.error qr))
+              (str "execute-sql must not error; pre-fix surfaced a "
+                   "JSqlParser failure because the rewrite hit the "
+                   "comment text. got: " (.error qr)))
+          (is (= "ERASE 1" (.commandTag qr))
+              "tag should be ERASE 1 (one row deleted)"))
+        (let [cols (get @(:registry srv) "salaries")
+              n (stratum.index/idx-length (:index (:eid cols)))
+              eids (mapv #(stratum.index/idx-get-long (:index (:eid cols)) %)
+                         (range n))]
+          (is (= [1 3] eids)
+              "only eid=2 erased; comment content untouched"))
+        (finally (server/stop srv))))))
+
 (deftest sql-erase-from-without-where-purges-all
   (testing "ERASE FROM <t> with no WHERE wipes the entire table"
     (let [srv (server/start {:port 0})

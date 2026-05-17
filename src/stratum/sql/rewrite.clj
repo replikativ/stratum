@@ -136,7 +136,8 @@
         ;; side channel; SELECT statements get the clause rewritten
         ;; into WHERE predicates inline. Otherwise the FOR ALL form
         ;; would be claimed by both preprocessors.
-        [_ leading] (read-word sql (long (skip-ws-and-comments sql 0)))
+        leading-pos (long (skip-ws-and-comments sql 0))
+        [leading-end leading] (read-word sql leading-pos)
         select-stmt? (= "select" leading)
         erase-stmt? (= "erase" leading)
         ;; `ERASE FROM <t> [WHERE <p>]` — physical purge across
@@ -147,8 +148,17 @@
         ;; for GDPR-style right-to-be-forgotten purges across
         ;; temporal axes (vs `DELETE FOR PORTION OF`, which is a
         ;; bounded logical retract).
+        ;;
+        ;; Use a position-based splice (not `.replaceFirst` with a
+        ;; regex) — `skip-ws-and-comments` already gave us the exact
+        ;; position of the leading statement keyword, so we replace
+        ;; only that substring. A regex would also hit any earlier
+        ;; "ERASE FROM" appearing inside a leading SQL comment
+        ;; (`/* ERASE FROM foo */ ERASE FROM bar`), leaving the
+        ;; actual keyword intact and breaking JSqlParser.
+        ;; (Copilot review #4.)
         sql (if erase-stmt?
-              (.replaceFirst ^String sql "(?i)\\s*ERASE\\s+FROM" "DELETE FROM")
+              (str (subs sql 0 leading-pos) "DELETE" (subs sql leading-end))
               sql)
         sql (if select-stmt? (preprocess-select-temporal sql) sql)
         {:keys [sql period]} (if select-stmt?
