@@ -178,6 +178,44 @@
 ;; correctness in isolation.
 ;; ============================================================================
 
+(deftest end-to-end-indexed-count-with-nulls
+  ;; Phase 1d-count — end-to-end through the planner's PChunkedSIMDCount
+  ;; path on an indexed column with NULLs. The dispatch routes to
+  ;; ColumnOpsChunkedSimdNullable when any chunk has non-nil validity.
+  (testing "WHERE col < 100 on indexed long col with NULLs"
+    (let [n 10000
+          data (vec (for [i (range n)]
+                      (if (zero? (mod i 7)) Long/MIN_VALUE
+                          (mod (* i 13) 1000))))
+          idx (index/index-from-seq :int64 data)
+          result (q/q {:from {:c idx}
+                       :where [[:< :c 100]]
+                       :agg [[:count]]})
+          ;; Reference: non-NULL rows with value < 100
+          expected (count (filter (fn [v] (and (not= v Long/MIN_VALUE) (< v 100))) data))]
+      (is (= expected (:_count (first result))))))
+  (testing "WHERE col != 0 on indexed long col with NULLs"
+    (let [;; 10000 rows: NULLs at every 7th position, zeros at every 11th
+          n 10000
+          data (vec (for [i (range n)]
+                      (cond (zero? (mod i 7))  Long/MIN_VALUE
+                            (zero? (mod i 11)) 0
+                            :else              (mod (* i 13) 1000))))
+          idx (index/index-from-seq :int64 data)
+          result (q/q {:from {:c idx}
+                       :where [[:!= :c 0]]
+                       :agg [[:count]]})
+          ;; Reference
+          expected (count (filter (fn [v] (and (not= v Long/MIN_VALUE) (not= v 0))) data))]
+      (is (= expected (:_count (first result))))))
+  (testing "dense indexed col (no NULLs) takes the no-bitmap fast path"
+    (let [data (vec (range 10000))
+          idx (index/index-from-seq :int64 data)
+          result (q/q {:from {:c idx}
+                       :where [[:< :c 5000]]
+                       :agg [[:count]]})]
+      (is (= 5000 (:_count (first result)))))))
+
 (deftest f001-fused-simd-sum-skips-nulls
   ;; Phase 1c — fusedSimdParallel sibling. Same shape as count but
   ;; the SUM aggregator side keeps its existing IEEE-NaN sentinel-

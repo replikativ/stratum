@@ -12,7 +12,7 @@
             [stratum.query.postprocess :as post]
             [stratum.index :as index]
             [stratum.chunk :as chunk])
-  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsChunked ColumnOpsChunkedSimd ColumnOpsChunkedLong ColumnOpsAnalytics]
+  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsChunked ColumnOpsChunkedSimd ColumnOpsChunkedSimdNullable ColumnOpsChunkedLong ColumnOpsAnalytics]
            [stratum.index ChunkEntry]))
 
 (set! *warn-on-reflection* true)
@@ -562,11 +562,50 @@
                          simd-result)
                :count total-count})))))))
 
+(defn- combine-per-chunk-validity
+  "For the chunked nullable dispatch: build a long[][] of per-chunk
+   AND'd validity bitmaps across all predicate columns. The result
+   is null when no chunk on any predicate column has nulls (route
+   to the no-bitmap kernel). Otherwise `validity[c]` is nil for
+   chunks where every pred col is all-valid at that chunk, or the
+   bitwise AND of the non-nil chunk bitmaps."
+  [pred-cols-entries simd-chunks chunk-lengths]
+  ;; Walk every chunk; for each, collect non-nil chunk validities
+  ;; from each pred col and AND them.
+  (let [n-simd (count simd-chunks)
+        validity-arr (make-array (Class/forName "[J") n-simd)
+        any-nullable (volatile! false)]
+    (dotimes [s n-simd]
+      (let [c (int (nth simd-chunks s))
+            chunk-len (int (aget ^ints chunk-lengths s))
+            chunk-bitmaps
+            (->> pred-cols-entries
+                 (keep (fn [entries]
+                         (let [^ChunkEntry entry (nth entries c)
+                               bm (chunk/chunk-validity (.chunk entry))]
+                           bm))))]
+        (when (seq chunk-bitmaps)
+          (vreset! any-nullable true)
+          ;; AND the bitmaps. Allocate result long[] sized to chunk.
+          (let [n-entries (chunk/bitmap-entry-count chunk-len)
+                combined (long-array n-entries)]
+            (java.util.Arrays/fill combined -1)
+            (doseq [^longs bm chunk-bitmaps]
+              (dotimes [i n-entries]
+                (aset combined i (bit-and (aget combined i) (aget bm i)))))
+            (aset ^objects validity-arr s combined)))))
+    (when @any-nullable validity-arr)))
+
 (defn execute-chunked-fused-count
   "JIT-isolated chunked COUNT for index inputs.
    Calls ColumnOpsExt/fusedSimdChunkedCountParallel which has no aggType switch,
    avoiding JIT aggType interference from fusedSimdChunkBatch (B5 idx: 27ms→2ms).
-   No agg columns needed — only predicate columns are streamed."
+   No agg columns needed — only predicate columns are streamed.
+
+   Phase 1d: dispatches to `ColumnOpsChunkedSimdNullable/fusedSimdChunkedCountParallel`
+   when any chunk on any predicate column carries a non-nil validity
+   bitmap. Otherwise the existing no-bitmap path runs unchanged (zero
+   overhead for dense data)."
   [preds columns _length]
   (let [{:keys [long-preds dbl-preds n-long n-dbl
                 long-pred-types long-lo long-hi
@@ -613,8 +652,16 @@
               ^ChunkEntry entry (nth (get col-entries col-name) (nth simd-chunks s))]
           (aset ^objects (aget ^"[[[D" dbl-pred-arrs p) s (chunk/chunk-as-doubles (.chunk entry))))))
 
-    ;; Stats-only chunks: accumulate count
-    (let [stats-count (if classifications
+    ;; Build per-chunk combined validity across pred cols (or nil for
+    ;; the all-valid fast path).
+    (let [pred-col-entries-list
+          (concat (map #(get col-entries %) long-col-names)
+                  (map #(get col-entries %) dbl-col-names))
+          per-chunk-validity
+          (when (seq pred-col-entries-list)
+            (combine-per-chunk-validity pred-col-entries-list simd-chunks chunk-lengths))
+
+          stats-count (if classifications
                         (reduce (fn [^long acc c]
                                   (if (= :stats-only (nth classifications c))
                                     (let [^ChunkEntry entry (nth first-col-entries c)]
@@ -627,12 +674,20 @@
         {:result (double stats-count) :count (long stats-count)}
 
         (let [^doubles result
-              (ColumnOpsChunkedSimd/fusedSimdChunkedCountParallel
-               (int n-long) ^ints long-pred-types
-               ^"[[[J" long-pred-arrs ^longs long-lo ^longs long-hi
-               (int n-dbl) ^ints dbl-pred-types
-               ^"[[[D" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
-               ^ints chunk-lengths (int n-simd))
+              (if per-chunk-validity
+                (ColumnOpsChunkedSimdNullable/fusedSimdChunkedCountParallel
+                 (int n-long) ^ints long-pred-types
+                 ^"[[[J" long-pred-arrs ^longs long-lo ^longs long-hi
+                 (int n-dbl) ^ints dbl-pred-types
+                 ^"[[[D" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
+                 ^"[[J" per-chunk-validity
+                 ^ints chunk-lengths (int n-simd))
+                (ColumnOpsChunkedSimd/fusedSimdChunkedCountParallel
+                 (int n-long) ^ints long-pred-types
+                 ^"[[[J" long-pred-arrs ^longs long-lo ^longs long-hi
+                 (int n-dbl) ^ints dbl-pred-types
+                 ^"[[[D" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
+                 ^ints chunk-lengths (int n-simd)))
               simd-count (long (aget result 1))
               total-count (+ simd-count (long stats-count))]
           {:result (double total-count) :count total-count})))))
