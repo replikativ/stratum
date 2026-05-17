@@ -82,6 +82,81 @@
 (defn- word-char? [^Character c]
   (or (Character/isLetterOrDigit c) (= \_ c)))
 
+(defn- mask-non-code-spans
+  "Return a length-preserved copy of `sql` with every character
+   inside a SQL line comment (`-- … \\n`), block comment (`/* …
+   */`), single-quoted string (`'…'` with `''` escape), or
+   double-quoted identifier (`\"…\"` with `\"\"` escape) replaced
+   with a space (newlines preserved so line-comment terminators
+   stay intact for the regex flag `(?s)` consumers).
+
+   The mask is used to defang regex-based preprocessors that
+   otherwise match keyword sequences appearing inside comments or
+   string literals — e.g. `re-find #\"FOR ALL VALID_TIME\" sql`
+   incorrectly matching a leading SQL comment such as
+   `/* migration: FOR ALL VALID_TIME … */`. Run the regex on the
+   masked copy; use the matched positions to splice the original.
+
+   Length preservation is critical: callers compute `(.indexOf
+   masked …)` and `(subs original 0 idx)` based on the same
+   offsets, so any character substitution must keep the index map
+   1-to-1."
+  ^String [^String sql]
+  (let [n  (.length sql)
+        sb (StringBuilder. sql)
+        space (fn [^long i] (when-not (= \newline (.charAt sql i))
+                              (.setCharAt sb i \space)))]
+    (loop [i (long 0)]
+      (if (>= i n)
+        (.toString sb)
+        (let [c  (.charAt sql i)
+              c1 (when (< (inc i) n) (.charAt sql (inc i)))]
+          (cond
+            ;; -- line comment
+            (and (= \- c) (= \- c1))
+            (let [end (loop [j (+ i 2)]
+                        (cond
+                          (>= j n) n
+                          (= \newline (.charAt sql j)) j
+                          :else (recur (inc j))))]
+              (dotimes [k (- (long end) i)] (space (+ i k)))
+              (recur (long end)))
+            ;; /* block comment */
+            (and (= \/ c) (= \* c1))
+            (let [end (loop [j (+ i 2)]
+                        (cond
+                          (>= j (dec n)) n
+                          (and (= \* (.charAt sql j))
+                               (= \/ (.charAt sql (inc j)))) (+ j 2)
+                          :else (recur (inc j))))]
+              (dotimes [k (- (long end) i)] (space (+ i k)))
+              (recur (long end)))
+            ;; '…' string literal (with '' escape)
+            (= \' c)
+            (let [end (loop [j (inc i)]
+                        (cond
+                          (>= j n) n
+                          (and (= \' (.charAt sql j))
+                               (< (inc j) n)
+                               (= \' (.charAt sql (inc j)))) (recur (+ j 2))
+                          (= \' (.charAt sql j)) (inc j)
+                          :else (recur (inc j))))]
+              (dotimes [k (- (long end) i)] (space (+ i k)))
+              (recur (long end)))
+            ;; "…" delimited identifier (with "" escape)
+            (= \" c)
+            (let [end (loop [j (inc i)]
+                        (cond
+                          (>= j n) n
+                          (and (= \" (.charAt sql j))
+                               (< (inc j) n)
+                               (= \" (.charAt sql (inc j)))) (recur (+ j 2))
+                          (= \" (.charAt sql j)) (inc j)
+                          :else (recur (inc j))))]
+              (dotimes [k (- (long end) i)] (space (+ i k)))
+              (recur (long end)))
+            :else (recur (inc i))))))))
+
 (defn- read-word
   "Read an unquoted identifier or keyword starting at i. Returns [end-index
    lowercase-word] or [i nil] if the char at i isn't a word start."
@@ -391,21 +466,36 @@
   ;; SYSTEM_TIME) — SQL:2011 temporal DML scope clause. Strip first
   ;; and emit `:period {:axis ... :from MIN :to MAX}` so the lowering
   ;; treats it as a window spanning all time.
-  (if-let [all-m (re-find #"(?is)\bFOR\s+(?:ALL\s+(VALID_TIME|SYSTEM_TIME)|(VALID_TIME|SYSTEM_TIME)\s+ALL)\b" sql)]
-    (let [axis (or (nth all-m 1) (nth all-m 2))
-          full ^String (first all-m)
-          start (.indexOf sql full)
-          rewritten (str (subs sql 0 start) (subs sql (+ start (.length full))))]
-      {:sql rewritten
-       :period {:axis (keyword (.toLowerCase ^String axis))
-                :from Long/MIN_VALUE
-                :to   Long/MAX_VALUE}})
-    (let [m (re-find #"(?is)\bFOR\s+PORTION\s+OF\s+(VALID_TIME|SYSTEM_TIME)\s+FROM\s+" sql)]
-      (if-not m
-      {:sql sql :period nil}
-      (let [[full-prefix axis] m
-            start (.indexOf sql ^String full-prefix)
-            after-from (+ start (.length ^String full-prefix))
+  ;;
+  ;; Run the regex on `masked` (comments + string literals replaced
+  ;; with spaces, character offsets preserved) so a leading comment
+  ;; or string containing the literal phrase doesn't get matched.
+  ;; Use the matched offsets to splice the ORIGINAL `sql` — that's
+  ;; safe because mask preserves length. Agent-discovered pattern,
+  ;; same shape as copilot review #4 (ERASE) but in a different
+  ;; preprocessor.
+  (let [masked (mask-non-code-spans sql)]
+    (if-let [all-m (re-find #"(?is)\bFOR\s+(?:ALL\s+(VALID_TIME|SYSTEM_TIME)|(VALID_TIME|SYSTEM_TIME)\s+ALL)\b" masked)]
+      (let [axis (or (nth all-m 1) (nth all-m 2))
+            full ^String (first all-m)
+            start (.indexOf masked full)
+            rewritten (str (subs sql 0 start) (subs sql (+ start (.length full))))]
+        {:sql rewritten
+         :period {:axis (keyword (.toLowerCase ^String axis))
+                  :from Long/MIN_VALUE
+                  :to   Long/MAX_VALUE}})
+      ;; Match WITHOUT a trailing `\s+` — when the regex runs on
+      ;; `masked`, any string literal after `FROM` has been
+      ;; replaced with spaces; a greedy `\s+` would swallow the
+      ;; entire literal up to the next non-space token, producing
+      ;; a wrong end-of-prefix offset. We advance past whitespace
+      ;; ourselves via `skip-ws-and-comments` on the original.
+      (let [m (re-find #"(?is)\bFOR\s+PORTION\s+OF\s+(VALID_TIME|SYSTEM_TIME)\s+FROM\b" masked)]
+        (if-not m
+          {:sql sql :period nil}
+          (let [[full-prefix axis] m
+                start (.indexOf masked ^String full-prefix)
+                after-from (long (skip-ws-and-comments sql (+ start (.length ^String full-prefix))))
             ;; Walk forward to either a literal TO keyword or to the
             ;; next DML tail keyword (WHERE/SET/...) — that's where
             ;; the FROM expression ends.
@@ -431,7 +521,7 @@
         {:sql rewritten
          :period {:axis (keyword (.toLowerCase ^String axis))
                   :from vf-val
-                  :to vt-val}})))))
+                  :to vt-val}}))))))
 
 ;; ============================================================================
 ;; Public: SQL:2011 SELECT-side `FOR VALID_TIME (AS OF | BETWEEN |
@@ -543,7 +633,7 @@
    of the `FOR` keyword; `end` is just past the spec."
   [^String sql]
   (let [n (.length sql)]
-    (loop [i 0]
+    (loop [i (long 0)]
       (cond
         (>= i n) nil
 
@@ -624,7 +714,7 @@
                            "union" "intersect" "except"}
           ;; Find WHERE keyword position, if any.
           where-pos
-          (loop [i 0]
+          (loop [i (long 0)]
             (cond
               (>= i n) -1
               (= \' (.charAt sql i)) (recur (long (skip-string sql i \')))
@@ -640,7 +730,7 @@
           ;; Find a "stop" keyword position (GROUP/ORDER/...) for
           ;; locating where to insert WHERE when none exists.
           stop-pos
-          (loop [i 0]
+          (loop [i (long 0)]
             (cond
               (>= i n) n
               (= \' (.charAt sql i)) (recur (long (skip-string sql i \')))

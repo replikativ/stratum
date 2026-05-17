@@ -3349,6 +3349,72 @@
           (is (= [1 3] eids)))
         (finally (server/stop srv))))))
 
+(deftest sql-for-portion-of-survives-leading-comment-with-phrase
+  ;; Regression lock for pattern-hunt P1 (rewrite.clj:403): the
+  ;; `FOR PORTION OF VALID_TIME FROM …` preprocessor used
+  ;; `re-find` on the raw SQL. A leading comment containing the
+  ;; phrase (e.g. a changelog reference) was matched as if it were
+  ;; real syntax — the rewriter then spliced from inside the
+  ;; comment, corrupting the SQL and stamping a bogus :period
+  ;; side-channel on a statement the user never intended as
+  ;; temporal DML. Same root cause as copilot review #4 (ERASE),
+  ;; different preprocessor. Fix: `mask-non-code-spans` replaces
+  ;; comments/strings with spaces (length-preserving) before the
+  ;; regex runs.
+  (testing "DELETE FROM with a leading comment that mentions FOR PORTION OF VALID_TIME FROM is not corrupted"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        (exec "CREATE TABLE t (id BIGINT, v BIGINT)"
+              (:registry srv) (:data-dir srv))
+        (exec "INSERT INTO t (id, v) VALUES (1, 100), (2, 200)"
+              (:registry srv) (:data-dir srv))
+        (let [;; Adversarial SQL: comment mentions FOR PORTION OF
+              ;; VALID_TIME FROM as a changelog reference. Pre-fix,
+              ;; the rewriter matched inside the comment and either
+              ;; spliced garbage or stamped a bogus :period on a
+              ;; non-bitemporal table (which then errored).
+              sql (str "/* legacy archive: FOR PORTION OF VALID_TIME FROM 2020 TO 2021 */\n"
+                       "DELETE FROM t WHERE id = 1")
+              ^PgWireServer$QueryResult r (exec sql (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r))
+              (str "execute-sql must not error; pre-fix surfaced "
+                   "either a parser failure or a non-bitemporal-"
+                   "table error from the bogus :period. got: "
+                   (.error r))))
+        (let [cols (get @(:registry srv) "t")
+              ids (vec (aclone ^longs (:id cols)))]
+          (is (= [2] ids)
+              "id=1 deleted; comment content untouched"))
+        (finally (server/stop srv))))))
+
+(deftest sql-for-all-valid-time-survives-leading-comment-with-phrase
+  ;; Regression lock for pattern-hunt P1 (rewrite.clj:394): the
+  ;; `FOR ALL VALID_TIME` / `FOR VALID_TIME ALL` preprocessor used
+  ;; `re-find` on the raw SQL. A leading comment containing the
+  ;; phrase was matched, stamping a bogus :period {:from
+  ;; Long/MIN_VALUE :to Long/MAX_VALUE} on a non-temporal statement.
+  ;; Fix: mask before regex.
+  (testing "UPDATE with a leading comment that mentions FOR ALL VALID_TIME runs as a plain UPDATE"
+    (let [srv (server/start {:port 0})
+          exec @(resolve 'stratum.server/execute-sql)]
+      (try
+        (exec "CREATE TABLE t (id BIGINT, v BIGINT)"
+              (:registry srv) (:data-dir srv))
+        (exec "INSERT INTO t (id, v) VALUES (1, 100), (2, 200)"
+              (:registry srv) (:data-dir srv))
+        (let [sql (str "/* GDPR sweep — previously: FOR ALL VALID_TIME archive */\n"
+                       "UPDATE t SET v = 999 WHERE id = 1")
+              ^PgWireServer$QueryResult r (exec sql (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r))
+              (str "pre-fix: bogus :period side-channel on plain UPDATE. got: "
+                   (.error r))))
+        (let [cols (get @(:registry srv) "t")
+              vs  (vec (aclone ^longs (:v cols)))]
+          (is (= [999 200] vs)
+              "id=1 updated to 999; comment content untouched"))
+        (finally (server/stop srv))))))
+
 (deftest sql-erase-survives-leading-comment-with-erase-text
   ;; Regression lock for copilot review #4 (sql/rewrite.clj:151):
   ;; the ERASE→DELETE rewrite used `.replaceFirst` with a regex,
