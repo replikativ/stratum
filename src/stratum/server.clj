@@ -709,14 +709,19 @@
 
                 ;; Plain INSERT on an index-backed bitemporal table
                 ;; with explicit column list lowers to append! so
-                ;; the user can supply vf/vt directly.
+                ;; the user can supply vf/vt directly. When valid is
+                ;; present, build metadata via `bitemporal-ds-meta`
+                ;; so the :system axis is preserved — without it,
+                ;; `dataset/append!` won't auto-stamp _system_from/_to
+                ;; and SCD2-on-system silently breaks (caught by
+                ;; copilot review #1 on PR #27).
                 (and (index-backed-cols? existing) (:columns ddl))
                 (let [valid (bitemporal-valid-cfg existing (meta existing))
-                      ds-meta (merge (or (:bitemporal (meta existing)) {})
-                                     (when valid {:bitemporal {:valid valid}}))
+                      ds-meta (when valid
+                                (bitemporal-ds-meta existing (meta existing) valid))
                       ds (dataset/make-dataset existing
                                                (cond-> {:name table}
-                                                 (seq ds-meta) (assoc :metadata ds-meta)))
+                                                 ds-meta (assoc :metadata ds-meta)))
                       mutated (reduce (fn [tds row-vals]
                                         (dataset/append! tds (zipmap (:columns ddl) row-vals)))
                                       (transient ds)

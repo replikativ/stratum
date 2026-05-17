@@ -2599,6 +2599,65 @@
                 "_system_to must be MAX (open) for a fresh insertion")))
         (finally (server/stop srv))))))
 
+(deftest sql-plain-insert-bitemporal-preserves-system-axis
+  ;; Regression lock for copilot review #1 (server.clj:719):
+  ;; the plain-INSERT-with-columns path on an index-backed bitemporal
+  ;; table was building :metadata with only `{:bitemporal {:valid …}}`,
+  ;; flattening the axis map AND dropping the :system axis. Result:
+  ;; `dataset/append!` ran without :system metadata so `_system_from`
+  ;; was never auto-stamped (left as whatever the unit's default
+  ;; produced — typically `now-in-unit` from append, *not* a pinned
+  ;; sys-now, breaking SCD2-on-system).
+  ;;
+  ;; This test exercises a plain `INSERT (cols) VALUES …` on a fully-
+  ;; bitemporal table and asserts the new row's `_system_from` is a
+  ;; real sys-now stamp (positive, not MAX, not 0) and `_system_to`
+  ;; is MAX (open). Pre-fix, this would either throw a missing-column
+  ;; error or silently leak a non-pinned timestamp.
+  (testing "plain INSERT (no FOR PORTION OF) on a fully-bitemporal table stamps _system_from"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "salaries"
+          (with-meta
+            {:eid          (stratum.index/index-from-seq :int64 [])
+             :salary       (stratum.index/index-from-seq :int64 [])
+             :_valid_from  (stratum.index/index-from-seq :int64 [])
+             :_valid_to    (stratum.index/index-from-seq :int64 [])
+             :_system_from (stratum.index/index-from-seq :int64 [])
+             :_system_to   (stratum.index/index-from-seq :int64 [])}
+            {:bitemporal
+             {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+              :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)]
+          ;; Plain INSERT — user supplies _valid_from/_valid_to
+          ;; explicitly; system axis must be auto-stamped by stratum.
+          (exec (str "INSERT INTO salaries "
+                     "(eid, salary, _valid_from, _valid_to) "
+                     "VALUES (1, 100, "
+                     "1704067200000000, " ; 2024-01-01 micros
+                     "9223372036854775807)") ; Long/MAX_VALUE (open)
+                (:registry srv) (:data-dir srv)))
+        (let [cols (get @(:registry srv) "salaries")
+              n    (stratum.index/idx-length (:index (:eid cols)))
+              read-col (fn [k] (mapv #(stratum.index/idx-get-long
+                                        (:index (get cols k)) %)
+                                     (range n)))
+              rows (mapv (fn [i] {:vf (nth (read-col :_valid_from) i)
+                                  :vt (nth (read-col :_valid_to) i)
+                                  :sf (nth (read-col :_system_from) i)
+                                  :st (nth (read-col :_system_to) i)})
+                         (range n))]
+          (is (= 1 n) "one row inserted")
+          (let [{:keys [vf vt sf st]} (first rows)]
+            (is (= 1704067200000000 vf))
+            (is (= Long/MAX_VALUE vt))
+            (is (and (pos? sf) (not= Long/MAX_VALUE sf))
+                "_system_from must be a real sys-now stamp — proves :system axis was preserved through ds-meta")
+            (is (= Long/MAX_VALUE st)
+                "_system_to must be MAX (open) for a fresh insertion")))
+        (finally (server/stop srv))))))
+
 (deftest sql-upsert-for-portion-of-valid-time-rejected
   (testing "INSERT … ON CONFLICT … FOR PORTION OF VALID_TIME throws a clear error"
     (let [srv (server/start {:port 0})]
