@@ -35,7 +35,7 @@
             PFusedExtractCount PBitmapSemiJoin PHashJoin
             PPerfectHashJoin PAsofJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
             PProject PWindow PHaving PSort PDistinct PLimit
-            PMaterializeExpr]))
+            PMaterializeExpr PRecompose]))
 
 (set! *warn-on-reflection* true)
 
@@ -880,6 +880,31 @@
                   (-> agg (dissoc :expr) (assoc :op base-op :col (:col match) :as as))
                   {:linear-recipe recipe})))))
         agg)))
+
+(defn smcs-decomposition
+  "Rewrite `LGlobalAgg` and `LGroupBy` aggs of the form `SUM(a*(c-b))`
+   into `c*SUM(a) - SUM_PRODUCT(a,b)` and wrap the node in `PRecompose`.
+
+   Runs BEFORE `expr-materialization` so the compound expression never
+   gets materialized as a temp column — the decomposed aggs reference
+   `a` and `b` directly, which on indexed inputs keeps the L2-resident
+   chunked group-by streaming path eligible. `execute-chunked-group-by`
+   would do the same rewrite itself, but only sees aggs after the
+   planner has replaced their `:expr` with `:col` refs to the
+   materialized temp column — too late for the rewrite to fire."
+  [plan]
+  (ir/walk-plan plan
+                (fn [node]
+                  (cond
+                    (or (instance? LGlobalAgg node)
+                        (instance? LGroupBy node))
+                    (if-let [decomp (gb/decompose-smcs-aggs (:aggs node))]
+                      (ir/->PRecompose
+                       (:mapping decomp)
+                       (:aggs node)
+                       (assoc node :aggs (:aggs decomp)))
+                      node)
+                    :else node))))
 
 (defn linear-agg-rewrite
   "Rewrite `LGlobalAgg` and `LGroupBy` aggs of the form
@@ -2162,6 +2187,13 @@
                 ;; so the rewritten `LHaving (LWindow ...)` shape is the
                 ;; one strategy-selection sees.
                 window-having-pushdown
+                ;; Algebraic rewrite of `SUM(a·(c−b))` → `c·SUM(a) −
+                ;; SUM_PRODUCT(a,b)`, wrapped in PRecompose for output
+                ;; reassembly. Runs BEFORE expr-materialization so the
+                ;; SMCS pattern matches its `:expr` shape (after that
+                ;; pass, exprs are gone). Disjoint from linear-agg-rewrite:
+                ;; linear matches `s·x + o`, SMCS matches `a·(c−b)`.
+                smcs-decomposition
                 ;; Algebraic rewrite of `SUM/AVG/MIN/MAX(s·col + o)` → base
                 ;; agg on `col` + decode-time recipe. Runs BEFORE
                 ;; expr-materialization so the temp-column shim is
@@ -2475,6 +2507,12 @@
      [["Column" (name (:col-name node))]
       ["Expr"   (format-col-or-expr (:expr node))]
       (when (:target node) ["Target" (name (:target node))])]
+
+     (instance? PRecompose node)
+     [["SMCS Recompose"
+       (let [n (count (filter #(= :sum-mul-const-sub (:type (val %)))
+                              (:mapping node)))]
+         (str n " agg(s)"))]]
 
      (instance? LScan node)
      [(d-columns (:columns node))

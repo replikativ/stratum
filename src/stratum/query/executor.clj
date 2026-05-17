@@ -34,7 +34,7 @@
             PFusedExtractCount PBitmapSemiJoin PHashJoin
             PPerfectHashJoin PAsofJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
             PProject PWindow PHaving PSort PDistinct PLimit
-            PMaterializeExpr LTopN LHead LSetOp LAnomaly LStringMaterialize]
+            PMaterializeExpr PRecompose LTopN LHead LSetOp LAnomaly LStringMaterialize]
            [stratum.internal ColumnOps ColumnOpsExt ColumnOpsAnalytics]))
 
 (set! *warn-on-reflection* true)
@@ -1035,6 +1035,24 @@
 
       :else results)))
 
+;; --- SMCS recompose ----------------------------------------------------------
+
+(defn- execute-recompose
+  "Run the child aggregator and reassemble user-visible aggs from
+   the SMCS-decomposed result. The mapping was produced by
+   `smcs-decomposition` (planner pass); for each original-agg index
+   it specifies either `:passthrough` (no work) or `:sum-mul-const-sub`
+   (apply `c·SUM(a) − SUM_PRODUCT(a,b)` and drop the synthetic
+   __sp_ alias). Columnar output keeps the per-row arrays intact and
+   transforms in-place; row output remaps each row."
+  [node columnar?]
+  (let [child-result (execute-node (:input node) columnar?)
+        mapping  (:mapping node)
+        orig-aggs (:orig-aggs node)]
+    (if columnar?
+      (gb/recompose-columnar-results child-result orig-aggs mapping)
+      (mapv #(gb/recompose-row-results % orig-aggs mapping) child-result))))
+
 ;; --- Expression materialization ----------------------------------------------
 
 (defn- execute-materialize-expr [node]
@@ -1336,6 +1354,9 @@
 
      ;; Expression materialization
     (instance? PMaterializeExpr node) (execute-materialize-expr node)
+
+     ;; SMCS post-aggregation recompose (planner-inserted wrapper)
+    (instance? PRecompose node) (execute-recompose node columnar?)
 
      ;; Top-N pushdown — LTopN is recognized directly (no separate
      ;; physical record) and dispatched to the streaming primitive.
