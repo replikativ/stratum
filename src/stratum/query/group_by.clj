@@ -8,7 +8,7 @@
             [stratum.chunk :as chunk]
             [stratum.stats :as stats]
             [org.replikativ.persistent-sorted-set :as pss])
-  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsChunked ColumnOpsAnalytics ColumnOpsVar]
+  (:import [stratum.internal ColumnOps ColumnOpsExt ColumnOpsLong ColumnOpsChunked ColumnOpsAnalytics ColumnOpsVar ColumnOpsTemporal]
            [stratum.index ChunkEntry]))
 
 (set! *warn-on-reflection* true)
@@ -369,8 +369,8 @@
                       :minute      (* (Math/floorDiv v 60000000) 60000000)
                       :hour        (* (Math/floorDiv v 3600000000) 3600000000)
                       :day         (* (Math/floorDiv v 86400000000) 86400000000)
-                      :year        (let [^longs r (ColumnOps/arrayDateTruncYearMicros (long-array [v]) 1)] (aget r 0))
-                      :month       (let [^longs r (ColumnOps/arrayDateTruncMonthMicros (long-array [v]) 1)] (aget r 0)))
+                      :year        (let [^longs r (ColumnOpsTemporal/arrayDateTruncYearMicros (long-array [v]) 1)] (aget r 0))
+                      :month       (let [^longs r (ColumnOpsTemporal/arrayDateTruncMonthMicros (long-array [v]) 1)] (aget r 0)))
                     :seconds
                     (case unit
                       :second v
@@ -399,8 +399,8 @@
                       :minutes      (+ v (* (long n) 60000000))
                       :hours        (+ v (* (long n) 3600000000))
                       :days         (+ v (* (long n) 86400000000))
-                      :months       (let [^longs r (ColumnOps/arrayDateAddMonthsMicros (long-array [v]) (int n) 1)] (aget r 0))
-                      :years        (let [^longs r (ColumnOps/arrayDateAddMonthsMicros (long-array [v]) (int (* n 12)) 1)] (aget r 0)))
+                      :months       (let [^longs r (ColumnOpsTemporal/arrayDateAddMonthsMicros (long-array [v]) (int n) 1)] (aget r 0))
+                      :years        (let [^longs r (ColumnOpsTemporal/arrayDateAddMonthsMicros (long-array [v]) (int (* n 12)) 1)] (aget r 0)))
                     :seconds
                     (case unit
                       :days    (+ v (* (long n) 86400))
@@ -444,7 +444,7 @@
                     (case unit
                       :days   (* (Math/floorDiv v width) width)
                       :weeks  (* (Math/floorDiv v (* width 7)) (* width 7))
-                      :months (let [^longs r (ColumnOps/arrayTimeBucketMonths (long-array [v]) (int width) 1)]
+                      :months (let [^longs r (ColumnOpsTemporal/arrayTimeBucketMonths (long-array [v]) (int width) 1)]
                                 (aget r 0))))))
 
         :date-diff
