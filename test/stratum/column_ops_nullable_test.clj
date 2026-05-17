@@ -178,6 +178,46 @@
 ;; correctness in isolation.
 ;; ============================================================================
 
+(deftest f001-fused-simd-sum-skips-nulls
+  ;; Phase 1c — fusedSimdParallel sibling. Same shape as count but
+  ;; the SUM aggregator side keeps its existing IEEE-NaN sentinel-
+  ;; skip semantics; the bitmap fixes the predicate side.
+  (testing "SUM(v) WHERE col < 100 on long col with NULLs"
+    (let [n 10000
+          ;; Pred col with NULLs at every 7th position; agg col is double
+          pred-data (vec (for [i (range n)]
+                           (if (zero? (mod i 7)) Long/MIN_VALUE
+                               (mod (* i 13) 1000))))
+          agg-data (vec (for [i (range n)] (* 0.5 (mod i 100))))
+          pred-arr (long-array pred-data)
+          agg-arr  (double-array agg-data)
+          validity (let [v (long-array (chunk/bitmap-entry-count n))]
+                     (dotimes [i n]
+                       (when (not= (nth pred-data i) Long/MIN_VALUE)
+                         (let [eidx (quot i 64), bit (rem i 64)]
+                           (aset v eidx (bit-or (aget v eidx)
+                                                (bit-shift-left 1 bit))))))
+                     v)
+          ;; Expected: SUM agg over rows where pred-data IS NOT NULL AND < 100
+          expected (->> (range n)
+                        (filter (fn [i] (and (not= (nth pred-data i) Long/MIN_VALUE)
+                                             (< (nth pred-data i) 100))))
+                        (map #(nth agg-data %))
+                        (reduce + 0.0))
+          ^doubles result
+          (ColumnOpsNullable/fusedSimdParallel
+           1 (int-array [ColumnOps/PRED_LT])
+           (into-array (Class/forName "[J") [pred-arr])
+           (long-array [Long/MIN_VALUE]) (long-array [100])
+           0 (int-array 0)
+           (into-array (Class/forName "[D") [])
+           (double-array 0) (double-array 0)
+           ColumnOps/AGG_SUM ^doubles agg-arr (double-array 0)
+           ^longs validity
+           (int n) true)]
+      (is (= (Math/round (* 100.0 expected))
+             (Math/round (* 100.0 (aget result 0))))))))
+
 (deftest dispatch-survives-validity-passthrough
   ;; Lock in the wiring: `cols/materialize-column` preserves an
   ;; existing `:validity` field rather than dropping it during the

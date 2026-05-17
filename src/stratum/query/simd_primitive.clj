@@ -300,26 +300,44 @@
              (int agg-type)
              ^longs agg-col1
              (int length))
-            ;; Double path
+            ;; Double path — validity-aware dispatch
             (let [nan-safe (boolean
                             (or (and agg-col1 (ColumnOps/arrayHasNaN ^doubles agg-col1 (alength ^doubles agg-col1)))
                                 (and agg-col2 (ColumnOps/arrayHasNaN ^doubles agg-col2 (alength ^doubles agg-col2)))))]
-              (ColumnOps/fusedSimdParallel
-               (int (:num-long-preds pp))
-               ^ints (:long-pred-types pp)
-               ^"[[J" (:long-cols pp)
-               ^longs (:long-lo pp)
-               ^longs (:long-hi pp)
-               (int (:num-dbl-preds pp))
-               ^ints (:dbl-pred-types pp)
-               ^"[[D" (:dbl-cols pp)
-               ^doubles (:dbl-lo pp)
-               ^doubles (:dbl-hi pp)
-               (int agg-type)
-               ^doubles agg-col1
-               ^doubles agg-col2
-               (int length)
-               nan-safe))))]
+              (if-let [validity (:combined-validity pp)]
+                (ColumnOpsNullable/fusedSimdParallel
+                 (int (:num-long-preds pp))
+                 ^ints (:long-pred-types pp)
+                 ^"[[J" (:long-cols pp)
+                 ^longs (:long-lo pp)
+                 ^longs (:long-hi pp)
+                 (int (:num-dbl-preds pp))
+                 ^ints (:dbl-pred-types pp)
+                 ^"[[D" (:dbl-cols pp)
+                 ^doubles (:dbl-lo pp)
+                 ^doubles (:dbl-hi pp)
+                 (int agg-type)
+                 ^doubles agg-col1
+                 ^doubles agg-col2
+                 ^longs validity
+                 (int length)
+                 nan-safe)
+                (ColumnOps/fusedSimdParallel
+                 (int (:num-long-preds pp))
+                 ^ints (:long-pred-types pp)
+                 ^"[[J" (:long-cols pp)
+                 ^longs (:long-lo pp)
+                 ^longs (:long-hi pp)
+                 (int (:num-dbl-preds pp))
+                 ^ints (:dbl-pred-types pp)
+                 ^"[[D" (:dbl-cols pp)
+                 ^doubles (:dbl-lo pp)
+                 ^doubles (:dbl-hi pp)
+                 (int agg-type)
+                 ^doubles agg-col1
+                 ^doubles agg-col2
+                 (int length)
+                 nan-safe)))))]
     {:result (aget result 0)
      :count  (long (aget result 1))}))
 

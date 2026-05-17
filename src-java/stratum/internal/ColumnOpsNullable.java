@@ -11,6 +11,11 @@ import static stratum.internal.ColumnOps.PRED_LTE;
 import static stratum.internal.ColumnOps.PRED_GTE;
 import static stratum.internal.ColumnOps.PRED_NEQ;
 import static stratum.internal.ColumnOps.PRED_NOT_RANGE;
+import static stratum.internal.ColumnOps.AGG_COUNT;
+import static stratum.internal.ColumnOps.AGG_SUM;
+import static stratum.internal.ColumnOps.AGG_SUM_PRODUCT;
+import static stratum.internal.ColumnOps.AGG_MIN;
+import static stratum.internal.ColumnOps.AGG_MAX;
 import static stratum.internal.ColumnOps.MORSEL_SIZE;
 import static stratum.internal.ColumnOps.PARALLEL_THRESHOLD;
 import static stratum.internal.ColumnOps.POOL;
@@ -242,6 +247,255 @@ public final class ColumnOpsNullable {
             throw new RuntimeException("Parallel execution failed", e);
         }
         return new double[] { 0.0, (double) count };
+    }
+
+    // ============================================================================
+    // fusedSimdParallel — validity-aware sibling (filter + aggregate)
+    // ============================================================================
+
+    /**
+     * Parallel fused filter + aggregate, validity-aware. Identical
+     * signature to {@link ColumnOps#fusedSimdParallel} plus a
+     * {@code validity} parameter. Used for SUM / SUM_PRODUCT / MIN /
+     * MAX (and COUNT, though dedicated {@link #fusedSimdCountParallel}
+     * is preferred for COUNT-only).
+     *
+     * <p>The aggregator side continues to use the existing IEEE-NaN
+     * sentinel-skip when {@code nanSafe} is true — that's correct for
+     * F-006 era aggregator behavior. The validity bitmap fixes the
+     * *predicate* side: SIMD comparisons no longer leak NULL rows
+     * through LT/LTE/NEQ/NOT_RANGE etc. (audit F-001/F-002).
+     */
+    public static double[] fusedSimdParallel(
+            int numLongPreds, int[] longPredTypes,
+            long[][] longCols, long[] longLo, long[] longHi,
+            int numDblPreds, int[] dblPredTypes,
+            double[][] dblCols, double[] dblLo, double[] dblHi,
+            int aggType, double[] aggCol1, double[] aggCol2,
+            long[] validity,
+            int length, boolean nanSafe) {
+
+        if (validity == null) {
+            throw new IllegalArgumentException(
+                "ColumnOpsNullable methods require non-null validity.");
+        }
+
+        if (length < PARALLEL_THRESHOLD) {
+            return fusedSimdUnrolledRange(numLongPreds, longPredTypes, longCols, longLo, longHi,
+                    numDblPreds, dblPredTypes, dblCols, dblLo, dblHi,
+                    aggType, aggCol1, aggCol2, validity, 0, length, nanSafe);
+        }
+
+        int nThreads = Runtime.getRuntime().availableProcessors();
+        int threadRange = ((length + nThreads - 1) / nThreads);
+        // Align to LONG_LANES so validity-extraction stays lane-aligned.
+        threadRange = ((threadRange + LONG_LANES - 1) / LONG_LANES) * LONG_LANES;
+
+        @SuppressWarnings("unchecked")
+        Future<double[]>[] futures = new Future[nThreads];
+
+        for (int t = 0; t < nThreads; t++) {
+            final int threadStart = t * threadRange;
+            final int threadEnd = Math.min(threadStart + threadRange, length);
+            if (threadStart >= length) { futures[t] = null; continue; }
+            futures[t] = POOL.submit(() -> {
+                double revenue = (aggType == AGG_MIN) ? Double.POSITIVE_INFINITY
+                               : (aggType == AGG_MAX) ? Double.NEGATIVE_INFINITY : 0.0;
+                long cnt = 0;
+                for (int ms = threadStart; ms < threadEnd; ms += MORSEL_SIZE) {
+                    int me = Math.min(ms + MORSEL_SIZE, threadEnd);
+                    double[] partial = fusedSimdUnrolledRange(
+                            numLongPreds, longPredTypes, longCols, longLo, longHi,
+                            numDblPreds, dblPredTypes, dblCols, dblLo, dblHi,
+                            aggType, aggCol1, aggCol2, validity, ms, me, nanSafe);
+                    cnt += (long) partial[1];
+                    switch (aggType) {
+                        case AGG_SUM_PRODUCT: case AGG_SUM: revenue += partial[0]; break;
+                        case AGG_MIN: revenue = Math.min(revenue, partial[0]); break;
+                        case AGG_MAX: revenue = Math.max(revenue, partial[0]); break;
+                    }
+                }
+                return new double[] { revenue, (double) cnt };
+            });
+        }
+
+        double result = (aggType == AGG_MIN) ? Double.POSITIVE_INFINITY
+                       : (aggType == AGG_MAX) ? Double.NEGATIVE_INFINITY : 0.0;
+        long count = 0;
+        try {
+            for (Future<double[]> f : futures) {
+                if (f == null) continue;
+                double[] partial = f.get();
+                count += (long) partial[1];
+                switch (aggType) {
+                    case AGG_SUM_PRODUCT: case AGG_SUM: result += partial[0]; break;
+                    case AGG_MIN: result = Math.min(result, partial[0]); break;
+                    case AGG_MAX: result = Math.max(result, partial[0]); break;
+                    case AGG_COUNT: break;
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Parallel execution failed", e);
+        }
+        return new double[] { result, (double) count };
+    }
+
+    static double[] fusedSimdUnrolledRange(
+            int numLongPreds, int[] longPredTypes,
+            long[][] longCols, long[] longLo, long[] longHi,
+            int numDblPreds, int[] dblPredTypes,
+            double[][] dblCols, double[] dblLo, double[] dblHi,
+            int aggType, double[] aggCol1, double[] aggCol2,
+            long[] validity,
+            int start, int end, boolean nanSafe) {
+
+        int rangeLen = end - start;
+        double revenue = 0.0;
+        int matchCount = 0;
+        int upperBound = start + (rangeLen - (rangeLen % LONG_LANES));
+
+        final long[] lc0 = numLongPreds > 0 ? longCols[0] : null;
+        final long[] lc1 = numLongPreds > 1 ? longCols[1] : null;
+        final long[] lc2 = numLongPreds > 2 ? longCols[2] : null;
+        final long[] lc3 = numLongPreds > 3 ? longCols[3] : null;
+        final double[] dc0 = numDblPreds > 0 ? dblCols[0] : null;
+        final double[] dc1 = numDblPreds > 1 ? dblCols[1] : null;
+        final double[] dc2 = numDblPreds > 2 ? dblCols[2] : null;
+        final double[] dc3 = numDblPreds > 3 ? dblCols[3] : null;
+
+        final int lt0 = numLongPreds > 0 ? longPredTypes[0] : -1;
+        final int lt1 = numLongPreds > 1 ? longPredTypes[1] : -1;
+        final int lt2 = numLongPreds > 2 ? longPredTypes[2] : -1;
+        final int lt3 = numLongPreds > 3 ? longPredTypes[3] : -1;
+        final int dt0 = numDblPreds > 0 ? dblPredTypes[0] : -1;
+        final int dt1 = numDblPreds > 1 ? dblPredTypes[1] : -1;
+        final int dt2 = numDblPreds > 2 ? dblPredTypes[2] : -1;
+        final int dt3 = numDblPreds > 3 ? dblPredTypes[3] : -1;
+
+        final LongVector llo0 = numLongPreds > 0 ? LongVector.broadcast(LONG_SPECIES, longLo[0]) : null;
+        final LongVector lhi0 = numLongPreds > 0 ? LongVector.broadcast(LONG_SPECIES, longHi[0]) : null;
+        final LongVector llo1 = numLongPreds > 1 ? LongVector.broadcast(LONG_SPECIES, longLo[1]) : null;
+        final LongVector lhi1 = numLongPreds > 1 ? LongVector.broadcast(LONG_SPECIES, longHi[1]) : null;
+        final LongVector llo2 = numLongPreds > 2 ? LongVector.broadcast(LONG_SPECIES, longLo[2]) : null;
+        final LongVector lhi2 = numLongPreds > 2 ? LongVector.broadcast(LONG_SPECIES, longHi[2]) : null;
+        final LongVector llo3 = numLongPreds > 3 ? LongVector.broadcast(LONG_SPECIES, longLo[3]) : null;
+        final LongVector lhi3 = numLongPreds > 3 ? LongVector.broadcast(LONG_SPECIES, longHi[3]) : null;
+
+        final DoubleVector dlo0 = numDblPreds > 0 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblLo[0]) : null;
+        final DoubleVector dhi0 = numDblPreds > 0 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblHi[0]) : null;
+        final DoubleVector dlo1 = numDblPreds > 1 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblLo[1]) : null;
+        final DoubleVector dhi1 = numDblPreds > 1 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblHi[1]) : null;
+        final DoubleVector dlo2 = numDblPreds > 2 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblLo[2]) : null;
+        final DoubleVector dhi2 = numDblPreds > 2 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblHi[2]) : null;
+        final DoubleVector dlo3 = numDblPreds > 3 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblLo[3]) : null;
+        final DoubleVector dhi3 = numDblPreds > 3 ? DoubleVector.broadcast(DOUBLE_SPECIES, dblHi[3]) : null;
+
+        DoubleVector revenueVec;
+        if (aggType == AGG_MIN) {
+            revenueVec = DoubleVector.broadcast(DOUBLE_SPECIES, Double.POSITIVE_INFINITY);
+            revenue = Double.POSITIVE_INFINITY;
+        } else if (aggType == AGG_MAX) {
+            revenueVec = DoubleVector.broadcast(DOUBLE_SPECIES, Double.NEGATIVE_INFINITY);
+            revenue = Double.NEGATIVE_INFINITY;
+        } else {
+            revenueVec = DoubleVector.zero(DOUBLE_SPECIES);
+        }
+        boolean[] maskBits = new boolean[DOUBLE_LANES];
+
+        for (int i = start; i < upperBound; i += LONG_LANES) {
+            // Validity-AND at SIMD entry — DuckDB pattern.
+            VectorMask<Long> lm = validityLaneMask(validity, i);
+            if (!lm.anyTrue()) continue;
+            if (numLongPreds > 0) { lm = applyLongPred(lm, LongVector.fromArray(LONG_SPECIES, lc0, i), lt0, llo0, lhi0); if (!lm.anyTrue()) continue; }
+            if (numLongPreds > 1) { lm = applyLongPred(lm, LongVector.fromArray(LONG_SPECIES, lc1, i), lt1, llo1, lhi1); if (!lm.anyTrue()) continue; }
+            if (numLongPreds > 2) { lm = applyLongPred(lm, LongVector.fromArray(LONG_SPECIES, lc2, i), lt2, llo2, lhi2); if (!lm.anyTrue()) continue; }
+            if (numLongPreds > 3) { lm = applyLongPred(lm, LongVector.fromArray(LONG_SPECIES, lc3, i), lt3, llo3, lhi3); if (!lm.anyTrue()) continue; }
+
+            VectorMask<Double> dm;
+            if (numDblPreds > 0 || aggType != AGG_COUNT) {
+                for (int lane = 0; lane < LONG_LANES; lane++) maskBits[lane] = lm.laneIsSet(lane);
+                dm = VectorMask.fromArray(DOUBLE_SPECIES, maskBits, 0);
+            } else { matchCount += lm.trueCount(); continue; }
+
+            if (numDblPreds > 0) { dm = applyDoublePred(dm, DoubleVector.fromArray(DOUBLE_SPECIES, dc0, i), dt0, dlo0, dhi0); if (!dm.anyTrue()) continue; }
+            if (numDblPreds > 1) { dm = applyDoublePred(dm, DoubleVector.fromArray(DOUBLE_SPECIES, dc1, i), dt1, dlo1, dhi1); if (!dm.anyTrue()) continue; }
+            if (numDblPreds > 2) { dm = applyDoublePred(dm, DoubleVector.fromArray(DOUBLE_SPECIES, dc2, i), dt2, dlo2, dhi2); if (!dm.anyTrue()) continue; }
+            if (numDblPreds > 3) { dm = applyDoublePred(dm, DoubleVector.fromArray(DOUBLE_SPECIES, dc3, i), dt3, dlo3, dhi3); if (!dm.anyTrue()) continue; }
+
+            if (aggType == AGG_SUM_PRODUCT) {
+                DoubleVector a = DoubleVector.fromArray(DOUBLE_SPECIES, aggCol1, i);
+                DoubleVector b = DoubleVector.fromArray(DOUBLE_SPECIES, aggCol2, i);
+                if (nanSafe) {
+                    VectorMask<Double> validDm = dm.andNot(a.test(VectorOperators.IS_NAN)).andNot(b.test(VectorOperators.IS_NAN));
+                    revenueVec = revenueVec.add(a.mul(b), validDm);
+                    matchCount += validDm.trueCount();
+                } else {
+                    revenueVec = revenueVec.add(a.mul(b), dm);
+                    matchCount += dm.trueCount();
+                }
+            } else if (aggType == AGG_SUM) {
+                DoubleVector a = DoubleVector.fromArray(DOUBLE_SPECIES, aggCol1, i);
+                if (nanSafe) {
+                    VectorMask<Double> validDm = dm.andNot(a.test(VectorOperators.IS_NAN));
+                    revenueVec = revenueVec.add(a, validDm);
+                    matchCount += validDm.trueCount();
+                } else {
+                    revenueVec = revenueVec.add(a, dm);
+                    matchCount += dm.trueCount();
+                }
+            } else if (aggType == AGG_MIN) {
+                DoubleVector a = DoubleVector.fromArray(DOUBLE_SPECIES, aggCol1, i);
+                if (nanSafe) {
+                    VectorMask<Double> validDm = dm.andNot(a.test(VectorOperators.IS_NAN));
+                    revenueVec = revenueVec.min(DoubleVector.broadcast(DOUBLE_SPECIES, Double.POSITIVE_INFINITY).blend(a, validDm));
+                    matchCount += validDm.trueCount();
+                } else {
+                    revenueVec = revenueVec.min(DoubleVector.broadcast(DOUBLE_SPECIES, Double.POSITIVE_INFINITY).blend(a, dm));
+                    matchCount += dm.trueCount();
+                }
+            } else if (aggType == AGG_MAX) {
+                DoubleVector a = DoubleVector.fromArray(DOUBLE_SPECIES, aggCol1, i);
+                if (nanSafe) {
+                    VectorMask<Double> validDm = dm.andNot(a.test(VectorOperators.IS_NAN));
+                    revenueVec = revenueVec.max(DoubleVector.broadcast(DOUBLE_SPECIES, Double.NEGATIVE_INFINITY).blend(a, validDm));
+                    matchCount += validDm.trueCount();
+                } else {
+                    revenueVec = revenueVec.max(DoubleVector.broadcast(DOUBLE_SPECIES, Double.NEGATIVE_INFINITY).blend(a, dm));
+                    matchCount += dm.trueCount();
+                }
+            } else {
+                matchCount += dm.trueCount();
+            }
+        }
+
+        if (aggType == AGG_MIN) revenue = revenueVec.reduceLanes(VectorOperators.MIN);
+        else if (aggType == AGG_MAX) revenue = revenueVec.reduceLanes(VectorOperators.MAX);
+        else revenue = revenueVec.reduceLanes(VectorOperators.ADD);
+
+        // Scalar tail — validity-aware predicate eval.
+        for (int i = upperBound; i < end; i++) {
+            if (evaluatePredicatesWithValidity(validity,
+                    numLongPreds, longPredTypes, longCols, longLo, longHi,
+                    numDblPreds, dblPredTypes, dblCols, dblLo, dblHi, i)) {
+                if (aggType == AGG_COUNT) {
+                    matchCount++;
+                } else {
+                    double v = aggCol1[i];
+                    if (!nanSafe || v == v) {
+                        switch (aggType) {
+                            case AGG_SUM_PRODUCT:
+                                double v2 = aggCol2[i];
+                                if (!nanSafe || v2 == v2) { revenue += v * v2; matchCount++; }
+                                break;
+                            case AGG_SUM: revenue += v; matchCount++; break;
+                            case AGG_MIN: revenue = Math.min(revenue, v); matchCount++; break;
+                            case AGG_MAX: revenue = Math.max(revenue, v); matchCount++; break;
+                        }
+                    }
+                }
+            }
+        }
+        return new double[] { revenue, (double) matchCount };
     }
 
     static double[] fusedSimdCountRange(
