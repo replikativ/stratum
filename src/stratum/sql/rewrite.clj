@@ -608,9 +608,22 @@
 
       :else nil)))
 
+(defn- axis-cols
+  "Column-pair names for an axis-kw. Uses the SQL:2011 convention
+   names directly; consumers that configured non-standard column
+   names via `:bitemporal {axis-kw {:from-col … :to-col …}}` need
+   to alias / view to the conventional names for the SQL surface.
+
+   Returns `[from-col to-col]` as strings."
+  [axis-kw]
+  (case axis-kw
+    :valid  ["_valid_from"  "_valid_to"]
+    :system ["_system_from" "_system_to"]))
+
 (defn- spec->predicate-sql
-  "Build the WHERE-clause SQL fragment for a temporal spec.
-   Uses the SQL:2011 convention `_valid_from` / `_valid_to`.
+  "Build the WHERE-clause SQL fragment for a temporal spec on the
+   given axis (`:valid` or `:system`). Uses the SQL:2011
+   convention column names per axis-cols.
 
    Emits unqualified column names. The single-table SELECT case (the
    common MVP) works directly because the planner resolves
@@ -619,8 +632,9 @@
    documented limitation — making this fragment qualified
    (`<table>._valid_from`) requires teaching the planner's column
    resolver to strip the qualifier, which is out of scope here. Until
-   that lands, two-`FOR VALID_TIME` SELECTs against joined bitemporal
-   tables are unsupported; single-table works.
+   that lands, two-`FOR <SAME_AXIS>` SELECTs against joined
+   bitemporal tables are unsupported; single-table and one-clause-
+   per-axis work.
 
    `qualifier` is captured for the future extension but unused today.
 
@@ -637,18 +651,29 @@
    equals `y` starts exactly at the period's exclusive upper bound
    and must NOT be included. Round-3 agent P2: pre-fix used
    `vf <= y`, over-including the boundary row."
-  [_qualifier {:keys [kind at from to]}]
-  (case kind
-    :all     nil
-    :as-of   (str "_valid_from <= " at " AND _valid_to > " at)
-    :between (str "_valid_from <= " to " AND _valid_to > " from)
-    :from-to (str "_valid_from < "  to " AND _valid_to > " from)))
+  [_qualifier axis-kw {:keys [kind at from to]}]
+  (let [[from-col to-col] (axis-cols axis-kw)]
+    (case kind
+      :all     nil
+      :as-of   (str from-col " <= " at " AND " to-col " > " at)
+      :between (str from-col " <= " to " AND " to-col " > " from)
+      :from-to (str from-col " < "  to " AND " to-col " > " from))))
 
-(defn- find-for-valid-time-clause
-  "Scan `sql` for the next `FOR VALID_TIME <spec>` or `FOR ALL
-   VALID_TIME` / `FOR VALID_TIME ALL` clause. Returns `[start end
-   spec]` for the next such clause, or nil. `start` is the position
-   of the `FOR` keyword; `end` is just past the spec."
+(defn- axis-keyword
+  "Map a parser keyword to an axis-kw, or nil if not an axis keyword."
+  [w]
+  (case w
+    "valid_time"  :valid
+    "system_time" :system
+    nil))
+
+(defn- find-for-time-clause
+  "Scan `sql` for the next `FOR (VALID_TIME|SYSTEM_TIME) <spec>`
+   or `FOR ALL (VALID_TIME|SYSTEM_TIME)` / `FOR (VALID_TIME|
+   SYSTEM_TIME) ALL` clause. Returns `[start end spec axis-kw]`
+   for the next such clause, or nil. `start` is the position of
+   the `FOR` keyword; `end` is just past the spec; `axis-kw` is
+   `:valid` or `:system`."
   [^String sql]
   (let [n (.length sql)]
     (loop [i (long 0)]
@@ -684,24 +709,26 @@
             (let [[k1end* k1] (next-keyword sql wend)
                   k1end (long k1end*)]
               (cond
-                ;; `FOR VALID_TIME …`
-                (= "valid_time" k1)
-                (let [[k2end* k2] (next-keyword sql k1end)]
+                ;; `FOR (VALID_TIME|SYSTEM_TIME) …`
+                (axis-keyword k1)
+                (let [axis (axis-keyword k1)
+                      [k2end* k2] (next-keyword sql k1end)]
                   (cond
-                    ;; `FOR VALID_TIME ALL`
+                    ;; `FOR <axis> ALL`
                     (= "all" k2)
-                    [i (long k2end*) {:kind :all}]
+                    [i (long k2end*) {:kind :all} axis]
                     :else
                     (if-let [[spec-end spec] (parse-select-temporal-spec sql k1end)]
-                      [i (long spec-end) spec]
+                      [i (long spec-end) spec axis]
                       (recur wend))))
-                ;; `FOR ALL VALID_TIME`
+                ;; `FOR ALL (VALID_TIME|SYSTEM_TIME)`
                 (= "all" k1)
-                (let [[k2end* k2] (next-keyword sql k1end)]
-                  (if (= "valid_time" k2)
-                    [i (long k2end*) {:kind :all}]
+                (let [[k2end* k2] (next-keyword sql k1end)
+                      axis (axis-keyword k2)]
+                  (if axis
+                    [i (long k2end*) {:kind :all} axis]
                     (recur wend)))
-                ;; Other FOR keywords (FOR PORTION OF / FOR SYSTEM_TIME) —
+                ;; Other FOR keywords (FOR PORTION OF, etc.) —
                 ;; not our concern; skip past `for` only.
                 :else (recur wend)))
             (recur wend)))
@@ -790,56 +817,58 @@
                (subs sql after-where)))))))
 
 (defn preprocess-select-temporal
-  "Rewrite SELECT-side `FOR VALID_TIME <spec>` clauses into
-   equivalent WHERE predicates. Returns the rewritten SQL string.
+  "Rewrite SELECT-side `FOR (VALID_TIME|SYSTEM_TIME) <spec>`
+   clauses into equivalent WHERE predicates. Returns the
+   rewritten SQL string.
 
-   **Multi-clause limit**: only one `FOR VALID_TIME` clause per
-   SELECT is supported today. The emitted predicate is unqualified
-   (`_valid_from`/`_valid_to`); two clauses on a joined SELECT both
-   reference the same unqualified columns and the planner's
-   resolver picks an arbitrary source — silently wrong. Reject at
-   preprocess time rather than ship that. The proper fix is
-   qualifier-aware column resolution in the planner; until then,
-   callers needing multi-table vt should write the predicates
-   themselves with explicit `<table>._valid_from` refs (which the
-   planner does handle in WHERE since the qualifier is part of the
-   column identifier the parser sees).
+   **Bitemporal SELECT** — one clause per axis is supported and
+   composable on the same SELECT:
+
+     SELECT … FROM t
+       FOR VALID_TIME  AS OF '2024-04-15'
+       FOR SYSTEM_TIME AS OF '2024-04-20'
+
+   Both predicates are ANDed into the WHERE clause.
+
+   **Multi-clause-per-axis limit**: two `FOR VALID_TIME` (or two
+   `FOR SYSTEM_TIME`) clauses per SELECT are rejected with
+   `:sql/multi-for-<axis>-unsupported`. The emitted predicate
+   uses unqualified column names; two clauses on the same axis on
+   a joined SELECT would both reference the same columns and the
+   planner can't disambiguate. Workaround: write `<table>._valid_from`
+   refs explicitly in WHERE.
 
    See module docstring above for the supported specs."
   [^String sql]
-  (loop [sql sql, preds []]
-    (if-let [[start end spec] (find-for-valid-time-clause sql)]
+  (loop [sql sql, preds [], seen-axes #{}]
+    (if-let [[start end spec axis] (find-for-time-clause sql)]
       (let [qualifier (table-qualifier-before sql start)
-            ;; Always emit the predicate. `spec->predicate-sql`
-            ;; currently emits unqualified `_valid_from` /
-            ;; `_valid_to` (the `qualifier` arg is reserved for
-            ;; future qualifier-aware emission), so it doesn't
-            ;; actually depend on the qualifier value — but the
-            ;; previous gate `(when qualifier ...)` would silently
-            ;; STRIP the FOR VALID_TIME clause and emit NO
-            ;; predicate when `table-qualifier-before` couldn't
-            ;; resolve a name (e.g. tables starting with `_`,
-            ;; quoted identifiers, or subqueries). Result: the
-            ;; query ran with no temporal filter, silently
-            ;; returning unfiltered rows.
-            ;;
-            ;; `:all` (FOR ALL VALID_TIME) returns nil from
-            ;; `spec->predicate-sql` and is intentional: strip the
-            ;; clause, don't add a predicate (no filter).
-            ;; (Copilot review #2 suppressed comment.)
-            new-pred (spec->predicate-sql qualifier spec)
-            ;; Strip the FOR VALID_TIME clause from start..end.
+            ;; Always emit the predicate when the spec yields one.
+            ;; `spec->predicate-sql` returns nil for `:all` (strip
+            ;; the clause, no filter). For `:as-of`/`:between`/
+            ;; `:from-to` it always returns a predicate even when
+            ;; `qualifier` is nil (round-3 agent suppressed
+            ;; comment: gating on qualifier silently dropped the
+            ;; filter for underscore/quoted/subquery tables).
+            new-pred (spec->predicate-sql qualifier axis spec)
             stripped (str (subs sql 0 start) (subs sql end))]
-        (when (and new-pred (seq preds))
+        (when (and new-pred (contains? seen-axes axis))
           (throw (ex-info (str "Multi-table SELECT with more than one "
-                               "FOR VALID_TIME clause is not yet supported "
+                               "FOR " (case axis :valid "VALID_TIME"
+                                                 :system "SYSTEM_TIME")
+                               " clause is not yet supported "
                                "— the rewriter emits unqualified column "
-                               "refs (`_valid_from`/`_valid_to`) which the "
-                               "planner cannot disambiguate across joined "
-                               "tables. Write the predicates explicitly "
-                               "with `<table>._valid_from` qualifiers, or "
-                               "split into separate queries.")
-                          {:error :sql/multi-for-valid-time-unsupported})))
+                               "refs which the planner cannot disambiguate "
+                               "across joined tables. Write the predicates "
+                               "explicitly with `<table>." (case axis
+                                                              :valid "_valid_from"
+                                                              :system "_system_from")
+                               "` qualifiers, or split into separate queries.")
+                          {:error (case axis
+                                    :valid :sql/multi-for-valid-time-unsupported
+                                    :system :sql/multi-for-system-time-unsupported)
+                           :axis axis})))
         (recur stripped
-               (if new-pred (conj preds new-pred) preds)))
+               (if new-pred (conj preds new-pred) preds)
+               (if new-pred (conj seen-axes axis) seen-axes)))
       (inject-where-predicates sql preds))))

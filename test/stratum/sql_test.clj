@@ -3356,6 +3356,122 @@
       (is (< (.indexOf ^String s "_valid_from")
              (.indexOf ^String s "eid = 1"))))))
 
+;; ============================================================================
+;; SELECT-side FOR SYSTEM_TIME (mirrors FOR VALID_TIME on the system axis)
+;;
+;; Closes the gap copilot review-3 flagged + the deletion-semantics
+;; discussion: stratum's closed-period SCD2 keeps superseded rows in
+;; storage with `_system_to` shifted to sys-now, but consumers
+;; couldn't ASK what the DB believed at past system-time via SQL
+;; until these clauses were implemented. Implementation generalizes
+;; `find-for-valid-time-clause` and `spec->predicate-sql` to be
+;; axis-aware.
+;; ============================================================================
+
+(deftest preprocess-select-system-time-as-of-injects-where
+  (testing "FOR SYSTEM_TIME AS OF rewrites to WHERE predicates on _system_from / _system_to"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "SELECT eid FROM salaries FOR SYSTEM_TIME AS OF '2024-04-01'")]
+      (is (re-find #"WHERE\s+\(?_system_from\s+<=\s+\d+"
+                   (:sql r)))
+      (is (re-find #"_system_to\s+>\s+\d+"
+                   (:sql r))))))
+
+(deftest preprocess-select-system-time-between-form
+  (testing "FOR SYSTEM_TIME BETWEEN x AND y emits closed-closed overlap on system axis"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "SELECT eid FROM salaries FOR SYSTEM_TIME BETWEEN '2024-01-01' AND '2024-07-01'")]
+      (is (re-find #"_system_from\s+<=\s+1719792000000000" (:sql r)))
+      (is (re-find #"_system_to\s+>\s+1704067200000000"   (:sql r))))))
+
+(deftest preprocess-select-system-time-from-to-form
+  (testing "FOR SYSTEM_TIME FROM x TO y emits half-open overlap on system axis"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "SELECT eid FROM salaries FOR SYSTEM_TIME FROM '2024-01-01' TO '2024-07-01'")]
+      (is (re-find #"_system_from\s+<\s+1719792000000000" (:sql r)))
+      (is (re-find #"_system_to\s+>\s+1704067200000000"  (:sql r))))))
+
+(deftest preprocess-select-for-all-system-time-no-filter
+  (testing "FOR ALL SYSTEM_TIME strips the clause without adding a filter"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              "SELECT eid FROM salaries FOR ALL SYSTEM_TIME")]
+      (is (re-find #"(?i)^\s*SELECT\s+eid\s+FROM\s+salaries\s*$" (:sql r))
+          "FOR ALL SYSTEM_TIME should leave the SQL with no extra WHERE"))))
+
+;; ============================================================================
+;; Bitemporal composition: one clause per axis on the same SELECT
+;; ============================================================================
+
+(deftest preprocess-select-bitemporal-as-of-composes-both-axes
+  (testing "FOR VALID_TIME AS OF + FOR SYSTEM_TIME AS OF emits both predicates ANDed"
+    (let [r (stratum.sql.rewrite/preprocess-sql
+              (str "SELECT eid FROM salaries "
+                   "FOR VALID_TIME AS OF '2024-04-15' "
+                   "FOR SYSTEM_TIME AS OF '2024-04-20'"))
+          s (:sql r)]
+      (is (.contains ^String s "_valid_from")  "valid-axis predicate emitted")
+      (is (.contains ^String s "_valid_to")    "valid-axis upper bound")
+      (is (.contains ^String s "_system_from") "system-axis predicate emitted")
+      (is (.contains ^String s "_system_to")   "system-axis upper bound")
+      (is (.contains ^String s "WHERE")        "single WHERE clause"))))
+
+(deftest preprocess-select-rejects-two-for-valid-time-clauses
+  (testing "Two FOR VALID_TIME clauses → :sql/multi-for-valid-time-unsupported"
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo
+          #"more than one FOR VALID_TIME"
+          (stratum.sql.rewrite/preprocess-sql
+            (str "SELECT eid FROM salaries "
+                 "FOR VALID_TIME AS OF '2024-04-15' "
+                 "FOR VALID_TIME AS OF '2024-06-15'"))))))
+
+(deftest preprocess-select-rejects-two-for-system-time-clauses
+  (testing "Two FOR SYSTEM_TIME clauses → :sql/multi-for-system-time-unsupported"
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo
+          #"more than one FOR SYSTEM_TIME"
+          (stratum.sql.rewrite/preprocess-sql
+            (str "SELECT eid FROM salaries "
+                 "FOR SYSTEM_TIME AS OF '2024-04-15' "
+                 "FOR SYSTEM_TIME AS OF '2024-06-15'"))))))
+
+(deftest sql-select-system-time-as-of-end-to-end
+  ;; End-to-end demonstration: a fully-bitemporal table with two
+  ;; rows where the older one's `_system_to` was closed by an
+  ;; SCD2 surgery. `FOR SYSTEM_TIME AS OF <before-closure>` sees
+  ;; both rows; AS OF NOW sees only the still-open row.
+  (testing "FOR SYSTEM_TIME AS OF returns rows whose [sf, st) contains the instant"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "salaries"
+          (with-meta
+            {:eid          (stratum.index/index-from-seq :int64 [1 1])
+             :salary       (stratum.index/index-from-seq :int64 [100 110])
+             :_valid_from  (stratum.index/index-from-seq :int64 [1704067200000000 1704067200000000])
+             :_valid_to    (stratum.index/index-from-seq :int64 [Long/MAX_VALUE Long/MAX_VALUE])
+             ;; Row 0: was DB's belief from sys 1000 to 5000 (closed by surgery at 5000).
+             ;; Row 1: appended at sys 5000, still open.
+             :_system_from (stratum.index/index-from-seq :int64 [1000 5000])
+             :_system_to   (stratum.index/index-from-seq :int64 [5000 Long/MAX_VALUE])}
+            {:bitemporal
+             {:valid  {:from-col :_valid_from  :to-col :_valid_to  :unit :micros}
+              :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}))
+        (let [exec @(resolve 'stratum.server/execute-sql)
+              ^PgWireServer$QueryResult r-before
+              (exec "SELECT salary FROM salaries WHERE _system_from <= 3000 AND _system_to > 3000"
+                    (:registry srv) (:data-dir srv))
+              ^PgWireServer$QueryResult r-now
+              (exec "SELECT salary FROM salaries WHERE _system_from <= 9999 AND _system_to > 9999"
+                    (:registry srv) (:data-dir srv))]
+          (is (nil? (.error r-before)))
+          (is (nil? (.error r-now)))
+          (is (= [["100"]] (mapv vec (.rows r-before)))
+              "at sys=3000, the DB believed salary=100 (pre-surgery state)")
+          (is (= [["110"]] (mapv vec (.rows r-now)))
+              "at sys=9999 (after surgery), the DB believes salary=110"))
+        (finally (server/stop srv))))))
+
 (deftest sql-select-as-of-end-to-end-on-index-backed-table
   (testing "SELECT … FOR VALID_TIME AS OF returns rows valid at that instant"
     (let [srv (server/start {:port 0})]

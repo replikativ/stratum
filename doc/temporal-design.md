@@ -321,14 +321,21 @@ direct `append!`.
 Stratum's SQL recognises SQL:2011 temporal forms directly:
 
 ```sql
--- per-query SQL:2011 SELECT forms (VALID_TIME only — SYSTEM_TIME
--- on SELECT is not yet implemented; the rewriter recognises
--- VALID_TIME and skips other FOR keywords.)
+-- per-query SQL:2011 SELECT forms (both axes supported and
+-- composable on the same SELECT)
 SELECT * FROM employees
-  FOR VALID_TIME AS OF '2024-04-15';
+  FOR VALID_TIME AS OF '2024-04-15'
+  FOR SYSTEM_TIME AS OF '2024-04-20';
 
 SELECT * FROM employees
   FOR VALID_TIME BETWEEN '2024-01-01' AND '2024-12-31';
+
+-- system-time-only: "what did the DB believe about this entity
+-- before the correction at sys-instant S?" — the audit demo of
+-- closed-period SCD2.
+SELECT salary FROM employees
+  FOR SYSTEM_TIME AS OF '2024-04-10'
+  WHERE id = 42;
 
 -- bitemporal DML
 INSERT INTO employees (id, salary, _valid_from, _valid_to)
@@ -377,46 +384,80 @@ Plain `DELETE WHERE` / `INSERT VALUES` / `UPDATE WHERE` (without
 
 ### SELECT-side temporal grammar
 
-`SELECT … FROM t FOR VALID_TIME (AS OF x | BETWEEN x AND y |
-FROM x TO y | ALL)` is rewritten by the same preprocessor into
-equivalent `WHERE` predicates over the table's `_valid_from` /
-`_valid_to` columns. Convention is the SQL:2011 default naming; tables that opt into a custom axis via `:bitemporal
-{:valid {:from-col …}}` would need a view to expose the canonical
-names for SELECT-side use (or extend the preprocessor to consult
-the registry — deferred).
+`SELECT … FROM t FOR (VALID_TIME | SYSTEM_TIME) (AS OF x |
+BETWEEN x AND y | FROM x TO y | ALL)` is rewritten by the
+preprocessor into equivalent `WHERE` predicates over the table's
+axis columns. Convention is the SQL:2011 default naming
+(`_valid_from`/`_valid_to`, `_system_from`/`_system_to`); tables
+that opt into custom axis column names via `:bitemporal {axis
+{:from-col …}}` would need a view to expose the canonical names
+for SELECT-side use (or extend the preprocessor to consult the
+registry — deferred).
 
 ```sql
--- point-in-vt
+-- valid-time: point-in-vt
 SELECT salary FROM salaries
   FOR VALID_TIME AS OF '2024-04-01'
   WHERE eid = 1;
 
--- range overlap
+-- valid-time: range overlap
 SELECT eid, salary FROM salaries
   FOR VALID_TIME BETWEEN '2024-01-01' AND '2024-07-01';
 
--- explicit half-open
+-- valid-time: explicit half-open
 SELECT eid, salary FROM salaries
   FOR VALID_TIME FROM '2024-01-01' TO '2024-07-01';
 
 -- no temporal filter (full vt-history)
 SELECT eid, salary FROM salaries FOR ALL VALID_TIME;
+
+-- system-time: "what did the DB believe at instant S?"
+-- The audit demo of closed-period SCD2 — superseded rows are
+-- preserved with `_system_to` shifted to sys-now, so this query
+-- can reconstruct the pre-correction view.
+SELECT salary FROM salaries
+  FOR SYSTEM_TIME AS OF '2024-04-10'
+  WHERE eid = 1;
+
+-- bitemporal: one clause per axis on the same SELECT (composable)
+SELECT salary FROM salaries
+  FOR VALID_TIME  AS OF '2024-04-15'
+  FOR SYSTEM_TIME AS OF '2024-04-20'
+  WHERE eid = 1;
 ```
 
-The rewriter strips the clause and injects the equivalent
-predicate into `WHERE`.
+The rewriter strips each clause and injects the equivalent
+predicate into `WHERE`. Both predicates are ANDed when a SELECT
+carries both axes.
 
-**Multi-table limitation**: only one `FOR VALID_TIME` clause per
-SELECT is supported today. The emitted predicate uses unqualified
-column names (`_valid_from`/`_valid_to`), so two clauses on a
-joined SELECT would both reference the same unqualified columns
-and the planner cannot disambiguate them. A second clause throws
-`:sql/multi-for-valid-time-unsupported`. The proper fix is
+**Multi-clause-per-axis limit**: two `FOR VALID_TIME` (or two
+`FOR SYSTEM_TIME`) clauses on the same SELECT are rejected with
+`:sql/multi-for-valid-time-unsupported` or
+`:sql/multi-for-system-time-unsupported`. The emitted predicate
+uses unqualified column names; two clauses on the same axis on a
+joined SELECT would both reference the same columns and the
+planner cannot disambiguate them. The proper fix is
 qualifier-aware predicate emission; until then, callers needing
 per-table temporal filters on a join should write the WHERE
 predicates explicitly with `<table>._valid_from` /
-`<table>._valid_to` refs (which the planner DOES handle since the
-qualifier is part of the column identifier the parser sees).
+`<table>._system_from` refs (which the planner DOES handle since
+the qualifier is part of the column identifier the parser sees).
+One clause per axis composes freely — that's the canonical
+bitemporal cut.
+
+**Note on `_system_to` literal value at past system-time
+queries**: stratum's closed-period SCD2 mutates `_system_to` in
+place when a row is superseded. A query `SELECT _system_to FROM
+t FOR SYSTEM_TIME AS OF '<past>'` returns the *closure* value
+(the sys-now at which the surgery fired), not the `Long/MAX_VALUE`
+the column literally held at the queried instant. Row visibility
+is correct — the `(from <= s < to)` predicate the rewriter emits
+filters correctly. Workloads that need the literal historical
+`_system_to` ("regulatory reconstruction of exactly what the DB
+displayed at instant S") should derive it from the next-later
+row's `_system_from` for the same entity, or use an append-only
+storage layer instead. For accounting / audit, the visibility
+filter is the relevant question and it works.
 
 ### Allen interval predicates
 
