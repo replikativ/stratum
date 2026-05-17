@@ -200,7 +200,17 @@
   "Classify a chunk as :skip, :stats-only, or :simd based on zone predicates.
    zone-filters is from build-zone-filters.
    col-entries maps col-name -> vec of ChunkEntry.
-   c is the chunk ordinal index."
+   c is the chunk ordinal index.
+
+   NULL handling: a chunk where any predicate column has non-zero
+   `:null-count` cannot use :stats-only — the chunk's NULL rows fail
+   the predicate in SQL 3VL (regardless of the non-NULL min/max being
+   inside the range) and stats-only would over-count them. Force
+   :simd for such chunks so the per-row predicate eval (and bitmap-AND
+   in the Nullable kernel) excludes them correctly. Phase 1 of the
+   null-handling redesign added populated null-counts to the
+   ChunkStats; before Phase 0 null-count was always 0 so this gate
+   wasn't necessary."
   [zone-filters col-entries ^long c]
   (if (empty? zone-filters)
     :simd  ;; No zone filters, must process all
@@ -211,11 +221,16 @@
         (let [{:keys [col may-contain fully-inside]} (first filters)
               entries (get col-entries col)
               ^ChunkEntry entry (nth entries c)
-              chunk-stats (.stats entry)]
+              chunk-stats (.stats entry)
+              ;; Any NULL on this pred col → fully-inside is unsafe:
+              ;; NULL rows fail the predicate but stats-only would
+              ;; count them in the chunk's `count` field.
+              has-nulls? (pos? (long (or (:null-count chunk-stats) 0)))]
           (if-not (may-contain chunk-stats)
             :skip  ;; This pred proves no values match
             (recur (rest filters)
                    (and all-fully-inside?
+                        (not has-nulls?)
                         (some? fully-inside)
                         (fully-inside chunk-stats)))))))))
 
