@@ -165,16 +165,25 @@
                                (string? e)  e
                                (nil? e)     nil
                                (vector? e)
-                               (case (first e)
-                                 :+ (+ (double (eval-val (nth e 1)))
-                                       (double (eval-val (nth e 2))))
-                                 :- (- (double (eval-val (nth e 1)))
-                                       (double (eval-val (nth e 2))))
-                                 :* (* (double (eval-val (nth e 1)))
-                                       (double (eval-val (nth e 2))))
-                                 :/ (/ (double (eval-val (nth e 1)))
-                                       (double (eval-val (nth e 2))))
-                                 nil)))]
+                               ;; SQL 3-valued logic: NULL propagates
+                               ;; through arithmetic. If either operand
+                               ;; is nil (NULL sentinel decoded by
+                               ;; read-cell), the expression is NULL —
+                               ;; downstream comparisons already treat
+                               ;; nil as non-matching via their
+                               ;; `(some? l) (some? r)` guards.
+                               ;; Division by zero also returns nil
+                               ;; rather than throwing.
+                               (let [l (eval-val (nth e 1))
+                                     r (eval-val (nth e 2))]
+                                 (when (and (some? l) (some? r))
+                                   (case (first e)
+                                     :+ (+ (double l) (double r))
+                                     :- (- (double l) (double r))
+                                     :* (* (double l) (double r))
+                                     :/ (when-not (zero? (double r))
+                                          (/ (double l) (double r)))
+                                     nil)))))]
               (case (first pred)
                 :=   (let [l (eval-val (nth pred 1))
                            r (eval-val (nth pred 2))]
@@ -1155,60 +1164,16 @@
                     delete-mask (boolean-array n-rows)
                     _ (if (nil? where)
                         (java.util.Arrays/fill delete-mask true)
+                        ;; `read-cell` (used by eval-dml-predicate)
+                        ;; handles both raw arrays AND :source :index
+                        ;; columns, so the inline duplicate that
+                        ;; previously lived here only covered raw
+                        ;; arrays and silently NPE'd on NULL
+                        ;; arithmetic (copilot review #2). Route
+                        ;; through the canonical evaluator.
                         (dotimes [i n-rows]
                           (aset delete-mask i
-                                (boolean
-                                 (every? (fn [pred]
-                                           (let [eval-val (fn eval-val [e]
-                                                            (cond
-                                                              (keyword? e)
-                                                              (let [arr (get existing e)]
-                                                                (cond
-                                                                  (instance? (Class/forName "[J") arr)
-                                                                  (let [v (aget ^longs arr i)]
-                                                                    (when-not (= v Long/MIN_VALUE) v))
-                                                                  (instance? (Class/forName "[D") arr)
-                                                                  (let [v (aget ^doubles arr i)]
-                                                                    (when-not (Double/isNaN v) v))
-                                                                  (instance? (Class/forName "[Ljava.lang.String;") arr)
-                                                                  (aget ^"[Ljava.lang.String;" arr i)))
-                                                              (number? e) e
-                                                              (string? e) e
-                                                              (nil? e) nil
-                                                              (vector? e)
-                                                              (case (first e)
-                                                                :+ (+ (double (eval-val (nth e 1))) (double (eval-val (nth e 2))))
-                                                                :- (- (double (eval-val (nth e 1))) (double (eval-val (nth e 2))))
-                                                                :* (* (double (eval-val (nth e 1))) (double (eval-val (nth e 2))))
-                                                                :/ (/ (double (eval-val (nth e 1))) (double (eval-val (nth e 2))))
-                                                                nil)))]
-                                             (case (first pred)
-                                               := (let [l (eval-val (nth pred 1))
-                                                        r (eval-val (nth pred 2))]
-                                                    (and (some? l) (some? r) (= l r)))
-                                               (:!= :<>) (let [l (eval-val (nth pred 1))
-                                                               r (eval-val (nth pred 2))]
-                                                           (and (some? l) (some? r) (not= l r)))
-                                               :> (let [l (eval-val (nth pred 1))
-                                                        r (eval-val (nth pred 2))]
-                                                    (and (some? l) (some? r)
-                                                         (> (double l) (double r))))
-                                               :< (let [l (eval-val (nth pred 1))
-                                                        r (eval-val (nth pred 2))]
-                                                    (and (some? l) (some? r)
-                                                         (< (double l) (double r))))
-                                               :>= (let [l (eval-val (nth pred 1))
-                                                         r (eval-val (nth pred 2))]
-                                                     (and (some? l) (some? r)
-                                                          (>= (double l) (double r))))
-                                               :<= (let [l (eval-val (nth pred 1))
-                                                         r (eval-val (nth pred 2))]
-                                                     (and (some? l) (some? r)
-                                                          (<= (double l) (double r))))
-                                               :is-null (nil? (eval-val (nth pred 1)))
-                                               :is-not-null (some? (eval-val (nth pred 1)))
-                                               false)))
-                                         where)))))
+                                (boolean (eval-dml-predicate existing where i)))))
                         ;; Count deletes and gather surviving indices
                     n-deleted (loop [i (int 0) c (int 0)]
                                 (if (>= i n-rows) c

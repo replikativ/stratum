@@ -2599,6 +2599,45 @@
                 "_system_to must be MAX (open) for a fresh insertion")))
         (finally (server/stop srv))))))
 
+(deftest sql-dml-arithmetic-where-handles-null-operand
+  ;; Regression lock for copilot review #2 (server.clj:176):
+  ;; eval-dml-predicate arithmetic (:+/:-/:*/:/) called
+  ;; `(double (eval-val ...))` without NULL propagation. If a row's
+  ;; column resolves to nil (NULL sentinel Long/MIN_VALUE on int64),
+  ;; `(double nil)` threw NPE rather than following SQL 3-valued
+  ;; logic (expression → NULL → predicate false → row not matched).
+  ;;
+  ;; Reproducer: a DELETE with `WHERE col + 1 > 5` where one row's
+  ;; col is the NULL sentinel. Pre-fix: NPE inside eval-dml-predicate.
+  ;; Post-fix: the nil-bearing row is treated as non-matching and the
+  ;; DELETE only affects the non-nil rows that match.
+  (testing "DML WHERE with arithmetic on a NULL-bearing column does not NPE"
+    (let [srv (server/start {:port 0})]
+      (try
+        (server/register-table!
+          srv "t"
+          (with-meta
+            ;; rows: id=1 v=10, id=2 v=NULL (Long/MIN_VALUE), id=3 v=20
+            {:id (stratum.index/index-from-seq :int64 [1 2 3])
+             :v  (stratum.index/index-from-seq :int64 [10 Long/MIN_VALUE 20])}
+            {}))
+        (let [exec @(resolve 'stratum.server/execute-sql)]
+          ;; Pre-fix: throws NPE because row 2's :v reads as nil and
+          ;; the arithmetic `v + 1` calls `(double nil)`.
+          (exec "DELETE FROM t WHERE v + 1 > 15"
+                (:registry srv) (:data-dir srv)))
+        (let [cols (get @(:registry srv) "t")
+              n    (stratum.index/idx-length (:index (:id cols)))
+              ids  (mapv #(stratum.index/idx-get-long (:index (:id cols)) %)
+                         (range n))
+              vs   (mapv #(stratum.index/idx-get-long (:index (:v cols)) %)
+                         (range n))]
+          (is (= 2 n) "row id=3 (v=20, v+1=21 > 15) deleted; rows id=1 + NULL row survive")
+          (is (= [1 2] ids)
+              "id=1 (v=10, v+1=11 ≤ 15) and id=2 (v=NULL → predicate NULL → false) both kept")
+          (is (= [10 Long/MIN_VALUE] vs)))
+        (finally (server/stop srv))))))
+
 (deftest sql-plain-insert-bitemporal-preserves-system-axis
   ;; Regression lock for copilot review #1 (server.clj:719):
   ;; the plain-INSERT-with-columns path on an index-backed bitemporal
