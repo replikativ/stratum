@@ -158,9 +158,60 @@ Every Stratum dataset is a copy-on-write value. Fork one in O(1) to create an is
 (def snapshot (st/resolve store "orders" {:as-of commit-uuid}))
 ```
 
+## Audit and Integrity
+
+Stores configured with `:crypto-hash? true` produce content-addressed commits whose UUIDs are deterministic hashes of the payload. Any bytes-level tampering on the underlying konserve blobs surfaces as a recomputed UUID that no longer matches the address it was stored under. `stratum.audit` exposes the verification surface that turns this into actionable reports.
+
+```clojure
+(require '[stratum.audit :as audit])
+
+;; Write with crypto-hashed commit IDs
+(st/sync! ds store "main" {:crypto-hash? true})
+
+;; Walk the commit DAG and verify every commit's recomputed cid
+(audit/verify-chain store {:branch "main"})
+;; => {:status :ok :commits [{:cid ... :recomputed ... :status :ok} ...]}
+
+;; Deep walk: also verify every column's PSS-tree node hashes
+(audit/verify-chain store {:branch "main" :deep? true})
+```
+
+Adapters that embed stratum inside a larger storage substrate (e.g. as a Datalog secondary index) can implement the `IAuditable` protocol on their wrapper types to compose stratum verification with other engines' verification in one pass. The result-map shape (`:ok`, `:mismatch`, `:unsupported`, `:advisory`, `:incomplete`) is stable so multi-engine drivers don't need translation layers. See [doc/audit.md](doc/audit.md) for the full surface.
+
+## Bitemporal (SQL:2011 valid- and system-time)
+
+Datasets opt into bitemporal semantics via `:metadata`. Axis columns (`_valid_from`/`_valid_to`, `_system_from`/`_system_to`) are tracked separately, write primitives enforce non-overlap and append system-time history, and queries can pin both axes independently.
+
+```clojure
+(def t (st/make-dataset
+        {:_valid_from   (long-array [...])  ;; epoch-micros
+         :_valid_to     (long-array [...])
+         :_system_from  (long-array [...])
+         :_system_to    (long-array [...])
+         :eid           (long-array [...])
+         :price         (double-array [...])}
+        {:metadata
+         {:bitemporal
+          {:valid  {:from-col :_valid_from :to-col :_valid_to :unit :micros}
+           :system {:from-col :_system_from :to-col :_system_to :unit :micros}}}}))
+
+;; SQL:2011 DML — surgical replace of a sub-period:
+(st/q "DELETE FROM t FOR PORTION OF VALID_TIME
+       FROM '2024-04-01' TO '2024-07-01'
+       WHERE eid = 1" {"t" t})
+
+;; Time-travel reads on either axis:
+(st/q "SELECT * FROM t FOR SYSTEM_TIME AS OF '2024-06-01'
+                       FOR VALID_TIME AS OF '2024-03-15'" {"t" t})
+```
+
+Allen interval predicates (`OVERLAPS`, `CONTAINS`, `PRECEDES`, `MEETS`, …) and `FOR PORTION OF VALID_TIME` DML are supported; `FOR SYSTEM_TIME` DML is intentionally not exposed (audit-integrity by construction). See [doc/temporal-design.md](doc/temporal-design.md) for the full design, including the rationale for the system-axis read-only stance and how stratum compares to XTDB / SQL:2011 RDBMSes / cloud-warehouse Time Travel.
+
 ## SQL Capabilities
 
 **DML**: SELECT, INSERT, UPDATE, DELETE, UPSERT (INSERT ON CONFLICT), UPDATE FROM (joined updates), CREATE TABLE, DROP TABLE
+
+**Bitemporal (SQL:2011)**: `FOR PORTION OF VALID_TIME` DML on bitemporal tables, `FOR VALID_TIME AS OF` / `FOR SYSTEM_TIME AS OF` time-travel reads, Allen interval predicates (OVERLAPS / CONTAINS / PRECEDES / MEETS / …). See [doc/temporal-design.md](doc/temporal-design.md).
 
 **Joins**: INNER, LEFT, RIGHT, FULL, ASOF (with optional LEFT outer) - single and multi-column keys
 
@@ -262,6 +313,8 @@ All share copy-on-write semantics and can be branched together via Yggdrasil.
 - **Query planner**: cost-based IR planner with predicate pushdown, top-N rewrite, window-having pushdown, NDV-based join cardinality, operator fusion, column pruning
 - **Performance**: SIMD filter/aggregate/group-by via Java Vector API, fused single-pass execution, zone map pruning, parallel execution
 - **Persistence**: O(1) CoW snapshots, branching, time-travel, lazy loading from storage
+- **Audit**: content-addressed `:crypto-hash?` commits, `stratum.audit/verify-chain` for tamper detection (shallow + deep PSS-tree walks), `IAuditable` protocol for embedding into larger storage substrates ([doc/audit.md](doc/audit.md))
+- **Bitemporal**: SQL:2011 valid- and system-time axes, `FOR PORTION OF VALID_TIME` DML, `FOR (VALID|SYSTEM)_TIME AS OF` time-travel reads, Allen interval predicates ([doc/temporal-design.md](doc/temporal-design.md))
 - **Data**: CSV/Parquet import, dictionary-encoded strings, PostgreSQL NULL semantics, ad-hoc file queries
 - **Integration**: tablecloth/tech.ml.dataset interop, Datahike, Yggdrasil
 - **Analytics**: Isolation forest anomaly detection (SQL model management, scoring, online rotation)
@@ -340,18 +393,10 @@ After modifying Java files in `src-java/`:
 ```bash
 clj -T:build compile-java
 
-# or directly with javac (must list every Java file we ship)
+# or directly with javac (`clj -T:build compile-java` is preferred — it
+# auto-discovers every .java under src-java/ and uses the deps.edn classpath)
 javac --add-modules jdk.incubator.vector -d target/classes \
-  src-java/stratum/internal/ColumnOps.java \
-  src-java/stratum/internal/ColumnOpsExt.java \
-  src-java/stratum/internal/ColumnOpsLong.java \
-  src-java/stratum/internal/ColumnOpsString.java \
-  src-java/stratum/internal/ColumnOpsVar.java \
-  src-java/stratum/internal/ColumnOpsChunked.java \
-  src-java/stratum/internal/ColumnOpsChunkedSimd.java \
-  src-java/stratum/internal/ColumnOpsChunkedLong.java \
-  src-java/stratum/internal/ColumnOpsAsof.java \
-  src-java/stratum/internal/ColumnOpsAnalytics.java
+  src-java/stratum/internal/*.java
 # Restart REPL (JVM can't reload classes)
 ```
 
