@@ -128,6 +128,22 @@ public final class ColumnOpsChunked {
         // AggregateDenseRange.
         final int accSize = numAggs * 2 + 1;
         final int markerSlot = numAggs * 2;
+        // F-006 fast path: any AGG_COUNT in the agg list provides a
+        // built-in per-group post-filter row count (COUNT never
+        // NULL-skips), so its count slot equals the marker definition
+        // by construction. Find the first such agg and snapshot its
+        // count into the marker at function end — saves a full per-row
+        // sweep. Without this, COUNT-only chunked group-by paid ~30%
+        // overhead on B6 (3 groups, 6M rows: 6M extra writes per
+        // query). Most realistic GROUP BY queries include COUNT(*) so
+        // this covers the common case; the no-COUNT fallback below
+        // does the explicit per-row marker pass.
+        int countAggIdx = -1;
+        for (int a = 0; a < numAggs; a++) {
+            if (aggTypes[a] == AGG_COUNT) { countAggIdx = a; break; }
+        }
+        final boolean markerFromCount = countAggIdx >= 0;
+        final int countSlot = markerFromCount ? countAggIdx * 2 + 1 : -1;
         double[] groups = new double[maxKey * accSize];
         // Init MIN to +Inf, MAX to -Inf
         for (int a = 0; a < numAggs; a++) {
@@ -258,13 +274,16 @@ public final class ColumnOpsChunked {
 
             if (validCount == 0) continue; // Skip chunk entirely
 
-            // F-006: bump per-group marker for every valid row before
-            // the agg passes. The agg passes themselves still skip
-            // NULL values for per-agg counts/sums, but the marker
-            // tracks "row matched filter and landed in group k".
-            for (int i = 0; i < len; i++) {
-                int k = rowKeys[i];
-                if (k >= 0) groups[k * accSize + markerSlot]++;
+            // F-006: bump per-group marker for every valid row that
+            // entered a group, so SQL still emits a row for groups
+            // whose every agg-column value was NULL. Skipped when at
+            // least one agg is AGG_COUNT (markerFromCount above); the
+            // post-loop sweep copies that COUNT's slot into the marker.
+            if (!markerFromCount) {
+                for (int i = 0; i < len; i++) {
+                    int k = rowKeys[i];
+                    if (k >= 0) groups[k * accSize + markerSlot]++;
+                }
             }
 
             // === Pass 2+: Per-agg-type accumulation using precomputed keys ===
@@ -304,6 +323,15 @@ public final class ColumnOpsChunked {
                         if (k >= 0) { double sv = col[i]; if (!nanSafe || sv == sv) { int off = k * accSize + aOff; groups[off] = Math.max(groups[off], sv); groups[off + 1]++; } }
                     }
                 }
+            }
+        }
+        // F-006 deferred marker: when an AGG_COUNT was present, copy
+        // its post-filter count slot into the marker in a single
+        // sweep over `maxKey`. AGG_COUNT never NULL-skips, so its
+        // count == the marker definition.
+        if (markerFromCount) {
+            for (int k = 0; k < maxKey; k++) {
+                groups[k * accSize + markerSlot] = groups[k * accSize + countSlot];
             }
         }
         return groups;
