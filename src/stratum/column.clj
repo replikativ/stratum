@@ -10,6 +10,46 @@
 
 (set! *warn-on-reflection* true)
 
+;; ----------------------------------------------------------------------------
+;; Validity-bitmap identity cache
+;;
+;; `encode-column` derives a validity bitmap from raw long[]/double[] inputs
+;; by scanning for the per-type NULL sentinel. The scan is O(n) per column,
+;; and ad-hoc query shapes that pass the same raw array into `q/q` repeatedly
+;; (e.g. the OLAP bench's `bench-1t` running 5+10 iterations over h2o's 6M-row
+;; vectors) re-paid the scan on every iteration — bisect traced H2O-J1 going
+;; from 27.7ms to 42.7ms exactly to the encode-column scan added in 88bfaca.
+;;
+;; Identity cache: keyed on the array reference itself (Java arrays use
+;; identity equality / identity hashCode, so a plain WeakHashMap is an
+;; identity cache without any extra wrapping). WeakHashMap lets GC reclaim
+;; entries once no caller still holds the array. `Collections.synchronizedMap`
+;; makes get/put atomic across threads — the wrapper is enough because we
+;; do at most one get + one put per call.
+;;
+;; The cached value is either a `long[]` bitmap or the `::no-nulls` sentinel
+;; (Clojure keyword) standing in for "scanned, no nulls present" — needed
+;; because nil already means "miss" inside a HashMap.get call.
+;; ----------------------------------------------------------------------------
+
+(def ^:private ^java.util.Map validity-cache
+  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+
+(defn- cached-scan-validity
+  "Like `chunk/scan-validity` but memoised by array identity. Returns the
+   bitmap (or nil for all-valid) and caches the result so subsequent calls
+   on the same array reference skip the O(n) sentinel scan."
+  ^longs [arr datatype ^long length]
+  (let [hit (.get validity-cache arr)]
+    (cond
+      (nil? hit)
+      (let [v (chunk/scan-validity arr datatype length)]
+        (.put validity-cache arr (or v ::no-nulls))
+        v)
+
+      (identical? hit ::no-nulls) nil
+      :else hit)))
+
 (defn encode-column
   "Detect column type and extract data array from various inputs.
    Pre-encoding columns avoids repeated dictionary encoding on every query.
@@ -55,7 +95,7 @@
     ;; preserving the all-valid fast path.
     (instance? (Class/forName "[J") col-val)
     (let [v (when nullable?
-              (chunk/scan-validity col-val :int64 (alength ^longs col-val)))]
+              (cached-scan-validity col-val :int64 (alength ^longs col-val)))]
       (cond-> {:type :int64 :data col-val}
         (false? nullable?) (assoc :nullable? false)
         v (assoc :validity v)))
@@ -63,7 +103,7 @@
     ;; Raw double array — same lazy validity derivation.
     (instance? (Class/forName "[D") col-val)
     (let [v (when nullable?
-              (chunk/scan-validity col-val :float64 (alength ^doubles col-val)))]
+              (cached-scan-validity col-val :float64 (alength ^doubles col-val)))]
       (cond-> {:type :float64 :data col-val}
         (false? nullable?) (assoc :nullable? false)
         v (assoc :validity v)))
