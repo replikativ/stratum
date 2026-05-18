@@ -138,6 +138,79 @@ public final class ColumnOpsTemporal {
         return r;
     }
 
+    /** DATE_TRUNC to week (ISO 8601: Monday) on epoch-micros column. Step 4b. */
+    public static long[] arrayDateTruncWeekMicros(long[] em, int length) {
+        long[] r = new long[length];
+        for (int i = 0; i < length; i++) {
+            long v = em[i];
+            if (v == NULL_L) { r[i] = NULL_L; continue; }
+            long epochDays = Math.floorDiv(v, MICROS_PER_DAY);
+            long dow = ((epochDays % 7) + 10) % 7;  // 0=Mon..6=Sun
+            r[i] = (epochDays - dow) * MICROS_PER_DAY;
+        }
+        return r;
+    }
+
+    /** DATE_TRUNC to quarter on epoch-micros column. Step 4b. */
+    public static long[] arrayDateTruncQuarterMicros(long[] em, int length) {
+        long[] r = new long[length];
+        long[] ymd = new long[3];
+        for (int i = 0; i < length; i++) {
+            long v = em[i];
+            if (v == NULL_L) { r[i] = NULL_L; continue; }
+            long epochDays = Math.floorDiv(v, MICROS_PER_DAY);
+            civilFromDays(epochDays, ymd);
+            long qStartMonth = ((ymd[1] - 1) / 3) * 3 + 1;
+            r[i] = civilToDays(ymd[0], qStartMonth, 1) * MICROS_PER_DAY;
+        }
+        return r;
+    }
+
+    /** DATE_TRUNC to decade on epoch-micros column. Step 4b. */
+    public static long[] arrayDateTruncDecadeMicros(long[] em, int length) {
+        long[] r = new long[length];
+        long[] ymd = new long[3];
+        for (int i = 0; i < length; i++) {
+            long v = em[i];
+            if (v == NULL_L) { r[i] = NULL_L; continue; }
+            long epochDays = Math.floorDiv(v, MICROS_PER_DAY);
+            civilFromDays(epochDays, ymd);
+            long decYear = ymd[0] - Math.floorMod(ymd[0], 10);
+            r[i] = civilToDays(decYear, 1, 1) * MICROS_PER_DAY;
+        }
+        return r;
+    }
+
+    /** DATE_TRUNC to century on epoch-micros column. Step 4b. */
+    public static long[] arrayDateTruncCenturyMicros(long[] em, int length) {
+        long[] r = new long[length];
+        long[] ymd = new long[3];
+        for (int i = 0; i < length; i++) {
+            long v = em[i];
+            if (v == NULL_L) { r[i] = NULL_L; continue; }
+            long epochDays = Math.floorDiv(v, MICROS_PER_DAY);
+            civilFromDays(epochDays, ymd);
+            long centStart = ((ymd[0] - 1) / 100) * 100 + 1;
+            r[i] = civilToDays(centStart, 1, 1) * MICROS_PER_DAY;
+        }
+        return r;
+    }
+
+    /** DATE_TRUNC to millennium on epoch-micros column. Step 4b. */
+    public static long[] arrayDateTruncMillenniumMicros(long[] em, int length) {
+        long[] r = new long[length];
+        long[] ymd = new long[3];
+        for (int i = 0; i < length; i++) {
+            long v = em[i];
+            if (v == NULL_L) { r[i] = NULL_L; continue; }
+            long epochDays = Math.floorDiv(v, MICROS_PER_DAY);
+            civilFromDays(epochDays, ymd);
+            long milStart = ((ymd[0] - 1) / 1000) * 1000 + 1;
+            r[i] = civilToDays(milStart, 1, 1) * MICROS_PER_DAY;
+        }
+        return r;
+    }
+
     /** Extract hour (0-23) from epoch-micros array. */
     public static double[] arrayExtractHourMicros(long[] em, int length) {
         double[] r = new double[length];

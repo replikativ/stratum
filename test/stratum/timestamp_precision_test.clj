@@ -53,9 +53,11 @@
     (is (= :seconds
            (-> parsed :ddl :columns first :temporal-unit)))))
 
-(deftest timestamp-ns-errors-clearly
+(deftest timestamp-ns-ddl-now-supported
+  ;; Step 4c lifted the prior "not yet supported" stub.
   (let [parsed (sql/parse-sql "CREATE TABLE t (ts TIMESTAMP_NS)" {})]
-    (is (re-find #"TIMESTAMP_NS is not yet supported" (or (:error parsed) "")))))
+    (is (= :nanos
+           (-> parsed :ddl :columns first :temporal-unit)))))
 
 ;; ===========================================================================
 ;; DATE_ADD on :millis column — every unit, scaled through the micros kernel

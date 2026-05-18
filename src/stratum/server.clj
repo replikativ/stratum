@@ -1420,8 +1420,15 @@
                          result)
                 result (if-let [sel-cols (:_select-columns query)]
                          (sql/apply-select-columns result sel-cols)
-                         result)]
-            (sql/format-results result))
+                         result)
+                ;; Step 4a: build a column-meta map from the live
+                ;; registry so DDL-declared types (DATE, TIMESTAMP_MS,
+                ;; ENUM, …) surface as the correct PG OID instead of
+                ;; OID_INT8 / OID_TEXT. Computed columns and CAST
+                ;; outputs that don't match a registered column fall
+                ;; back to value-based inference.
+                column-meta (sql/collect-column-meta @table-registry-atom)]
+            (sql/format-results result column-meta))
 
           :else
           (PgWireServer$QueryResult. "Internal error: unexpected parse result"))))

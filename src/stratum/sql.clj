@@ -258,7 +258,9 @@
 
     ;; EXTRACT(field FROM col) — emit the granular op (:hour, :year, etc.).
     ;; Recognized fields: year, month, day, hour, minute, second,
-    ;; millisecond, microsecond, day-of-week (DOW), week-of-year (WEEK).
+    ;; millisecond, microsecond, day-of-week (PG/DuckDB convention
+    ;; Sunday=0..Saturday=6), ISO day-of-week (Monday=1..Sunday=7),
+    ;; week-of-year, quarter, decade, century, millennium.
     (instance? ExtractExpression expr)
     (let [^ExtractExpression ee expr
           field (some-> (.getName ee) str/upper-case str/trim)
@@ -272,8 +274,19 @@
                "SECOND" :second
                "MILLISECOND" :millisecond
                "MICROSECOND" :microsecond
-               ("DOW" "ISODOW" "DAYOFWEEK") :day-of-week
+               ;; Step 4b: DOW (Sun=0..Sat=6, PG/DuckDB) and ISODOW
+               ;; (Mon=1..Sun=7) are distinct conventions. Pre-step-4b
+               ;; both were aliased to `:day-of-week` which returned
+               ;; Stratum's idiosyncratic Monday=0..Sunday=6 — broken
+               ;; for any client expecting either PG or ISO output.
+               ("DOW" "DAYOFWEEK")           :day-of-week
+               "ISODOW"                      :iso-day-of-week
                ("WEEK" "ISOWEEK" "WEEKOFYEAR") :week-of-year
+               "QUARTER"                     :quarter
+               "DECADE"                      :decade
+               "CENTURY"                     :century
+               "MILLENNIUM"                  :millennium
+               "NANOSECOND"                  :nanosecond
                (throw (ex-info (str "Unsupported EXTRACT field: " field)
                                {:field field})))]
       [op col])
@@ -1265,8 +1278,14 @@
                    "YEAR" :year "MONTH" :month "DAY" :day
                    "HOUR" :hour "MINUTE" :minute "SECOND" :second
                    "MILLISECOND" :millisecond "MICROSECOND" :microsecond
-                   "DOW" :day-of-week "ISODOW" :day-of-week "DAYOFWEEK" :day-of-week
+                   ;; Step 4b: see translate-expr ExtractExpression for
+                   ;; DOW vs ISODOW semantics.
+                   "DOW" :day-of-week "DAYOFWEEK" :day-of-week
+                   "ISODOW" :iso-day-of-week
                    "WEEK" :week-of-year "ISOWEEK" :week-of-year "WEEKOFYEAR" :week-of-year
+                   "QUARTER" :quarter "DECADE" :decade
+                   "CENTURY" :century "MILLENNIUM" :millennium
+                   "NANOSECOND" :nanosecond
                    (throw (ex-info (str "Unsupported EXTRACT field: " field)
                                    {:field field})))]
           [op (second params)])
@@ -2500,12 +2519,7 @@
       {:type :int64 :temporal-unit :millis}
 
       (= t "TIMESTAMP_NS")
-      (throw (ex-info
-              (str "TIMESTAMP_NS is not yet supported at the query layer "
-                   "— use TIMESTAMP (micros) or TIMESTAMP_MS. Parquet "
-                   "ingest preserves NS values at storage, but date kernels "
-                   "below microsecond precision are a planned follow-up.")
-              {:type-name type-str}))
+      {:type :int64 :temporal-unit :nanos}
 
       ;; Unknown type — leave it for the server to resolve. ENUM type
       ;; names (declared via CREATE TYPE … AS ENUM) are recognised
@@ -2919,20 +2933,86 @@
                           (if (Float/isNaN f) nil (str f)))
     :else (str v)))
 
-(defn- infer-oid
-  "Infer PostgreSQL OID from a result value."
-  [v]
+(defn- meta->oid
+  "Resolve a Postgres OID from per-column metadata. Returns nil when the
+   metadata doesn't pin a type, in which case the caller falls back to
+   value-based inference. Pulled out as a helper so the columnar and
+   row-form result paths share one resolver."
+  [{:keys [temporal-unit enum-oid] :as col-meta}]
   (cond
-    (nil? v) OID_TEXT
-    (instance? Long v) OID_INT8
-    (integer? v) OID_INT8
-    (instance? Double v) OID_FLOAT8
-    (float? v) OID_FLOAT8
-    :else OID_TEXT))
+    enum-oid     (int enum-oid)
+    ;; Date column — stored as epoch-days.
+    (= :days temporal-unit) (:date pg-type-oids)
+    ;; TIMESTAMP family (seconds/millis/micros/nanos). PG only has OID
+    ;; 1114 for timestamp; the precision tag is for the engine, not
+    ;; the wire. Clients see "timestamp" and the value in the column's
+    ;; native unit — same wire shape as DuckDB's PG extension.
+    (#{:seconds :millis :micros :nanos} temporal-unit)
+    (:timestamp pg-type-oids)
+    :else nil))
+
+(defn- infer-oid
+  "Infer PostgreSQL OID for a result column. Prefers explicit per-column
+   metadata (DDL-declared type) when provided; falls back to value-based
+   inference (single value sample) when meta is absent or doesn't pin a
+   type — preserves the pre-step-4a behaviour for computed columns,
+   CASTs, expressions, and other outputs that aren't simple column
+   references."
+  ([v] (infer-oid v nil))
+  ([v col-meta]
+   (or (meta->oid col-meta)
+       (cond
+         (nil? v) OID_TEXT
+         (instance? Long v) OID_INT8
+         (integer? v) OID_INT8
+         (instance? Double v) OID_FLOAT8
+         (float? v) OID_FLOAT8
+         :else OID_TEXT))))
+
+(defn collect-column-meta
+  "Walk every registered table and merge their :column-schema metadata
+   into a single map keyed by column-keyword. Enum-typed columns get an
+   `:enum-oid` field resolved from the server's `__enums__` registry.
+
+   Used at format-results time: when an output column's keyword matches
+   a registered column with declared metadata, we know its source
+   :temporal-unit / :enum-of and can emit the right PG OID. Outputs
+   that don't match a registered column (computed expressions, CASTs,
+   aliases) fall back to value-based OID inference. This is best-effort
+   — same-named columns across tables collide; the user-visible result
+   is still correct because the engine itself has type info,
+   format-results only feeds the wire-protocol type tag."
+  [registry]
+  (let [enums (get registry "__enums__")]
+    (reduce (fn [acc [tname tcols]]
+              (if (str/starts-with? (str tname) "__")
+                acc
+                (if-let [schema (some-> tcols meta :column-schema)]
+                  (merge acc
+                         (reduce-kv (fn [m col-kw col-spec]
+                                      (assoc m col-kw
+                                             (cond-> col-spec
+                                               (:enum-of col-spec)
+                                               (assoc :enum-oid
+                                                      (get-in enums [(:enum-of col-spec) :oid])))))
+                                    {}
+                                    schema))
+                  acc)))
+            {}
+            registry)))
 
 (defn format-results
-  "Format Stratum query results into a PgWireServer.QueryResult."
-  [results]
+  "Format Stratum query results into a PgWireServer.QueryResult.
+
+   The 2-arity form takes an optional `column-meta` map
+   `{col-kw {:temporal-unit ... :enum-of ... :enum-oid ...}}` so
+   declared per-column types surface as the correct PG OID on the
+   wire (DATE / TIMESTAMP / ENUM) instead of `OID_INT8` /
+   `OID_TEXT`. Columns absent from the map fall back to value-based
+   inference — the pre-step-4a behaviour. See `collect-column-meta`
+   for the standard caller pattern."
+  ([results] (format-results results nil))
+  ([results column-meta]
   (cond
     ;; System query with pre-formatted result
     (and (:system results) (:result results))
@@ -2958,13 +3038,15 @@
     (let [n-rows (long (:n-rows results))
           col-keys (vec (remove #{:n-rows} (keys results)))
           col-names (mapv name col-keys)
-          ;; Infer OIDs from first row values
+          ;; Step 4a: prefer declared per-column OID; fall back to
+          ;; array-shape inference (the pre-step-4a behaviour).
           oids (int-array (map (fn [k]
                                  (let [arr (get results k)]
-                                   (cond
-                                     (instance? (Class/forName "[J") arr) OID_INT8
-                                     (instance? (Class/forName "[D") arr) OID_FLOAT8
-                                     :else OID_TEXT)))
+                                   (or (meta->oid (get column-meta k))
+                                       (cond
+                                         (instance? (Class/forName "[J") arr) OID_INT8
+                                         (instance? (Class/forName "[D") arr) OID_FLOAT8
+                                         :else OID_TEXT))))
                                col-keys))
           rows (into-array (Class/forName "[Ljava.lang.String;")
                            (for [i (range n-rows)]
@@ -2999,7 +3081,7 @@
             ;; Filter out internal engine keys (starting with _) before serializing
             col-keys (vec (filter #(not (str/starts-with? (name %) "_")) (keys first-row)))
             col-names (mapv name col-keys)
-            oids (int-array (map #(infer-oid (get first-row %)) col-keys))
+            oids (int-array (map #(infer-oid (get first-row %) (get column-meta %)) col-keys))
             rows (into-array (Class/forName "[Ljava.lang.String;")
                              (mapv (fn [row]
                                      (into-array String
@@ -3013,7 +3095,7 @@
 
     ;; Single map (non-grouped aggregate)
     (map? results)
-    (format-results [results])
+    (format-results [results] column-meta)
 
     :else
-    (PgWireServer$QueryResult. (str "Unexpected result type: " (type results)))))
+    (PgWireServer$QueryResult. (str "Unexpected result type: " (type results))))))
