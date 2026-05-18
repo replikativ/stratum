@@ -38,7 +38,8 @@
 ;; near `make-handler-factory`). Needed because `execute-sql` — defined
 ;; earlier in the file for historical reasons — calls into them.
 (declare make-durable-sql-table! durable-cols? resync-durable-table!
-         hydrate-sql-tables! empty-col-array columns->descriptors
+         hydrate-sql-tables! hydrate-models! hydrate-live-tables!
+         empty-col-array columns->descriptors
          durable-branch durable-meta)
 
 ;; ============================================================================
@@ -829,6 +830,12 @@
                         train-fn (:train-fn type-config)
                         model (assoc (train-fn train-opts) :model-type model-type)]
                     (swap! table-registry-atom assoc-in ["__models__" model-name] model)
+                    ;; R3: durable model registry. Trained models are
+                    ;; plain Clojure data (per `iforest.clj`), so
+                    ;; Konserve serialisation is just a write. On
+                    ;; restart `hydrate-models!` reinstates them.
+                    (when store
+                      (srv-state/put! store :models model-name model))
                     (println (str "Created model '" model-name "' (" model-type ") with "
                                   (:n-features model) " features"))
                     (PgWireServer$QueryResult/empty "CREATE MODEL")))
@@ -841,6 +848,8 @@
                                     {:model model-name
                                      :available (keys models)})))
                   (swap! table-registry-atom update "__models__" dissoc model-name)
+                  (when store
+                    (srv-state/delete! store :models model-name))
                   (PgWireServer$QueryResult/empty "DROP MODEL"))
 
                 :insert
@@ -1502,6 +1511,30 @@
                         "' from branch '" branch "': " (.getMessage t))))))
     (count records)))
 
+(defn- hydrate-models!
+  "On server start with a configured store, reinstall every persisted
+   trained model into the in-memory registry's `__models__` slot.
+   Returns the count of models loaded."
+  [store registry-atom]
+  (let [records (srv-state/list-section store :models)]
+    (doseq [[model-name model] records]
+      (swap! registry-atom assoc-in ["__models__" model-name] model))
+    (count records)))
+
+(defn- hydrate-live-tables!
+  "On server start with a configured store, reinstall every persisted
+   live-table binding pointing at this server's store. Live tables that
+   pointed at a *different* Konserve store can't be reinstalled
+   automatically (we don't serialize foreign store handles) — those
+   require the user to call `register-live-table!` again at start.
+   Returns the count of bindings restored."
+  [store registry-atom]
+  (let [records (srv-state/list-section store :live-tables)]
+    (doseq [[table-name {:keys [branch]}] records]
+      (swap! registry-atom assoc table-name
+             {:__live true :store store :branch branch}))
+    (count records)))
+
 (defn- make-handler-factory
   "Create a PgWireServer.QueryHandlerFactory. Each call to .create() returns
    an independent QueryHandler with its own per-connection transaction state.
@@ -1596,8 +1629,11 @@
              ;; Each persisted SQL table is loaded as an index-backed
              ;; column map with the original :durable-binding metadata
              ;; so subsequent DML re-syncs back to the same branch.
-             (let [n (hydrate-sql-tables! store registry)]
-               (println (format "Hydrated server state: %d SQL tables" n)))
+             (let [n-tables (hydrate-sql-tables! store registry)
+                   n-models (hydrate-models! store registry)
+                   n-live   (hydrate-live-tables! store registry)]
+               (println (format "Hydrated server state: %d SQL tables, %d models, %d live tables"
+                                n-tables n-models n-live)))
              (do
                (println "WARNING: stratum.server/start invoked without :store —")
                (println "         SQL CREATE TABLE / ENUM / MODEL state is session-scoped")
@@ -1655,9 +1691,26 @@
    PgWire clients always see the current branch HEAD.
 
    store  — konserve store containing the dataset
-   branch — branch name to resolve HEAD from (e.g., \"main\")"
-  [{:keys [registry]} table-name store branch]
-  (swap! registry assoc table-name {:__live true :store store :branch branch})
+   branch — branch name to resolve HEAD from (e.g., \"main\")
+
+   When `server-map` carries a `:store` (the server's durable
+   state store) AND the supplied `store` is identical to it
+   (same Konserve handle), the binding is persisted under
+   [:server :live-tables <table-name>] and reinstalled on next
+   restart. A live-table backed by a *different* Konserve store
+   is registered for the current session only; the user must
+   re-register after restart (a warning is printed). Future v2
+   may add a labeled multi-store registry."
+  [{:keys [registry store] :as _server-map} table-name live-store branch]
+  (swap! registry assoc table-name {:__live true :store live-store :branch branch})
+  (cond
+    (and store (identical? store live-store))
+    (srv-state/put! store :live-tables table-name {:branch branch})
+
+    store
+    (println (str "WARNING: live table '" table-name "' uses a Konserve "
+                  "store that is not the server's :store — the binding is "
+                  "session-scoped and will be lost on restart.")))
   (println (str "Registered live table '" table-name "' on branch '" branch "'")))
 
 (defn index-file!
@@ -1685,18 +1738,28 @@
                   (files/file-store-dir data-dir file-path)))))
 
 (defn unregister-table!
-  "Remove a table from the server."
-  [{:keys [registry]} table-name]
-  (swap! registry dissoc table-name))
+  "Remove a table from the server. When the server has a `:store`
+   configured and the table was a durable live-table binding, the
+   persisted [:server :live-tables <name>] record is removed too."
+  [{:keys [registry store]} table-name]
+  (swap! registry dissoc table-name)
+  (when store
+    (srv-state/delete! store :live-tables table-name)))
 
 (defn register-model!
   "Register a trained isolation forest model with the server.
    The model can then be used in SQL: ANOMALY_SCORE('model_name', col1, col2, ...)
 
    model-name — String name for the model
-   model      — trained model from stratum.iforest/train"
-  [{:keys [registry]} model-name model]
+   model      — trained model from stratum.iforest/train
+
+   When the server was started with `:store`, the model is also
+   persisted under [:server :models <model-name>] and reinstalled on
+   subsequent restarts."
+  [{:keys [registry store]} model-name model]
   (swap! registry assoc-in ["__models__" model-name] model)
+  (when store
+    (srv-state/put! store :models model-name model))
   (println (str "Registered model '" model-name "' with "
                 (:n-features model) " features")))
 

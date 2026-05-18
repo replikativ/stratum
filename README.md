@@ -133,6 +133,38 @@ clj -M:olap asof         # ASOF JOIN tier only (3 canonical shapes)
 (st/q {:from ds :agg [[:avg :age]]})
 ```
 
+## Server-side durability
+
+By default, a Stratum PgWire server starts with an empty in-memory registry — convenient for ad-hoc demos and read-only queries against pre-indexed files (`--index`), but SQL `CREATE TABLE`, `INSERT`/`UPDATE`/`DELETE`, `CREATE MODEL`, and `register-live-table!` bindings live only in heap and evaporate on restart.
+
+Pass a Konserve store via `:store` (or the CLI `--data-dir`) to make those durable:
+
+```clojure
+(require '[stratum.server :as srv]
+         '[konserve.filestore :as kfile])
+
+(def store
+  (kfile/connect-fs-store "/var/lib/stratum/server"
+                          {:sync? true}))
+
+(def server (srv/start {:port 5432 :store store}))
+
+;; CREATE TABLE foo (id INT, price DOUBLE);
+;; INSERT INTO foo VALUES (1, 9.5);
+;; — stop the server, restart, foo still has its rows
+```
+
+What's persisted:
+
+- **SQL CREATE TABLE** (with int/float/temporal columns; string columns currently fall back to non-durable heap storage with a per-table warning — dict-string append is a planned follow-up)
+- **INSERT / UPDATE / DELETE / UPSERT** — each statement re-syncs to a per-table branch
+- **CREATE MODEL** (isolation forest, plain-data serialization)
+- **register-live-table!** bindings whose Konserve store is the same as the server's `:store` (foreign-store live-tables stay session-scoped and emit a warning)
+
+What stays transient (matches PostgreSQL semantics): per-connection transaction state, prepared statements, cursors, session settings (`SET …`).
+
+Without `:store` the server prints a startup warning naming the surprise — programmatic users who manage their own datasets with `dataset/sync!` are unaffected and run as before.
+
 ## Snapshots and Branching
 
 Every Stratum dataset is a copy-on-write value. Fork one in O(1) to create an isolated branch - modifications only touch the changed chunks, everything else is structurally shared. Persist snapshots to named branches, load them back, or time-travel to any previous commit.
@@ -312,7 +344,7 @@ All share copy-on-write semantics and can be branched together via Yggdrasil.
 - **SQL**: PostgreSQL wire protocol (v3), full DML, CTEs, window functions, joins, subqueries
 - **Query planner**: cost-based IR planner with predicate pushdown, top-N rewrite, window-having pushdown, NDV-based join cardinality, operator fusion, column pruning
 - **Performance**: SIMD filter/aggregate/group-by via Java Vector API, fused single-pass execution, zone map pruning, parallel execution
-- **Persistence**: O(1) CoW snapshots, branching, time-travel, lazy loading from storage
+- **Persistence**: O(1) CoW snapshots, branching, time-travel, lazy loading from storage; SQL `CREATE TABLE`/`INSERT`/`CREATE MODEL` + live-table bindings survive restart when the server is started with `:store`
 - **Audit**: content-addressed `:crypto-hash?` commits, `stratum.audit/verify-chain` for tamper detection (shallow + deep PSS-tree walks), `IAuditable` protocol for embedding into larger storage substrates ([doc/audit.md](doc/audit.md))
 - **Bitemporal**: SQL:2011 valid- and system-time axes, `FOR PORTION OF VALID_TIME` DML, `FOR (VALID|SYSTEM)_TIME AS OF` time-travel reads, Allen interval predicates ([doc/temporal-design.md](doc/temporal-design.md))
 - **Data**: CSV/Parquet import, dictionary-encoded strings, PostgreSQL NULL semantics, ad-hoc file queries

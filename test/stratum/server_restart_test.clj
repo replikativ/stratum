@@ -4,6 +4,7 @@
    INSERTs after restart correctly append."
   (:require [clojure.test :refer [deftest is testing]]
             [konserve.core :as kstore]
+            [stratum.dataset]
             [stratum.server :as srv])
   (:import [java.io File]
            [java.util UUID]
@@ -163,3 +164,122 @@
     (is (nil? (:error (run-sql s "CREATE TABLE t (id INT)"))))
     (is (nil? (:error (run-sql s "INSERT INTO t VALUES (42)"))))
     (is (= [["42"]] (:rows (run-sql s "SELECT id FROM t"))))))
+
+;; ============================================================================
+;; R3: trained models survive restart
+
+(deftest create-model-persists-across-restart
+  (let [path (temp-dir)]
+    (try
+      (let [store (file-store-at path)]
+        (with-server [s {:port (next-port) :store store}]
+          ;; Build training data
+          (run-sql s "CREATE TABLE sensors (temp DOUBLE, hum DOUBLE)")
+          (doseq [vals [[20.0 50.0] [21.0 52.0] [19.5 48.0] [22.0 55.0] [20.5 51.0]
+                        [100.0 5.0]  ; outlier
+                        [21.5 53.0] [19.0 47.0] [20.8 50.5] [21.2 52.5]]]
+            (run-sql s (format "INSERT INTO sensors VALUES (%s, %s)" (first vals) (second vals))))
+          (is (nil? (:error (run-sql s "CREATE MODEL m TYPE ISOLATION_FOREST OPTIONS (n_trees = 50, sample_size = 8, seed = 42, contamination = 0.1) AS SELECT temp, hum FROM sensors"))))
+          (is (contains? (get @(:registry s) "__models__") "m"))))
+
+      ;; Reopen — model must be hydrated back
+      (let [store (file-store-at path)]
+        (with-server [s {:port (next-port) :store store}]
+          (is (contains? (get @(:registry s) "__models__") "m")
+              "Trained model 'm' must be in registry after restart")
+          ;; ANOMALY_SCORE works against the rehydrated model
+          (let [r (run-sql s "SELECT ANOMALY_SCORE('m', 100.0, 5.0) AS score")]
+            (is (nil? (:error r)))
+            (is (= 1 (count (:rows r)))))))
+      (finally (delete-dir path)))))
+
+(deftest drop-model-clears-durable-record
+  (let [path (temp-dir)]
+    (try
+      (let [store (file-store-at path)]
+        (with-server [s {:port (next-port) :store store}]
+          (run-sql s "CREATE TABLE sensors (temp DOUBLE, hum DOUBLE)")
+          (doseq [vals [[1.0 2.0] [3.0 4.0] [5.0 6.0] [7.0 8.0] [9.0 10.0]
+                        [11.0 12.0] [13.0 14.0] [15.0 16.0]]]
+            (run-sql s (format "INSERT INTO sensors VALUES (%s, %s)" (first vals) (second vals))))
+          (run-sql s "CREATE MODEL m TYPE ISOLATION_FOREST OPTIONS (n_trees = 10, sample_size = 4, seed = 1) AS SELECT temp, hum FROM sensors")
+          (is (contains? (get @(:registry s) "__models__") "m"))
+          (run-sql s "DROP MODEL m")
+          (is (not (contains? (get @(:registry s) "__models__") "m"))
+              "Model dropped from in-memory registry")))
+      ;; After restart the model must not reappear
+      (let [store (file-store-at path)]
+        (with-server [s {:port (next-port) :store store}]
+          (is (not (contains? (get @(:registry s) "__models__") "m"))
+              "Dropped model must not be rehydrated")))
+      (finally (delete-dir path)))))
+
+;; ============================================================================
+;; R4: live-table bindings survive restart
+
+(deftest live-table-binding-persists
+  (let [path (temp-dir)]
+    (try
+      ;; Session 1: create a dataset via the Clojure API + register-live-table!
+      (let [store (file-store-at path)]
+        (with-server [s {:port (next-port) :store store}]
+          (let [ds (-> (stratum.dataset/make-dataset
+                        {:k (long-array [1 2 3]) :v (double-array [10.0 20.0 30.0])}
+                        {:name "live"})
+                       stratum.dataset/ensure-indexed
+                       (stratum.dataset/sync! store "live-branch"))]
+            (srv/register-live-table! s "lt" store "live-branch")
+            (is (= [["1" "10.0"] ["2" "20.0"] ["3" "30.0"]]
+                   (:rows (run-sql s "SELECT k, v FROM lt ORDER BY k")))))))
+      ;; Session 2: binding must come back with no user action
+      (let [store (file-store-at path)]
+        (with-server [s {:port (next-port) :store store}]
+          (is (contains? @(:registry s) "lt")
+              "Live-table binding 'lt' must be hydrated after restart")
+          (is (= [["1" "10.0"] ["2" "20.0"] ["3" "30.0"]]
+                 (:rows (run-sql s "SELECT k, v FROM lt ORDER BY k"))))))
+      (finally (delete-dir path)))))
+
+(deftest unregister-table-clears-durable-binding
+  (let [path (temp-dir)]
+    (try
+      (let [store (file-store-at path)]
+        (with-server [s {:port (next-port) :store store}]
+          (-> (stratum.dataset/make-dataset {:x (long-array [42])} {:name "x"})
+              stratum.dataset/ensure-indexed
+              (stratum.dataset/sync! store "x-branch"))
+          (srv/register-live-table! s "lt" store "x-branch")
+          (is (contains? @(:registry s) "lt"))
+          (srv/unregister-table! s "lt")
+          (is (not (contains? @(:registry s) "lt")))))
+      ;; After restart, the live-table must NOT reappear
+      (let [store (file-store-at path)]
+        (with-server [s {:port (next-port) :store store}]
+          (is (not (contains? @(:registry s) "lt"))
+              "Unregistered live-table must not be rehydrated")))
+      (finally (delete-dir path)))))
+
+;; ============================================================================
+;; Defensive: registry-only and live-table from a foreign store
+
+(deftest foreign-store-live-table-not-persisted
+  (let [path-server (temp-dir)
+        path-foreign (temp-dir)]
+    (try
+      (let [server-store (file-store-at path-server)
+            foreign-store (file-store-at path-foreign)]
+        (with-server [s {:port (next-port) :store server-store}]
+          (-> (stratum.dataset/make-dataset {:n (long-array [1 2 3])} {:name "n"})
+              stratum.dataset/ensure-indexed
+              (stratum.dataset/sync! foreign-store "main"))
+          (srv/register-live-table! s "remote" foreign-store "main")
+          (is (contains? @(:registry s) "remote") "in this session: yes")))
+      ;; After restart with just server-store: foreign-store-backed
+      ;; live-table can't be hydrated automatically
+      (let [server-store (file-store-at path-server)]
+        (with-server [s {:port (next-port) :store server-store}]
+          (is (not (contains? @(:registry s) "remote"))
+              "Foreign-store live-table is NOT persisted (documented v1 limit)")))
+      (finally
+        (delete-dir path-server)
+        (delete-dir path-foreign)))))
