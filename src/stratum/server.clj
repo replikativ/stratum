@@ -26,6 +26,7 @@
             [stratum.files :as files]
             [stratum.iforest :as iforest]
             [stratum.server.state :as srv-state]
+            [stratum.util.decimal :as decimal]
             [clojure.string :as str])
   (:import [stratum.internal PgWireServer PgWireServer$QueryHandler PgWireServer$QueryHandlerFactory PgWireServer$QueryResult]
            [java.util Random]
@@ -42,7 +43,8 @@
          hydrate-enums!
          empty-col-array columns->descriptors
          durable-branch durable-meta
-         resolve-enum-columns validate-enum-rows!)
+         resolve-enum-columns validate-enum-rows!
+         coerce-rows-for-decimals)
 
 ;; ============================================================================
 ;; File path validation
@@ -873,6 +875,8 @@
 
                 :insert
                 (let [existing (get @table-registry-atom table)
+                      _        (when-not existing
+                                 (throw (ex-info (str "Table not found: " table) {:table table})))
                       ;; Auto-fill column list for durable tables when
                       ;; INSERT INTO t VALUES (...) omits the explicit
                       ;; column list. The declaration order is recorded
@@ -882,17 +886,22 @@
                                    (some-> existing meta :durable-binding :column-order))
                             (assoc ddl :columns
                                    (-> existing meta :durable-binding :column-order))
-                            ddl)]
-                  (when-not existing
-                    (throw (ex-info (str "Table not found: " table) {:table table})))
+                            ddl)
+                      ;; Step 5: DECIMAL columns store int64 unscaled
+                      ;; values. Coerce any BigDecimal/Long/Double/String
+                      ;; literal in each row to the column's unscaled
+                      ;; long form before the storage path sees it.
+                      ;; No-op when the table has no DECIMAL columns.
+                      col-order (or (:columns ddl) (vec (keys existing)))
+                      schema    (:column-schema (meta existing))
+                      rows      (coerce-rows-for-decimals rows col-order schema table)
+                      ddl       (assoc ddl :rows rows)]
                   ;; ENUM validation: for each enum-typed column,
                   ;; every inserted label must be in the declared set.
                   ;; Runs before any storage path so partial-insert
                   ;; can't leave the table in a half-validated state.
                   (validate-enum-rows!
-                   table (or (:columns ddl) (vec (keys existing)))
-                   rows
-                   (meta existing)
+                   table col-order rows (meta existing)
                    (get @table-registry-atom "__enums__"))
                   (cond
                 ;; INSERT … FOR PORTION OF VALID_TIME on a fully
@@ -1461,20 +1470,57 @@
   ^String [^String table-name]
   (str "sql/" table-name))
 
+(defn- coerce-row-for-decimals
+  "Pre-INSERT row transformation: for each column tagged `:decimal?`
+   in the table's `:column-schema` metadata, convert the row's value
+   (Long/Double/String/BigDecimal) to the int64 unscaled
+   representation at the column's declared scale. Non-decimal cells
+   pass through unchanged.
+
+   Returns the new row. `col-order` is the parallel list of column
+   keywords for the row's positional values."
+  [row col-order column-schema table-name]
+  (if-not (some #(get-in column-schema [% :decimal?]) col-order)
+    row
+    (mapv (fn [col-kw v]
+            (if-let [spec (get column-schema col-kw)]
+              (if (:decimal? spec)
+                (when (some? v)
+                  (decimal/bigdec->unscaled-long
+                   (decimal/coerce->bigdec v)
+                   (:scale spec)
+                   (str table-name "." (name col-kw))))
+                v)
+              v))
+          col-order
+          row)))
+
+(defn- coerce-rows-for-decimals
+  "Map `coerce-row-for-decimals` over a sequence of rows. No-op when
+   the table has no DECIMAL columns."
+  [rows col-order column-schema table-name]
+  (if-not (some #(get-in column-schema [% :decimal?]) col-order)
+    rows
+    (mapv #(coerce-row-for-decimals % col-order column-schema table-name) rows)))
+
 (defn- columns->descriptors
   "Reduce a DDL :columns vector into a {col-kw <descriptor>} schema map.
    Used to compose the side-schema attached as Clojure metadata so
    downstream INSERT/UPDATE handlers can see per-column policy
    without re-reading the parser output. Captures `:temporal-unit`
-   (DATE/TIMESTAMP precision) and `:enum-of` (declared enum name)."
+   (DATE/TIMESTAMP precision), `:enum-of` (declared enum name), and
+   `:decimal? :precision :scale` (step 5 — DECIMAL/NUMERIC tagging)."
   [columns]
   (into {}
-        (keep (fn [{:keys [name temporal-unit enum-of]}]
-                (when (or temporal-unit enum-of)
+        (keep (fn [{:keys [name temporal-unit enum-of decimal? precision scale]}]
+                (when (or temporal-unit enum-of decimal?)
                   [(keyword name)
                    (cond-> {}
                      temporal-unit (assoc :temporal-unit temporal-unit)
-                     enum-of       (assoc :enum-of enum-of))])))
+                     enum-of       (assoc :enum-of enum-of)
+                     decimal?      (assoc :decimal? true
+                                          :precision precision
+                                          :scale scale))])))
         columns))
 
 (defn- durable-meta

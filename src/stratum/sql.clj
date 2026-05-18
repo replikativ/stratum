@@ -15,7 +15,8 @@
             [stratum.csv :as csv]
             [stratum.parquet :as parquet]
             [stratum.sql.enum-ddl :as enum-ddl]
-            [stratum.sql.rewrite :as rewrite])
+            [stratum.sql.rewrite :as rewrite]
+            [stratum.util.decimal :as decimal])
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.statement Statement]
            [net.sf.jsqlparser.statement.select
@@ -2284,6 +2285,7 @@
    :bool 16
    :date 1082
    :timestamp 1114
+   :numeric 1700
    :oid 26
    :name 19})
 
@@ -2492,9 +2494,28 @@
           (= t "TINYINT") (= t "INT4") (= t "INT8") (= t "SERIAL"))
       {:type :int64}
 
-      (or (= t "DOUBLE") (= t "FLOAT") (= t "REAL") (= t "NUMERIC")
-          (= t "DECIMAL") (= t "DOUBLE PRECISION") (= t "FLOAT8") (= t "FLOAT4"))
+      (or (= t "DOUBLE") (= t "FLOAT") (= t "REAL")
+          (= t "DOUBLE PRECISION") (= t "FLOAT8") (= t "FLOAT4"))
       {:type :float64}
+
+      ;; Step 5: DECIMAL(p,s) / NUMERIC(p,s) — int64-backed for p ≤ 18.
+      ;; Bare `NUMERIC` and `DECIMAL` (no precision/scale) are rejected
+      ;; per the open-question agreement — PG's unconstrained-NUMERIC
+      ;; would need BigDecimal-as-storage (step 8 territory).
+      (let [d (decimal/parse-decimal-type type-str)]
+        (cond
+          (= d :unconstrained)
+          (throw (ex-info
+                  (str "Bare NUMERIC / DECIMAL is not supported — specify "
+                       "(precision, scale), e.g. DECIMAL(10,2). "
+                       "Unconstrained NUMERIC requires BigDecimal-backed "
+                       "storage (planned step 8).")
+                  {:type-name type-str}))
+          (map? d)
+          (do (decimal/validate-precision! (:precision d) (:scale d))
+              true)))
+      (let [{:keys [precision scale]} (decimal/parse-decimal-type type-str)]
+        {:type :int64 :decimal? true :precision precision :scale scale})
 
       (or (= t "VARCHAR") (= t "TEXT") (= t "CHAR") (= t "STRING")
           (.startsWith t "VARCHAR(") (.startsWith t "CHAR("))
@@ -2544,6 +2565,13 @@
                                        :type (:type type-info)}
                                 (:temporal-unit type-info)
                                 (assoc :temporal-unit (:temporal-unit type-info))
+                                ;; Step 5: DECIMAL precision/scale ride along
+                                ;; in the column descriptor and end up in the
+                                ;; table's :column-schema metadata.
+                                (:decimal? type-info)
+                                (assoc :decimal? true
+                                       :precision (:precision type-info)
+                                       :scale (:scale type-info))
                                 ;; Pass through the literal SQL type name
                                 ;; for any unrecognised type. The server
                                 ;; resolves these against its enum
@@ -2555,14 +2583,24 @@
                           col-defs)}}))
 
 (defn- parse-insert-value
-  "Convert a JSqlParser expression from INSERT VALUES to a Clojure value."
+  "Convert a JSqlParser expression from INSERT VALUES to a Clojure value.
+
+   Step 5: `DoubleValue` is returned as a `BigDecimal` parsed from the
+   token's textual form (`.toString`) so trailing-zero precision
+   (`1.10`) is preserved end-to-end. Server-side INSERT coercion then
+   scales the BigDecimal to the column's target scale when the column
+   is DECIMAL; non-DECIMAL int64/float64 targets coerce back to
+   Long/Double as before."
   [expr]
   (cond
     (instance? LongValue expr)
     (.getValue ^LongValue expr)
 
     (instance? DoubleValue expr)
-    (.getValue ^DoubleValue expr)
+    ;; Re-parse from the textual representation rather than going
+    ;; through the double — preserves any trailing zeros that the
+    ;; double would discard.
+    (java.math.BigDecimal. (.toString ^DoubleValue expr))
 
     (instance? StringValue expr)
     (.getValue ^StringValue expr)
@@ -2576,7 +2614,10 @@
           inner (parse-insert-value (.getExpression se))]
       (when inner
         (if (= sign \-)
-          (if (instance? Long inner) (- (long inner)) (- (double inner)))
+          (cond
+            (instance? Long inner)               (- (long inner))
+            (instance? java.math.BigDecimal inner) (.negate ^java.math.BigDecimal inner)
+            :else                                 (- (double inner)))
           inner)))
 
     :else
@@ -2923,24 +2964,36 @@
 (def ^:private ^:const OID_TEXT 25)
 
 (defn- value->string
-  "Convert a Clojure value to a string for pgwire text format."
-  [v]
-  (cond
-    (nil? v) nil
-    (instance? Double v) (let [d (double v)]
-                           (if (Double/isNaN d) nil (str d)))
-    (instance? Float v) (let [f (float v)]
-                          (if (Float/isNaN f) nil (str f)))
-    :else (str v)))
+  "Convert a Clojure value to a string for pgwire text format. The
+   2-arity form takes per-column metadata so DECIMAL columns can
+   render their int64 unscaled value as `BigDecimal.toPlainString()`
+   at the declared scale — without meta the value would land as a
+   plain long string (`12345` instead of `123.45`)."
+  ([v] (value->string v nil))
+  ([v col-meta]
+   (cond
+     (nil? v) nil
+     ;; Step 5: DECIMAL column rendering. The stored value is an
+     ;; int64 unscaled long; reconstruct as BigDecimal at the
+     ;; declared scale, then toPlainString (no scientific notation).
+     (and (:decimal? col-meta) (instance? Long v))
+     (decimal/unscaled-long->plain-string (long v) (:scale col-meta))
+     (instance? Double v) (let [d (double v)]
+                            (if (Double/isNaN d) nil (str d)))
+     (instance? Float v) (let [f (float v)]
+                           (if (Float/isNaN f) nil (str f)))
+     :else (str v))))
 
 (defn- meta->oid
   "Resolve a Postgres OID from per-column metadata. Returns nil when the
    metadata doesn't pin a type, in which case the caller falls back to
    value-based inference. Pulled out as a helper so the columnar and
    row-form result paths share one resolver."
-  [{:keys [temporal-unit enum-oid] :as col-meta}]
+  [{:keys [temporal-unit enum-oid decimal?] :as col-meta}]
   (cond
     enum-oid     (int enum-oid)
+    ;; Step 5: DECIMAL / NUMERIC → OID 1700.
+    decimal?     (:numeric pg-type-oids)
     ;; Date column — stored as epoch-days.
     (= :days temporal-unit) (:date pg-type-oids)
     ;; TIMESTAMP family (seconds/millis/micros/nanos). PG only has OID
@@ -3052,11 +3105,18 @@
                            (for [i (range n-rows)]
                              (into-array String
                                          (for [k col-keys]
-                                           (let [arr (get results k)]
+                                           (let [arr (get results k)
+                                                 cm  (get column-meta k)]
                                              (cond
                                                (instance? (Class/forName "[J") arr)
                                                (let [v (aget ^longs arr (int i))]
-                                                 (if (= v Long/MIN_VALUE) nil (str v)))
+                                                 (cond
+                                                   (= v Long/MIN_VALUE) nil
+                                                   ;; Step 5: render DECIMAL longs as scaled BigDecimal.
+                                                   (:decimal? cm)
+                                                   (decimal/unscaled-long->plain-string
+                                                    v (:scale cm))
+                                                   :else (str v)))
                                                (instance? (Class/forName "[D") arr)
                                                (let [v (aget ^doubles arr (int i))]
                                                  (if (Double/isNaN v) nil (str v)))
@@ -3085,7 +3145,9 @@
             rows (into-array (Class/forName "[Ljava.lang.String;")
                              (mapv (fn [row]
                                      (into-array String
-                                                 (mapv #(value->string (get row %)) col-keys)))
+                                                 (mapv #(value->string (get row %)
+                                                                       (get column-meta %))
+                                                       col-keys)))
                                    results))]
         (PgWireServer$QueryResult.
          (into-array String col-names)
