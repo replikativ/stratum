@@ -2778,6 +2778,70 @@
         :else
         [default rest-sql]))))
 
+(defn- column-decimal-meta
+  "If `col-key` references a registered DECIMAL column, return its
+   `{:precision :scale}` map. Else nil. Step 5b helper used by the
+   literal-rescale pass."
+  [registry col-key]
+  (some (fn [[_ tcols]]
+          (when-let [schema (some-> tcols meta :column-schema)]
+            (when-let [cm (get schema col-key)]
+              (when (:decimal? cm) cm))))
+        registry))
+
+(defn- ^:private rescale-literal-for-decimal
+  "Convert a numeric literal to the int64 unscaled representation at
+   `scale`. Used at parse time so the predicate / arithmetic long
+   fast path works against DECIMAL columns without BigDecimal at
+   each row."
+  [v ^long scale]
+  (cond
+    (or (instance? Long v) (instance? Integer v))
+    (try (Math/multiplyExact (long v) (decimal/pow10 scale))
+         (catch ArithmeticException _
+           (throw (ex-info (str "DECIMAL literal " v " overflows int64 at scale " scale)
+                           {:literal v :scale scale}))))
+    (instance? java.math.BigDecimal v)
+    (decimal/bigdec->unscaled-long v scale "decimal literal in WHERE/SELECT")
+    (or (instance? Double v) (instance? Float v))
+    (decimal/bigdec->unscaled-long
+     (java.math.BigDecimal. (str v)) scale "decimal literal in WHERE/SELECT")
+    :else v))
+
+(defn- rescale-decimal-literals
+  "Walk a translated query and rewrite any `[OP col-kw lit]` /
+   `[OP lit col-kw]` where col-kw is a DECIMAL column: rescale lit
+   to the column's unscaled-long form. Leaves other shapes alone
+   (col-vs-col, lit-vs-lit, non-decimal columns, expression
+   sub-trees) so the existing long fast path works correctly.
+
+   In-scope shapes: binary comparison (`= != < <= > >=`), binary
+   arithmetic (`+ - * /`). Out of scope for this pass: `:in`,
+   `:between`, `:like`, function applications. Those still produce
+   the correct answer at low scale columns (Double comparison
+   would float-promote and may be slightly off — documented as a
+   step-5b limitation in `decimal_test.clj`)."
+  [query registry]
+  (let [decimal-binary-ops #{:= :!= :< :<= :> :>= :+ :- :* :/}]
+    (clojure.walk/postwalk
+     (fn [form]
+       (if (and (vector? form)
+                (= 3 (count form))
+                (decimal-binary-ops (first form)))
+         (let [[op a b] form]
+           (cond
+             (and (keyword? a) (number? b))
+             (if-let [cm (column-decimal-meta registry a)]
+               [op a (rescale-literal-for-decimal b (:scale cm))]
+               form)
+             (and (keyword? b) (number? a))
+             (if-let [cm (column-decimal-meta registry b)]
+               [op (rescale-literal-for-decimal a (:scale cm)) b]
+               form)
+             :else form))
+         form))
+     query)))
+
 (defn parse-sql
   "Parse a SQL string and translate to a Stratum query map.
 
@@ -2792,6 +2856,20 @@
      {:options {:analyze? bool :format :text | :json}
       :inner   {:query <map>} | {:system true :tag <str>}}"
   [sql table-registry]
+  (letfn [(post-rescale [r]
+            ;; Step 5b: rescale literals in DECIMAL comparisons /
+            ;; arithmetic so the long fast path sees correctly-scaled
+            ;; values. No-op for non-DECIMAL queries.
+            (cond
+              (:query r)
+              (assoc r :query (rescale-decimal-literals (:query r) table-registry))
+              (:explain r)
+              (if-let [inner-q (get-in r [:explain :inner :query])]
+                (assoc-in r [:explain :inner :query]
+                          (rescale-decimal-literals inner-q table-registry))
+                r)
+              :else r))]
+  (post-rescale
   (try
     ;; Check for EXPLAIN prefix
     (if-let [[opts inner-sql] (parse-explain-prefix sql)]
@@ -2952,7 +3030,7 @@
         (cond-> {:error (.getMessage e)}
           (:sqlstate data) (assoc :sqlstate (:sqlstate data)))))
     (catch Exception e
-      {:error (.getMessage e)})))
+      {:error (.getMessage e)})))))
 
 ;; ============================================================================
 ;; Result formatting for pgwire
@@ -2968,16 +3046,27 @@
    2-arity form takes per-column metadata so DECIMAL columns can
    render their int64 unscaled value as `BigDecimal.toPlainString()`
    at the declared scale — without meta the value would land as a
-   plain long string (`12345` instead of `123.45`)."
+   plain long string (`12345` instead of `123.45`).
+
+   Aggregation outputs (SUM/MIN/MAX) come back as Double from the
+   engine; when the engine-supplied meta tags them as DECIMAL we
+   round-trip via the unscaled long path. Sums > 2^53 lose precision
+   in the Double round-trip — documented step-5c limitation; fixed
+   when SUM returns a typed long result."
   ([v] (value->string v nil))
   ([v col-meta]
    (cond
      (nil? v) nil
-     ;; Step 5: DECIMAL column rendering. The stored value is an
-     ;; int64 unscaled long; reconstruct as BigDecimal at the
-     ;; declared scale, then toPlainString (no scientific notation).
+     ;; Step 5: DECIMAL column rendering — Long input.
      (and (:decimal? col-meta) (instance? Long v))
      (decimal/unscaled-long->plain-string (long v) (:scale col-meta))
+     ;; Step 5c: DECIMAL aggregation result — Double input. Convert
+     ;; via Math/round to recover the unscaled long, then render.
+     (and (:decimal? col-meta) (instance? Double v))
+     (let [d (double v)]
+       (if (Double/isNaN d)
+         nil
+         (decimal/unscaled-long->plain-string (Math/round d) (:scale col-meta))))
      (instance? Double v) (let [d (double v)]
                             (if (Double/isNaN d) nil (str d)))
      (instance? Float v) (let [f (float v)]
@@ -3021,6 +3110,90 @@
          (instance? Double v) OID_FLOAT8
          (float? v) OID_FLOAT8
          :else OID_TEXT))))
+
+(defn- ^:private agg-spec-input-col
+  "Pull the input column keyword out of an agg spec. Examples:
+     [:sum :price]                → :price
+     [:as [:sum :price] :total]   → :price
+     [:count :*]                  → :*
+   Returns nil for shapes we don't recognise (computed agg, function
+   call etc.) — those columns fall back to value-inference at output."
+  [agg-spec]
+  (cond
+    (not (vector? agg-spec)) nil
+    (= :as (first agg-spec)) (recur (second agg-spec))
+    (and (= 2 (count agg-spec)) (keyword? (second agg-spec)))
+    (second agg-spec)
+    :else nil))
+
+(defn- agg-spec-output-keys
+  "Derive the candidate result-map key(s) for an agg spec. The query
+   engine names a single agg by the op kw (`:sum`) but disambiguates
+   duplicate ops as `:op_col` (`:sum_qty`, `:sum_price`). We emit both
+   candidates so the format-results meta lookup hits whichever key
+   the engine ended up using. An explicit `:as alias` wrapper wins."
+  [agg-spec]
+  (cond
+    (not (vector? agg-spec)) []
+    (= :as (first agg-spec)) [(nth agg-spec 2)]
+    (and (= 2 (count agg-spec)) (keyword? (second agg-spec)))
+    [(first agg-spec)
+     (keyword (str (name (first agg-spec)) "_" (name (second agg-spec))))]
+    :else [(first agg-spec)]))
+
+(defn- agg-spec-op
+  "Strip any `:as` wrapper and return the underlying op kw."
+  [agg-spec]
+  (if (and (vector? agg-spec) (= :as (first agg-spec)))
+    (recur (second agg-spec))
+    (when (vector? agg-spec) (first agg-spec))))
+
+(defn output-column-meta
+  "Step 5c: walk a translated query's `:agg` and `:select` and build
+   `{output-col-kw <col-meta>}` for any output column that should
+   carry an input column's DECIMAL precision/scale metadata.
+
+   Rules
+     SUM(dec_col), MIN(dec_col), MAX(dec_col) → preserve (p,s)
+     AVG(dec_col)                              → DOUBLE (no DEC meta)
+     Plain SELECT dec_col                      → preserve (p,s)
+     [:as dec_col alias]                       → alias gets (p,s)
+     Computed expressions, CASTs               → no meta (value-infer)
+
+   Step 5c does not yet flow precision through arithmetic; that lands
+   in a future sub-step. For now this covers the most common pattern
+   (`SELECT SUM(price), MIN(price), MAX(price) FROM t`) where the
+   user expects DECIMAL rendering on the wire."
+  [query registry]
+  (let [;; Reuse column-decimal-meta defined above to look up a
+        ;; col-kw's DECIMAL spec from the registry.
+        agg-meta (into {}
+                       (mapcat (fn [spec]
+                                 (let [outputs (agg-spec-output-keys spec)
+                                       in-col  (agg-spec-input-col spec)
+                                       op      (agg-spec-op spec)
+                                       dec-cm  (when (and in-col (not= in-col :*))
+                                                 (column-decimal-meta registry in-col))]
+                                   (when (and (seq outputs) dec-cm
+                                              (#{:sum :min :max} op))
+                                     (map (fn [k] [k dec-cm]) outputs)))))
+                       (:agg query []))
+        sel-meta (into {}
+                       (keep (fn [spec]
+                               (cond
+                                 ;; bare column reference
+                                 (keyword? spec)
+                                 (when-let [cm (column-decimal-meta registry spec)]
+                                   [spec cm])
+                                 ;; aliased column reference `[:as :col :alias]`
+                                 (and (vector? spec)
+                                      (= :as (first spec))
+                                      (keyword? (second spec)))
+                                 (when-let [cm (column-decimal-meta registry (second spec))]
+                                   [(nth spec 2) cm])
+                                 :else nil)))
+                       (:select query []))]
+    (merge sel-meta agg-meta)))
 
 (defn collect-column-meta
   "Walk every registered table and merge their :column-schema metadata

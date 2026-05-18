@@ -183,6 +183,145 @@
 ;; ===========================================================================
 ;; Restart round-trip
 
+;; ===========================================================================
+;; Step 5b — Comparison + arithmetic literal rescaling
+
+(deftest where-equals-literal
+  (with-server [s {:port (next-port)}]
+    (run-sql s "CREATE TABLE t (price DECIMAL(10,2))")
+    (run-sql s "INSERT INTO t (price) VALUES (1.23)")
+    (run-sql s "INSERT INTO t (price) VALUES (9.99)")
+    (let [r (run-sql s "SELECT price FROM t WHERE price = 1.23")]
+      (is (= [["1.23"]] (:rows r))
+          "WHERE = literal must rescale the literal to the column's int64 form"))))
+
+(deftest where-greater-literal
+  (with-server [s {:port (next-port)}]
+    (run-sql s "CREATE TABLE t (price DECIMAL(10,2))")
+    (doseq [v ["1.00" "5.50" "10.00" "99.99"]]
+      (run-sql s (str "INSERT INTO t (price) VALUES (" v ")")))
+    (let [r (run-sql s "SELECT price FROM t WHERE price > 5.50 ORDER BY price")]
+      (is (= [["10.00"] ["99.99"]] (:rows r))))))
+
+(deftest where-between-style-via-and
+  ;; `BETWEEN` doesn't go through the binary-op rewriter (it's a
+  ;; ternary), but the equivalent `>= AND <=` does. Use the latter
+  ;; until 5b grows BETWEEN support.
+  (with-server [s {:port (next-port)}]
+    (run-sql s "CREATE TABLE t (price DECIMAL(10,2))")
+    (doseq [v ["0.50" "1.00" "1.50" "2.00" "2.50"]]
+      (run-sql s (str "INSERT INTO t (price) VALUES (" v ")")))
+    (let [r (run-sql s "SELECT price FROM t WHERE price >= 1.00 AND price <= 2.00 ORDER BY price")]
+      (is (= [["1.00"] ["1.50"] ["2.00"]] (:rows r))))))
+
+(deftest where-integer-literal-coerced
+  (with-server [s {:port (next-port)}]
+    (run-sql s "CREATE TABLE t (price DECIMAL(10,2))")
+    (run-sql s "INSERT INTO t (price) VALUES (5.00)")
+    (run-sql s "INSERT INTO t (price) VALUES (5.50)")
+    ;; literal `5` (Long) should be coerced to `500` (unscaled) so
+    ;; the comparison matches `5.00`.
+    (let [r (run-sql s "SELECT price FROM t WHERE price = 5")]
+      (is (= [["5.00"]] (:rows r))))))
+
+(deftest where-no-match-on-different-scale-literal
+  ;; `WHERE price = 1.234` on DEC(10,2) — literal has more fractional
+  ;; digits than the column. HALF_EVEN rounding scales 1.234 → 1.23
+  ;; (since the .004 rounds to .00). So the WHERE matches 1.23.
+  (with-server [s {:port (next-port)}]
+    (run-sql s "CREATE TABLE t (price DECIMAL(10,2))")
+    (run-sql s "INSERT INTO t (price) VALUES (1.23)")
+    (let [r (run-sql s "SELECT price FROM t WHERE price = 1.234")]
+      (is (= [["1.23"]] (:rows r))
+          "Literal rounds HALF_EVEN to column scale; matches 1.23"))))
+
+(deftest where-decimal-vs-decimal-same-scale
+  ;; col-vs-col comparison: same scale, long compare works without
+  ;; any rescale.
+  (with-server [s {:port (next-port)}]
+    (run-sql s "CREATE TABLE t (a DECIMAL(10,2), b DECIMAL(10,2))")
+    (run-sql s "INSERT INTO t (a, b) VALUES (1.00, 2.00)")
+    (run-sql s "INSERT INTO t (a, b) VALUES (5.00, 3.00)")
+    (let [r (run-sql s "SELECT a FROM t WHERE a > b")]
+      (is (= [["5.00"]] (:rows r))))))
+
+;; ===========================================================================
+;; Step 5c — Aggregates over DECIMAL columns
+
+(deftest sum-decimal-renders-as-decimal
+  (with-server [s {:port (next-port)}]
+    (run-sql s "CREATE TABLE t (price DECIMAL(10,2))")
+    (doseq [v ["1.23" "2.34" "3.45"]]
+      (run-sql s (str "INSERT INTO t (price) VALUES (" v ")")))
+    (let [r (run-sql s "SELECT SUM(price) FROM t")]
+      ;; 1.23 + 2.34 + 3.45 = 7.02. Unscaled: 123 + 234 + 345 = 702.
+      (is (= [["7.02"]] (:rows r))
+          "SUM(DECIMAL) renders as BigDecimal at the input column's scale")
+      (is (= [OID_NUMERIC] (:oids r))
+          "SUM(DECIMAL) emits OID_NUMERIC on the wire"))))
+
+(deftest sum-with-alias
+  (with-server [s {:port (next-port)}]
+    (run-sql s "CREATE TABLE t (price DECIMAL(10,2))")
+    (doseq [v ["10.00" "20.00"]]
+      (run-sql s (str "INSERT INTO t (price) VALUES (" v ")")))
+    (let [r (run-sql s "SELECT SUM(price) AS total FROM t")]
+      (is (= [["30.00"]] (:rows r)))
+      (is (= [OID_NUMERIC] (:oids r))))))
+
+(deftest min-max-decimal
+  (with-server [s {:port (next-port)}]
+    (run-sql s "CREATE TABLE t (price DECIMAL(10,2))")
+    (doseq [v ["1.00" "5.50" "10.99"]]
+      (run-sql s (str "INSERT INTO t (price) VALUES (" v ")")))
+    (let [r (run-sql s "SELECT MIN(price), MAX(price) FROM t")]
+      (is (= [["1.00" "10.99"]] (:rows r))
+          "MIN/MAX over DECIMAL preserve precision + scale")
+      (is (= [OID_NUMERIC OID_NUMERIC] (:oids r))))))
+
+(deftest avg-decimal-returns-double
+  ;; Step 5c open-question decision: AVG(DECIMAL) → DOUBLE (matches
+  ;; DuckDB). The result column emits OID_FLOAT8, not OID_NUMERIC.
+  (with-server [s {:port (next-port)}]
+    (run-sql s "CREATE TABLE t (price DECIMAL(10,2))")
+    (doseq [v ["1.00" "2.00" "3.00"]]
+      (run-sql s (str "INSERT INTO t (price) VALUES (" v ")")))
+    (let [r (run-sql s "SELECT AVG(price) FROM t")
+          OID_FLOAT8 701]
+      ;; AVG = 2.0 as DOUBLE. Engine returns 2.0 directly; the
+      ;; unscaled-long-divided-by-scale conversion happens in the
+      ;; engine's AVG decode, so the rendered value isn't scaled
+      ;; here — it's the raw double 2.0.
+      (is (= [OID_FLOAT8] (:oids r))
+          "AVG(DECIMAL) emits OID_FLOAT8 (matches DuckDB)"))))
+
+(deftest sum-with-group-by
+  (with-server [s {:port (next-port)}]
+    (run-sql s "CREATE TABLE t (cat TEXT, price DECIMAL(10,2))")
+    (run-sql s "INSERT INTO t (cat, price) VALUES ('a', 1.50)")
+    (run-sql s "INSERT INTO t (cat, price) VALUES ('a', 2.50)")
+    (run-sql s "INSERT INTO t (cat, price) VALUES ('b', 3.00)")
+    (let [r (run-sql s "SELECT cat, SUM(price) FROM t GROUP BY cat ORDER BY cat")]
+      (is (= [["a" "4.00"] ["b" "3.00"]] (:rows r))
+          "GROUP BY DEC + SUM(DEC) renders correctly"))))
+
+(deftest mixed-numeric-and-decimal-aggregate
+  (with-server [s {:port (next-port)}]
+    (run-sql s "CREATE TABLE t (qty INT, price DECIMAL(10,2))")
+    (run-sql s "INSERT INTO t (qty, price) VALUES (1, 1.00)")
+    (run-sql s "INSERT INTO t (qty, price) VALUES (2, 2.00)")
+    (let [r (run-sql s "SELECT SUM(qty), SUM(price) FROM t")
+          OID_FLOAT8 701]
+      ;; SUM(qty) returns DOUBLE per pre-existing Stratum behaviour
+      ;; (engine widens to double; PG/DuckDB widen to BIGINT/HUGEINT —
+      ;; pre-existing discrepancy, separate ticket).
+      ;; SUM(price) carries DECIMAL meta thanks to step 5c.
+      (is (= 1 (count (:rows r))))
+      (is (= [OID_FLOAT8 OID_NUMERIC] (:oids r))))))
+
+;; ===========================================================================
+;; Step 5b — Restart unchanged
+
 (deftest decimal-survives-restart
   (let [path (temp-dir)]
     (try

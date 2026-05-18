@@ -1430,13 +1430,14 @@
                 result (if-let [sel-cols (:_select-columns query)]
                          (sql/apply-select-columns result sel-cols)
                          result)
-                ;; Step 4a: build a column-meta map from the live
-                ;; registry so DDL-declared types (DATE, TIMESTAMP_MS,
-                ;; ENUM, …) surface as the correct PG OID instead of
-                ;; OID_INT8 / OID_TEXT. Computed columns and CAST
-                ;; outputs that don't match a registered column fall
+                ;; Step 4a + 5c: build the column-meta map from the
+                ;; live registry (declared columns) and overlay
+                ;; per-query output-meta (aggregations preserve their
+                ;; input column's DECIMAL precision/scale, etc.).
+                ;; Computed columns / CASTs / expressions still fall
                 ;; back to value-based inference.
-                column-meta (sql/collect-column-meta @table-registry-atom)]
+                column-meta (merge (sql/collect-column-meta @table-registry-atom)
+                                   (sql/output-column-meta query @table-registry-atom))]
             (sql/format-results result column-meta))
 
           :else
