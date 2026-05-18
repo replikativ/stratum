@@ -1210,6 +1210,9 @@
                        out-cols)
         ;; Per-key reader fn that decodes the i-th row, applying dict
         ;; lookup for dict-encoded string columns.
+        ;; F-034: map sentinels to nil at the API boundary. Long
+        ;; Long.MIN_VALUE and Double NaN reach user code as `nil`,
+        ;; mirroring `aget-col-decoded` from the columnar path.
         reader  (fn [k]
                   (let [col (get prefixed k)
                         data (:data col)
@@ -1222,9 +1225,13 @@
                           (when (>= code 0)
                             (aget ^"[Ljava.lang.String;" dict (int code)))))
                       (instance? (Class/forName "[J") data)
-                      (fn [^long i] (aget ^longs data i))
+                      (fn [^long i]
+                        (let [lv (aget ^longs data i)]
+                          (when (not= lv Long/MIN_VALUE) lv)))
                       (instance? (Class/forName "[D") data)
-                      (fn [^long i] (aget ^doubles data i))
+                      (fn [^long i]
+                        (let [dv (aget ^doubles data i)]
+                          (when-not (Double/isNaN dv) dv)))
                       (instance? (Class/forName "[Ljava.lang.String;") data)
                       (fn [^long i] (aget ^"[Ljava.lang.String;" data i))
                       :else (fn [^long _i] nil))))

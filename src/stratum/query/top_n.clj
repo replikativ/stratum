@@ -140,20 +140,31 @@
    comparison ordering — dict-IDs are insertion-ordered and not
    directly meaningful, so string ordering returns is supported only
    when a sorted dict (or numeric dict) is in use. Callers gate on
-   `:type` already; this is a guard."
+   `:type` already; this is a guard.
+
+   F-019: long NULL (Long.MIN_VALUE) maps to Double/NaN so the heap
+   comparator (`Double/compare`) sorts NULL keys after every real
+   value in ASC order — matches PG's default NULLS LAST. Without the
+   mapping, Long.MIN_VALUE casted to double is -9.22e18 and sorts as
+   the smallest, putting NULLs FIRST."
   ^double [chk ^long i datatype]
   (case datatype
     :float64 (chunk/read-double chk i)
-    :int64   (double (chunk/read-long chk i))
-    :string  (double (chunk/read-long chk i))))
+    :int64   (let [lv (chunk/read-long chk i)]
+               (if (= lv Long/MIN_VALUE) Double/NaN (double lv)))
+    :string  (let [lv (chunk/read-long chk i)]
+               (if (= lv Long/MIN_VALUE) Double/NaN (double lv)))))
 
 (defn- key-double-from-array
-  "Same as `key-double` but pulls from a heap array (long[]/double[])."
+  "Same as `key-double` but pulls from a heap array (long[]/double[]).
+   F-019: long NULL sentinel maps to NaN — see `key-double`."
   ^double [arr ^long i datatype]
   (case datatype
     :float64 (aget ^doubles arr i)
-    :int64   (double (aget ^longs arr i))
-    :string  (double (aget ^longs arr i))))
+    :int64   (let [lv (aget ^longs arr i)]
+               (if (= lv Long/MIN_VALUE) Double/NaN (double lv)))
+    :string  (let [lv (aget ^longs arr i)]
+               (if (= lv Long/MIN_VALUE) Double/NaN (double lv)))))
 
 (defn- maybe-evict-and-offer!
   "Heap-fill or evict-and-replace logic shared between the index and
@@ -412,7 +423,11 @@
                                       (chunks-by-id-for idx surviving-chunk-ids))]
                               (vswap! chunk-maps assoc k m)
                               m)))]
-    ;; Phase 2: fetch rows
+    ;; Phase 2: fetch rows.
+    ;; F-033: map sentinel values to nil at the API boundary so the
+    ;; user-visible result doesn't expose Long.MIN_VALUE / NaN.
+    ;; `decode-string-value` runs after the sentinel mapping so a
+    ;; dict-encoded NULL string already passed through as nil.
     (mapv
      (fn [^TopNEntry e]
        (let [chunk-id (.chunk-id e)
@@ -425,15 +440,19 @@
                                 (let [d (:data col-info)]
                                   (cond
                                     (expr/long-array? d)
-                                    (aget ^longs d (int local-idx))
+                                    (let [lv (aget ^longs d (int local-idx))]
+                                      (when (not= lv Long/MIN_VALUE) lv))
                                     (expr/double-array? d)
-                                    (aget ^doubles d (int local-idx))
+                                    (let [dv (aget ^doubles d (int local-idx))]
+                                      (when-not (Double/isNaN dv) dv))
                                     :else (nth d local-idx)))
                                 (:index col-info)
                                 (when-let [chk (get (get-chunk-map k) chunk-id)]
                                   (case (:type col-info)
-                                    :float64 (chunk/read-double chk local-idx)
-                                    (chunk/read-long chk local-idx)))
+                                    :float64 (let [dv (chunk/read-double chk local-idx)]
+                                               (when-not (Double/isNaN dv) dv))
+                                    (let [lv (chunk/read-long chk local-idx)]
+                                      (when (not= lv Long/MIN_VALUE) lv))))
                                 :else nil)
                             v (decode-string-value col-info v)]
                         [(norm/strip-ns k) v])))
