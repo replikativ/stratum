@@ -347,7 +347,7 @@ All share copy-on-write semantics and can be branched together via Yggdrasil.
 - **Persistence**: O(1) CoW snapshots, branching, time-travel, lazy loading from storage; SQL `CREATE TABLE`/`INSERT`/`CREATE MODEL` + live-table bindings survive restart when the server is started with `:store`
 - **Audit**: content-addressed `:crypto-hash?` commits, `stratum.audit/verify-chain` for tamper detection (shallow + deep PSS-tree walks), `IAuditable` protocol for embedding into larger storage substrates ([doc/audit.md](doc/audit.md))
 - **Bitemporal**: SQL:2011 valid- and system-time axes, `FOR PORTION OF VALID_TIME` DML, `FOR (VALID|SYSTEM)_TIME AS OF` time-travel reads, Allen interval predicates ([doc/temporal-design.md](doc/temporal-design.md))
-- **Data**: CSV/Parquet import, dictionary-encoded strings, PostgreSQL NULL semantics, ad-hoc file queries
+- **Data**: CSV/Parquet import, dictionary-encoded strings, PostgreSQL NULL semantics, ad-hoc file queries, user-defined `ENUM` types (`CREATE TYPE … AS ENUM (…)` with INSERT validation + `pg_type`/`pg_enum` introspection)
 - **Integration**: tablecloth/tech.ml.dataset interop, Datahike, Yggdrasil
 - **Analytics**: Isolation forest anomaly detection (SQL model management, scoring, online rotation)
 - **Time-series**: microsecond-precision TIMESTAMP, RANGE-BETWEEN-INTERVAL frames, TIME_BUCKET, FIRST/LAST/NTH_VALUE, FILLS/LOCF, EMA, RLEID, q-style moving aggregates (MAVG/MSUM/MMIN/MMAX/MDEV), window-join (`wj`) and LATEST ON (DISTINCT ON) helpers

@@ -39,8 +39,10 @@
 ;; earlier in the file for historical reasons — calls into them.
 (declare make-durable-sql-table! durable-cols? resync-durable-table!
          hydrate-sql-tables! hydrate-models! hydrate-live-tables!
+         hydrate-enums!
          empty-col-array columns->descriptors
-         durable-branch durable-meta)
+         durable-branch durable-meta
+         resolve-enum-columns validate-enum-rows!)
 
 ;; ============================================================================
 ;; File path validation
@@ -764,15 +766,47 @@
             (let [{:keys [op table columns rows assignments where
                           conflict-cols action from table-alias] :as ddl} (:ddl parsed)]
               (case op
+                :create-type-enum
+                (let [{:keys [type-name values or-replace?]} ddl
+                      existing (get-in @table-registry-atom ["__enums__" type-name])]
+                  (when (and existing (not or-replace?))
+                    (throw (ex-info (str "Type already exists: " type-name
+                                         " (use OR REPLACE to overwrite)")
+                                    {:type-name type-name})))
+                  (let [oid    (if (and existing store (= values (:values-ordered existing)))
+                                 (:oid existing)
+                                 (if store
+                                   (srv-state/allocate-oid! store)
+                                   ;; No durable store: allocate a session-local OID.
+                                   ;; Counter lives in the registry's `__enum-oid__` slot.
+                                   (let [next (-> (swap! table-registry-atom
+                                                         update "__enum-oid__"
+                                                         (fnil inc srv-state/FIRST-USER-OID))
+                                                  (get "__enum-oid__"))]
+                                     (long next))))
+                        record {:values-ordered (vec values) :oid (long oid)}]
+                    (swap! table-registry-atom assoc-in ["__enums__" type-name] record)
+                    (when store
+                      (srv-state/put! store :enums type-name record)))
+                  (PgWireServer$QueryResult/empty "CREATE TYPE"))
+
                 :create-table
                 (do
-                  ;; Phase-R2 limit: the durable INSERT path goes through
-                  ;; dataset/append! → idx-append!, which does not yet
-                  ;; encode strings against a column's dict. Until that
-                  ;; lands (separate ticket), a CREATE TABLE with any
-                  ;; TEXT/VARCHAR/STRING column falls back to the
-                  ;; non-durable heap path with a clear warning, so
-                  ;; INSERT keeps working — just doesn't persist.
+                  ;; Resolve enum-typed columns against the registry
+                  ;; before the storage shape is decided. An unknown
+                  ;; type that doesn't match any registered enum is
+                  ;; an error (no silent fall-through to :string —
+                  ;; the user typed something we don't recognise).
+                  (let [enums (get @table-registry-atom "__enums__")
+                        columns (resolve-enum-columns columns enums)]
+                    ;; Phase-R2 limit: the durable INSERT path goes through
+                    ;; dataset/append! → idx-append!, which does not yet
+                    ;; encode strings against a column's dict. Until that
+                    ;; lands (separate ticket), a CREATE TABLE with any
+                    ;; TEXT/VARCHAR/STRING column (including any column
+                    ;; that resolved to an enum) falls back to the
+                    ;; non-durable heap path with a clear warning, so
+                    ;; INSERT keeps working — just doesn't persist.
                   (if (and store (not (some #(= :string (:type %)) columns)))
                     ;; Durable path (restart-safety R2): allocate an
                     ;; empty index-backed dataset, sync to a per-table
@@ -801,7 +835,7 @@
                             cols (if (seq schema)
                                    (with-meta cols {:column-schema schema})
                                    cols)]
-                        (swap! table-registry-atom assoc table cols))))
+                        (swap! table-registry-atom assoc table cols)))))
                   (PgWireServer$QueryResult/empty "CREATE TABLE"))
 
                 :drop-table
@@ -866,6 +900,15 @@
                             ddl)]
                   (when-not existing
                     (throw (ex-info (str "Table not found: " table) {:table table})))
+                  ;; ENUM validation: for each enum-typed column,
+                  ;; every inserted label must be in the declared set.
+                  ;; Runs before any storage path so partial-insert
+                  ;; can't leave the table in a half-validated state.
+                  (validate-enum-rows!
+                   table (or (:columns ddl) (vec (keys existing)))
+                   rows
+                   (meta existing)
+                   (get @table-registry-atom "__enums__"))
                   (cond
                 ;; INSERT … FOR PORTION OF VALID_TIME on a fully
                 ;; index-backed bitemporal table lowers to append!
@@ -1427,13 +1470,19 @@
   (str "sql/" table-name))
 
 (defn- columns->descriptors
-  "Reduce a DDL :columns vector into a {col-kw {:type unit}} schema map.
-   Used to compose the side-schema attached as Clojure metadata."
+  "Reduce a DDL :columns vector into a {col-kw <descriptor>} schema map.
+   Used to compose the side-schema attached as Clojure metadata so
+   downstream INSERT/UPDATE handlers can see per-column policy
+   without re-reading the parser output. Captures `:temporal-unit`
+   (DATE/TIMESTAMP precision) and `:enum-of` (declared enum name)."
   [columns]
   (into {}
-        (keep (fn [{:keys [name temporal-unit]}]
-                (when temporal-unit
-                  [(keyword name) {:temporal-unit temporal-unit}])))
+        (keep (fn [{:keys [name temporal-unit enum-of]}]
+                (when (or temporal-unit enum-of)
+                  [(keyword name)
+                   (cond-> {}
+                     temporal-unit (assoc :temporal-unit temporal-unit)
+                     enum-of       (assoc :enum-of enum-of))])))
         columns))
 
 (defn- durable-meta
@@ -1520,6 +1569,75 @@
     (doseq [[model-name model] records]
       (swap! registry-atom assoc-in ["__models__" model-name] model))
     (count records)))
+
+(defn- hydrate-enums!
+  "On server start with a configured store, reinstall every persisted
+   ENUM declaration into the in-memory registry's `__enums__` slot.
+   Returns the count of enums loaded. The value-set + OID round-trips
+   without modification — `resolve-enum-columns` consults this map
+   when a CREATE TABLE column names an enum type, and INSERT
+   validation reads it to reject unknown labels."
+  [store registry-atom]
+  (let [records (srv-state/list-section store :enums)]
+    (doseq [[enum-name record] records]
+      (swap! registry-atom assoc-in ["__enums__" enum-name] record))
+    (count records)))
+
+(defn- validate-enum-rows!
+  "Reject INSERT/UPSERT/UPDATE rows whose enum-typed column values
+   aren't in the declared label set. Throws with column + offending
+   value on first violation — pre-empts any storage write so a
+   partial-insert can't leave the table half-validated. NULL is
+   permitted (SQL standard); column-level NOT NULL is a separate
+   axis."
+  [table-name col-order rows table-meta enums]
+  (let [col-schema (:column-schema table-meta)
+        enum-cols  (vec
+                    (keep-indexed
+                     (fn [idx col-kw]
+                       (when-let [enum-name (get-in col-schema [col-kw :enum-of])]
+                         (let [values (-> enums (get enum-name) :values-ordered set)]
+                           {:idx       idx
+                            :col       col-kw
+                            :enum-name enum-name
+                            :values    values})))
+                     col-order))]
+    (when (seq enum-cols)
+      (doseq [[row-idx row] (map-indexed vector rows)
+              {:keys [idx col enum-name values]} enum-cols]
+        (let [v (nth row idx nil)]
+          (when (and (some? v) (not (contains? values v)))
+            (throw (ex-info (str "invalid input value for enum "
+                                 enum-name ": " (pr-str v))
+                            {:table     table-name
+                             :column    col
+                             :row       row-idx
+                             :enum      enum-name
+                             :value     v
+                             :allowed   values}))))))))
+
+(defn- resolve-enum-columns
+  "Walk the DDL :columns vector and rewrite any column whose
+   `:type` is `:unknown` to a string column tagged with the
+   resolved enum metadata. Throws a clear error if the named type
+   isn't in `enums` — silent fall-through to `:string` (the old
+   behaviour) would mask user typos."
+  [columns enums]
+  (mapv (fn [{:keys [type type-name] :as col}]
+          (if (= type :unknown)
+            (if-let [enum (get enums type-name)]
+              (-> col
+                  (assoc :type :string)
+                  (assoc :enum-of type-name)
+                  (assoc :enum-values (:values-ordered enum))
+                  (dissoc :type-name))
+              (throw (ex-info (str "Unknown column type: " type-name
+                                   " (no CREATE TYPE declares it)")
+                              {:type-name type-name
+                               :column    (:name col)
+                               :available (keys enums)})))
+            col))
+        columns))
 
 (defn- hydrate-live-tables!
   "On server start with a configured store, reinstall every persisted
@@ -1631,9 +1749,10 @@
              ;; so subsequent DML re-syncs back to the same branch.
              (let [n-tables (hydrate-sql-tables! store registry)
                    n-models (hydrate-models! store registry)
-                   n-live   (hydrate-live-tables! store registry)]
-               (println (format "Hydrated server state: %d SQL tables, %d models, %d live tables"
-                                n-tables n-models n-live)))
+                   n-live   (hydrate-live-tables! store registry)
+                   n-enums  (hydrate-enums! store registry)]
+               (println (format "Hydrated server state: %d SQL tables, %d models, %d live tables, %d enums"
+                                n-tables n-models n-live n-enums)))
              (do
                (println "WARNING: stratum.server/start invoked without :store —")
                (println "         SQL CREATE TABLE / ENUM / MODEL state is session-scoped")

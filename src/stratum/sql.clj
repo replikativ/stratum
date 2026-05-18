@@ -2227,6 +2227,10 @@
           (.contains sql-lower "pg_catalog.pg_namespace"))
       :pg_namespace
 
+      (or (.contains sql-lower "pg_enum")
+          (.contains sql-lower "pg_catalog.pg_enum"))
+      :pg_enum
+
       (or (.contains sql-lower "pg_type")
           (.contains sql-lower "pg_catalog.pg_type"))
       :pg_type
@@ -2283,19 +2287,46 @@
      :tag (str "SELECT " (count rows))}))
 
 (defn- handle-pg-type
-  "Return minimal pg_type rows for type introspection."
-  []
-  (let [rows [["20" "int8" "8"]
+  "Return pg_type rows for type introspection. The base set covers the
+   wire-protocol-relevant builtin OIDs; user-declared ENUM types
+   (registered under `__enums__` in the table-registry) are appended
+   with their allocated OIDs and `typlen = 4` so clients (psql `\\dT`,
+   Odoo, pgjdbc introspection) see them."
+  [table-registry]
+  (let [base [["20" "int8" "8"]
               ["23" "int4" "4"]
               ["701" "float8" "8"]
               ["25" "text" "-1"]
               ["1043" "varchar" "-1"]
               ["16" "bool" "1"]
               ["1082" "date" "4"]
-              ["1114" "timestamp" "8"]]]
+              ["1114" "timestamp" "8"]]
+        enums (get table-registry "__enums__")
+        enum-rows (mapv (fn [[type-name {:keys [oid]}]]
+                          [(str oid) type-name "4"])
+                        (sort-by first enums))
+        rows (into base enum-rows)]
     {:system true
      :result {:columns ["oid" "typname" "typlen"]
               :oids [(:oid pg-type-oids) (:name pg-type-oids) (:int4 pg-type-oids)]
+              :rows rows}
+     :tag (str "SELECT " (count rows))}))
+
+(defn- handle-pg-enum
+  "Return pg_enum rows for ENUM introspection. One row per (enum,
+   label) pair carrying `enumtypid` (the enum's allocated OID),
+   `enumsortorder` (the declaration index as float4, matching PG
+   semantics), and `enumlabel` (the value). Empty when no ENUM types
+   are declared."
+  [table-registry]
+  (let [enums (get table-registry "__enums__")
+        rows (vec
+              (for [[type-name {:keys [oid values-ordered]}] (sort-by first enums)
+                    [idx label] (map-indexed vector values-ordered)]
+                [(str oid) (str (double (inc idx))) label]))]
+    {:system true
+     :result {:columns ["enumtypid" "enumsortorder" "enumlabel"]
+              :oids [(:oid pg-type-oids) (:float4 pg-type-oids) (:name pg-type-oids)]
               :rows rows}
      :tag (str "SELECT " (count rows))}))
 
@@ -2346,7 +2377,8 @@
     :pg_database (handle-pg-database)
     :pg_class (handle-pg-class table-registry)
     :pg_namespace (handle-pg-namespace)
-    :pg_type (handle-pg-type)
+    :pg_type (handle-pg-type table-registry)
+    :pg_enum (handle-pg-enum table-registry)
     :pg_attribute (handle-pg-attribute table-registry)
     :pg_tables (handle-pg-tables table-registry)
     :information_schema {:system true
@@ -2400,7 +2432,12 @@
           (= t "TIMESTAMP WITHOUT TIME ZONE") (= t "TIMESTAMP WITH TIME ZONE"))
       {:type :int64 :temporal-unit :micros}
 
-      :else {:type :string})))
+      ;; Unknown type — leave it for the server to resolve. ENUM type
+      ;; names (declared via CREATE TYPE … AS ENUM) are recognised
+      ;; here as the *literal* identifier the user typed; the DDL
+      ;; descriptor carries it forward and the server's :create-table
+      ;; handler resolves it against the enum registry.
+      :else {:type :unknown :type-name type-str})))
 
 (defn- translate-create-table
   "Translate a JSqlParser CreateTable into a DDL descriptor.
@@ -2417,7 +2454,15 @@
                               (cond-> {:name (.getColumnName cd)
                                        :type (:type type-info)}
                                 (:temporal-unit type-info)
-                                (assoc :temporal-unit (:temporal-unit type-info)))))
+                                (assoc :temporal-unit (:temporal-unit type-info))
+                                ;; Pass through the literal SQL type name
+                                ;; for any unrecognised type. The server
+                                ;; resolves these against its enum
+                                ;; registry; absence here means the user
+                                ;; named a type that no CREATE TYPE
+                                ;; declared.
+                                (:type-name type-info)
+                                (assoc :type-name (:type-name type-info)))))
                           col-defs)}}))
 
 (defn- parse-insert-value
