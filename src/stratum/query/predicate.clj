@@ -309,20 +309,29 @@
                        (let [codes ^longs (:data col-info)
                              dict ^"[Ljava.lang.String;" (:dict col-info)
                              alpha-masks ^ints (:dict-alpha-masks col-info)
-                             bigram-masks ^longs (:dict-bigram-masks col-info)]
+                             bigram-masks ^longs (:dict-bigram-masks col-info)
+                             ;; F-015 (3VL for NOT-LIKE/NOT-ILIKE): the
+                             ;; positive-LIKE mask emits 0 for NULL codes
+                             ;; (correct: NULL LIKE x is UNKNOWN). The
+                             ;; previous `(if (zero? m) 1 0)` flip would
+                             ;; then claim NULL rows match NOT-LIKE,
+                             ;; which is also wrong (NOT NULL = UNKNOWN).
+                             ;; Gate the flip on a per-row NULL check so
+                             ;; NULL rows stay 0 for negated forms.
+                             flip-not (fn ^longs [^longs m]
+                                        (let [r (long-array length)]
+                                          (dotimes [j length]
+                                            (when (and (not= (aget codes j) Long/MIN_VALUE)
+                                                       (zero? (aget m j)))
+                                              (aset r j 1)))
+                                          r))]
                          (case op
                            :like (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern) (int length) alpha-masks bigram-masks)
-                           :not-like (let [m (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern) (int length) alpha-masks bigram-masks)
-                                           r (long-array length)]
-                                       (dotimes [j length] (aset r j (if (zero? (aget m j)) 1 0)))
-                                       r)
+                           :not-like (flip-not (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern) (int length) alpha-masks bigram-masks))
                            :ilike (let [ldict (into-array String (map #(.toLowerCase ^String %) dict))]
                                     (ColumnOpsString/arrayStringLikeFastMasked codes ldict (.toLowerCase (str pattern)) (int length) alpha-masks bigram-masks))
-                           :not-ilike (let [ldict (into-array String (map #(.toLowerCase ^String %) dict))
-                                            m (ColumnOpsString/arrayStringLikeFastMasked codes ldict (.toLowerCase (str pattern)) (int length) alpha-masks bigram-masks)
-                                            r (long-array length)]
-                                        (dotimes [j length] (aset r j (if (zero? (aget m j)) 1 0)))
-                                        r)
+                           :not-ilike (let [ldict (into-array String (map #(.toLowerCase ^String %) dict))]
+                                        (flip-not (ColumnOpsString/arrayStringLikeFastMasked codes ldict (.toLowerCase (str pattern)) (int length) alpha-masks bigram-masks)))
                            :contains (ColumnOpsString/arrayStringLikeFastMasked codes dict (str "%" pattern "%") (int length) alpha-masks bigram-masks)
                            :starts-with (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern "%") (int length) alpha-masks bigram-masks)
                            :ends-with (ColumnOpsString/arrayStringLikeFastMasked codes dict (str "%" pattern) (int length) alpha-masks bigram-masks)))

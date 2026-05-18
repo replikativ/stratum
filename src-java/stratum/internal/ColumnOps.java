@@ -1464,7 +1464,9 @@ public final class ColumnOps {
     public static double[] arrayExtractYear(long[] epochDays, int length) {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
-            long z = epochDays[i] + 719468;
+            long v = epochDays[i];
+            if (v == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
+            long z = v + 719468;
             long era = (z >= 0 ? z : z - 146096) / 146097;
             long doe = z - era * 146097;
             long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
@@ -1481,7 +1483,9 @@ public final class ColumnOps {
     public static double[] arrayExtractMonth(long[] epochDays, int length) {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
-            long z = epochDays[i] + 719468;
+            long v = epochDays[i];
+            if (v == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
+            long z = v + 719468;
             long era = (z >= 0 ? z : z - 146096) / 146097;
             long doe = z - era * 146097;
             long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
@@ -1496,7 +1500,9 @@ public final class ColumnOps {
     public static double[] arrayExtractDay(long[] epochDays, int length) {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
-            long z = epochDays[i] + 719468;
+            long v = epochDays[i];
+            if (v == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
+            long z = v + 719468;
             long era = (z >= 0 ? z : z - 146096) / 146097;
             long doe = z - era * 146097;
             long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
@@ -1512,6 +1518,7 @@ public final class ColumnOps {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
             long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
             long daySeconds = ((s % 86400) + 86400) % 86400;
             r[i] = (double) (daySeconds / 3600);
         }
@@ -1523,6 +1530,7 @@ public final class ColumnOps {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
             long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
             long daySeconds = ((s % 86400) + 86400) % 86400;
             r[i] = (double) ((daySeconds % 3600) / 60);
         }
@@ -1534,6 +1542,7 @@ public final class ColumnOps {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
             long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
             long daySeconds = ((s % 86400) + 86400) % 86400;
             r[i] = (double) (daySeconds % 60);
         }
@@ -1544,8 +1553,10 @@ public final class ColumnOps {
     public static double[] arrayExtractDayOfWeek(long[] epochDays, int length) {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
+            long v = epochDays[i];
+            if (v == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
             // 1970-01-01 is Thursday (3 in 0=Mon scheme)
-            long d = ((epochDays[i] % 7) + 10) % 7; // shift to 0=Mon
+            long d = ((v % 7) + 10) % 7; // shift to 0=Mon
             r[i] = (double) d;
         }
         return r;
@@ -1556,6 +1567,7 @@ public final class ColumnOps {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
             long ed = epochDays[i];
+            if (ed == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
             long dow = ((ed % 7) + 10) % 7; // 0=Mon
             // Thursday of this week
             long thu = ed + (3 - dow);
@@ -2132,12 +2144,16 @@ public final class ColumnOps {
         ymd[2] = d;
     }
 
-    /** DATE_TRUNC to year: zero month/day, keep as epoch-seconds */
+    /** DATE_TRUNC to year: zero month/day, keep as epoch-seconds.
+     *  F-017: NULL sentinel (Long.MIN_VALUE) propagates as-is so downstream
+     *  agg / extract paths recognise the same convention. */
     public static long[] arrayDateTruncYear(long[] epochSeconds, int length) {
         long[] r = new long[length];
         long[] ymd = new long[3];
         for (int i = 0; i < length; i++) {
-            long epochDays = Math.floorDiv(epochSeconds[i], 86400L);
+            long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Long.MIN_VALUE; continue; }
+            long epochDays = Math.floorDiv(s, 86400L);
             civilFromDays(epochDays, ymd);
             r[i] = civilToDays(ymd[0], 1, 1) * 86400L;
         }
@@ -2149,7 +2165,9 @@ public final class ColumnOps {
         long[] r = new long[length];
         long[] ymd = new long[3];
         for (int i = 0; i < length; i++) {
-            long epochDays = Math.floorDiv(epochSeconds[i], 86400L);
+            long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Long.MIN_VALUE; continue; }  // F-017
+            long epochDays = Math.floorDiv(s, 86400L);
             civilFromDays(epochDays, ymd);
             r[i] = civilToDays(ymd[0], ymd[1], 1) * 86400L;
         }
@@ -2160,7 +2178,8 @@ public final class ColumnOps {
     public static long[] arrayDateTruncDay(long[] epochSeconds, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorDiv(epochSeconds[i], 86400L) * 86400L;
+            long s = epochSeconds[i];
+            r[i] = (s == Long.MIN_VALUE) ? Long.MIN_VALUE : Math.floorDiv(s, 86400L) * 86400L;  // F-017
         }
         return r;
     }
@@ -2169,7 +2188,8 @@ public final class ColumnOps {
     public static long[] arrayDateTruncHour(long[] epochSeconds, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorDiv(epochSeconds[i], 3600L) * 3600L;
+            long s = epochSeconds[i];
+            r[i] = (s == Long.MIN_VALUE) ? Long.MIN_VALUE : Math.floorDiv(s, 3600L) * 3600L;  // F-017
         }
         return r;
     }
@@ -2178,32 +2198,40 @@ public final class ColumnOps {
     public static long[] arrayDateTruncMinute(long[] epochSeconds, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorDiv(epochSeconds[i], 60L) * 60L;
+            long s = epochSeconds[i];
+            r[i] = (s == Long.MIN_VALUE) ? Long.MIN_VALUE : Math.floorDiv(s, 60L) * 60L;  // F-017
         }
         return r;
     }
 
-    /** DATE_ADD days: add N days (as seconds) */
+    /** DATE_ADD days: add N days (as seconds). F-017: preserve NULL. */
     public static long[] arrayDateAddDays(long[] epochSeconds, long nDays, int length) {
         long[] r = new long[length];
         long delta = nDays * 86400L;
-        for (int i = 0; i < length; i++) r[i] = epochSeconds[i] + delta;
+        for (int i = 0; i < length; i++) {
+            long s = epochSeconds[i];
+            r[i] = (s == Long.MIN_VALUE) ? Long.MIN_VALUE : s + delta;
+        }
         return r;
     }
 
-    /** DATE_ADD seconds: add N seconds */
+    /** DATE_ADD seconds: add N seconds. F-017: preserve NULL. */
     public static long[] arrayDateAddSeconds(long[] epochSeconds, long nSeconds, int length) {
         long[] r = new long[length];
-        for (int i = 0; i < length; i++) r[i] = epochSeconds[i] + nSeconds;
+        for (int i = 0; i < length; i++) {
+            long s = epochSeconds[i];
+            r[i] = (s == Long.MIN_VALUE) ? Long.MIN_VALUE : s + nSeconds;
+        }
         return r;
     }
 
-    /** DATE_ADD months: add N months using Hinnant civil date arithmetic */
+    /** DATE_ADD months: add N months using Hinnant civil date arithmetic. F-017: preserve NULL. */
     public static long[] arrayDateAddMonths(long[] epochSeconds, int nMonths, int length) {
         long[] r = new long[length];
         long[] ymd = new long[3];
         for (int i = 0; i < length; i++) {
             long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Long.MIN_VALUE; continue; }
             long epochDays = Math.floorDiv(s, 86400L);
             long timeOfDay = s - epochDays * 86400L;
             civilFromDays(epochDays, ymd);
@@ -2226,17 +2254,27 @@ public final class ColumnOps {
         return r;
     }
 
-    /** DATE_DIFF: difference in fractional days between two epoch-second columns */
+    /** DATE_DIFF: difference in fractional days between two epoch-second columns.
+     *  F-017: if either side is NULL, result is NaN (SQL UNKNOWN). */
     public static double[] arrayDateDiffDays(long[] a, long[] b, int length) {
         double[] r = new double[length];
-        for (int i = 0; i < length; i++) r[i] = (double)(a[i] - b[i]) / 86400.0;
+        for (int i = 0; i < length; i++) {
+            long av = a[i], bv = b[i];
+            r[i] = (av == Long.MIN_VALUE || bv == Long.MIN_VALUE)
+                   ? Double.NaN : (double)(av - bv) / 86400.0;
+        }
         return r;
     }
 
-    /** DATE_DIFF: difference in seconds between two epoch-second columns */
+    /** DATE_DIFF: difference in seconds between two epoch-second columns.
+     *  F-017: NULL on either side → NaN. */
     public static double[] arrayDateDiffSeconds(long[] a, long[] b, int length) {
         double[] r = new double[length];
-        for (int i = 0; i < length; i++) r[i] = (double)(a[i] - b[i]);
+        for (int i = 0; i < length; i++) {
+            long av = a[i], bv = b[i];
+            r[i] = (av == Long.MIN_VALUE || bv == Long.MIN_VALUE)
+                   ? Double.NaN : (double)(av - bv);
+        }
         return r;
     }
 

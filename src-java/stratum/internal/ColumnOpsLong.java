@@ -68,7 +68,9 @@ public final class ColumnOpsLong {
     public static long[] arrayExtractYearLong(long[] epochDays, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            long z = epochDays[i] + 719468;
+            long v = epochDays[i];
+            if (v == NULL) { r[i] = NULL; continue; }  // F-017
+            long z = v + 719468;
             long era = (z >= 0 ? z : z - 146096) / 146097;
             long doe = z - era * 146097;
             long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
@@ -84,7 +86,9 @@ public final class ColumnOpsLong {
     public static long[] arrayExtractMonthLong(long[] epochDays, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            long z = epochDays[i] + 719468;
+            long v = epochDays[i];
+            if (v == NULL) { r[i] = NULL; continue; }  // F-017
+            long z = v + 719468;
             long era = (z >= 0 ? z : z - 146096) / 146097;
             long doe = z - era * 146097;
             long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
@@ -98,7 +102,9 @@ public final class ColumnOpsLong {
     public static long[] arrayExtractDayLong(long[] epochDays, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            long z = epochDays[i] + 719468;
+            long v = epochDays[i];
+            if (v == NULL) { r[i] = NULL; continue; }  // F-017
+            long z = v + 719468;
             long era = (z >= 0 ? z : z - 146096) / 146097;
             long doe = z - era * 146097;
             long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
@@ -112,7 +118,8 @@ public final class ColumnOpsLong {
     public static long[] arrayExtractHourLong(long[] epochSeconds, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorMod(epochSeconds[i], 86400L) / 3600;
+            long v = epochSeconds[i];
+            r[i] = (v == NULL) ? NULL : Math.floorMod(v, 86400L) / 3600;  // F-017
         }
         return r;
     }
@@ -120,7 +127,8 @@ public final class ColumnOpsLong {
     public static long[] arrayExtractMinuteLong(long[] epochSeconds, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorMod(epochSeconds[i], 3600L) / 60;
+            long v = epochSeconds[i];
+            r[i] = (v == NULL) ? NULL : Math.floorMod(v, 3600L) / 60;  // F-017
         }
         return r;
     }
@@ -128,7 +136,8 @@ public final class ColumnOpsLong {
     public static long[] arrayExtractSecondLong(long[] epochSeconds, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorMod(epochSeconds[i], 60L);
+            long v = epochSeconds[i];
+            r[i] = (v == NULL) ? NULL : Math.floorMod(v, 60L);  // F-017
         }
         return r;
     }
@@ -136,7 +145,8 @@ public final class ColumnOpsLong {
     public static long[] arrayExtractDayOfWeekLong(long[] epochDays, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorMod(epochDays[i] + 3, 7L);
+            long v = epochDays[i];
+            r[i] = (v == NULL) ? NULL : Math.floorMod(v + 3, 7L);  // F-017
         }
         return r;
     }
@@ -145,6 +155,7 @@ public final class ColumnOpsLong {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
             long ed = epochDays[i];
+            if (ed == NULL) { r[i] = NULL; continue; }  // F-017
             long dow = ((ed % 7) + 10) % 7;
             long thu = ed + (3 - dow);
             long z = thu + 719468;

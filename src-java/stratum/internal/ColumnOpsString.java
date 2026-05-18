@@ -77,7 +77,11 @@ public final class ColumnOpsString {
         return arrayStringLikeFastMasked(codes, dict, pattern, length, null, null);
     }
 
-    /** LIKE predicate with optional bitmask pre-filtering for large dictionaries. */
+    /** LIKE predicate with optional bitmask pre-filtering for large dictionaries.
+     *  F-015: NULL strings dict-encode as Long.MIN_VALUE; gathering with
+     *  `(int) Long.MIN_VALUE = Integer.MIN_VALUE` would AIOOBE into
+     *  dictMatch. SQL 3VL says NULL LIKE x → UNKNOWN → row drops out of
+     *  WHERE, so emit 0 for NULL rows without touching the dict. */
     public static long[] arrayStringLikeFastMasked(long[] codes, String[] dict, String pattern,
                                                     int length, int[] alphaMasks, long[] bigramMasks) {
         boolean[] dictMatch = new boolean[dict.length];
@@ -87,7 +91,10 @@ public final class ColumnOpsString {
             matchDictLike(dict, pattern, dictMatch, alphaMasks, bigramMasks);
         }
         long[] r = new long[length];
-        for (int i = 0; i < length; i++) r[i] = dictMatch[(int) codes[i]] ? 1L : 0L;
+        for (int i = 0; i < length; i++) {
+            long c = codes[i];
+            r[i] = (c == Long.MIN_VALUE) ? 0L : (dictMatch[(int) c] ? 1L : 0L);
+        }
         return r;
     }
 
@@ -122,7 +129,9 @@ public final class ColumnOpsString {
         return r;
     }
 
-    /** Apply LIKE pattern to a range of raw strings with fast-path detection. */
+    /** Apply LIKE pattern to a range of raw strings with fast-path detection.
+     *  F-015 (raw path): null entries match SQL NULL semantics — UNKNOWN
+     *  → row excluded from WHERE — so emit 0 without dereferencing. */
     private static void rawStringLikeRange(String[] strings, String pattern, long[] r, int start, int end) {
         int pLen = pattern.length();
         boolean startsPercent = pLen > 0 && pattern.charAt(0) == '%';
@@ -130,15 +139,27 @@ public final class ColumnOpsString {
         String inner = pattern.substring(startsPercent ? 1 : 0, endsPercent ? pLen - 1 : pLen);
         boolean innerHasWild = inner.indexOf('%') >= 0 || inner.indexOf('_') >= 0;
         if (!innerHasWild && startsPercent && endsPercent && inner.length() > 0) {
-            for (int i = start; i < end; i++) r[i] = strings[i].contains(inner) ? 1L : 0L;
+            for (int i = start; i < end; i++) {
+                String s = strings[i];
+                r[i] = (s != null && s.contains(inner)) ? 1L : 0L;
+            }
         } else if (!innerHasWild && !startsPercent && endsPercent && inner.length() > 0) {
-            for (int i = start; i < end; i++) r[i] = strings[i].startsWith(inner) ? 1L : 0L;
+            for (int i = start; i < end; i++) {
+                String s = strings[i];
+                r[i] = (s != null && s.startsWith(inner)) ? 1L : 0L;
+            }
         } else if (!innerHasWild && startsPercent && !endsPercent && inner.length() > 0) {
-            for (int i = start; i < end; i++) r[i] = strings[i].endsWith(inner) ? 1L : 0L;
+            for (int i = start; i < end; i++) {
+                String s = strings[i];
+                r[i] = (s != null && s.endsWith(inner)) ? 1L : 0L;
+            }
         } else {
             String regex = ColumnOps.likeToRegex(pattern);
             java.util.regex.Pattern p = java.util.regex.Pattern.compile(regex);
-            for (int i = start; i < end; i++) r[i] = p.matcher(strings[i]).matches() ? 1L : 0L;
+            for (int i = start; i < end; i++) {
+                String s = strings[i];
+                r[i] = (s != null && p.matcher(s).matches()) ? 1L : 0L;
+            }
         }
     }
 
