@@ -3073,6 +3073,46 @@
                            (if (Float/isNaN f) nil (str f)))
      :else (str v))))
 
+(defn- value->typed
+  "Step W2: convert a Clojure value to the raw Java representation that
+   `stratum.internal.PgBinaryCodec/encode` expects for the column's OID.
+
+   The wire layer reads from `typedRows` when the client requests binary
+   output for a column. Rules mirror `value->string`:
+
+     - DECIMAL Long → BigDecimal at declared scale
+     - DECIMAL Double → BigDecimal via Math/round + declared scale
+       (same precision caveat as text mode: aggregate sums > 2^53
+       lose precision through Double; fixed when SUM returns long)
+     - TIMESTAMP_MS → multiply by 1000 to reach micros (PG binary unit)
+     - TIMESTAMP_NS → divide by 1000 to reach micros
+     - TIMESTAMP_S  → multiply by 1_000_000 to reach micros
+     - DATE (:days), :micros TIMESTAMP, ENUM string, INT8/FLOAT8/TEXT
+       all pass through unchanged
+     - Double NaN → nil (wire NULL)"
+  [v col-meta]
+  (cond
+    (nil? v) nil
+    ;; Step 5 DECIMAL — Long unscaled.
+    (and (:decimal? col-meta) (instance? Long v))
+    (decimal/unscaled-long->bigdec (long v) (:scale col-meta))
+    ;; Step 5c DECIMAL — Double agg result.
+    (and (:decimal? col-meta) (instance? Double v))
+    (let [d (double v)]
+      (when-not (Double/isNaN d)
+        (decimal/unscaled-long->bigdec (Math/round d) (:scale col-meta))))
+    ;; TIMESTAMP unit normalization — PG binary wants micros.
+    (and (instance? Long v) (= :millis (:temporal-unit col-meta)))
+    (Long/valueOf (* (long v) 1000))
+    (and (instance? Long v) (= :nanos (:temporal-unit col-meta)))
+    (Long/valueOf (quot (long v) 1000))
+    (and (instance? Long v) (= :seconds (:temporal-unit col-meta)))
+    (Long/valueOf (* (long v) 1000000))
+    ;; Floats: NaN → nil, otherwise pass through as java.lang.Double/Float.
+    (instance? Double v) (let [d (double v)] (when-not (Double/isNaN d) v))
+    (instance? Float v)  (let [f (float v)]  (when-not (Float/isNaN f) v))
+    :else v))
+
 (defn- meta->oid
   "Resolve a Postgres OID from per-column metadata. Returns nil when the
    metadata doesn't pin a type, in which case the caller falls back to
@@ -3274,32 +3314,41 @@
                                          (instance? (Class/forName "[D") arr) OID_FLOAT8
                                          :else OID_TEXT))))
                                col-keys))
+          ;; Step W2: build text rows and typed rows in a single pass so
+          ;; the wire layer can switch per-column on the requested format.
+          row-pairs (for [i (range n-rows)]
+                      (mapv (fn [k]
+                              (let [arr (get results k)
+                                    cm  (get column-meta k)]
+                                (cond
+                                  (instance? (Class/forName "[J") arr)
+                                  (let [v (aget ^longs arr (int i))]
+                                    (if (= v Long/MIN_VALUE)
+                                      [nil nil]
+                                      [(value->string v cm) (value->typed v cm)]))
+                                  (instance? (Class/forName "[D") arr)
+                                  (let [v (aget ^doubles arr (int i))]
+                                    (if (Double/isNaN v)
+                                      [nil nil]
+                                      [(value->string v cm) (value->typed v cm)]))
+                                  (instance? (Class/forName "[Ljava.lang.String;") arr)
+                                  (let [v (aget ^"[Ljava.lang.String;" arr (int i))]
+                                    [v v])
+                                  :else
+                                  (let [v (nth (seq arr) i)]
+                                    [(value->string v cm) (value->typed v cm)]))))
+                            col-keys))
           rows (into-array (Class/forName "[Ljava.lang.String;")
-                           (for [i (range n-rows)]
-                             (into-array String
-                                         (for [k col-keys]
-                                           (let [arr (get results k)
-                                                 cm  (get column-meta k)]
-                                             (cond
-                                               (instance? (Class/forName "[J") arr)
-                                               (let [v (aget ^longs arr (int i))]
-                                                 (cond
-                                                   (= v Long/MIN_VALUE) nil
-                                                   ;; Step 5: render DECIMAL longs as scaled BigDecimal.
-                                                   (:decimal? cm)
-                                                   (decimal/unscaled-long->plain-string
-                                                    v (:scale cm))
-                                                   :else (str v)))
-                                               (instance? (Class/forName "[D") arr)
-                                               (let [v (aget ^doubles arr (int i))]
-                                                 (if (Double/isNaN v) nil (str v)))
-                                               (instance? (Class/forName "[Ljava.lang.String;") arr)
-                                               (aget ^"[Ljava.lang.String;" arr (int i))
-                                               :else (str (nth (seq arr) i))))))))]
+                           (for [pair-row row-pairs]
+                             (into-array String (map first pair-row))))
+          typed-rows (into-array (Class/forName "[Ljava.lang.Object;")
+                                 (for [pair-row row-pairs]
+                                   (into-array Object (map second pair-row))))]
       (PgWireServer$QueryResult.
        (into-array String col-names)
        oids
        rows
+       typed-rows
        (str "SELECT " n-rows)))
 
     ;; Vector of maps (standard Stratum result)
@@ -3309,6 +3358,7 @@
        (into-array String [])
        (int-array [])
        (into-array (Class/forName "[Ljava.lang.String;") [])
+       (into-array (Class/forName "[Ljava.lang.Object;") [])
        "SELECT 0")
       (let [first-row (first results)
             ;; Filter out internal engine keys (starting with _) before serializing
@@ -3321,11 +3371,19 @@
                                                  (mapv #(value->string (get row %)
                                                                        (get column-meta %))
                                                        col-keys)))
-                                   results))]
+                                   results))
+            typed-rows (into-array (Class/forName "[Ljava.lang.Object;")
+                                   (mapv (fn [row]
+                                           (into-array Object
+                                                       (mapv #(value->typed (get row %)
+                                                                            (get column-meta %))
+                                                             col-keys)))
+                                         results))]
         (PgWireServer$QueryResult.
          (into-array String col-names)
          oids
          rows
+         typed-rows
          (str "SELECT " (count results)))))
 
     ;; Single map (non-grouped aggregate)

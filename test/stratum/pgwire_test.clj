@@ -502,28 +502,8 @@
         (is (= 3 (count rows))
             "rows still arrive correctly when format codes are explicit text")))))
 
-(deftest w1-result-format-binary-rejected-test
-  (testing "Bind requesting binary result format triggers ErrorResponse 0A000 and connection stays usable"
-    (with-conn [c (srv-port)]
-      (send-parse!   c "SELECT price FROM orders WHERE price > $1")
-      ;; Single result format code = 1 → broadcast binary request
-      (send-bind-fmt! c [0] ["50.0"] [1])
-      (send-execute! c)
-      (send-sync!    c)
-      (let [result (drain-rfq c)
-            err    (find-error result)
-            types  (mapv :type (:messages result))]
-        (is (some? err) "ErrorResponse expected")
-        (is (= "0A000" (:code err)) "feature_not_supported code expected")
-        (is (re-find #"[Bb]inary result format" (:message err)) "message must mention binary result format")
-        (is (not (some #{\D} types)) "no DataRow must be emitted when binary is refused"))
-      ;; Connection must remain usable for the next query
-      (send-query! c "SELECT COUNT(*) FROM orders")
-      (let [rows (decode-data-rows (drain-rfq c))]
-        (is (= "5" (ffirst rows)) "connection remains functional after binary-format error")))))
-
 (deftest w1-param-format-binary-rejected-test
-  (testing "Bind with binary input format triggers ErrorResponse 0A000 and connection stays usable"
+  (testing "Bind with binary input format triggers ErrorResponse 0A000 and connection stays usable (until W3 lands)"
     (with-conn [c (srv-port)]
       (send-parse!   c "SELECT COUNT(*) FROM orders WHERE price > $1")
       ;; Param format = 1 (binary) — refused before any param byte is decoded
@@ -540,47 +520,110 @@
       (let [rows (decode-data-rows (drain-rfq c))]
         (is (= "5" (ffirst rows)) "connection remains functional after binary-param error")))))
 
-(deftest w1-describe-rejects-binary-before-row-description-test
-  (testing "Describe with binary result format refuses at Describe time (no RowDescription)"
+(deftest w1-unknown-result-format-code-rejected-test
+  (testing "Unknown wire format code (e.g., 2) is refused with 0A000"
     (with-conn [c (srv-port)]
       (send-parse!   c "SELECT price FROM orders WHERE price > $1")
-      (send-bind-fmt! c [0] ["50.0"] [1])  ;; binary requested
-      (send-describe-portal! c)
+      ;; Format code 2 is not defined in the PG protocol (only 0=text, 1=binary)
+      (send-bind-fmt! c [0] ["50.0"] [2])
       (send-execute! c)
       (send-sync!    c)
       (let [result (drain-rfq c)
-            err    (find-error result)
-            types  (mapv :type (:messages result))]
+            err    (find-error result)]
         (is (some? err))
         (is (= "0A000" (:code err)))
-        ;; Critical: no RowDescription must be emitted when we refuse
-        (is (not (some #{\T} types))
-            "RowDescription must not be sent when Describe refuses binary")
-        (is (not (some #{\D} types))
-            "no DataRow must follow a binary refusal")))))
+        (is (re-find #"[Uu]nknown wire format" (:message err))
+            "error message must mention the unknown format code"))
+      ;; Connection still usable
+      (send-query! c "SELECT COUNT(*) FROM orders")
+      (let [rows (decode-data-rows (drain-rfq c))]
+        (is (= "5" (ffirst rows)))))))
 
-(deftest w1-mixed-result-format-per-column-test
-  (testing "Per-column result format codes: all 0 succeeds, any 1 triggers 0A000"
+;; ============================================================================
+;; Step W2 — outbound binary encoders
+;; ============================================================================
+
+(defn- decode-data-rows-raw
+  "Like decode-data-rows but returns raw payload byte[] per column instead of UTF-8 strings."
+  [result]
+  (for [{:keys [type body]} (:messages result)
+        :when (= type \D)]
+    (let [buf (ByteBuffer/wrap body)
+          n   (.getShort buf)]
+      (mapv (fn [_]
+              (let [len (.getInt buf)]
+                (when-not (neg? len)
+                  (let [b (byte-array len)]
+                    (.get buf b)
+                    b))))
+            (range n)))))
+
+(defn- be->long
+  "Decode a big-endian byte[] (1..8 bytes) into a signed long."
+  ^long [^bytes b]
+  (let [n (alength b)]
+    (loop [i 0 acc 0]
+      (if (= i n)
+        (let [shift (* 8 (- 8 n))]
+          (if (zero? shift) acc (bit-shift-right (bit-shift-left acc shift) shift)))
+        (recur (inc i) (bit-or (bit-shift-left acc 8) (long (bit-and (aget b i) 0xff))))))))
+
+(deftest w2-binary-int8-test
+  (testing "Bind requesting binary result format for INT8 returns 8-byte big-endian payload"
     (with-conn [c (srv-port)]
-      ;; Query with two output columns — first per-column format request, all text
-      (send-parse!   c "SELECT price, quantity FROM orders WHERE price > $1")
-      (send-bind-fmt! c [0] ["50.0"] [0 0])
+      (send-parse!   c "SELECT quantity FROM orders WHERE price > $1 ORDER BY quantity")
+      (send-bind-fmt! c [0] ["50.0"] [1])  ;; binary result
       (send-describe-portal! c)
       (send-execute! c)
       (send-sync!    c)
       (let [result (drain-rfq c)
-            rd-body (:body (first (filter #(= \T (:type %)) (:messages result))))
-            cols    (decode-row-description-fmts rd-body)]
-        (is (= [0 0] (mapv #(nth % 2) cols))
-            "explicit per-column text codes echo back as text")))
+            rd     (decode-row-description-fmts
+                    (:body (first (filter #(= \T (:type %)) (:messages result)))))
+            rows   (vec (decode-data-rows-raw result))]
+        (is (= 1 (count rd)))
+        (is (= 1 (nth (first rd) 2)) "RowDescription must advertise format=1 (binary)")
+        ;; price > 50: rows are 5, 10, 20 (sorted asc)
+        (is (= 3 (count rows)))
+        (is (every? #(= 8 (alength ^bytes (first %))) rows)
+            "every INT8 payload must be 8 bytes")
+        (is (= [5 10 20] (mapv (fn [r] (be->long (first r))) rows))
+            "binary-decoded INT8 values must match the rows")))))
+
+(deftest w2-binary-float8-test
+  (testing "Bind requesting binary result format for FLOAT8 returns 8-byte IEEE 754 BE payload"
     (with-conn [c (srv-port)]
-      ;; Now mix: column 1 text, column 2 binary → must refuse
-      (send-parse!   c "SELECT price, quantity FROM orders WHERE price > $1")
-      (send-bind-fmt! c [0] ["50.0"] [0 1])
+      (send-parse!   c "SELECT price FROM orders WHERE price > $1 ORDER BY price")
+      (send-bind-fmt! c [0] ["50.0"] [1])
       (send-execute! c)
       (send-sync!    c)
-      (let [err (find-error (drain-rfq c))]
-        (is (some? err))
-        (is (= "0A000" (:code err)))
-        (is (re-find #"column 2" (:message err))
-            "error message must identify the offending column (1-based)")))))
+      (let [rows (vec (decode-data-rows-raw (drain-rfq c)))]
+        ;; price > 50: 100.0, 200.0, 500.0
+        (is (= 3 (count rows)))
+        (let [decoded (mapv (fn [r]
+                              (Double/longBitsToDouble (be->long (first r))))
+                            rows)]
+          (is (= [100.0 200.0 500.0] decoded)
+              "binary-decoded FLOAT8 values match the rows"))))))
+
+(deftest w2-binary-mixed-row-test
+  (testing "Per-column mix: column 1 text, column 2 binary — both work in the same row"
+    (with-conn [c (srv-port)]
+      (send-parse!   c "SELECT region, quantity FROM orders WHERE price > $1 ORDER BY price")
+      (send-bind-fmt! c [0] ["50.0"] [0 1])  ;; text + binary
+      (send-describe-portal! c)
+      (send-execute! c)
+      (send-sync!    c)
+      (let [result (drain-rfq c)
+            rd     (decode-row-description-fmts
+                    (:body (first (filter #(= \T (:type %)) (:messages result)))))
+            rows   (vec (decode-data-rows-raw result))]
+        (is (= [0 1] (mapv #(nth % 2) rd))
+            "RowDescription advertises per-column formats matching the request")
+        (is (= 3 (count rows)))
+        ;; price > 50 sorted ascending by price: [S 5] [S 10] [E 20]
+        (let [decoded (mapv (fn [r]
+                              [(String. ^bytes (first r) StandardCharsets/UTF_8)
+                               (be->long (second r))])
+                            rows)]
+          (is (= [["S" 5] ["S" 10] ["E" 20]] decoded)
+              "text + binary mix decodes correctly"))))))

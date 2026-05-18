@@ -64,22 +64,42 @@ public final class PgWireServer {
 
     /**
      * Result of a SQL query execution.
+     *
+     * <p>{@link #rows} holds the text-formatted values used directly by the
+     * text wire path. {@link #typedRows} (optional, may be {@code null})
+     * holds the parallel raw Java values (Long, Double, BigDecimal, String,
+     * Boolean, UUID, …) used by the binary wire path. When the client
+     * requests binary output via Bind, the wire layer reads from
+     * {@code typedRows[r][c]} and passes it to {@link PgBinaryCodec#encode}.
      */
     public static final class QueryResult {
         public final String[] columnNames;
         public final int[] columnOids;
         public final String[][] rows;
+        /** Parallel typed values for binary output. {@code null} when only text was prepared. */
+        public final Object[][] typedRows;
         public final String commandTag;
         public final String error;
         /** Transaction status: 'I'=idle, 'T'=in transaction, 'E'=error in transaction. */
         public char txStatus;
 
-        /** Successful result with rows. */
+        /** Successful result with text rows only — binary output not supported for this result. */
         public QueryResult(String[] columnNames, int[] columnOids,
                            String[][] rows, String commandTag) {
+            this(columnNames, columnOids, rows, null, commandTag);
+        }
+
+        /**
+         * Successful result with both text rows and typed rows. {@code typedRows}
+         * is the parallel raw-value matrix used when the client requests binary
+         * output for one or more columns.
+         */
+        public QueryResult(String[] columnNames, int[] columnOids,
+                           String[][] rows, Object[][] typedRows, String commandTag) {
             this.columnNames = columnNames;
             this.columnOids = columnOids;
             this.rows = rows;
+            this.typedRows = typedRows;
             this.commandTag = commandTag;
             this.error = null;
             this.txStatus = 'I';
@@ -90,6 +110,7 @@ public final class PgWireServer {
             this.columnNames = null;
             this.columnOids = null;
             this.rows = null;
+            this.typedRows = null;
             this.commandTag = null;
             this.error = error;
             this.txStatus = 'I';
@@ -560,6 +581,52 @@ public final class PgWireServer {
         return -1;
     }
 
+    /**
+     * Return the index of the first column whose requested format isn't
+     * supported by {@link PgBinaryCodec}, or -1 if every requested format
+     * is either text (0) or a binary format we can encode for the given
+     * OID. Used at Describe/Execute time to fail with 0A000 before we
+     * commit to writing rows we can't actually produce.
+     */
+    private static int firstUnsupportedFormatColumn(int[] formats, int[] oids, Object[][] typedRows) {
+        if (formats == null) return -1;
+        for (int i = 0; i < formats.length; i++) {
+            if (formats[i] == 0) continue;
+            if (formats[i] != 1) return i;             // unknown format code
+            if (!PgBinaryCodec.supportsBinaryOutput(oids[i])) return i;
+            if (typedRows == null) return i;           // no typed values available
+        }
+        return -1;
+    }
+
+    /**
+     * Build a one-line reason explaining why the given column's format
+     * request can't be honoured. Returns a stable string for the
+     * ErrorResponse message field.
+     */
+    private static String unsupportedFormatReason(int col, int[] formats, int[] oids,
+                                                  String[] names, Object[][] typedRows) {
+        int fmt = formats[col];
+        int oid = oids[col];
+        String name = names[col];
+        if (fmt != 1) {
+            return "Unknown wire format code " + fmt + " for column "
+                + (col + 1) + " (" + name + ").";
+        }
+        if (!PgBinaryCodec.supportsBinaryOutput(oid)) {
+            return "Binary result format not supported for column "
+                + (col + 1) + " (" + name + ", OID=" + oid
+                + "). Configure your client to request text format for this column.";
+        }
+        if (typedRows == null) {
+            return "Binary result format requested for column "
+                + (col + 1) + " (" + name + ", OID=" + oid
+                + ") but the server only produced text values for this result. "
+                + "This is an internal limitation — please report it.";
+        }
+        return "Binary result format unavailable for column " + (col + 1) + " (" + name + ").";
+    }
+
     private void handleDescribe(byte[] body, DataOutputStream out,
                                 String[] lastParsedSql, String[][] lastBoundParams,
                                 QueryResult[] cachedResult,
@@ -618,18 +685,14 @@ public final class PgWireServer {
                 out.writeInt(4);
             } else {
                 int[] formats = resolveResultFormats(resultFormatCodes[0], result.columnNames.length);
-                int binaryCol = firstBinaryColumn(formats);
-                if (binaryCol >= 0) {
+                int badCol = firstUnsupportedFormatColumn(formats, result.columnOids, result.typedRows);
+                if (badCol >= 0) {
                     // Refuse early — better than advertising a format in
-                    // RowDescription that we'll then refuse at Execute. Drop the
-                    // cached result so Execute doesn't re-stream the same rows.
+                    // RowDescription that we can't actually honour at Execute.
                     cachedResult[0] = null;
                     sendError(out, "ERROR", "0A000",
-                        "Binary result format not yet supported for column "
-                            + (binaryCol + 1) + " ("
-                            + result.columnNames[binaryCol]
-                            + ", OID=" + result.columnOids[binaryCol]
-                            + "). Configure your client to request text format.");
+                        unsupportedFormatReason(badCol, formats, result.columnOids,
+                                                result.columnNames, result.typedRows));
                 } else {
                     sendRowDescription(out, result.columnNames, result.columnOids, formats);
                 }
@@ -682,24 +745,17 @@ public final class PgWireServer {
                 sendCommandComplete(out, result.commandTag);
             } else {
                 int[] formats = resolveResultFormats(resultFormatCodes[0], result.columnNames.length);
-                int binaryCol = firstBinaryColumn(formats);
-                if (binaryCol >= 0) {
-                    // Step W1: outbound binary not yet implemented. Reject loudly
-                    // *before* sending any DataRow so the protocol stays consistent.
+                int badCol = firstUnsupportedFormatColumn(formats, result.columnOids, result.typedRows);
+                if (badCol >= 0) {
                     sendError(out, "ERROR", "0A000",
-                        "Binary result format not yet supported for column "
-                            + (binaryCol + 1) + " ("
-                            + result.columnNames[binaryCol]
-                            + ", OID=" + result.columnOids[binaryCol]
-                            + "). Configure your client to request text format.");
+                        unsupportedFormatReason(badCol, formats, result.columnOids,
+                                                result.columnNames, result.typedRows));
                 } else {
                     // Describe already sent RowDescription — don't repeat it
                     if (!describedAlready) {
                         sendRowDescription(out, result.columnNames, result.columnOids, formats);
                     }
-                    for (String[] row : result.rows) {
-                        sendDataRow(out, row, formats);
-                    }
+                    sendDataRows(out, result, formats);
                     sendCommandComplete(out, result.commandTag);
                 }
             }
@@ -709,6 +765,24 @@ public final class PgWireServer {
         lastBoundParams[0] = null;
         resultFormatCodes[0] = null;
         out.flush();
+    }
+
+    /**
+     * Stream all DataRow messages for a result, choosing text or binary
+     * per column based on {@code formats}. When all formats are 0 this
+     * is equivalent to the old text-only loop.
+     */
+    private void sendDataRows(DataOutputStream out, QueryResult result, int[] formats) throws IOException {
+        if (formats == null || firstBinaryColumn(formats) < 0) {
+            for (String[] row : result.rows) sendDataRow(out, row, null);
+            return;
+        }
+        int nRows = result.rows.length;
+        for (int r = 0; r < nRows; r++) {
+            String[] textRow = result.rows[r];
+            Object[] typedRow = result.typedRows[r];
+            sendDataRowMixed(out, textRow, typedRow, result.columnOids, formats);
+        }
     }
 
     private void handleSync(DataOutputStream out, char[] txStatus,
@@ -786,6 +860,43 @@ public final class PgWireServer {
             out.writeInt(-1);               // type modifier
             int fmt = (formats == null) ? 0 : formats[i];
             out.writeShort(fmt);            // format code (0=text, 1=binary)
+        }
+        out.flush();
+    }
+
+    /**
+     * Emit a DataRow that mixes text- and binary-formatted columns. The
+     * caller must have validated the format requests via
+     * {@link #firstUnsupportedFormatColumn} before calling.
+     */
+    private void sendDataRowMixed(DataOutputStream out,
+                                  String[] textRow,
+                                  Object[] typedRow,
+                                  int[] oids,
+                                  int[] formats) throws IOException {
+        int n = formats.length;
+        byte[][] payloads = new byte[n][];
+        int bodyLen = 2; // column count int16
+        for (int i = 0; i < n; i++) {
+            if (formats[i] == 1) {
+                Object v = typedRow == null ? null : typedRow[i];
+                payloads[i] = (v == null) ? null : PgBinaryCodec.encode(oids[i], v);
+            } else {
+                String s = textRow[i];
+                payloads[i] = (s == null) ? null : s.getBytes(StandardCharsets.UTF_8);
+            }
+            bodyLen += 4 + (payloads[i] == null ? 0 : payloads[i].length);
+        }
+        out.writeByte('D');
+        out.writeInt(4 + bodyLen);
+        out.writeShort(n);
+        for (byte[] p : payloads) {
+            if (p == null) {
+                out.writeInt(-1);
+            } else {
+                out.writeInt(p.length);
+                out.write(p);
+            }
         }
         out.flush();
     }
