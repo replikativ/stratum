@@ -1464,7 +1464,9 @@ public final class ColumnOps {
     public static double[] arrayExtractYear(long[] epochDays, int length) {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
-            long z = epochDays[i] + 719468;
+            long v = epochDays[i];
+            if (v == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
+            long z = v + 719468;
             long era = (z >= 0 ? z : z - 146096) / 146097;
             long doe = z - era * 146097;
             long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
@@ -1481,7 +1483,9 @@ public final class ColumnOps {
     public static double[] arrayExtractMonth(long[] epochDays, int length) {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
-            long z = epochDays[i] + 719468;
+            long v = epochDays[i];
+            if (v == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
+            long z = v + 719468;
             long era = (z >= 0 ? z : z - 146096) / 146097;
             long doe = z - era * 146097;
             long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
@@ -1496,7 +1500,9 @@ public final class ColumnOps {
     public static double[] arrayExtractDay(long[] epochDays, int length) {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
-            long z = epochDays[i] + 719468;
+            long v = epochDays[i];
+            if (v == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
+            long z = v + 719468;
             long era = (z >= 0 ? z : z - 146096) / 146097;
             long doe = z - era * 146097;
             long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
@@ -1512,6 +1518,7 @@ public final class ColumnOps {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
             long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
             long daySeconds = ((s % 86400) + 86400) % 86400;
             r[i] = (double) (daySeconds / 3600);
         }
@@ -1523,6 +1530,7 @@ public final class ColumnOps {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
             long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
             long daySeconds = ((s % 86400) + 86400) % 86400;
             r[i] = (double) ((daySeconds % 3600) / 60);
         }
@@ -1534,6 +1542,7 @@ public final class ColumnOps {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
             long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
             long daySeconds = ((s % 86400) + 86400) % 86400;
             r[i] = (double) (daySeconds % 60);
         }
@@ -1544,8 +1553,10 @@ public final class ColumnOps {
     public static double[] arrayExtractDayOfWeek(long[] epochDays, int length) {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
+            long v = epochDays[i];
+            if (v == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
             // 1970-01-01 is Thursday (3 in 0=Mon scheme)
-            long d = ((epochDays[i] % 7) + 10) % 7; // shift to 0=Mon
+            long d = ((v % 7) + 10) % 7; // shift to 0=Mon
             r[i] = (double) d;
         }
         return r;
@@ -1556,6 +1567,7 @@ public final class ColumnOps {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
             long ed = epochDays[i];
+            if (ed == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }  // F-017
             long dow = ((ed % 7) + 10) % 7; // 0=Mon
             // Thursday of this week
             long thu = ed + (3 - dow);
@@ -2132,12 +2144,16 @@ public final class ColumnOps {
         ymd[2] = d;
     }
 
-    /** DATE_TRUNC to year: zero month/day, keep as epoch-seconds */
+    /** DATE_TRUNC to year: zero month/day, keep as epoch-seconds.
+     *  F-017: NULL sentinel (Long.MIN_VALUE) propagates as-is so downstream
+     *  agg / extract paths recognise the same convention. */
     public static long[] arrayDateTruncYear(long[] epochSeconds, int length) {
         long[] r = new long[length];
         long[] ymd = new long[3];
         for (int i = 0; i < length; i++) {
-            long epochDays = Math.floorDiv(epochSeconds[i], 86400L);
+            long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Long.MIN_VALUE; continue; }
+            long epochDays = Math.floorDiv(s, 86400L);
             civilFromDays(epochDays, ymd);
             r[i] = civilToDays(ymd[0], 1, 1) * 86400L;
         }
@@ -2149,7 +2165,9 @@ public final class ColumnOps {
         long[] r = new long[length];
         long[] ymd = new long[3];
         for (int i = 0; i < length; i++) {
-            long epochDays = Math.floorDiv(epochSeconds[i], 86400L);
+            long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Long.MIN_VALUE; continue; }  // F-017
+            long epochDays = Math.floorDiv(s, 86400L);
             civilFromDays(epochDays, ymd);
             r[i] = civilToDays(ymd[0], ymd[1], 1) * 86400L;
         }
@@ -2160,7 +2178,8 @@ public final class ColumnOps {
     public static long[] arrayDateTruncDay(long[] epochSeconds, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorDiv(epochSeconds[i], 86400L) * 86400L;
+            long s = epochSeconds[i];
+            r[i] = (s == Long.MIN_VALUE) ? Long.MIN_VALUE : Math.floorDiv(s, 86400L) * 86400L;  // F-017
         }
         return r;
     }
@@ -2169,7 +2188,8 @@ public final class ColumnOps {
     public static long[] arrayDateTruncHour(long[] epochSeconds, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorDiv(epochSeconds[i], 3600L) * 3600L;
+            long s = epochSeconds[i];
+            r[i] = (s == Long.MIN_VALUE) ? Long.MIN_VALUE : Math.floorDiv(s, 3600L) * 3600L;  // F-017
         }
         return r;
     }
@@ -2178,32 +2198,40 @@ public final class ColumnOps {
     public static long[] arrayDateTruncMinute(long[] epochSeconds, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorDiv(epochSeconds[i], 60L) * 60L;
+            long s = epochSeconds[i];
+            r[i] = (s == Long.MIN_VALUE) ? Long.MIN_VALUE : Math.floorDiv(s, 60L) * 60L;  // F-017
         }
         return r;
     }
 
-    /** DATE_ADD days: add N days (as seconds) */
+    /** DATE_ADD days: add N days (as seconds). F-017: preserve NULL. */
     public static long[] arrayDateAddDays(long[] epochSeconds, long nDays, int length) {
         long[] r = new long[length];
         long delta = nDays * 86400L;
-        for (int i = 0; i < length; i++) r[i] = epochSeconds[i] + delta;
+        for (int i = 0; i < length; i++) {
+            long s = epochSeconds[i];
+            r[i] = (s == Long.MIN_VALUE) ? Long.MIN_VALUE : s + delta;
+        }
         return r;
     }
 
-    /** DATE_ADD seconds: add N seconds */
+    /** DATE_ADD seconds: add N seconds. F-017: preserve NULL. */
     public static long[] arrayDateAddSeconds(long[] epochSeconds, long nSeconds, int length) {
         long[] r = new long[length];
-        for (int i = 0; i < length; i++) r[i] = epochSeconds[i] + nSeconds;
+        for (int i = 0; i < length; i++) {
+            long s = epochSeconds[i];
+            r[i] = (s == Long.MIN_VALUE) ? Long.MIN_VALUE : s + nSeconds;
+        }
         return r;
     }
 
-    /** DATE_ADD months: add N months using Hinnant civil date arithmetic */
+    /** DATE_ADD months: add N months using Hinnant civil date arithmetic. F-017: preserve NULL. */
     public static long[] arrayDateAddMonths(long[] epochSeconds, int nMonths, int length) {
         long[] r = new long[length];
         long[] ymd = new long[3];
         for (int i = 0; i < length; i++) {
             long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Long.MIN_VALUE; continue; }
             long epochDays = Math.floorDiv(s, 86400L);
             long timeOfDay = s - epochDays * 86400L;
             civilFromDays(epochDays, ymd);
@@ -2226,17 +2254,27 @@ public final class ColumnOps {
         return r;
     }
 
-    /** DATE_DIFF: difference in fractional days between two epoch-second columns */
+    /** DATE_DIFF: difference in fractional days between two epoch-second columns.
+     *  F-017: if either side is NULL, result is NaN (SQL UNKNOWN). */
     public static double[] arrayDateDiffDays(long[] a, long[] b, int length) {
         double[] r = new double[length];
-        for (int i = 0; i < length; i++) r[i] = (double)(a[i] - b[i]) / 86400.0;
+        for (int i = 0; i < length; i++) {
+            long av = a[i], bv = b[i];
+            r[i] = (av == Long.MIN_VALUE || bv == Long.MIN_VALUE)
+                   ? Double.NaN : (double)(av - bv) / 86400.0;
+        }
         return r;
     }
 
-    /** DATE_DIFF: difference in seconds between two epoch-second columns */
+    /** DATE_DIFF: difference in seconds between two epoch-second columns.
+     *  F-017: NULL on either side → NaN. */
     public static double[] arrayDateDiffSeconds(long[] a, long[] b, int length) {
         double[] r = new double[length];
-        for (int i = 0; i < length; i++) r[i] = (double)(a[i] - b[i]);
+        for (int i = 0; i < length; i++) {
+            long av = a[i], bv = b[i];
+            r[i] = (av == Long.MIN_VALUE || bv == Long.MIN_VALUE)
+                   ? Double.NaN : (double)(av - bv);
+        }
         return r;
     }
 
@@ -2470,7 +2508,10 @@ public final class ColumnOps {
                     numAggs, aggTypes, aggCols, aggCol2s, length, maxKey, nanSafe);
         }
 
-        final int accSize = numAggs * 2;
+        // F-006: accSize matches Range variant — `numAggs * 2 + 1` to
+        // hold the per-group post-filter row count marker.
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
         final int flatLen = maxKey * accSize;
 
         // Limit threads so total accumulators fit in L3.
@@ -2541,6 +2582,8 @@ public final class ColumnOps {
                             }
                             accs[off + 1] += partial[off + 1];
                         }
+                        // F-006: marker is purely additive across morsels.
+                        accs[base + markerSlot] += partial[base + markerSlot];
                     }
                 }
                 return accs;
@@ -2586,6 +2629,8 @@ public final class ColumnOps {
                         double[] left = results[p * 2];
                         double[] right = results[p * 2 + 1];
                         if (!fHasMinMax) {
+                            // Flat-bulk merge sweeps every slot including
+                            // the F-006 marker.
                             for (int j = 0; j < flatLen; j++) left[j] += right[j];
                         } else {
                             for (int k = 0; k < maxKey; k++) {
@@ -2608,6 +2653,8 @@ public final class ColumnOps {
                                     }
                                     left[off + 1] += right[off + 1];
                                 }
+                                // F-006: additive merge of marker.
+                                left[base + markerSlot] += right[base + markerSlot];
                             }
                         }
                         results[p] = left;
@@ -2880,8 +2927,17 @@ public final class ColumnOps {
             int numAggs, int[] aggTypes, double[][] aggCols, double[][] aggCol2s,
             int start, int end, int maxKey, boolean nanSafe) {
 
-        final int accSize = numAggs * 2;
-        // Flat contiguous array: groups[key * accSize + a*2] = value, [key * accSize + a*2 + 1] = count
+        // F-006: group-exists marker. accSize includes one extra slot per
+        // group at offset `numAggs * 2`, incremented once per row that
+        // passes the filter (regardless of per-agg NULL state). The
+        // compact-fn checks this marker so SQL emits the group with NULL
+        // aggregates when every value in the group's agg column was NULL.
+        // Per-agg count slots still mean "non-NULL count for that agg",
+        // preserving AVG correctness.
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
+        // Flat contiguous array: groups[key * accSize + a*2] = value, [key * accSize + a*2 + 1] = count,
+        //                        groups[key * accSize + markerSlot] = post-filter row count.
         double[] groups = new double[maxKey * accSize];
         // Init MIN/MAX accumulators (SUM/COUNT default to 0.0 which is correct)
         for (int a = 0; a < numAggs; a++) {
@@ -2925,6 +2981,9 @@ public final class ColumnOps {
             assert key >= 0 && key < maxKey : "Dense key out of range: " + key + " (maxKey=" + maxKey + ")";
 
             int base = key * accSize;
+            // F-006: post-filter row count; lets the compact-fn keep the
+            // group even when every value for every agg column was NULL.
+            groups[base + markerSlot] += m;
             for (int a = 0; a < numAggs; a++) {
                 int off = base + a * 2;
                 switch (aggTypes[a]) {
@@ -3519,7 +3578,10 @@ public final class ColumnOps {
             int start, int end, int maxKey) {
 
         int mask = capacity - 1;
-        final int accSize = numAggs * 2;
+        // F-006: accSize includes a per-group marker slot at numAggs*2
+        // so all-NULL groups still appear in the join+group-by output.
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
         double[] groups = new double[maxKey * accSize];
         // Init MIN/MAX accumulators
         for (int a = 0; a < numAggs; a++) {
@@ -3569,6 +3631,9 @@ public final class ColumnOps {
 
                         // Accumulate fact-side values into flat array
                         int base0 = key * accSize;
+                        // F-006: bump per-group post-filter row count;
+                        // INNER join match counts as one row entering the group.
+                        groups[base0 + markerSlot] += 1;
                         for (int a = 0; a < numAggs; a++) {
                             int off = base0 + a * 2;
                             switch (aggTypes[a]) {
@@ -3649,7 +3714,9 @@ public final class ColumnOps {
                     numAggs, aggTypes, factAggCols, maxKey);
         }
         int threadRange = (probeLength + nThreads - 1) / nThreads;
-        final int accSize = numAggs * 2;
+        // F-006: matches Range variant.
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
 
         @SuppressWarnings("unchecked")
         Future<double[]>[] futures = new Future[nThreads];
@@ -3685,8 +3752,10 @@ public final class ColumnOps {
                 double[] partial = f.get();
                 for (int k = 0; k < maxKey; k++) {
                     int base0 = k * accSize;
-                    // Skip empty groups (count in slot 1 is zero)
-                    if (partial[base0 + 1] == 0.0) continue;
+                    // F-006: use marker (not agg-0 count) to detect "group touched
+                    // by this partial". A SUM-only path with all NULLs has agg-0
+                    // count == 0 yet the group exists.
+                    if (partial[base0 + markerSlot] == 0.0) continue;
                     for (int a = 0; a < numAggs; a++) {
                         int off = base0 + a * 2;
                         switch (aggTypes[a]) {
@@ -3699,6 +3768,7 @@ public final class ColumnOps {
                         }
                         merged[off + 1] += partial[off + 1];
                     }
+                    merged[base0 + markerSlot] += partial[base0 + markerSlot];
                 }
             }
         } catch (Exception e) {
@@ -3818,6 +3888,10 @@ public final class ColumnOps {
             for (int g = 6; g < numGroupCols; g++) key += (int)(groupCols[g][i] * groupMuls[g]);
 
             long val = distinctCol[i];
+            // F-008 sibling: skip NULL sentinel before insertion. SQL
+            // COUNT(DISTINCT col) excludes NULL; without this the
+            // sentinel becomes a distinct "value" in each group.
+            if (val == Long.MIN_VALUE) continue;
 
             // Lazy-init hash table for this group
             if (groupTables[key] == null) {
@@ -4045,6 +4119,9 @@ public final class ColumnOps {
             for (int g = 6; g < numGroupCols; g++) key += (int)(groupCols[g][i] * groupMuls[g]);
 
             long val = distinctCol[i];
+            // F-008 sibling: skip NULL sentinel before hashing — same
+            // reason as fusedFilterGroupCountDistinctDenseRange above.
+            if (val == Long.MIN_VALUE) continue;
 
             if (groupTables[key] == null) {
                 int cap = 16;
@@ -4242,11 +4319,13 @@ public final class ColumnOps {
      */
     public static double[] groupPercentileDense(long[] groupKeys, double[] values,
                                                  long[] mask, int length, int maxKey, double pct) {
-        // Pass 1: count per-group sizes
+        // Pass 1: count per-group sizes. F-011: skip NaN (double NULL).
         int[] counts = new int[maxKey];
         int totalCount = 0;
         for (int i = 0; i < length; i++) {
             if (mask == null || mask[i] == 1) {
+                double v = values[i];
+                if (Double.isNaN(v)) continue;  // SQL percentile ignores NULL
                 int g = (int) groupKeys[i];
                 if (g >= 0 && g < maxKey) {
                     counts[g]++;
@@ -4263,15 +4342,17 @@ public final class ColumnOps {
             offset += counts[g];
         }
 
-        // Pass 2: scatter values into flat array
+        // Pass 2: scatter values into flat array (same NULL skip).
         double[] flat = new double[totalCount];
         int[] writePos = new int[maxKey];
         System.arraycopy(offsets, 0, writePos, 0, maxKey);
         for (int i = 0; i < length; i++) {
             if (mask == null || mask[i] == 1) {
+                double v = values[i];
+                if (Double.isNaN(v)) continue;
                 int g = (int) groupKeys[i];
                 if (g >= 0 && g < maxKey) {
-                    flat[writePos[g]++] = values[i];
+                    flat[writePos[g]++] = v;
                 }
             }
         }
@@ -4299,10 +4380,13 @@ public final class ColumnOps {
      */
     public static double[] groupPercentileDenseLong(long[] groupKeys, long[] values,
                                                      long[] mask, int length, int maxKey, double pct) {
+        // F-011: skip Long.MIN_VALUE sentinel (long NULL).
         int[] counts = new int[maxKey];
         int totalCount = 0;
         for (int i = 0; i < length; i++) {
             if (mask == null || mask[i] == 1) {
+                long v = values[i];
+                if (v == Long.MIN_VALUE) continue;
                 int g = (int) groupKeys[i];
                 if (g >= 0 && g < maxKey) {
                     counts[g]++;
@@ -4321,9 +4405,11 @@ public final class ColumnOps {
         System.arraycopy(offsets, 0, writePos, 0, maxKey);
         for (int i = 0; i < length; i++) {
             if (mask == null || mask[i] == 1) {
+                long v = values[i];
+                if (v == Long.MIN_VALUE) continue;
                 int g = (int) groupKeys[i];
                 if (g >= 0 && g < maxKey) {
-                    flat[writePos[g]++] = (double) values[i];
+                    flat[writePos[g]++] = (double) v;
                 }
             }
         }

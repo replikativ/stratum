@@ -113,7 +113,14 @@
 
 (defn eval-case-pred-mask
   "Evaluate a CASE/WHEN predicate expression to a long[] mask (1=true, 0=false).
-   Predicate can be a comparison like [:= :col val] or an expression."
+   Predicate can be a comparison like [:= :col val] or an expression.
+
+   F-038: when `v` is NULL (NaN — long Long.MIN_VALUE was already
+   mapped to NaN by `col-as-doubles-cached`) the SQL 3VL semantics
+   yield UNKNOWN → CASE WHEN treats it as 'no match' → mask=0. The
+   `:neq` op needs an explicit guard because `(not (== NaN x))` is
+   true in Clojure/Java equality, which would fire the WHEN branch
+   on a NULL row."
   ^longs [pred-expr col-arrays ^long length ^java.util.HashMap cache]
   (let [pred (norm/normalize-pred pred-expr)
         col-ref (first pred)
@@ -126,16 +133,17 @@
     (dotimes [i length]
       (let [v (aget ^doubles col-data i)]
         (aset mask i
-              (long (if (case op
-                          :lt  (< v (double (first args)))
-                          :gt  (> v (double (first args)))
-                          :lte (<= v (double (first args)))
-                          :gte (>= v (double (first args)))
-                          :eq  (== v (double (first args)))
-                          :neq (not (== v (double (first args))))
-                          :range (and (>= v (double (first args))) (< v (double (second args))))
-                          false)
-                      1 0)))))
+              (long (if (or (Double/isNaN v)
+                            (not (case op
+                                   :lt  (< v (double (first args)))
+                                   :gt  (> v (double (first args)))
+                                   :lte (<= v (double (first args)))
+                                   :gte (>= v (double (first args)))
+                                   :eq  (== v (double (first args)))
+                                   :neq (not (== v (double (first args))))
+                                   :range (and (>= v (double (first args))) (< v (double (second args))))
+                                   false)))
+                      0 1)))))
     mask))
 
 ;; ============================================================================
@@ -666,23 +674,27 @@
            col-data (get col-arrays source-key)
            col-meta (when *columns-meta* (get *columns-meta* source-key))]
        (case target-type
+         ;; F-016: CAST(long AS DOUBLE) must map Long.MIN_VALUE → NaN so
+         ;; the long-NULL convention crosses the cast boundary; sibling
+         ;; `arrayLongToDouble` does a raw `(double)` and would emit
+         ;; the finite -9.22e18.
          :double
          (cond
            (long-array? col-data)
            (if (and col-meta (:dict col-meta) (= :string (:dict-type col-meta)))
              (ColumnOps/arrayStringToDouble ^longs col-data ^"[Ljava.lang.String;" (:dict col-meta) (int length))
-             (ColumnOps/arrayLongToDouble ^longs col-data (int length)))
+             (ColumnOps/longToDoubleNullSafe ^longs col-data (int length)))
            :else col-data)
          :long
          (cond
            (long-array? col-data)
            (if (and col-meta (:dict col-meta) (= :string (:dict-type col-meta)))
              (let [^longs la (ColumnOps/arrayStringToLong ^longs col-data ^"[Ljava.lang.String;" (:dict col-meta) (int length))]
-               (ColumnOps/arrayLongToDouble la (int length)))
+               (ColumnOps/longToDoubleNullSafe la (int length)))
              (col-as-doubles-cached col-data length cache))
            :else
            (let [^longs la (ColumnOps/arrayDoubleToLong ^doubles col-data (int length))]
-             (ColumnOps/arrayLongToDouble la (int length))))
+             (ColumnOps/longToDoubleNullSafe la (int length))))
          :string
          (throw (ex-info "CAST to string must be pre-materialized" {:expr expr}))))
 
@@ -837,31 +849,50 @@
                                       (:year :month :day :day-of-week :week-of-year) :days))]
           (case tu
             :micros
+            ;; F-031: per-row NULL guard. Inline micros extracts and the
+            ;; micros→days conversion (the latter feeds ColumnOpsLong
+            ;; extracts which themselves are NULL-safe under F-017; but
+            ;; floorDiv(Long.MIN_VALUE, ...) destroys the sentinel before
+            ;; it reaches them, so map sentinel→sentinel here too).
             (case op
               :hour         (let [r (long-array length)]
                               (dotimes [i length]
-                                (aset r i (quot (Math/floorMod (aget long-data i) 86400000000) 3600000000)))
+                                (let [v (aget long-data i)]
+                                  (aset r i (if (= v Long/MIN_VALUE) Long/MIN_VALUE
+                                                (quot (Math/floorMod v 86400000000) 3600000000)))))
                               r)
               :minute       (let [r (long-array length)]
                               (dotimes [i length]
-                                (aset r i (quot (Math/floorMod (aget long-data i) 3600000000) 60000000)))
+                                (let [v (aget long-data i)]
+                                  (aset r i (if (= v Long/MIN_VALUE) Long/MIN_VALUE
+                                                (quot (Math/floorMod v 3600000000) 60000000)))))
                               r)
               :second       (let [r (long-array length)]
                               (dotimes [i length]
-                                (aset r i (quot (Math/floorMod (aget long-data i) 60000000) 1000000)))
+                                (let [v (aget long-data i)]
+                                  (aset r i (if (= v Long/MIN_VALUE) Long/MIN_VALUE
+                                                (quot (Math/floorMod v 60000000) 1000000)))))
                               r)
               :millisecond  (let [r (long-array length)]
                               (dotimes [i length]
-                                (aset r i (quot (Math/floorMod (aget long-data i) 1000000) 1000)))
+                                (let [v (aget long-data i)]
+                                  (aset r i (if (= v Long/MIN_VALUE) Long/MIN_VALUE
+                                                (quot (Math/floorMod v 1000000) 1000)))))
                               r)
               :microsecond  (let [r (long-array length)]
                               (dotimes [i length]
-                                (aset r i (Math/floorMod (aget long-data i) 1000000)))
+                                (let [v (aget long-data i)]
+                                  (aset r i (if (= v Long/MIN_VALUE) Long/MIN_VALUE
+                                                (Math/floorMod v 1000000)))))
                               r)
               ;; Day/month/year: convert micros to days first
               (:year :month :day :day-of-week :week-of-year)
               (let [ed (long-array length)]
-                (dotimes [i length] (aset ed i (Math/floorDiv (aget long-data i) 86400000000)))
+                (dotimes [i length]
+                  (let [v (aget long-data i)]
+                    (aset ed i (if (= v Long/MIN_VALUE)
+                                 Long/MIN_VALUE
+                                 (Math/floorDiv v 86400000000)))))
                 (case op
                   :year         (ColumnOpsLong/arrayExtractYearLong ed (int length))
                   :month        (ColumnOpsLong/arrayExtractMonthLong ed (int length))

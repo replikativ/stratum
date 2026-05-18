@@ -54,6 +54,28 @@ following all apply per-axis:
 or `nil`. Helpers `valid-time-config` and `system-time-config` return
 the per-axis subset.
 
+### Axis columns are non-nullable
+
+Configured axis columns are stamped `:nullable? false` in their
+column metadata. Every write primitive (`append!`, `upsert!`,
+`retract!`, `bounded-update!`) rejects nil row-map entries for axis
+columns at runtime, and the SQL surface refuses an `INSERT` /
+`INSERT FOR PORTION OF` whose period bound or axis-column value
+would land NULL.
+
+This frees the int64 NULL sentinel value (`Long/MIN_VALUE`) on axis
+columns to mean **`START_OF_TIME`** unambiguously — the SQL
+preprocessor at `sql/rewrite.clj` lowers the `START_OF_TIME` literal
+to `Long/MIN_VALUE`, and `END_OF_TIME` to `Long/MAX_VALUE`. Allen
+predicates over these sentinels work as expected: `_valid_from <
+END_OF_TIME` is always true; `_valid_from >= START_OF_TIME` is
+always true. There is no overlap with NULL semantics on axis cols
+because axes can't be NULL.
+
+If you need "unknown valid-time" in your domain, model it as an
+absent row (the row doesn't appear until the valid-from is known)
+rather than as a NULL axis bound.
+
 ## Why both axes?
 
 System-time is already implicit at the konserve commit layer — every

@@ -1531,6 +1531,16 @@
   (chunk-constant? [_] false)
   (chunk-constant-val [_] nil)
 
+  (chunk-validity [this]
+    ;; Parquet chunks may carry NULLs. Lazy-decode the data once,
+    ;; then scan for sentinels to produce the bitmap. The decode is
+    ;; needed anyway for any read; the scan is the same shape as
+    ;; `chunk/scan-validity` and is part of the materialise cost.
+    ;; Return nil (all-valid fast path) when no sentinels found.
+    (let [arr (chunk/chunk-data this)
+          dt  (chunk/chunk-datatype this)]
+      (chunk/scan-validity arr dt length)))
+
   chunk/IColChunkMut
   (write-value! [_ _ _]
     (throw (UnsupportedOperationException. "ParquetRowGroupChunk is read-only")))

@@ -52,7 +52,10 @@ public final class ColumnOpsTemporal {
         ymd[2] = d;
     }
 
-    /** DATE_TRUNC to micro (identity): pass-through, no rounding needed. */
+    private static final long NULL_L = Long.MIN_VALUE;
+
+    /** DATE_TRUNC to micro (identity): pass-through, no rounding needed.
+     *  F-017: copyOf preserves the NULL sentinel verbatim. */
     public static long[] arrayDateTruncMicroMicros(long[] em, int length) {
         return java.util.Arrays.copyOf(em, length);
     }
@@ -61,7 +64,8 @@ public final class ColumnOpsTemporal {
     public static long[] arrayDateTruncMilliMicros(long[] em, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorDiv(em[i], MICROS_PER_MILLI) * MICROS_PER_MILLI;
+            long v = em[i];
+            r[i] = (v == NULL_L) ? NULL_L : Math.floorDiv(v, MICROS_PER_MILLI) * MICROS_PER_MILLI;
         }
         return r;
     }
@@ -70,7 +74,8 @@ public final class ColumnOpsTemporal {
     public static long[] arrayDateTruncSecondMicros(long[] em, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorDiv(em[i], MICROS_PER_SECOND) * MICROS_PER_SECOND;
+            long v = em[i];
+            r[i] = (v == NULL_L) ? NULL_L : Math.floorDiv(v, MICROS_PER_SECOND) * MICROS_PER_SECOND;
         }
         return r;
     }
@@ -79,7 +84,8 @@ public final class ColumnOpsTemporal {
     public static long[] arrayDateTruncMinuteMicros(long[] em, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorDiv(em[i], MICROS_PER_MINUTE) * MICROS_PER_MINUTE;
+            long v = em[i];
+            r[i] = (v == NULL_L) ? NULL_L : Math.floorDiv(v, MICROS_PER_MINUTE) * MICROS_PER_MINUTE;
         }
         return r;
     }
@@ -88,7 +94,8 @@ public final class ColumnOpsTemporal {
     public static long[] arrayDateTruncHourMicros(long[] em, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorDiv(em[i], MICROS_PER_HOUR) * MICROS_PER_HOUR;
+            long v = em[i];
+            r[i] = (v == NULL_L) ? NULL_L : Math.floorDiv(v, MICROS_PER_HOUR) * MICROS_PER_HOUR;
         }
         return r;
     }
@@ -97,7 +104,8 @@ public final class ColumnOpsTemporal {
     public static long[] arrayDateTruncDayMicros(long[] em, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorDiv(em[i], MICROS_PER_DAY) * MICROS_PER_DAY;
+            long v = em[i];
+            r[i] = (v == NULL_L) ? NULL_L : Math.floorDiv(v, MICROS_PER_DAY) * MICROS_PER_DAY;
         }
         return r;
     }
@@ -107,7 +115,9 @@ public final class ColumnOpsTemporal {
         long[] r = new long[length];
         long[] ymd = new long[3];
         for (int i = 0; i < length; i++) {
-            long epochDays = Math.floorDiv(em[i], MICROS_PER_DAY);
+            long v = em[i];
+            if (v == NULL_L) { r[i] = NULL_L; continue; }
+            long epochDays = Math.floorDiv(v, MICROS_PER_DAY);
             civilFromDays(epochDays, ymd);
             r[i] = civilToDays(ymd[0], ymd[1], 1) * MICROS_PER_DAY;
         }
@@ -119,7 +129,9 @@ public final class ColumnOpsTemporal {
         long[] r = new long[length];
         long[] ymd = new long[3];
         for (int i = 0; i < length; i++) {
-            long epochDays = Math.floorDiv(em[i], MICROS_PER_DAY);
+            long v = em[i];
+            if (v == NULL_L) { r[i] = NULL_L; continue; }
+            long epochDays = Math.floorDiv(v, MICROS_PER_DAY);
             civilFromDays(epochDays, ymd);
             r[i] = civilToDays(ymd[0], 1, 1) * MICROS_PER_DAY;
         }
@@ -130,7 +142,9 @@ public final class ColumnOpsTemporal {
     public static double[] arrayExtractHourMicros(long[] em, int length) {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
-            long t = Math.floorMod(em[i], MICROS_PER_DAY);
+            long v = em[i];
+            if (v == NULL_L) { r[i] = Double.NaN; continue; }
+            long t = Math.floorMod(v, MICROS_PER_DAY);
             r[i] = (double) (t / MICROS_PER_HOUR);
         }
         return r;
@@ -140,7 +154,9 @@ public final class ColumnOpsTemporal {
     public static double[] arrayExtractMinuteMicros(long[] em, int length) {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
-            long t = Math.floorMod(em[i], MICROS_PER_HOUR);
+            long v = em[i];
+            if (v == NULL_L) { r[i] = Double.NaN; continue; }
+            long t = Math.floorMod(v, MICROS_PER_HOUR);
             r[i] = (double) (t / MICROS_PER_MINUTE);
         }
         return r;
@@ -150,7 +166,9 @@ public final class ColumnOpsTemporal {
     public static double[] arrayExtractSecondMicros(long[] em, int length) {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
-            long t = Math.floorMod(em[i], MICROS_PER_MINUTE);
+            long v = em[i];
+            if (v == NULL_L) { r[i] = Double.NaN; continue; }
+            long t = Math.floorMod(v, MICROS_PER_MINUTE);
             r[i] = (double) (t / MICROS_PER_SECOND);
         }
         return r;
@@ -160,7 +178,9 @@ public final class ColumnOpsTemporal {
     public static double[] arrayExtractMillisecondMicros(long[] em, int length) {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
-            long t = Math.floorMod(em[i], MICROS_PER_SECOND);
+            long v = em[i];
+            if (v == NULL_L) { r[i] = Double.NaN; continue; }
+            long t = Math.floorMod(v, MICROS_PER_SECOND);
             r[i] = (double) (t / MICROS_PER_MILLI);
         }
         return r;
@@ -170,7 +190,8 @@ public final class ColumnOpsTemporal {
     public static double[] arrayExtractMicrosecondMicros(long[] em, int length) {
         double[] r = new double[length];
         for (int i = 0; i < length; i++) {
-            r[i] = (double) Math.floorMod(em[i], MICROS_PER_SECOND);
+            long v = em[i];
+            r[i] = (v == NULL_L) ? Double.NaN : (double) Math.floorMod(v, MICROS_PER_SECOND);
         }
         return r;
     }
@@ -178,7 +199,10 @@ public final class ColumnOpsTemporal {
     /** DATE_ADD on epoch-micros: add N micros. */
     public static long[] arrayDateAddMicrosMicros(long[] em, long n, int length) {
         long[] r = new long[length];
-        for (int i = 0; i < length; i++) r[i] = em[i] + n;
+        for (int i = 0; i < length; i++) {
+            long v = em[i];
+            r[i] = (v == NULL_L) ? NULL_L : v + n;
+        }
         return r;
     }
 
@@ -188,6 +212,7 @@ public final class ColumnOpsTemporal {
         long[] ymd = new long[3];
         for (int i = 0; i < length; i++) {
             long s = em[i];
+            if (s == NULL_L) { r[i] = NULL_L; continue; }
             long epochDays = Math.floorDiv(s, MICROS_PER_DAY);
             long timeOfDay = s - epochDays * MICROS_PER_DAY;
             civilFromDays(epochDays, ymd);
@@ -209,10 +234,13 @@ public final class ColumnOpsTemporal {
         return r;
     }
 
-    /** DATE_DIFF in micros between two epoch-micros columns. */
+    /** DATE_DIFF in micros between two epoch-micros columns. NULL on either side → NaN. */
     public static double[] arrayDateDiffMicros(long[] a, long[] b, int length) {
         double[] r = new double[length];
-        for (int i = 0; i < length; i++) r[i] = (double)(a[i] - b[i]);
+        for (int i = 0; i < length; i++) {
+            long av = a[i], bv = b[i];
+            r[i] = (av == NULL_L || bv == NULL_L) ? Double.NaN : (double)(av - bv);
+        }
         return r;
     }
 
@@ -223,7 +251,8 @@ public final class ColumnOpsTemporal {
     public static long[] arrayTimeBucketMicros(long[] em, long widthMicros, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorDiv(em[i], widthMicros) * widthMicros;
+            long v = em[i];
+            r[i] = (v == NULL_L) ? NULL_L : Math.floorDiv(v, widthMicros) * widthMicros;
         }
         return r;
     }
@@ -233,7 +262,9 @@ public final class ColumnOpsTemporal {
     public static long[] arrayTimeBucketMicrosOrigin(long[] em, long widthMicros, long originMicros, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            long shifted = em[i] - originMicros;
+            long v = em[i];
+            if (v == NULL_L) { r[i] = NULL_L; continue; }
+            long shifted = v - originMicros;
             r[i] = Math.floorDiv(shifted, widthMicros) * widthMicros + originMicros;
         }
         return r;
@@ -243,7 +274,8 @@ public final class ColumnOpsTemporal {
     public static long[] arrayTimeBucketDays(long[] ed, long widthDays, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorDiv(ed[i], widthDays) * widthDays;
+            long v = ed[i];
+            r[i] = (v == NULL_L) ? NULL_L : Math.floorDiv(v, widthDays) * widthDays;
         }
         return r;
     }
@@ -254,7 +286,9 @@ public final class ColumnOpsTemporal {
         long[] r = new long[length];
         long[] ymd = new long[3];
         for (int i = 0; i < length; i++) {
-            civilFromDays(ed[i], ymd);
+            long v = ed[i];
+            if (v == NULL_L) { r[i] = NULL_L; continue; }
+            civilFromDays(v, ymd);
             // months since 1970-01: year*12 + (month-1), but adjusted so 1970-01 = 0
             long totalMonths = (ymd[0] - 1970) * 12 + (ymd[1] - 1);
             long bucket = Math.floorDiv(totalMonths, widthMonths) * widthMonths;

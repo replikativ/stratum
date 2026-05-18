@@ -169,45 +169,92 @@
       nil)))
 
 (defn- eval-dml-predicate
-  "Evaluate the DML-style predicate list (each pred is `[op col val]`)
-   against row `i` of a column-map. Returns truthy/falsy. Reusable
-   across UPDATE / DELETE / UPSERT branches; works on both raw-array
-   and index-backed columns via `read-cell`."
+  "Evaluate the DML-style predicate list (each pred is `[op col val]`
+   or `[op pred ...]` for combinators) against row `i` of a column-map.
+   Returns truthy/falsy. Reusable across UPDATE / DELETE / UPSERT
+   branches; works on both raw-array and index-backed columns via
+   `read-cell`.
+
+   F-021: covers logical combinators (`:and`/`:or`/`:not`), set ops
+   (`:in`/`:not-in`), `:between`/`:not-between`, and the LIKE
+   family (`:like`/`:not-like`/`:contains`/`:starts-with`/`:ends-with`).
+   Pre-fix these all fell to the `false` default → DML silently
+   matched no rows."
   [existing where ^long i]
-  (every? (fn [pred]
-            (let [eval-val (fn eval-val [e]
-                             (cond
-                               (keyword? e) (read-cell existing e i)
-                               (number? e)  e
-                               (string? e)  e
-                               (nil? e)     nil
-                               (vector? e)
-                               (nil-safe-arith (first e)
-                                               (eval-val (nth e 1))
-                                               (eval-val (nth e 2)))))]
-              (case (first pred)
-                :=   (let [l (eval-val (nth pred 1))
-                           r (eval-val (nth pred 2))]
-                       (and (some? l) (some? r) (= l r)))
-                (:!= :<>) (let [l (eval-val (nth pred 1))
-                                r (eval-val (nth pred 2))]
-                            (and (some? l) (some? r) (not= l r)))
-                :>   (let [l (eval-val (nth pred 1))
-                           r (eval-val (nth pred 2))]
-                       (and (some? l) (some? r) (> (double l) (double r))))
-                :<   (let [l (eval-val (nth pred 1))
-                           r (eval-val (nth pred 2))]
-                       (and (some? l) (some? r) (< (double l) (double r))))
-                :>=  (let [l (eval-val (nth pred 1))
-                           r (eval-val (nth pred 2))]
-                       (and (some? l) (some? r) (>= (double l) (double r))))
-                :<=  (let [l (eval-val (nth pred 1))
-                           r (eval-val (nth pred 2))]
-                       (and (some? l) (some? r) (<= (double l) (double r))))
-                :is-null     (nil? (eval-val (nth pred 1)))
-                :is-not-null (some? (eval-val (nth pred 1)))
-                false)))
-          where))
+  (letfn [(eval-val [e]
+            (cond
+              (keyword? e) (read-cell existing e i)
+              (number? e)  e
+              (string? e)  e
+              (nil? e)     nil
+              (vector? e)
+              (nil-safe-arith (first e)
+                              (eval-val (nth e 1))
+                              (eval-val (nth e 2)))))
+          (like-match [s pattern]
+            (when (and (some? s) (some? pattern))
+              (let [regex (-> (str pattern)
+                              (java.util.regex.Pattern/quote)
+                              (.replace "%" "\\E.*\\Q")
+                              (.replace "_" "\\E.\\Q"))]
+                (boolean (re-matches (re-pattern (str "(?s)" regex)) (str s))))))
+          (eval1 [pred]
+            (case (first pred)
+              :and  (every? eval1 (rest pred))
+              :or   (boolean (some eval1 (rest pred)))
+              :not  (not (eval1 (second pred)))
+              :=    (let [l (eval-val (nth pred 1))
+                          r (eval-val (nth pred 2))]
+                      (and (some? l) (some? r) (= l r)))
+              (:!= :<>) (let [l (eval-val (nth pred 1))
+                              r (eval-val (nth pred 2))]
+                          (and (some? l) (some? r) (not= l r)))
+              :>    (let [l (eval-val (nth pred 1))
+                          r (eval-val (nth pred 2))]
+                      (and (some? l) (some? r) (> (double l) (double r))))
+              :<    (let [l (eval-val (nth pred 1))
+                          r (eval-val (nth pred 2))]
+                      (and (some? l) (some? r) (< (double l) (double r))))
+              :>=   (let [l (eval-val (nth pred 1))
+                          r (eval-val (nth pred 2))]
+                      (and (some? l) (some? r) (>= (double l) (double r))))
+              :<=   (let [l (eval-val (nth pred 1))
+                          r (eval-val (nth pred 2))]
+                      (and (some? l) (some? r) (<= (double l) (double r))))
+              :is-null     (nil? (eval-val (nth pred 1)))
+              :is-not-null (some? (eval-val (nth pred 1)))
+              :in     (let [l (eval-val (nth pred 1))
+                            xs (nth pred 2)]
+                        (and (some? l) (contains? (set xs) l)))
+              :not-in (let [l (eval-val (nth pred 1))
+                            xs (nth pred 2)
+                            has-null? (some nil? xs)]
+                        ;; PG 3VL: NOT IN with NULL in the set is UNKNOWN → false.
+                        (and (some? l) (not has-null?) (not (contains? (set xs) l))))
+              :between (let [v (eval-val (nth pred 1))
+                             lo (eval-val (nth pred 2))
+                             hi (eval-val (nth pred 3))]
+                         (and (some? v) (some? lo) (some? hi)
+                              (>= (double v) (double lo))
+                              (<= (double v) (double hi))))
+              :not-between (let [v (eval-val (nth pred 1))
+                                 lo (eval-val (nth pred 2))
+                                 hi (eval-val (nth pred 3))]
+                             (and (some? v) (some? lo) (some? hi)
+                                  (or (< (double v) (double lo))
+                                      (> (double v) (double hi)))))
+              :like     (like-match (eval-val (nth pred 1)) (nth pred 2))
+              :not-like (let [v (eval-val (nth pred 1))]
+                          ;; NOT LIKE NULL → UNKNOWN → false (3VL).
+                          (and (some? v) (not (like-match v (nth pred 2)))))
+              :contains    (let [v (eval-val (nth pred 1)) p (str (nth pred 2))]
+                             (and (some? v) (.contains (str v) p)))
+              :starts-with (let [v (eval-val (nth pred 1)) p (str (nth pred 2))]
+                             (and (some? v) (.startsWith (str v) p)))
+              :ends-with   (let [v (eval-val (nth pred 1)) p (str (nth pred 2))]
+                             (and (some? v) (.endsWith (str v) p)))
+              false))]
+    (every? eval1 where)))
 
 (defn- delete-via-index-backend
   "Apply a DELETE to a fully-index-backed table. Builds a sorted-desc

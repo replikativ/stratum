@@ -68,7 +68,9 @@ public final class ColumnOpsLong {
     public static long[] arrayExtractYearLong(long[] epochDays, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            long z = epochDays[i] + 719468;
+            long v = epochDays[i];
+            if (v == NULL) { r[i] = NULL; continue; }  // F-017
+            long z = v + 719468;
             long era = (z >= 0 ? z : z - 146096) / 146097;
             long doe = z - era * 146097;
             long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
@@ -84,7 +86,9 @@ public final class ColumnOpsLong {
     public static long[] arrayExtractMonthLong(long[] epochDays, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            long z = epochDays[i] + 719468;
+            long v = epochDays[i];
+            if (v == NULL) { r[i] = NULL; continue; }  // F-017
+            long z = v + 719468;
             long era = (z >= 0 ? z : z - 146096) / 146097;
             long doe = z - era * 146097;
             long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
@@ -98,7 +102,9 @@ public final class ColumnOpsLong {
     public static long[] arrayExtractDayLong(long[] epochDays, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            long z = epochDays[i] + 719468;
+            long v = epochDays[i];
+            if (v == NULL) { r[i] = NULL; continue; }  // F-017
+            long z = v + 719468;
             long era = (z >= 0 ? z : z - 146096) / 146097;
             long doe = z - era * 146097;
             long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
@@ -112,7 +118,8 @@ public final class ColumnOpsLong {
     public static long[] arrayExtractHourLong(long[] epochSeconds, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorMod(epochSeconds[i], 86400L) / 3600;
+            long v = epochSeconds[i];
+            r[i] = (v == NULL) ? NULL : Math.floorMod(v, 86400L) / 3600;  // F-017
         }
         return r;
     }
@@ -120,7 +127,8 @@ public final class ColumnOpsLong {
     public static long[] arrayExtractMinuteLong(long[] epochSeconds, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorMod(epochSeconds[i], 3600L) / 60;
+            long v = epochSeconds[i];
+            r[i] = (v == NULL) ? NULL : Math.floorMod(v, 3600L) / 60;  // F-017
         }
         return r;
     }
@@ -128,7 +136,8 @@ public final class ColumnOpsLong {
     public static long[] arrayExtractSecondLong(long[] epochSeconds, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorMod(epochSeconds[i], 60L);
+            long v = epochSeconds[i];
+            r[i] = (v == NULL) ? NULL : Math.floorMod(v, 60L);  // F-017
         }
         return r;
     }
@@ -136,7 +145,8 @@ public final class ColumnOpsLong {
     public static long[] arrayExtractDayOfWeekLong(long[] epochDays, int length) {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
-            r[i] = Math.floorMod(epochDays[i] + 3, 7L);
+            long v = epochDays[i];
+            r[i] = (v == NULL) ? NULL : Math.floorMod(v + 3, 7L);  // F-017
         }
         return r;
     }
@@ -145,6 +155,7 @@ public final class ColumnOpsLong {
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
             long ed = epochDays[i];
+            if (ed == NULL) { r[i] = NULL; continue; }  // F-017
             long dow = ((ed % 7) + 10) % 7;
             long thu = ed + (3 - dow);
             long z = thu + 719468;
@@ -526,7 +537,12 @@ public final class ColumnOpsLong {
             int numAggs, int[] aggTypes, long[][] aggCols,
             int start, int end, int maxKey) {
 
-        int accSize = numAggs * 2;
+        // F-006: extra slot per group at offset `numAggs*2` holds the
+        // post-filter row count, used by `compact-dense-long-to-pair`
+        // to keep all-NULL groups in the output. Per-agg count slots
+        // still mean "non-NULL count" for AVG correctness.
+        int accSize = numAggs * 2 + 1;
+        int markerSlot = numAggs * 2;
         long[] accs = new long[maxKey * accSize];
 
         // Initialize MIN to MAX_VALUE, MAX to MIN_VALUE+1
@@ -572,6 +588,9 @@ public final class ColumnOpsLong {
             }
 
             int base = key * accSize;
+            // F-006: post-filter row count for the group; needed so all-NULL
+            // groups still appear in the SQL output.
+            accs[base + markerSlot] += m;
             for (int a = 0; a < numAggs; a++) {
                 int off = base + a * 2;
                 switch (aggTypes[a]) {
@@ -639,7 +658,8 @@ public final class ColumnOpsLong {
                     numAggs, aggTypes, aggCols, length, maxKey);
         }
 
-        int accSize = numAggs * 2;
+        // F-006: accSize matches Range variant (`numAggs*2 + 1`).
+        int accSize = numAggs * 2 + 1;
         long perThreadMem = (long) maxKey * accSize * 8;
         boolean useMorsels = perThreadMem < 65536;
 
@@ -714,6 +734,9 @@ public final class ColumnOpsLong {
     /** Merge src long[] accumulators into dst. */
     private static void mergeLongAccs(long[] dst, long[] src, int maxKey, int accSize,
                                        int numAggs, int[] aggTypes) {
+        // F-006: accSize includes a marker slot at offset `numAggs*2`.
+        // Merge it additively even when no agg has non-NULL data.
+        int markerSlot = numAggs * 2;
         for (int k = 0; k < maxKey; k++) {
             int base = k * accSize;
             for (int a = 0; a < numAggs; a++) {
@@ -738,6 +761,7 @@ public final class ColumnOpsLong {
                         break;
                 }
             }
+            dst[base + markerSlot] += src[base + markerSlot];
         }
     }
 

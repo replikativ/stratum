@@ -803,6 +803,96 @@
       (is (nil? (dataset/valid-time-config ds)))
       (is (nil? (dataset/system-time-config ds))))))
 
+(deftest bitemporal-axis-cols-marked-nullable-false
+  ;; Phase 0.5 — axis columns carry an explicit `:nullable? false`
+  ;; metadata stamp. This frees the int64 NULL sentinel (Long/MIN_VALUE)
+  ;; to mean START_OF_TIME unambiguously on axis cols, and lets the
+  ;; subsequent validity-bitmap migration skip bitmap allocation for
+  ;; axis cols entirely.
+  (testing ":valid axis cols get :nullable? false + :axis-kw + :axis-role"
+    (let [ds (dataset/make-dataset
+              {:e (long-array [1])
+               :_valid_from (long-array [1700000000000000])
+               :_valid_to   (long-array [Long/MAX_VALUE])}
+              {:metadata {:bitemporal {:valid {:from-col :_valid_from
+                                               :to-col   :_valid_to}}}})
+          vf (dataset/column ds :_valid_from)
+          vt (dataset/column ds :_valid_to)]
+      (is (false? (:nullable? vf)))
+      (is (false? (:nullable? vt)))
+      (is (= :valid (:axis-kw vf)))
+      (is (= :valid (:axis-kw vt)))
+      (is (= :from (:axis-role vf)))
+      (is (= :to   (:axis-role vt)))
+      (testing "non-axis column is not stamped (implicitly nullable)"
+        (is (nil? (:nullable? (dataset/column ds :e)))))))
+  (testing "user-named axis cols (non-default names) get the same stamp"
+    (let [ds (dataset/make-dataset
+              {:e (long-array [1])
+               :start (long-array [1700000000000000])
+               :end   (long-array [Long/MAX_VALUE])}
+              {:metadata {:bitemporal {:valid {:from-col :start
+                                               :to-col   :end}}}})]
+      (is (false? (:nullable? (dataset/column ds :start))))
+      (is (false? (:nullable? (dataset/column ds :end))))
+      (is (= :from (:axis-role (dataset/column ds :start))))
+      (is (= :to   (:axis-role (dataset/column ds :end)))))))
+
+(deftest bitemporal-axis-nullable-stamps-survive-load
+  (testing "after sync!/load, axis cols still carry :nullable? false"
+    (let [store (make-store)
+          ds (dataset/make-dataset
+              {:e            (index/index-from-seq :int64 [1])
+               :_valid_from  (index/index-from-seq :int64 [1700000000000000])
+               :_valid_to    (index/index-from-seq :int64 [Long/MAX_VALUE])
+               :_system_from (index/index-from-seq :int64 [1700000000000000])
+               :_system_to   (index/index-from-seq :int64 [Long/MAX_VALUE])}
+              {:name "bt"
+               :metadata
+               {:bitemporal {:valid  {:from-col :_valid_from
+                                      :to-col   :_valid_to}
+                             :system {:from-col :_system_from
+                                      :to-col   :_system_to}}}})]
+      (dataset/sync! ds store "main")
+      (let [loaded (dataset/load store "main")]
+        (is (false? (:nullable? (dataset/column loaded :_valid_from))))
+        (is (false? (:nullable? (dataset/column loaded :_valid_to))))
+        (is (false? (:nullable? (dataset/column loaded :_system_from))))
+        (is (false? (:nullable? (dataset/column loaded :_system_to))))
+        (is (= :valid  (:axis-kw (dataset/column loaded :_valid_from))))
+        (is (= :system (:axis-kw (dataset/column loaded :_system_from))))))))
+
+(deftest bitemporal-append-rejects-nil-axis-value
+  ;; The runtime nil-rejection already exists in append! (added in a
+  ;; prior copilot review). Phase 0.5 locks it in as a regression test
+  ;; so future refactoring can't quietly drop the check.
+  (let [make-bt-ds (fn []
+                     (dataset/make-dataset
+                      {:e           (index/index-from-seq :int64 [])
+                       :_valid_from (index/index-from-seq :int64 [])
+                       :_valid_to   (index/index-from-seq :int64 [])}
+                      {:metadata {:bitemporal {:valid {:from-col :_valid_from
+                                                       :to-col   :_valid_to}}}}))]
+    (testing "append! throws on nil _valid_from"
+      (let [tds (transient (make-bt-ds))]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"non-nil.+:from-col"
+             (dataset/append! tds {:e 1 :_valid_from nil :_valid_to 1710000000000000})))))
+    (testing "append! throws on nil _valid_to"
+      (let [tds (transient (make-bt-ds))]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"non-nil.+:to-col"
+             (dataset/append! tds {:e 1 :_valid_from 1700000000000000 :_valid_to nil})))))
+    (testing "append! accepts START_OF_TIME / END_OF_TIME sentinels"
+      ;; Long/MIN_VALUE = START_OF_TIME; Long/MAX_VALUE = END_OF_TIME.
+      ;; Both must be acceptable as axis-col values (they're the canonical
+      ;; "from beginning of time" and "until end of time" markers).
+      (let [tds (transient (make-bt-ds))]
+        (dataset/append! tds {:e 1
+                              :_valid_from Long/MIN_VALUE
+                              :_valid_to   Long/MAX_VALUE})
+        (is (= 1 (dataset/row-count (persistent! tds))))))))
+
 (deftest bitemporal-config-rejects-unknown-unit
   ;; Regression lock for round-3 agent P1: `apply-axis-config`
   ;; previously accepted any value for `:unit` and silently fell

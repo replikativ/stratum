@@ -3135,7 +3135,12 @@ public final class ColumnOpsExt {
             int numAggs, int[] aggTypes, double[][] factAggCols,
             int start, int end, int maxKey) {
 
-        final int accSize = numAggs * 2;
+        // F-006: accSize includes a per-group marker slot at numAggs*2,
+        // matching ColumnOps.fusedJoinGroupAggregateDenseRange so the
+        // downstream Clojure decode applies its marker-aware compact
+        // uniformly across hash-join and perfect-hash-join paths.
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
         double[] groups = new double[maxKey * accSize];
         for (int a = 0; a < numAggs; a++) {
             if (aggTypes[a] == AGG_MIN) {
@@ -3182,6 +3187,7 @@ public final class ColumnOpsExt {
                     key += (int)(dimGroupCols[g][dimIdx] * dimGroupMuls[g]);
 
                 int base0 = key * accSize;
+                groups[base0 + markerSlot] += 1;  // F-006 marker
                 for (int a = 0; a < numAggs; a++) {
                     int off = base0 + a * 2;
                     switch (aggTypes[a]) {
@@ -3210,6 +3216,7 @@ public final class ColumnOpsExt {
                         key += (int)(dimGroupCols[g][dimIdx] * dimGroupMuls[g]);
 
                     int base0 = key * accSize;
+                    groups[base0 + markerSlot] += 1;  // F-006 marker
                     for (int a = 0; a < numAggs; a++) {
                         int off = base0 + a * 2;
                         switch (aggTypes[a]) {
@@ -3291,7 +3298,9 @@ public final class ColumnOpsExt {
                     0, probeLength, maxKey);
         }
         int threadRange = (probeLength + nThreads - 1) / nThreads;
-        final int accSize = numAggs * 2;
+        // F-006: matches Range variant.
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
 
         Future<double[]>[] futures = new Future[nThreads];
 
@@ -3326,7 +3335,8 @@ public final class ColumnOpsExt {
                 double[] partial = f.get();
                 for (int k = 0; k < maxKey; k++) {
                     int base0 = k * accSize;
-                    if (partial[base0 + 1] == 0.0) continue;
+                    // F-006: marker (not agg-0 count) is the "group exists" signal.
+                    if (partial[base0 + markerSlot] == 0.0) continue;
                     for (int a = 0; a < numAggs; a++) {
                         int off = base0 + a * 2;
                         switch (aggTypes[a]) {
@@ -3339,6 +3349,7 @@ public final class ColumnOpsExt {
                         }
                         merged[off + 1] += partial[off + 1];
                     }
+                    merged[base0 + markerSlot] += partial[base0 + markerSlot];
                 }
             }
         } catch (Exception e) {

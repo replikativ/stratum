@@ -3,11 +3,52 @@
 
    Provides column type detection and normalization to canonical format
    used by query engine and datasets."
-  (:require [stratum.index :as index])
+  (:require [stratum.chunk :as chunk]
+            [stratum.index :as index])
   (:import [stratum.index PersistentColumnIndex]
            [stratum.internal ColumnOpsString]))
 
 (set! *warn-on-reflection* true)
+
+;; ----------------------------------------------------------------------------
+;; Validity-bitmap identity cache
+;;
+;; `encode-column` derives a validity bitmap from raw long[]/double[] inputs
+;; by scanning for the per-type NULL sentinel. The scan is O(n) per column,
+;; and ad-hoc query shapes that pass the same raw array into `q/q` repeatedly
+;; (e.g. the OLAP bench's `bench-1t` running 5+10 iterations over h2o's 6M-row
+;; vectors) re-paid the scan on every iteration — bisect traced H2O-J1 going
+;; from 27.7ms to 42.7ms exactly to the encode-column scan added in 88bfaca.
+;;
+;; Identity cache: keyed on the array reference itself (Java arrays use
+;; identity equality / identity hashCode, so a plain WeakHashMap is an
+;; identity cache without any extra wrapping). WeakHashMap lets GC reclaim
+;; entries once no caller still holds the array. `Collections.synchronizedMap`
+;; makes get/put atomic across threads — the wrapper is enough because we
+;; do at most one get + one put per call.
+;;
+;; The cached value is either a `long[]` bitmap or the `::no-nulls` sentinel
+;; (Clojure keyword) standing in for "scanned, no nulls present" — needed
+;; because nil already means "miss" inside a HashMap.get call.
+;; ----------------------------------------------------------------------------
+
+(def ^:private ^java.util.Map validity-cache
+  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+
+(defn- cached-scan-validity
+  "Like `chunk/scan-validity` but memoised by array identity. Returns the
+   bitmap (or nil for all-valid) and caches the result so subsequent calls
+   on the same array reference skip the O(n) sentinel scan."
+  ^longs [arr datatype ^long length]
+  (let [hit (.get validity-cache arr)]
+    (cond
+      (nil? hit)
+      (let [v (chunk/scan-validity arr datatype length)]
+        (.put validity-cache arr (or v ::no-nulls))
+        v)
+
+      (identical? hit ::no-nulls) nil
+      :else hit)))
 
 (defn encode-column
   "Detect column type and extract data array from various inputs.
@@ -28,22 +69,44 @@
      :index          - PersistentColumnIndex (optional, if :source is :index)
      :dict           - String[] reverse dictionary (optional, for string columns)
      :dict-type      - :string (required if :dict present)
+     :validity       - long[] packed bitmap, present only when the data
+                       contains NULL sentinels; absent maps to the
+                       all-valid fast path
      :temporal-unit  - :days/:seconds/:millis/:micros (optional; tags long[]
                        columns as DATE or TIMESTAMP and selects the matching
-                       date kernels)"
-  [col-val]
+                       date kernels)
+
+  NULL opt-out: callers that know a column is non-nullable can pass
+  `:nullable? false` via the 2-arity form OR pre-normalise to
+  `{:type T :data arr}` (which already bypasses the sentinel scan,
+  because the passthrough branch trusts caller-supplied metadata).
+  Skipping the scan avoids an O(n) sweep at column registration;
+  downstream kernels then take the all-valid fast path."
+  ([col-val] (encode-column col-val nil))
+  ([col-val {:keys [nullable?] :or {nullable? true}}]
   (cond
     ;; Already normalized
     (and (map? col-val) (:type col-val) (or (:data col-val) (:index col-val)))
     col-val
 
-    ;; Raw long array
+    ;; Raw long array — scan once for Long.MIN_VALUE sentinels so the
+    ;; downstream kernels can dispatch to their Nullable siblings.
+    ;; Returns nil bitmap when no NULLs present (the common case),
+    ;; preserving the all-valid fast path.
     (instance? (Class/forName "[J") col-val)
-    {:type :int64 :data col-val}
+    (let [v (when nullable?
+              (cached-scan-validity col-val :int64 (alength ^longs col-val)))]
+      (cond-> {:type :int64 :data col-val}
+        (false? nullable?) (assoc :nullable? false)
+        v (assoc :validity v)))
 
-    ;; Raw double array
+    ;; Raw double array — same lazy validity derivation.
     (instance? (Class/forName "[D") col-val)
-    {:type :float64 :data col-val}
+    (let [v (when nullable?
+              (cached-scan-validity col-val :float64 (alength ^doubles col-val)))]
+      (cond-> {:type :float64 :data col-val}
+        (false? nullable?) (assoc :nullable? false)
+        v (assoc :validity v)))
 
     ;; String array — dictionary-encode to long[] for SIMD group-by
     ;; NULL strings (nil) are encoded as Long.MIN_VALUE sentinel (same as int64 NULL)
@@ -74,9 +137,13 @@
             (doseq [^java.util.Map$Entry e (.entrySet dict-map)]
               (when-let [k (.getKey e)]
                 (aset ^"[Ljava.lang.String;" reverse-dict (int (long (.getValue e))) k)))
-            {:type :int64 :data encoded :dict reverse-dict :dict-type :string
-             :dict-alpha-masks (ColumnOpsString/buildDictAlphaMasks reverse-dict)
-             :dict-bigram-masks (ColumnOpsString/buildDictBigramMasks reverse-dict)}))))
+            ;; nil strings became Long.MIN_VALUE sentinels above; derive
+            ;; validity so downstream Nullable kernels see the NULL set.
+            (let [v (chunk/scan-validity encoded :int64 n)]
+              (cond-> {:type :int64 :data encoded :dict reverse-dict :dict-type :string
+                       :dict-alpha-masks (ColumnOpsString/buildDictAlphaMasks reverse-dict)
+                       :dict-bigram-masks (ColumnOpsString/buildDictBigramMasks reverse-dict)}
+                v (assoc :validity v)))))))
 
     ;; Stratum index - preserve as index source for chunk-streaming
     (satisfies? index/IColumnIndex col-val)
@@ -101,4 +168,4 @@
 
     :else
     (throw (ex-info (str "Cannot detect column type for: " (type col-val))
-                    {:col-type (type col-val)}))))
+                    {:col-type (type col-val)})))))

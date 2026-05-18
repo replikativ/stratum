@@ -122,7 +122,32 @@ public final class ColumnOpsChunked {
             int[] chunkLengths, int startChunk, int endChunk, int maxChunkLen, int maxKey,
             boolean nanSafe, long[] nullSlots) {
 
-        final int accSize = numAggs * 2;
+        // F-006: accSize includes one trailing slot per group for the
+        // post-filter row count, so all-NULL groups survive the compact
+        // step downstream. Layout matches ColumnOps.fusedFilterGroup-
+        // AggregateDenseRange.
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
+        // F-006 fast path: any AGG_COUNT in the agg list provides a
+        // built-in per-group post-filter row count (COUNT never
+        // NULL-skips), so its count slot equals the marker definition
+        // by construction. Find the first such agg and snapshot its
+        // count into the marker at function end — saves a full per-row
+        // sweep. Without this, COUNT-only chunked group-by paid ~30%
+        // overhead on B6 (3 groups, 6M rows: 6M extra writes per
+        // query). Most realistic GROUP BY queries include COUNT(*) so
+        // this covers the common case; the no-COUNT fallback below
+        // does the explicit per-row marker pass. The marker-free
+        // variant `fusedGroupAggregateDenseChunkedNoMarker{Range,
+        // Parallel}` below handles the !nanSafe + no-COUNT case from
+        // its own JIT-isolated compilation unit so this hot loop
+        // never has to decide at runtime.
+        int countAggIdx = -1;
+        for (int a = 0; a < numAggs; a++) {
+            if (aggTypes[a] == AGG_COUNT) { countAggIdx = a; break; }
+        }
+        final boolean markerFromCount = countAggIdx >= 0;
+        final int countSlot = markerFromCount ? countAggIdx * 2 + 1 : -1;
         double[] groups = new double[maxKey * accSize];
         // Init MIN to +Inf, MAX to -Inf
         for (int a = 0; a < numAggs; a++) {
@@ -253,6 +278,18 @@ public final class ColumnOpsChunked {
 
             if (validCount == 0) continue; // Skip chunk entirely
 
+            // F-006: bump per-group marker for every valid row that
+            // entered a group, so SQL still emits a row for groups
+            // whose every agg-column value was NULL. Skipped when at
+            // least one agg is AGG_COUNT (markerFromCount above); the
+            // post-loop sweep copies that COUNT's slot into the marker.
+            if (!markerFromCount) {
+                for (int i = 0; i < len; i++) {
+                    int k = rowKeys[i];
+                    if (k >= 0) groups[k * accSize + markerSlot]++;
+                }
+            }
+
             // === Pass 2+: Per-agg-type accumulation using precomputed keys ===
             // Each inner loop has a single known agg type — no switch.
             // JIT compiles each loop body independently for perfect specialization.
@@ -292,6 +329,15 @@ public final class ColumnOpsChunked {
                 }
             }
         }
+        // F-006 deferred marker: when an AGG_COUNT was present, copy
+        // its post-filter count slot into the marker in a single
+        // sweep over `maxKey`. AGG_COUNT never NULL-skips, so its
+        // count == the marker definition.
+        if (markerFromCount) {
+            for (int k = 0; k < maxKey; k++) {
+                groups[k * accSize + markerSlot] = groups[k * accSize + countSlot];
+            }
+        }
         return groups;
     }
 
@@ -311,7 +357,9 @@ public final class ColumnOpsChunked {
             int[] chunkLengths, int nChunks, int maxChunkLen, int maxKey,
             boolean nanSafe, long[] nullSlots) {
 
-        final int accSize = numAggs * 2;
+        // F-006: accSize matches Range variant.
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
 
         // Compute total row count for PARALLEL_THRESHOLD check
         int totalRows = 0;
@@ -372,6 +420,7 @@ public final class ColumnOpsChunked {
                     continue;
                 }
                 if (!hasMinMax) {
+                    // Flat bulk merge sweeps every slot including the F-006 marker.
                     for (int j = 0; j < flatLen; j++) merged[j] += partial[j];
                 } else {
                     for (int k = 0; k < maxKey; k++) {
@@ -394,12 +443,327 @@ public final class ColumnOpsChunked {
                             }
                             merged[off + 1] += partial[off + 1];
                         }
+                        // F-006: marker merges additively.
+                        merged[base + markerSlot] += partial[base + markerSlot];
                     }
                 }
             }
             return merged != null ? merged : new double[flatLen];
         } catch (Exception e) {
             throw new RuntimeException("Chunked parallel group-by failed", e);
+        }
+    }
+
+    // =========================================================================
+    // Marker-free chunked dense group-by (JIT-isolated specialization)
+    //
+    // Used when:
+    //   - the dispatcher knows no agg input column has NULLs (nanSafe=false), AND
+    //   - the agg list contains no AGG_COUNT.
+    //
+    // In that case SUM/SUM_PRODUCT/MIN/MAX always increment their per-agg
+    // count slot once per filter-passing row, so agg-0's count slot
+    // already equals the post-filter row count — the F-006 marker.
+    // No per-row marker write needed; copy agg-0's count slot into the
+    // marker in a single sweep over `maxKey` at the end.
+    //
+    // Why this is a separate method instead of an `if` in the original:
+    // the marker-write branch / nan-check branch shifted the JIT's
+    // OSR tier-4 promotion timing for the AGG_SUM inner loop, producing
+    // a bimodal Q3 (42ms fast cluster vs 70ms slow cluster). Splitting
+    // the marker-free path into its own compilation unit lets JIT
+    // compile a single fixed-shape method to a stable tier-4 — no
+    // conditional, no NaN guard, deterministic ~42ms.
+    //
+    // Inner agg loops also drop the `!nanSafe || sv == sv` guard: by
+    // contract this method is only called when nanSafe is false.
+    // =========================================================================
+
+    private static double[] fusedGroupAggregateDenseChunkedNoMarkerRange(
+            int numLongPreds, int[] longPredTypes,
+            Object[][] longPredArrs, long[] longLo, long[] longHi,
+            int numDblPreds, int[] dblPredTypes,
+            Object[][] dblPredArrs, double[] dblLo, double[] dblHi,
+            int numGroupCols, Object[][] groupColArrs, long[] groupMuls, long[] groupOffsets,
+            int numAggs, int[] aggTypes, Object[][] aggColArrs, Object[][] aggCol2Arrs,
+            boolean[] aggColIsLong, boolean[] aggCol2IsLong,
+            int[] chunkLengths, int startChunk, int endChunk, int maxChunkLen, int maxKey,
+            long[] nullSlots) {
+
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
+        // Source slot for the post-loop marker sweep: prefer AGG_COUNT
+        // when present (zero-cost; this path also handles the
+        // legacy "any AGG_COUNT" fast path that the with-marker
+        // variant used to cover). Otherwise agg-0's count slot —
+        // safe because nanSafe is false by contract.
+        int countAggIdx = -1;
+        for (int a = 0; a < numAggs; a++) {
+            if (aggTypes[a] == AGG_COUNT) { countAggIdx = a; break; }
+        }
+        final int countSlot = countAggIdx >= 0 ? countAggIdx * 2 + 1 : 1;
+
+        double[] groups = new double[maxKey * accSize];
+        for (int a = 0; a < numAggs; a++) {
+            if (aggTypes[a] == AGG_MIN) {
+                for (int k = 0; k < maxKey; k++) groups[k * accSize + a * 2] = Double.POSITIVE_INFINITY;
+            } else if (aggTypes[a] == AGG_MAX) {
+                for (int k = 0; k < maxKey; k++) groups[k * accSize + a * 2] = Double.NEGATIVE_INFINITY;
+            }
+        }
+
+        double[][] tmpAggCols = new double[numAggs][];
+        double[][] tmpAggCol2s = new double[numAggs][];
+        double[][] longConvBufs = new double[numAggs][maxChunkLen];
+        double[][] longConvBufs2 = new double[numAggs][maxChunkLen];
+        long[][] tmpLongPreds = numLongPreds > 0 ? new long[numLongPreds][maxChunkLen] : null;
+        double[][] tmpDblPreds = numDblPreds > 0 ? new double[numDblPreds][maxChunkLen] : null;
+        int[] rowKeys = new int[maxChunkLen];
+
+        final boolean hasPredicates = numLongPreds > 0 || numDblPreds > 0;
+
+        for (int c = startChunk; c < endChunk; c++) {
+            int len = chunkLengths[c];
+
+            final long[] gc0 = numGroupCols > 0 ? (long[]) groupColArrs[0][c] : null;
+            final long[] gc1 = numGroupCols > 1 ? (long[]) groupColArrs[1][c] : null;
+            final long[] gc2 = numGroupCols > 2 ? (long[]) groupColArrs[2][c] : null;
+            final long[] gc3 = numGroupCols > 3 ? (long[]) groupColArrs[3][c] : null;
+            final long[] gc4 = numGroupCols > 4 ? (long[]) groupColArrs[4][c] : null;
+            final long[] gc5 = numGroupCols > 5 ? (long[]) groupColArrs[5][c] : null;
+            final long gm0 = numGroupCols > 0 ? groupMuls[0] : 0;
+            final long gm1 = numGroupCols > 1 ? groupMuls[1] : 0;
+            final long gm2 = numGroupCols > 2 ? groupMuls[2] : 0;
+            final long gm3 = numGroupCols > 3 ? groupMuls[3] : 0;
+            final long gm4 = numGroupCols > 4 ? groupMuls[4] : 0;
+            final long gm5 = numGroupCols > 5 ? groupMuls[5] : 0;
+            final long go0 = numGroupCols > 0 ? groupOffsets[0] : 0;
+            final long go1 = numGroupCols > 1 ? groupOffsets[1] : 0;
+            final long go2 = numGroupCols > 2 ? groupOffsets[2] : 0;
+            final long go3 = numGroupCols > 3 ? groupOffsets[3] : 0;
+            final long go4 = numGroupCols > 4 ? groupOffsets[4] : 0;
+            final long go5 = numGroupCols > 5 ? groupOffsets[5] : 0;
+
+            for (int a = 0; a < numAggs; a++) {
+                if (aggTypes[a] == AGG_COUNT) { tmpAggCols[a] = longConvBufs[a]; continue; }
+                if (aggColIsLong[a]) {
+                    long[] src = (long[]) aggColArrs[a][c];
+                    double[] buf = longConvBufs[a];
+                    for (int i = 0; i < len; i++) buf[i] = (double) src[i];
+                    tmpAggCols[a] = buf;
+                } else {
+                    tmpAggCols[a] = (double[]) aggColArrs[a][c];
+                }
+                if (aggTypes[a] == AGG_SUM_PRODUCT) {
+                    if (aggCol2IsLong[a]) {
+                        long[] src2 = (long[]) aggCol2Arrs[a][c];
+                        double[] buf2 = longConvBufs2[a];
+                        for (int i = 0; i < len; i++) buf2[i] = (double) src2[i];
+                        tmpAggCol2s[a] = buf2;
+                    } else {
+                        tmpAggCol2s[a] = (double[]) aggCol2Arrs[a][c];
+                    }
+                }
+            }
+
+            if (hasPredicates) {
+                for (int p = 0; p < numLongPreds; p++)
+                    System.arraycopy((long[]) longPredArrs[p][c], 0, tmpLongPreds[p], 0, len);
+                for (int p = 0; p < numDblPreds; p++)
+                    System.arraycopy((double[]) dblPredArrs[p][c], 0, tmpDblPreds[p], 0, len);
+            }
+
+            // Pass 1: precompute row keys (filter + NULL→slot mapping + key calc).
+            int validCount = 0;
+            final boolean hasNulls = nullSlots != null;
+            for (int i = 0; i < len; i++) {
+                if (hasPredicates && !evaluatePredicates(numLongPreds, longPredTypes, tmpLongPreds, longLo, longHi,
+                        numDblPreds, dblPredTypes, tmpDblPreds, dblLo, dblHi, i)) {
+                    rowKeys[i] = -1; continue;
+                }
+                long v0 = gc0[i] == Long.MIN_VALUE ? (hasNulls ? nullSlots[0] : -1) : gc0[i];
+                if (v0 < 0) { rowKeys[i] = -1; continue; }
+                int key = (int)((v0 - go0) * gm0);
+                if (numGroupCols > 1) {
+                    long v1 = gc1[i] == Long.MIN_VALUE ? (hasNulls ? nullSlots[1] : -1) : gc1[i];
+                    if (v1 < 0) { rowKeys[i] = -1; continue; }
+                    key += (int)((v1 - go1) * gm1);
+                }
+                if (numGroupCols > 2) {
+                    long v2 = gc2[i] == Long.MIN_VALUE ? (hasNulls ? nullSlots[2] : -1) : gc2[i];
+                    if (v2 < 0) { rowKeys[i] = -1; continue; }
+                    key += (int)((v2 - go2) * gm2);
+                }
+                if (numGroupCols > 3) {
+                    long v3 = gc3[i] == Long.MIN_VALUE ? (hasNulls ? nullSlots[3] : -1) : gc3[i];
+                    if (v3 < 0) { rowKeys[i] = -1; continue; }
+                    key += (int)((v3 - go3) * gm3);
+                }
+                if (numGroupCols > 4) {
+                    long v4 = gc4[i] == Long.MIN_VALUE ? (hasNulls ? nullSlots[4] : -1) : gc4[i];
+                    if (v4 < 0) { rowKeys[i] = -1; continue; }
+                    key += (int)((v4 - go4) * gm4);
+                }
+                if (numGroupCols > 5) {
+                    long v5 = gc5[i] == Long.MIN_VALUE ? (hasNulls ? nullSlots[5] : -1) : gc5[i];
+                    if (v5 < 0) { rowKeys[i] = -1; continue; }
+                    key += (int)((v5 - go5) * gm5);
+                }
+                boolean nullKey = false;
+                for (int g = 6; g < numGroupCols; g++) {
+                    long gv = ((long[]) groupColArrs[g][c])[i];
+                    if (gv == Long.MIN_VALUE) {
+                        if (hasNulls) gv = nullSlots[g]; else { nullKey = true; break; }
+                    }
+                    key += (int)((gv - groupOffsets[g]) * groupMuls[g]);
+                }
+                if (nullKey) { rowKeys[i] = -1; continue; }
+                assert key >= 0 && key < maxKey : "Dense key out of range: " + key + " (maxKey=" + maxKey + ")";
+                rowKeys[i] = key;
+                validCount++;
+            }
+
+            if (validCount == 0) continue;
+
+            // Pass 2+: per-agg-type accumulation, no nanSafe guard, no marker write.
+            for (int a = 0; a < numAggs; a++) {
+                int aggType = aggTypes[a];
+                int aOff = a * 2;
+                if (aggType == AGG_COUNT) {
+                    for (int i = 0; i < len; i++) {
+                        int k = rowKeys[i];
+                        if (k >= 0) groups[k * accSize + aOff + 1]++;
+                    }
+                } else if (aggType == AGG_SUM) {
+                    double[] col = tmpAggCols[a];
+                    for (int i = 0; i < len; i++) {
+                        int k = rowKeys[i];
+                        if (k >= 0) { int off = k * accSize + aOff; groups[off] += col[i]; groups[off + 1]++; }
+                    }
+                } else if (aggType == AGG_SUM_PRODUCT) {
+                    double[] col = tmpAggCols[a], col2 = tmpAggCol2s[a];
+                    for (int i = 0; i < len; i++) {
+                        int k = rowKeys[i];
+                        if (k >= 0) { int off = k * accSize + aOff; groups[off] += col[i] * col2[i]; groups[off + 1]++; }
+                    }
+                } else if (aggType == AGG_MIN) {
+                    double[] col = tmpAggCols[a];
+                    for (int i = 0; i < len; i++) {
+                        int k = rowKeys[i];
+                        if (k >= 0) { int off = k * accSize + aOff; groups[off] = Math.min(groups[off], col[i]); groups[off + 1]++; }
+                    }
+                } else if (aggType == AGG_MAX) {
+                    double[] col = tmpAggCols[a];
+                    for (int i = 0; i < len; i++) {
+                        int k = rowKeys[i];
+                        if (k >= 0) { int off = k * accSize + aOff; groups[off] = Math.max(groups[off], col[i]); groups[off + 1]++; }
+                    }
+                }
+            }
+        }
+        // Deferred marker sweep: agg-0's count (or AGG_COUNT's count if present)
+        // equals post-filter row count by construction.
+        for (int k = 0; k < maxKey; k++) {
+            groups[k * accSize + markerSlot] = groups[k * accSize + countSlot];
+        }
+        return groups;
+    }
+
+    public static double[] fusedGroupAggregateDenseChunkedNoMarkerParallel(
+            int numLongPreds, int[] longPredTypes,
+            Object[][] longPredArrs, long[] longLo, long[] longHi,
+            int numDblPreds, int[] dblPredTypes,
+            Object[][] dblPredArrs, double[] dblLo, double[] dblHi,
+            int numGroupCols, Object[][] groupColArrs, long[] groupMuls, long[] groupOffsets,
+            int numAggs, int[] aggTypes, Object[][] aggColArrs, Object[][] aggCol2Arrs,
+            boolean[] aggColIsLong, boolean[] aggCol2IsLong,
+            int[] chunkLengths, int nChunks, int maxChunkLen, int maxKey,
+            long[] nullSlots) {
+
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
+
+        int totalRows = 0;
+        for (int i = 0; i < nChunks; i++) totalRows += chunkLengths[i];
+
+        int nThreads;
+        if (totalRows < ColumnOps.PARALLEL_THRESHOLD) {
+            nThreads = 1;
+        } else {
+            long perThreadMem = (long) maxKey * accSize * 8;
+            nThreads = Math.min(POOL.getParallelism(), ColumnOps.effectiveGroupByThreads(perThreadMem));
+            nThreads = Math.min(nThreads, Math.max(1, nChunks / 4));
+        }
+
+        if (nThreads <= 1) {
+            return fusedGroupAggregateDenseChunkedNoMarkerRange(
+                numLongPreds, longPredTypes, longPredArrs, longLo, longHi,
+                numDblPreds, dblPredTypes, dblPredArrs, dblLo, dblHi,
+                numGroupCols, groupColArrs, groupMuls, groupOffsets,
+                numAggs, aggTypes, aggColArrs, aggCol2Arrs,
+                aggColIsLong, aggCol2IsLong,
+                chunkLengths, 0, nChunks, maxChunkLen, maxKey, nullSlots);
+        }
+
+        int batchSize = nChunks / nThreads;
+        @SuppressWarnings("unchecked")
+        Future<double[]>[] futures = new Future[nThreads];
+
+        for (int t = 0; t < nThreads; t++) {
+            final int startChunk = t * batchSize;
+            final int endChunk = (t == nThreads - 1) ? nChunks : startChunk + batchSize;
+            futures[t] = POOL.submit(() ->
+                fusedGroupAggregateDenseChunkedNoMarkerRange(
+                    numLongPreds, longPredTypes, longPredArrs, longLo, longHi,
+                    numDblPreds, dblPredTypes, dblPredArrs, dblLo, dblHi,
+                    numGroupCols, groupColArrs, groupMuls, groupOffsets,
+                    numAggs, aggTypes, aggColArrs, aggCol2Arrs,
+                    aggColIsLong, aggCol2IsLong,
+                    chunkLengths, startChunk, endChunk, maxChunkLen, maxKey, nullSlots));
+        }
+
+        final int flatLen = maxKey * accSize;
+        boolean hasMinMax = false;
+        for (int a = 0; a < numAggs; a++) {
+            if (aggTypes[a] == AGG_MIN || aggTypes[a] == AGG_MAX) { hasMinMax = true; break; }
+        }
+
+        try {
+            double[] merged = null;
+            for (Future<double[]> f : futures) {
+                if (f == null) continue;
+                double[] partial = f.get();
+                if (merged == null) { merged = partial; continue; }
+                if (!hasMinMax) {
+                    for (int j = 0; j < flatLen; j++) merged[j] += partial[j];
+                } else {
+                    for (int k = 0; k < maxKey; k++) {
+                        int base = k * accSize;
+                        for (int a = 0; a < numAggs; a++) {
+                            int off = base + a * 2;
+                            switch (aggTypes[a]) {
+                                case AGG_SUM: case AGG_SUM_PRODUCT: case AGG_COUNT:
+                                    merged[off] += partial[off]; break;
+                                case AGG_MIN:
+                                    if (partial[off + 1] > 0)
+                                        merged[off] = (merged[off + 1] > 0)
+                                            ? Math.min(merged[off], partial[off]) : partial[off];
+                                    break;
+                                case AGG_MAX:
+                                    if (partial[off + 1] > 0)
+                                        merged[off] = (merged[off + 1] > 0)
+                                            ? Math.max(merged[off], partial[off]) : partial[off];
+                                    break;
+                            }
+                            merged[off + 1] += partial[off + 1];
+                        }
+                        merged[base + markerSlot] += partial[base + markerSlot];
+                    }
+                }
+            }
+            return merged != null ? merged : new double[flatLen];
+        } catch (Exception e) {
+            throw new RuntimeException("Chunked parallel no-marker group-by failed", e);
         }
     }
 

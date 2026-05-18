@@ -27,29 +27,17 @@
          (contains? simd-ops op)
          (contains? columns col))))
 
-(defn rewrite-null-preds
-  "Rewrite IS-NULL/IS-NOT-NULL on long columns to SIMD-native EQ/NEQ.
-   Long NULL sentinel is Long/MIN_VALUE, so is-not-null → neq MIN_VALUE.
-   Double columns stay on the compiled mask path (NaN != NaN in IEEE754)."
-  [preds columns]
-  (mapv (fn [pred]
-          (let [col (first pred)
-                op  (second pred)]
-            (if (and (keyword? col)
-                     (or (= op :is-null) (= op :is-not-null))
-                     (= :int64 (:type (get columns col))))
-              (if (= op :is-null)
-                [col :eq (double Long/MIN_VALUE)]
-                [col :neq (double Long/MIN_VALUE)])
-              pred)))
-        preds))
-
 (defn split-preds
   "Split predicates into [simd-preds non-simd-preds].
-   SIMD preds go to Java. Non-SIMD preds get compiled to a mask."
+   SIMD preds go to Java. Non-SIMD preds (including IS-NULL/IS-NOT-NULL)
+   get compiled to a mask. The IS-NULL → EQ-sentinel rewrite that
+   previously routed nulls through the SIMD path was removed for SQL
+   3VL correctness: with validity bitmaps as the source of truth,
+   `WHERE col = NULL_SENTINEL` is treated as UNKNOWN (false) — the
+   rewrite would silently zero the result. The compiled-mask path
+   emits a direct sentinel check at codegen time and stays correct."
   [preds columns]
-  (let [preds (rewrite-null-preds preds columns)
-        groups (group-by #(simd-pred? % columns) preds)]
+  (let [groups (group-by #(simd-pred? % columns) preds)]
     [(vec (get groups true []))
      (vec (get groups false []))]))
 
@@ -126,31 +114,41 @@
                         ~@(mapv (fn [v] `(not= ~'v ~(double v))) (sort vals)))))))))
 
       ;; Simple comparison ops (fallback for preds on missing columns etc.)
+      ;; SQL 3VL: every op short-circuits to false when LHS is NULL.
+      ;; Long.MIN_VALUE < literal is true at IEEE level → would over-count
+      ;; NULL rows for :lt; (not= Long.MIN_VALUE literal) is true → same
+      ;; for :neq. NaN against any double literal is false at IEEE except
+      ;; :neq (which returns true and over-fires). One bind + null-guard
+      ;; on top covers all eight ops uniformly. Closes F-003 (long-NEQ /
+      ;; long-comparison mask leak) and F-004 (double-NEQ mask leak).
       (:lt :gt :lte :gte :eq :neq :range :not-range)
       (let [sym (get col-syms col)
             long-col? (= :int64 (:type (get columns col)))
-            args (subvec pred 2)]
-        (if long-col?
-          (let [v-expr `(aget ~sym (int ~'i))]
-            (case op
-              :lt        `(< ~v-expr ~(long (first args)))
-              :gt        `(> ~v-expr ~(long (first args)))
-              :lte       `(<= ~v-expr ~(long (first args)))
-              :gte       `(>= ~v-expr ~(long (first args)))
-              :eq        `(== ~v-expr ~(long (first args)))
-              :neq       `(not= ~v-expr ~(long (first args)))
-              :range     `(let [~'v ~v-expr] (and (>= ~'v ~(long (first args))) (<= ~'v ~(long (second args)))))
-              :not-range `(let [~'v ~v-expr] (or (< ~'v ~(long (first args))) (> ~'v ~(long (second args)))))))
-          (let [v-expr `(aget ~sym (int ~'i))]
-            (case op
-              :lt        `(< ~v-expr ~(double (first args)))
-              :gt        `(> ~v-expr ~(double (first args)))
-              :lte       `(<= ~v-expr ~(double (first args)))
-              :gte       `(>= ~v-expr ~(double (first args)))
-              :eq        `(== ~v-expr ~(double (first args)))
-              :neq       `(not= ~v-expr ~(double (first args)))
-              :range     `(let [~'v ~v-expr] (and (>= ~'v ~(double (first args))) (<= ~'v ~(double (second args)))))
-              :not-range `(let [~'v ~v-expr] (or (< ~'v ~(double (first args))) (> ~'v ~(double (second args)))))))))
+            args (subvec pred 2)
+            cmp (if long-col?
+                  (case op
+                    :lt        `(< ~'v ~(long (first args)))
+                    :gt        `(> ~'v ~(long (first args)))
+                    :lte       `(<= ~'v ~(long (first args)))
+                    :gte       `(>= ~'v ~(long (first args)))
+                    :eq        `(== ~'v ~(long (first args)))
+                    :neq       `(not= ~'v ~(long (first args)))
+                    :range     `(and (>= ~'v ~(long (first args))) (<= ~'v ~(long (second args))))
+                    :not-range `(or (< ~'v ~(long (first args))) (> ~'v ~(long (second args)))))
+                  (case op
+                    :lt        `(< ~'v ~(double (first args)))
+                    :gt        `(> ~'v ~(double (first args)))
+                    :lte       `(<= ~'v ~(double (first args)))
+                    :gte       `(>= ~'v ~(double (first args)))
+                    :eq        `(== ~'v ~(double (first args)))
+                    :neq       `(not= ~'v ~(double (first args)))
+                    :range     `(and (>= ~'v ~(double (first args))) (<= ~'v ~(double (second args))))
+                    :not-range `(or (< ~'v ~(double (first args))) (> ~'v ~(double (second args))))))
+            null-guard (if long-col?
+                         `(not= ~'v Long/MIN_VALUE)
+                         `(not (Double/isNaN ~'v)))]
+        `(let [~'v (aget ~sym (int ~'i))]
+           (and ~null-guard ~cmp)))
 
       ;; NULL predicates
       :is-null
@@ -311,20 +309,29 @@
                        (let [codes ^longs (:data col-info)
                              dict ^"[Ljava.lang.String;" (:dict col-info)
                              alpha-masks ^ints (:dict-alpha-masks col-info)
-                             bigram-masks ^longs (:dict-bigram-masks col-info)]
+                             bigram-masks ^longs (:dict-bigram-masks col-info)
+                             ;; F-015 (3VL for NOT-LIKE/NOT-ILIKE): the
+                             ;; positive-LIKE mask emits 0 for NULL codes
+                             ;; (correct: NULL LIKE x is UNKNOWN). The
+                             ;; previous `(if (zero? m) 1 0)` flip would
+                             ;; then claim NULL rows match NOT-LIKE,
+                             ;; which is also wrong (NOT NULL = UNKNOWN).
+                             ;; Gate the flip on a per-row NULL check so
+                             ;; NULL rows stay 0 for negated forms.
+                             flip-not (fn ^longs [^longs m]
+                                        (let [r (long-array length)]
+                                          (dotimes [j length]
+                                            (when (and (not= (aget codes j) Long/MIN_VALUE)
+                                                       (zero? (aget m j)))
+                                              (aset r j 1)))
+                                          r))]
                          (case op
                            :like (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern) (int length) alpha-masks bigram-masks)
-                           :not-like (let [m (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern) (int length) alpha-masks bigram-masks)
-                                           r (long-array length)]
-                                       (dotimes [j length] (aset r j (if (zero? (aget m j)) 1 0)))
-                                       r)
+                           :not-like (flip-not (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern) (int length) alpha-masks bigram-masks))
                            :ilike (let [ldict (into-array String (map #(.toLowerCase ^String %) dict))]
                                     (ColumnOpsString/arrayStringLikeFastMasked codes ldict (.toLowerCase (str pattern)) (int length) alpha-masks bigram-masks))
-                           :not-ilike (let [ldict (into-array String (map #(.toLowerCase ^String %) dict))
-                                            m (ColumnOpsString/arrayStringLikeFastMasked codes ldict (.toLowerCase (str pattern)) (int length) alpha-masks bigram-masks)
-                                            r (long-array length)]
-                                        (dotimes [j length] (aset r j (if (zero? (aget m j)) 1 0)))
-                                        r)
+                           :not-ilike (let [ldict (into-array String (map #(.toLowerCase ^String %) dict))]
+                                        (flip-not (ColumnOpsString/arrayStringLikeFastMasked codes ldict (.toLowerCase (str pattern)) (int length) alpha-masks bigram-masks)))
                            :contains (ColumnOpsString/arrayStringLikeFastMasked codes dict (str "%" pattern "%") (int length) alpha-masks bigram-masks)
                            :starts-with (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern "%") (int length) alpha-masks bigram-masks)
                            :ends-with (ColumnOpsString/arrayStringLikeFastMasked codes dict (str "%" pattern) (int length) alpha-masks bigram-masks)))

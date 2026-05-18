@@ -200,7 +200,17 @@
   "Classify a chunk as :skip, :stats-only, or :simd based on zone predicates.
    zone-filters is from build-zone-filters.
    col-entries maps col-name -> vec of ChunkEntry.
-   c is the chunk ordinal index."
+   c is the chunk ordinal index.
+
+   NULL handling: a chunk where any predicate column has non-zero
+   `:null-count` cannot use :stats-only — the chunk's NULL rows fail
+   the predicate in SQL 3VL (regardless of the non-NULL min/max being
+   inside the range) and stats-only would over-count them. Force
+   :simd for such chunks so the per-row predicate eval (and bitmap-AND
+   in the Nullable kernel) excludes them correctly. Phase 1 of the
+   null-handling redesign added populated null-counts to the
+   ChunkStats; before Phase 0 null-count was always 0 so this gate
+   wasn't necessary."
   [zone-filters col-entries ^long c]
   (if (empty? zone-filters)
     :simd  ;; No zone filters, must process all
@@ -211,11 +221,16 @@
         (let [{:keys [col may-contain fully-inside]} (first filters)
               entries (get col-entries col)
               ^ChunkEntry entry (nth entries c)
-              chunk-stats (.stats entry)]
+              chunk-stats (.stats entry)
+              ;; Any NULL on this pred col → fully-inside is unsafe:
+              ;; NULL rows fail the predicate but stats-only would
+              ;; count them in the chunk's `count` field.
+              has-nulls? (pos? (long (or (:null-count chunk-stats) 0)))]
           (if-not (may-contain chunk-stats)
             :skip  ;; This pred proves no values match
             (recur (rest filters)
                    (and all-fully-inside?
+                        (not has-nulls?)
                         (some? fully-inside)
                         (fully-inside chunk-stats)))))))))
 
@@ -238,9 +253,15 @@
     Double/NaN
 
     (keyword? expr)
+    ;; F-013: map Long.MIN_VALUE → Double/NaN at the leaf so downstream
+    ;; arithmetic (mul/add/sub/div/abs/sqrt/log/date-trunc/extract)
+    ;; propagates NULL via IEEE NaN. Without this, the sentinel becomes
+    ;; finite -9.22e18 and feeds into Hinnant civil-date arithmetic,
+    ;; producing bogus year/month/day for what should be a NULL result.
     (let [col (get col-arrays expr)]
       (if (expr/long-array? col)
-        (double (aget ^longs col i))
+        (let [lv (aget ^longs col i)]
+          (if (= lv Long/MIN_VALUE) Double/NaN (double lv)))
         (aget ^doubles col i)))
 
     (number? expr)
@@ -557,17 +578,32 @@
                                col-ref (first pred)
                                op (second pred)
                                pred-args (subvec pred 2)
+                               col-data (when (keyword? col-ref) (get col-arrays col-ref))
                                pv (if (keyword? col-ref)
-                                    (aget-col (get col-arrays col-ref) i)
+                                    (aget-col col-data i)
                                     (eval-agg-expr col-ref col-arrays i))
-                               match? (case op
-                                        :lt  (< pv (double (first pred-args)))
-                                        :gt  (> pv (double (first pred-args)))
-                                        :lte (<= pv (double (first pred-args)))
-                                        :gte (>= pv (double (first pred-args)))
-                                        :eq  (== pv (double (first pred-args)))
-                                        :neq (not (== pv (double (first pred-args))))
-                                        false)]
+                               ;; F-038 (scalar path): SQL 3VL — NULL LHS
+                               ;; makes every comparison UNKNOWN → WHEN
+                               ;; branch does not match. `:neq` would
+                               ;; otherwise return true on (not (== NaN x))
+                               ;; and incorrectly fire on NULL rows.
+                               ;; `aget-col` reads long Long.MIN_VALUE as
+                               ;; -9.22e18 (a finite double) so the NaN
+                               ;; check alone misses it; add the explicit
+                               ;; long-sentinel check on the source array.
+                               pv-null? (or (Double/isNaN pv)
+                                            (and col-data
+                                                 (expr/long-array? col-data)
+                                                 (= (aget ^longs col-data (int i)) Long/MIN_VALUE)))
+                               match? (and (not pv-null?)
+                                           (case op
+                                             :lt  (< pv (double (first pred-args)))
+                                             :gt  (> pv (double (first pred-args)))
+                                             :lte (<= pv (double (first pred-args)))
+                                             :gte (>= pv (double (first pred-args)))
+                                             :eq  (== pv (double (first pred-args)))
+                                             :neq (not (== pv (double (first pred-args))))
+                                             false))]
                            (when match?
                              (eval-agg-expr (:val branch) col-arrays i)))))
                      branches)
@@ -622,7 +658,12 @@
   "Evaluate a single predicate for a row.
    Handles standard comparisons, IN, NOT-IN, NOT-RANGE, and OR.
    Expects dict-column predicates to be preprocessed via preprocess-preds
-   (arguments already encoded to dict codes for long comparison)."
+   (arguments already encoded to dict codes for long comparison).
+
+   SQL 3VL: a comparison whose LHS or RHS is NULL yields UNKNOWN, which
+   `WHERE` treats as false. The sentinel check at the top short-circuits
+   every comparison/IN/RANGE op to false when the LHS value is NULL;
+   `:is-null` / `:is-not-null` keep their existing two-valued semantics."
   [col-arrays ^long i pred]
   (let [col-ref (first pred)
         op (second pred)]
@@ -642,9 +683,13 @@
       ;; like `[:_valid_from :lt :_valid_to]` then evaluate correctly
       ;; in SELECT WHERE clauses, not just DML.
       (let [col-data (if (keyword? col-ref) (get col-arrays col-ref) col-ref)
-            v (if (expr/long-array? col-data)
+            is-long? (expr/long-array? col-data)
+            v (if is-long?
                 (aget ^longs col-data i)
                 (aget ^doubles col-data i))
+            lhs-null? (if is-long?
+                        (== (long v) Long/MIN_VALUE)
+                        (Double/isNaN (double v)))
             args (subvec pred 2)
             resolve-arg (fn [a]
                           (if (keyword? a)
@@ -652,34 +697,59 @@
                               (if (expr/long-array? other)
                                 (aget ^longs other i)
                                 (aget ^doubles other i)))
-                            a))]
-        (case op
-          :lt    (< (double v) (double (resolve-arg (first args))))
-          :gt    (> (double v) (double (resolve-arg (first args))))
-          :lte   (<= (double v) (double (resolve-arg (first args))))
-          :gte   (>= (double v) (double (resolve-arg (first args))))
-          :eq    (== (double v) (double (resolve-arg (first args))))
-          :neq   (not (== (double v) (double (resolve-arg (first args)))))
-          :range (let [lo (double (resolve-arg (first args)))
-                       hi (double (resolve-arg (second args)))]
-                   (and (>= (double v) lo) (<= (double v) hi)))
-          :not-range (let [lo (double (resolve-arg (first args)))
-                           hi (double (resolve-arg (second args)))]
-                       (or (< (double v) lo) (> (double v) hi)))
-          :in    (let [s (first args)]
-                   (if (every? number? s)
-                     (contains? s (double v))
-                     (contains? s v)))
-          :not-in (let [s (first args)]
-                    (if (every? number? s)
-                      (not (contains? s (double v)))
-                      (not (contains? s v))))
-          :is-null (if (expr/long-array? col-data)
-                     (== (long v) Long/MIN_VALUE)
-                     (Double/isNaN (double v)))
-          :is-not-null (if (expr/long-array? col-data)
-                         (not= (long v) Long/MIN_VALUE)
-                         (not (Double/isNaN (double v)))))))))
+                            a))
+            ;; For col-vs-col preds, the RHS is also a column ref; check
+            ;; whether it resolves to NULL too. Literal RHS args are
+            ;; never NULL (we don't allow `nil` literals in normalised
+            ;; preds — IS-NULL handles that path).
+            rhs-null? (and (#{:lt :gt :lte :gte :eq :neq :range :not-range} op)
+                           (let [arg (first args)]
+                             (and (keyword? arg)
+                                  (let [other (get col-arrays arg)
+                                        ov (if (expr/long-array? other)
+                                             (aget ^longs other i)
+                                             (aget ^doubles other i))]
+                                    (if (expr/long-array? other)
+                                      (== (long ov) Long/MIN_VALUE)
+                                      (Double/isNaN (double ov)))))))]
+        (cond
+          ;; IS-NULL / IS-NOT-NULL keep their two-valued semantics.
+          (= op :is-null)
+          (if is-long?
+            (== (long v) Long/MIN_VALUE)
+            (Double/isNaN (double v)))
+
+          (= op :is-not-null)
+          (if is-long?
+            (not= (long v) Long/MIN_VALUE)
+            (not (Double/isNaN (double v))))
+
+          ;; Any other op against a NULL operand → UNKNOWN → false (WHERE 3VL).
+          (or lhs-null? rhs-null?)
+          false
+
+          :else
+          (case op
+            :lt    (< (double v) (double (resolve-arg (first args))))
+            :gt    (> (double v) (double (resolve-arg (first args))))
+            :lte   (<= (double v) (double (resolve-arg (first args))))
+            :gte   (>= (double v) (double (resolve-arg (first args))))
+            :eq    (== (double v) (double (resolve-arg (first args))))
+            :neq   (not (== (double v) (double (resolve-arg (first args)))))
+            :range (let [lo (double (resolve-arg (first args)))
+                         hi (double (resolve-arg (second args)))]
+                     (and (>= (double v) lo) (<= (double v) hi)))
+            :not-range (let [lo (double (resolve-arg (first args)))
+                             hi (double (resolve-arg (second args)))]
+                         (or (< (double v) lo) (> (double v) hi)))
+            :in    (let [s (first args)]
+                     (if (every? number? s)
+                       (contains? s (double v))
+                       (contains? s v)))
+            :not-in (let [s (first args)]
+                      (if (every? number? s)
+                        (not (contains? s (double v)))
+                        (not (contains? s v))))))))))
 
 (defn execute-scalar-aggs
   "Execute aggregations over matching rows using scalar loop."
@@ -1078,53 +1148,70 @@
 
 (defn decode-group-results
   "Decode Java Object[] = {long[] keys, double[] flatAccs} into Clojure result maps.
-   flatAccs has stride = numAggs*2 (sum+count per agg)."
-  [^objects result-pair group-cols ^longs group-muls aggs group-dicts]
-  (let [n-group (count group-cols)
-        ^longs keys (aget result-pair 0)
-        ^doubles flat-accs (aget result-pair 1)
-        n (alength keys)
-        n-aggs (count aggs)
-        stride (int (* 2 n-aggs))
-        ;; Pre-compute agg aliases and ops
-        agg-aliases (mapv #(or (:as %) (:op %)) aggs)
-        agg-ops (mapv :op aggs)]
-    (loop [i 0 results (transient [])]
-      (if (< i n)
-        (let [key (aget keys i)
-              base-offset (* i stride)
-              ;; Decode group key
-              group-vals (decode-key key group-muls n-group)
-              group-vals (if group-dicts
-                           (mapv (fn [v dict]
-                                   (if dict
-                                     (aget ^"[Ljava.lang.String;" dict (int (long v)))
-                                     v))
-                                 group-vals group-dicts)
-                           group-vals)
-              ;; Build result map in one shot
-              m (loop [j 0 m (transient (-> (into {} (map vector group-cols group-vals))
-                                            (assoc :_count (long (aget flat-accs (inc base-offset))))))]
-                  (if (< j n-aggs)
-                    (let [ab (+ base-offset (* j 2))
-                          cnt (long (aget flat-accs (inc ab)))
-                          op (nth agg-ops j)
-                          val (case op
-                                :count cnt
-                                :count-non-null (if (zero? cnt) 0 (long (aget flat-accs ab)))
-                                (:sum :sum-product) (if (zero? cnt) nil (aget flat-accs ab))
-                                (:min :max) (if (zero? cnt) nil (aget flat-accs ab))
-                                :avg (if (zero? cnt) nil
-                                         (/ (aget flat-accs ab) (double cnt)))
-                                (aget flat-accs ab))]
-                      (recur (inc j) (assoc! m (nth agg-aliases j) val)))
-                    (persistent! m)))]
-          (recur (inc i) (conj! results m)))
-        (persistent! results)))))
+
+   Two layouts are supported via the optional `marker?` flag:
+     - default (false): legacy stride = numAggs*2, `_count` reads agg-0's
+       count slot — used by the hash / partitioned kernels.
+     - true: F-006 stride = numAggs*2 + 1 with a per-group post-filter
+       row-count marker at offset numAggs*2. `_count` reads the marker,
+       guaranteeing all-NULL groups still appear in the output. Used by
+       the dense flat kernels which write the marker every filter pass."
+  ([result-pair group-cols group-muls aggs group-dicts]
+   (decode-group-results result-pair group-cols group-muls aggs group-dicts false))
+  ([^objects result-pair group-cols ^longs group-muls aggs group-dicts marker?]
+   (let [n-group (count group-cols)
+         ^longs keys (aget result-pair 0)
+         ^doubles flat-accs (aget result-pair 1)
+         n (alength keys)
+         n-aggs (count aggs)
+         stride (int (if marker? (+ (* 2 n-aggs) 1) (* 2 n-aggs)))
+         count-off (long (if marker? (* 2 n-aggs) 1))
+         ;; Pre-compute agg aliases and ops
+         agg-aliases (mapv #(or (:as %) (:op %)) aggs)
+         agg-ops (mapv :op aggs)]
+     (loop [i 0 results (transient [])]
+       (if (< i n)
+         (let [key (aget keys i)
+               base-offset (* i stride)
+               ;; Decode group key
+               group-vals (decode-key key group-muls n-group)
+               group-vals (if group-dicts
+                            (mapv (fn [v dict]
+                                    (if dict
+                                      (aget ^"[Ljava.lang.String;" dict (int (long v)))
+                                      v))
+                                  group-vals group-dicts)
+                            group-vals)
+               ;; Build result map in one shot
+               m (loop [j 0 m (transient (-> (into {} (map vector group-cols group-vals))
+                                             (assoc :_count (long (aget flat-accs (+ base-offset count-off))))))]
+                   (if (< j n-aggs)
+                     (let [ab (+ base-offset (* j 2))
+                           cnt (long (aget flat-accs (inc ab)))
+                           op (nth agg-ops j)
+                           val (case op
+                                 :count cnt
+                                 :count-non-null (if (zero? cnt) 0 (long (aget flat-accs ab)))
+                                 (:sum :sum-product) (if (zero? cnt) nil (aget flat-accs ab))
+                                 (:min :max) (if (zero? cnt) nil (aget flat-accs ab))
+                                 :avg (if (zero? cnt) nil
+                                          (/ (aget flat-accs ab) (double cnt)))
+                                 (aget flat-accs ab))]
+                       (recur (inc j) (assoc! m (nth agg-aliases j) val)))
+                     (persistent! m)))]
+           (recur (inc i) (conj! results m)))
+         (persistent! results))))))
 
 (defn compact-dense-flat-to-pair
   "Compact a flat dense accumulator array into [long[] keys, double[] accs] result pair.
-   Filters out groups where accs[key*acc-size + count-offset] <= 0."
+   Filters out groups where accs[key*acc-size + count-offset] <= 0.
+
+   F-006: callers pass the post-filter row-count marker as
+   `count-offset` (slot `numAggs*2` in the F-006 layout) so all-NULL
+   groups are still kept. Older sites that pass agg-0's count slot
+   (offset 1) keep their behaviour — groups with no non-NULL value for
+   agg-0 are dropped — but those callers no longer hit the dense agg
+   kernel; they target compact-dense-2d-to-pair (var/corr layout)."
   [^doubles flat-array ^long max-key ^long acc-size ^long count-offset]
   (let [key-list (java.util.ArrayList.)]
     (dotimes [k max-key]
@@ -1161,11 +1248,17 @@
 
 (defn decode-dense-group-results
   "Decode Java double[] (flat dense array) into Clojure result maps.
-   Compacts non-empty groups and delegates to decode-group-results."
+   Compacts non-empty groups and delegates to decode-group-results.
+
+   F-006: the Java kernel writes a per-group post-filter row count at
+   the marker slot (`numAggs*2`); compact filters on the marker so
+   all-NULL groups still appear in the result."
   [^doubles flat-array max-key group-cols ^longs group-muls aggs group-dicts]
-  (let [acc-size (int (* 2 (count aggs)))
-        pair (compact-dense-flat-to-pair flat-array (long max-key) acc-size 1)]
-    (decode-group-results pair group-cols group-muls aggs group-dicts)))
+  (let [n-aggs (count aggs)
+        acc-size (int (+ (* 2 n-aggs) 1))
+        marker-offset (long (* 2 n-aggs))
+        pair (compact-dense-flat-to-pair flat-array (long max-key) acc-size marker-offset)]
+    (decode-group-results pair group-cols group-muls aggs group-dicts true)))
 
 ;; ============================================================================
 ;; Columnar Result Format
@@ -1221,23 +1314,29 @@
 
 (defn decode-group-results-columnar
   "Decode Java Object[] = {long[] keys, double[] flatAccs} into columnar format.
-   Returns {:col1 array1 :col2 array2 ... :n-rows N}."
-  [^objects result-pair group-cols ^longs group-muls aggs group-dicts]
-  (let [^longs keys (aget result-pair 0)
-        ^doubles flat-accs (aget result-pair 1)
-        n (alength keys)
-        n-group (count group-cols)
-        n-aggs (count aggs)
-        stride (int (* 2 n-aggs))
-        ;; Decode group keys into per-column arrays
-        group-arrays (decode-group-key-columns keys group-muls n-group group-dicts)
-        ;; Decode agg results into per-column arrays
-        agg-arrays (decode-agg-columns flat-accs n stride aggs)
-        ;; Build result map: {col-keyword array ...}
-        agg-aliases (mapv #(or (:as %) (:op %)) aggs)]
-    (-> (into {} (map vector group-cols group-arrays))
-        (into (map vector agg-aliases agg-arrays))
-        (assoc :n-rows n))))
+   Returns {:col1 array1 :col2 array2 ... :n-rows N}.
+
+   F-006: when `marker?` is true the flat stride is `numAggs*2 + 1`
+   (the trailing slot is the per-group post-filter row count). When
+   false, legacy stride `numAggs*2` (hash / partitioned kernels)."
+  ([result-pair group-cols group-muls aggs group-dicts]
+   (decode-group-results-columnar result-pair group-cols group-muls aggs group-dicts false))
+  ([^objects result-pair group-cols ^longs group-muls aggs group-dicts marker?]
+   (let [^longs keys (aget result-pair 0)
+         ^doubles flat-accs (aget result-pair 1)
+         n (alength keys)
+         n-group (count group-cols)
+         n-aggs (count aggs)
+         stride (int (if marker? (+ (* 2 n-aggs) 1) (* 2 n-aggs)))
+         ;; Decode group keys into per-column arrays
+         group-arrays (decode-group-key-columns keys group-muls n-group group-dicts)
+         ;; Decode agg results into per-column arrays
+         agg-arrays (decode-agg-columns flat-accs n stride aggs)
+         ;; Build result map: {col-keyword array ...}
+         agg-aliases (mapv #(or (:as %) (:op %)) aggs)]
+     (-> (into {} (map vector group-cols group-arrays))
+         (into (map vector agg-aliases agg-arrays))
+         (assoc :n-rows n)))))
 
 (defn build-multi-key-lookup
   "Build a HashMap<Long, long[]> from compact multi-key hash lookup arrays.
@@ -1336,11 +1435,14 @@
 
 (defn decode-dense-group-results-columnar
   "Decode Java double[] (flat dense array) into columnar format.
-   Compacts non-empty groups and delegates to decode-group-results-columnar."
+   Compacts non-empty groups and delegates to decode-group-results-columnar.
+   F-006: filter on the group-marker slot, not agg-0's count."
   [^doubles flat-array max-key group-cols ^longs group-muls aggs group-dicts]
-  (let [acc-size (int (* 2 (count aggs)))
-        pair (compact-dense-flat-to-pair flat-array (long max-key) acc-size 1)]
-    (decode-group-results-columnar pair group-cols group-muls aggs group-dicts)))
+  (let [n-aggs (count aggs)
+        acc-size (int (+ (* 2 n-aggs) 1))
+        marker-offset (long (* 2 n-aggs))
+        pair (compact-dense-flat-to-pair flat-array (long max-key) acc-size marker-offset)]
+    (decode-group-results-columnar pair group-cols group-muls aggs group-dicts true)))
 
 ;; ============================================================================
 ;; Long[] Dense Group-By Decode
@@ -1395,77 +1497,97 @@
 
 (defn decode-group-results-long
   "Decode Java [long[] keys, long[] flatAccs] into Clojure result maps.
-   Type-preserving: SUM/MIN/MAX return Long values, not Double."
-  [^objects result-pair group-cols ^longs group-muls aggs group-dicts]
-  (let [n-group (count group-cols)
-        ^longs keys (aget result-pair 0)
-        ^longs flat-accs (aget result-pair 1)
-        n (alength keys)
-        n-aggs (count aggs)
-        stride (int (* 2 n-aggs))
-        agg-aliases (mapv #(or (:as %) (:op %)) aggs)
-        agg-ops (mapv :op aggs)]
-    (loop [i 0 results (transient [])]
-      (if (< i n)
-        (let [key (aget keys i)
-              base-offset (* i stride)
-              group-vals (decode-key key group-muls n-group)
-              group-vals (if group-dicts
-                           (mapv (fn [v dict]
-                                   (if dict
-                                     (aget ^"[Ljava.lang.String;" dict (int (long v)))
-                                     v))
-                                 group-vals group-dicts)
-                           group-vals)
-              m (loop [j 0 m (transient (-> (into {} (map vector group-cols group-vals))
-                                            (assoc :_count (aget flat-accs (inc base-offset)))))]
-                  (if (< j n-aggs)
-                    (let [ab (+ base-offset (* j 2))
-                          cnt (aget flat-accs (inc ab))
-                          op (nth agg-ops j)
-                          val (case op
-                                :count cnt
-                                (:sum :min :max) (if (zero? cnt) nil (aget flat-accs ab))
-                                :avg (if (zero? cnt) nil
-                                         (/ (double (aget flat-accs ab)) (double cnt)))
-                                (aget flat-accs ab))]
-                      (recur (inc j) (assoc! m (nth agg-aliases j) val)))
-                    (persistent! m)))]
-          (recur (inc i) (conj! results m)))
-        (persistent! results)))))
+   Type-preserving: SUM/MIN/MAX return Long values, not Double.
+
+   F-006: stride includes a post-filter row-count marker at offset
+   numAggs*2 when `marker?` is true; `_count` reads from the marker so
+   all-NULL groups still surface in the output. The default
+   (false) keeps the legacy `_count = agg-0 count` layout, used by
+   non-marker callers."
+  ([result-pair group-cols group-muls aggs group-dicts]
+   (decode-group-results-long result-pair group-cols group-muls aggs group-dicts false))
+  ([^objects result-pair group-cols ^longs group-muls aggs group-dicts marker?]
+   (let [n-group (count group-cols)
+         ^longs keys (aget result-pair 0)
+         ^longs flat-accs (aget result-pair 1)
+         n (alength keys)
+         n-aggs (count aggs)
+         stride (int (if marker? (+ (* 2 n-aggs) 1) (* 2 n-aggs)))
+         count-off (long (if marker? (* 2 n-aggs) 1))
+         agg-aliases (mapv #(or (:as %) (:op %)) aggs)
+         agg-ops (mapv :op aggs)]
+     (loop [i 0 results (transient [])]
+       (if (< i n)
+         (let [key (aget keys i)
+               base-offset (* i stride)
+               group-vals (decode-key key group-muls n-group)
+               group-vals (if group-dicts
+                            (mapv (fn [v dict]
+                                    (if dict
+                                      (aget ^"[Ljava.lang.String;" dict (int (long v)))
+                                      v))
+                                  group-vals group-dicts)
+                            group-vals)
+               m (loop [j 0 m (transient (-> (into {} (map vector group-cols group-vals))
+                                             (assoc :_count (aget flat-accs (+ base-offset count-off)))))]
+                   (if (< j n-aggs)
+                     (let [ab (+ base-offset (* j 2))
+                           cnt (aget flat-accs (inc ab))
+                           op (nth agg-ops j)
+                           val (case op
+                                 :count cnt
+                                 (:sum :min :max) (if (zero? cnt) nil (aget flat-accs ab))
+                                 :avg (if (zero? cnt) nil
+                                          (/ (double (aget flat-accs ab)) (double cnt)))
+                                 (aget flat-accs ab))]
+                       (recur (inc j) (assoc! m (nth agg-aliases j) val)))
+                     (persistent! m)))]
+           (recur (inc i) (conj! results m)))
+         (persistent! results))))))
 
 (defn decode-group-results-long-columnar
   "Decode Java [long[] keys, long[] flatAccs] into columnar format.
-   Returns {:col1 array1 :col2 array2 ... :n-rows N}."
-  [^objects result-pair group-cols ^longs group-muls aggs group-dicts]
-  (let [^longs keys (aget result-pair 0)
-        ^longs flat-accs (aget result-pair 1)
-        n (alength keys)
-        n-group (count group-cols)
-        n-aggs (count aggs)
-        stride (int (* 2 n-aggs))
-        group-arrays (decode-group-key-columns keys group-muls n-group group-dicts)
-        agg-arrays (decode-agg-columns-long flat-accs n stride aggs)
-        agg-aliases (mapv #(or (:as %) (:op %)) aggs)]
-    (-> (into {} (map vector group-cols group-arrays))
-        (into (map vector agg-aliases agg-arrays))
-        (assoc :n-rows n))))
+   Returns {:col1 array1 :col2 array2 ... :n-rows N}.
+
+   F-006: same marker?-aware shape as decode-group-results-columnar."
+  ([result-pair group-cols group-muls aggs group-dicts]
+   (decode-group-results-long-columnar result-pair group-cols group-muls aggs group-dicts false))
+  ([^objects result-pair group-cols ^longs group-muls aggs group-dicts marker?]
+   (let [^longs keys (aget result-pair 0)
+         ^longs flat-accs (aget result-pair 1)
+         n (alength keys)
+         n-group (count group-cols)
+         n-aggs (count aggs)
+         stride (int (if marker? (+ (* 2 n-aggs) 1) (* 2 n-aggs)))
+         group-arrays (decode-group-key-columns keys group-muls n-group group-dicts)
+         agg-arrays (decode-agg-columns-long flat-accs n stride aggs)
+         agg-aliases (mapv #(or (:as %) (:op %)) aggs)]
+     (-> (into {} (map vector group-cols group-arrays))
+         (into (map vector agg-aliases agg-arrays))
+         (assoc :n-rows n)))))
 
 (defn decode-dense-group-results-long
   "Decode Java long[] (flat dense array) into Clojure result maps.
-   Compacts non-empty groups, type-preserving Long results."
+   Compacts non-empty groups, type-preserving Long results.
+   F-006: filter on group-marker slot (`numAggs*2`) so all-NULL groups
+   remain in the output with NULL aggregates."
   [^longs flat-array max-key group-cols ^longs group-muls aggs group-dicts]
-  (let [acc-size (int (* 2 (count aggs)))
-        pair (compact-dense-long-to-pair flat-array (long max-key) acc-size 1)]
-    (decode-group-results-long pair group-cols group-muls aggs group-dicts)))
+  (let [n-aggs (count aggs)
+        acc-size (int (+ (* 2 n-aggs) 1))
+        marker-offset (long (* 2 n-aggs))
+        pair (compact-dense-long-to-pair flat-array (long max-key) acc-size marker-offset)]
+    (decode-group-results-long pair group-cols group-muls aggs group-dicts true)))
 
 (defn decode-dense-group-results-long-columnar
   "Decode Java long[] (flat dense array) into columnar format.
-   Compacts non-empty groups, type-preserving Long arrays."
+   Compacts non-empty groups, type-preserving Long arrays.
+   F-006: same marker-based compact as the row-form variant."
   [^longs flat-array max-key group-cols ^longs group-muls aggs group-dicts]
-  (let [acc-size (int (* 2 (count aggs)))
-        pair (compact-dense-long-to-pair flat-array (long max-key) acc-size 1)]
-    (decode-group-results-long-columnar pair group-cols group-muls aggs group-dicts)))
+  (let [n-aggs (count aggs)
+        acc-size (int (+ (* 2 n-aggs) 1))
+        marker-offset (long (* 2 n-aggs))
+        pair (compact-dense-long-to-pair flat-array (long max-key) acc-size marker-offset)]
+    (decode-group-results-long-columnar pair group-cols group-muls aggs group-dicts true)))
 
 (defn decode-dense-group-results-2d
   "Decode Java double[][] (per-key accumulator arrays) into Clojure result maps.
@@ -2761,17 +2883,22 @@
                          (int n-dbl) dbl-pred-types ^"[[D" dbl-cols dbl-lo dbl-hi
                          (int n-group) group-arrays group-muls
                          (int n-numeric) (int length) max-key-inc)
-                      ;; General path returns flat double[] — reshape to double[][] for CD decode
+                      ;; General path returns flat double[] — reshape to double[][] for CD decode.
+                      ;; F-006: flat-stride is `2*n + 1`, but the 2D
+                      ;; reshape only carries the per-agg slots (no
+                      ;; marker) so downstream `decode-dense-count-distinct-results`
+                      ;; sees the legacy layout it expects.
                         (let [^doubles flat (ColumnOps/fusedFilterGroupAggregateDenseParallel
                                              (int n-long) long-pred-types ^"[[J" long-cols long-lo long-hi
                                              (int n-dbl) dbl-pred-types ^"[[D" dbl-cols dbl-lo dbl-hi
                                              (int n-group) group-arrays group-muls
                                              (int n-numeric) numeric-agg-types ^"[[D" numeric-agg-cols ^"[[D" numeric-agg-col2s
                                              (int length) max-key-inc nan-safe)
+                              flat-stride (int (+ (* 2 n-numeric) 1))
                               acc-size (int (* 2 n-numeric))
                               result-2d ^"[[D" (make-array Double/TYPE (int max-key-inc) (int acc-size))]
                           (dotimes [k max-key-inc]
-                            (System/arraycopy flat (* k acc-size) (aget result-2d k) 0 acc-size))
+                            (System/arraycopy flat (* k flat-stride) (aget result-2d k) 0 acc-size))
                           result-2d))))
                 ;; Run each COUNT DISTINCT agg through dedicated Java path
                   cd-results
@@ -3280,9 +3407,18 @@
                                                                   false))
                                                               aggs))
 
-                  ;; Call Java — dispatch between standard and var-width chunked path
+                  ;; Call Java — three paths:
+                  ;;   1. VARIANCE/CORR → variable-width accumulator path
+                  ;;   2. !nan-safe (no agg-col NULLs) → marker-free
+                  ;;      JIT-isolated kernel: drops the per-row marker
+                  ;;      write *and* the NaN guard from inner loops,
+                  ;;      eliminating the Q3-style tier-4 OSR bimodal
+                  ;;      observed when one method carried both the
+                  ;;      marker conditional and the agg loops.
+                  ;;   3. otherwise → standard with-marker kernel.
                         ^doubles result-flat
-                        (if has-var-aggs?
+                        (cond
+                          has-var-aggs?
                           (ColumnOpsChunked/fusedGroupAggregateDenseVarChunkedParallel
                            (int n-long) ^ints long-pred-types
                            ^"[[Ljava.lang.Object;" long-pred-arrs ^longs long-lo ^longs long-hi
@@ -3292,6 +3428,19 @@
                            (int n-aggs) ^ints agg-types ^"[[Ljava.lang.Object;" agg-col-arrs ^"[[Ljava.lang.Object;" agg-col2-arrs
                            ^booleans agg-col-is-long ^booleans agg-col2-is-long
                            ^ints chunk-lengths (int n-simd) (int max-chunk-len) (int max-key-inc) nan-safe nil)
+
+                          (not nan-safe)
+                          (ColumnOpsChunked/fusedGroupAggregateDenseChunkedNoMarkerParallel
+                           (int n-long) ^ints long-pred-types
+                           ^"[[Ljava.lang.Object;" long-pred-arrs ^longs long-lo ^longs long-hi
+                           (int n-dbl) ^ints dbl-pred-types
+                           ^"[[Ljava.lang.Object;" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
+                           (int n-group) ^"[[Ljava.lang.Object;" group-col-arrs ^longs group-muls-arr ^longs group-offsets-arr
+                           (int n-aggs) ^ints agg-types ^"[[Ljava.lang.Object;" agg-col-arrs ^"[[Ljava.lang.Object;" agg-col2-arrs
+                           ^booleans agg-col-is-long ^booleans agg-col2-is-long
+                           ^ints chunk-lengths (int n-simd) (int max-chunk-len) (int max-key-inc) nil)
+
+                          :else
                           (ColumnOpsChunked/fusedGroupAggregateDenseChunkedParallel
                            (int n-long) ^ints long-pred-types
                            ^"[[Ljava.lang.Object;" long-pred-arrs ^longs long-lo ^longs long-hi
@@ -3504,20 +3653,48 @@
                           (aset accs base (+ (aget accs base) v))
                           (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                       :sum-product
+                      ;; F-009: dual null-check on BOTH operands. The NaN
+                      ;; guard catches double-NaN but a long col reads as
+                      ;; (double Long/MIN_VALUE) = -9.22e18 — finite — and
+                      ;; SUM was dragged by -9.22e18 * other per NULL row.
                       (let [[c1 c2] (:cols agg)
-                            v1 (aget-col (get col-arrays c1) i)
-                            v2 (aget-col (get col-arrays c2) i)]
-                        (when (and (== v1 v1) (== v2 v2))
+                            cd1 (get col-arrays c1)
+                            cd2 (get col-arrays c2)
+                            v1 (aget-col cd1 i)
+                            v2 (aget-col cd2 i)
+                            null1 (or (Double/isNaN v1)
+                                      (and (expr/long-array? cd1)
+                                           (= (aget ^longs cd1 (int i)) Long/MIN_VALUE)))
+                            null2 (or (Double/isNaN v2)
+                                      (and (expr/long-array? cd2)
+                                           (= (aget ^longs cd2 (int i)) Long/MIN_VALUE)))]
+                        (when-not (or null1 null2)
                           (aset accs base (+ (aget accs base) (* v1 v2)))
                           (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                       :count-distinct
-                      (let [v (aget-col (get col-arrays (:col agg)) i)]
-                        (.add ^java.util.HashSet (aget coll-accs agg-idx) (Double/valueOf v))
-                        (aset accs (inc base) (+ (aget accs (inc base)) 1.0)))
+                      ;; F-008: skip NULL sentinels before HashSet.add —
+                      ;; otherwise Long.MIN_VALUE-as-double becomes a
+                      ;; distinct "value".
+                      (let [cd (get col-arrays (:col agg))
+                            v (aget-col cd i)
+                            is-null (or (Double/isNaN v)
+                                        (and (expr/long-array? cd)
+                                             (= (aget ^longs cd (int i)) Long/MIN_VALUE)))]
+                        (when-not is-null
+                          (.add ^java.util.HashSet (aget coll-accs agg-idx) (Double/valueOf v))
+                          (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                       (:median :percentile :approx-quantile)
-                      (let [v (aget-col (get col-arrays (:col agg)) i)]
-                        (.add ^java.util.ArrayList (aget coll-accs agg-idx) (Double/valueOf v))
-                        (aset accs (inc base) (+ (aget accs (inc base)) 1.0)))
+                      ;; F-010: same shape as F-008 — skip NULL before
+                      ;; appending into the ArrayList that feeds the
+                      ;; per-group quickselect.
+                      (let [cd (get col-arrays (:col agg))
+                            v (aget-col cd i)
+                            is-null (or (Double/isNaN v)
+                                        (and (expr/long-array? cd)
+                                             (= (aget ^longs cd (int i)) Long/MIN_VALUE)))]
+                        (when-not is-null
+                          (.add ^java.util.ArrayList (aget coll-accs agg-idx) (Double/valueOf v))
+                          (aset accs (inc base) (+ (aget accs (inc base)) 1.0))))
                     ;; default
                       (aset accs (inc base) (+ (aget accs (inc base)) 1.0)))
                     (recur (inc agg-idx) (next ag))))))))

@@ -81,12 +81,17 @@
 
 (defn materialize-column
   "Ensure a column has array :data, materializing from index if needed.
-   Uses direct single-copy path (idx-materialize-to-array) to avoid
-   the intermediate native buffer allocation."
+   Uses direct single-copy path that ALSO concatenates per-chunk
+   validity bitmaps into a flat `:validity` field (nil when every
+   chunk is all-valid — the common case for dense data). Downstream
+   kernels dispatch on `:validity` being non-nil to select the
+   bitmap-aware sibling."
   [col-info]
   (if (:data col-info)
     col-info
-    (assoc col-info :data (index/idx-materialize-to-array (:index col-info)))))
+    (let [{:keys [data validity]}
+          (index/idx-materialize-to-array-with-validity (:index col-info))]
+      (assoc col-info :data data :validity validity))))
 
 (def ^:private long-array-class    (Class/forName "[J"))
 (def ^:private double-array-class  (Class/forName "[D"))

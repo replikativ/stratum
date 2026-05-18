@@ -35,7 +35,7 @@
             PPerfectHashJoin PAsofJoin PFusedJoinGroupAgg PFusedJoinGlobalAgg
             PProject PWindow PHaving PSort PDistinct PLimit
             PMaterializeExpr PRecompose LTopN LHead LSetOp LAnomaly LStringMaterialize]
-           [stratum.internal ColumnOps ColumnOpsExt ColumnOpsAnalytics]))
+           [stratum.internal ColumnOps ColumnOpsExt ColumnOpsAnalytics ColumnOpsNullable]))
 
 (set! *warn-on-reflection* true)
 
@@ -180,13 +180,20 @@
          (ColumnOps/arrayMaxLong arr (int build-length))])
 
       (and (= :float64 ctype) (expr/double-array? data))
+      ;; Skip NaN sentinels so the pushed-down range stays finite. PG
+      ;; semantics: NULL is excluded from min/max — and IEEE's
+      ;; Math.min(NaN, x) = Math.max(NaN, x) = NaN, which would push
+      ;; `:gte NaN` / `:lte NaN` onto the probe side and silently filter
+      ;; every row out (x >= NaN is always false). F-024-adjacent.
       (let [^doubles arr data
             n (int build-length)]
-        (loop [i 1, mn (aget arr 0), mx (aget arr 0)]
+        (loop [i 0, mn Double/POSITIVE_INFINITY, mx Double/NEGATIVE_INFINITY, seen? false]
           (if (>= i n)
-            [mn mx]
+            (when seen? [mn mx])
             (let [v (aget arr i)]
-              (recur (inc i) (Math/min mn v) (Math/max mx v))))))
+              (if (Double/isNaN v)
+                (recur (inc i) mn mx seen?)
+                (recur (inc i) (Math/min mn v) (Math/max mx v) true))))))
 
       :else nil)))
 
@@ -461,23 +468,62 @@
      (x/execute-chunked-fused-count preds columns length)
      agg)))
 
+(defn- block-skip-combined-validity
+  "AND the per-predicate-column validity bitmaps for the block-skip
+   path. Returns nil for the all-valid fast path (route to the
+   existing block-skip kernel)."
+  ^longs [preds mat-cols ^long length]
+  (let [bms (->> preds
+                 (keep #(:validity (get mat-cols (first %))))
+                 vec)]
+    (when (seq bms)
+      (let [bm-len (quot (+ length 63) 64)
+            combined (long-array bm-len)]
+        (System/arraycopy ^longs (first bms) 0 combined 0 bm-len)
+        (doseq [^longs v (rest bms)]
+          (dotimes [i bm-len]
+            (aset combined i (bit-and (aget combined i) (aget v i)))))
+        combined))))
+
 (defn- execute-block-skip-count [node columnar?]
   (let [ctx (execute-node (:input node))
         [preds columns length] (prepare-node-preds (:predicates node) ctx)
         mat-cols (cols/materialize-columns columns)
         pp (gb/prepare-pred-arrays preds mat-cols)
-        ^doubles r (ColumnOpsExt/fusedSimdCountBlockSkipParallel
-                    (int (:n-long pp))
-                    ^ints (:long-pred-types pp)
-                    ^"[[J" (:long-cols pp)
-                    ^longs (:long-lo pp)
-                    ^longs (:long-hi pp)
-                    (int (:n-dbl pp))
-                    ^ints (:dbl-pred-types pp)
-                    ^"[[D" (:dbl-cols pp)
-                    ^doubles (:dbl-lo pp)
-                    ^doubles (:dbl-hi pp)
-                    (int length))
+        validity (block-skip-combined-validity preds mat-cols length)
+        ^doubles r
+        (if validity
+          ;; Validity present: bypass block-skip and use the flat-array
+          ;; Nullable count kernel. Block-skip optimisation assumes
+          ;; predicate min/max bounds determine match status; with
+          ;; nulls present those bounds include the sentinel, breaking
+          ;; the analysis. The Nullable kernel ANDs validity into the
+          ;; per-row mask at every SIMD step instead.
+          (ColumnOpsNullable/fusedSimdCountParallel
+           (int (:n-long pp))
+           ^ints (:long-pred-types pp)
+           ^"[[J" (:long-cols pp)
+           ^longs (:long-lo pp)
+           ^longs (:long-hi pp)
+           (int (:n-dbl pp))
+           ^ints (:dbl-pred-types pp)
+           ^"[[D" (:dbl-cols pp)
+           ^doubles (:dbl-lo pp)
+           ^doubles (:dbl-hi pp)
+           ^longs validity
+           (int length))
+          (ColumnOpsExt/fusedSimdCountBlockSkipParallel
+           (int (:n-long pp))
+           ^ints (:long-pred-types pp)
+           ^"[[J" (:long-cols pp)
+           ^longs (:long-lo pp)
+           ^longs (:long-hi pp)
+           (int (:n-dbl pp))
+           ^ints (:dbl-pred-types pp)
+           ^"[[D" (:dbl-cols pp)
+           ^doubles (:dbl-lo pp)
+           ^doubles (:dbl-hi pp)
+           (int length)))
         agg (or (:agg node) {:op :count :as nil})]
     (post/format-fused-result {:result 0.0 :count (long (aget r 1))} agg)))
 
@@ -542,12 +588,35 @@
                                     (aset d (aget k 0) v)
                                     (aset k 0 (inc (aget k 0))))))
                               (java.util.Arrays/copyOf d (aget k 0)))))
+                        ;; F-012: when a predicate mask is present, the
+                        ;; raw `percentileFiltered{,Long}` Java fns
+                        ;; include NULL sentinels in the gather. Build a
+                        ;; compacted double[] combining mask + NULL skip,
+                        ;; then call the unmasked `percentile` kernel.
+                        compact-skip-nulls-masked
+                        (fn ^doubles []
+                          (let [n length
+                                d (double-array (max 1 n))
+                                k (int-array 1)]
+                            (if is-long?
+                              (let [la ^longs col-data]
+                                (dotimes [i n]
+                                  (when (and (== 1 (aget ^longs mask i))
+                                             (not= (aget la i) Long/MIN_VALUE))
+                                    (aset d (aget k 0) (double (aget la i)))
+                                    (aset k 0 (inc (aget k 0))))))
+                              (let [da ^doubles col-data]
+                                (dotimes [i n]
+                                  (when (and (== 1 (aget ^longs mask i))
+                                             (not (Double/isNaN (aget da i))))
+                                    (aset d (aget k 0) (aget da i))
+                                    (aset k 0 (inc (aget k 0)))))))
+                            (java.util.Arrays/copyOf d (aget k 0))))
                         result (case (:op agg)
                                  (:median :percentile)
                                  (if mask
-                                   (if is-long?
-                                     (ColumnOps/percentileFilteredLong ^longs col-data ^longs mask (int length) pct)
-                                     (ColumnOps/percentileFiltered ^doubles col-data ^longs mask (int length) pct))
+                                   (let [^doubles compacted (compact-skip-nulls-masked)]
+                                     (ColumnOps/percentile compacted (alength compacted) pct))
                                    (let [^doubles compacted (compact-skip-nulls)]
                                      (ColumnOps/percentile compacted (alength compacted) pct)))
                                  :approx-quantile
@@ -1141,6 +1210,9 @@
                        out-cols)
         ;; Per-key reader fn that decodes the i-th row, applying dict
         ;; lookup for dict-encoded string columns.
+        ;; F-034: map sentinels to nil at the API boundary. Long
+        ;; Long.MIN_VALUE and Double NaN reach user code as `nil`,
+        ;; mirroring `aget-col-decoded` from the columnar path.
         reader  (fn [k]
                   (let [col (get prefixed k)
                         data (:data col)
@@ -1153,9 +1225,13 @@
                           (when (>= code 0)
                             (aget ^"[Ljava.lang.String;" dict (int code)))))
                       (instance? (Class/forName "[J") data)
-                      (fn [^long i] (aget ^longs data i))
+                      (fn [^long i]
+                        (let [lv (aget ^longs data i)]
+                          (when (not= lv Long/MIN_VALUE) lv)))
                       (instance? (Class/forName "[D") data)
-                      (fn [^long i] (aget ^doubles data i))
+                      (fn [^long i]
+                        (let [dv (aget ^doubles data i)]
+                          (when-not (Double/isNaN dv) dv)))
                       (instance? (Class/forName "[Ljava.lang.String;") data)
                       (fn [^long i] (aget ^"[Ljava.lang.String;" data i))
                       :else (fn [^long _i] nil))))
@@ -1175,7 +1251,11 @@
 (defn- having-pred-matches?
   "Scalar evaluation of one normalized having predicate at row `i`,
    using the materialized `columns` map. Mirrors the operator set the
-   legacy `q` window-having pushdown supports."
+   legacy `q` window-having pushdown supports.
+
+   F-014: long Long.MIN_VALUE is mapped to Double/NaN before the IS-NULL
+   check, so the long NULL sentinel reads as NULL rather than as the
+   finite -9.22e18 it would become under a plain `(double aget)` cast."
   [columns ^long i pred]
   (let [col-key (first pred)
         op      (second pred)
@@ -1183,7 +1263,10 @@
         data    (col-array col)
         v (cond
             (expr/double-array? data) (aget ^doubles data i)
-            (expr/long-array? data)   (double (aget ^longs data i))
+            (expr/long-array? data)   (let [lv (aget ^longs data i)]
+                                        (if (= lv Long/MIN_VALUE)
+                                          Double/NaN
+                                          (double lv)))
             :else nil)]
     (cond
       (= op :is-null)     (or (nil? v) (Double/isNaN v))
