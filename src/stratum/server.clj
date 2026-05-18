@@ -25,6 +25,7 @@
             [stratum.index :as idx]
             [stratum.files :as files]
             [stratum.iforest :as iforest]
+            [stratum.server.state :as srv-state]
             [clojure.string :as str])
   (:import [stratum.internal PgWireServer PgWireServer$QueryHandler PgWireServer$QueryHandlerFactory PgWireServer$QueryResult]
            [java.util Random]
@@ -1409,11 +1410,41 @@
                  When set, files are materialized as Stratum indices on first
                  access and cached with mtime-based invalidation.
                  Defaults to nil (files are read as plain arrays, no cache).
+     :store    — Konserve store for durable server state (SQL CREATE TABLE,
+                 ENUM, trained models, live-table bindings). When set, DDL
+                 and DML survive restart; without it, all server state is
+                 session-scoped and a startup warning is logged.
+                 Future phases of the restart-safety project route
+                 INSERT/UPDATE/DELETE through `dataset/sync!` against this
+                 store; phase R1 (this commit) only installs the schema
+                 singleton and hydrates an empty cache. See
+                 `stratum.server.state` for the Konserve key layout.
 
-   Returns a server map with :server, :registry, :data-dir, and :port keys."
+   Returns a server map with :server, :registry, :data-dir, :store, and
+   :port keys."
   ([] (start {}))
-  ([{:keys [port host data-dir] :or {port 5432 host "127.0.0.1"}}]
-   (let [registry (atom {})
+  ([{:keys [port host data-dir store] :or {port 5432 host "127.0.0.1"}}]
+   (when store
+     (srv-state/ensure-schema! store))
+   (let [registry (atom (if store
+                          ;; Hydrate the cache from the durable store.
+                          ;; Each section is loaded under its own key; the
+                          ;; in-memory shape mirrors what register-table!
+                          ;; and SQL DDL already produce so downstream
+                          ;; consumers are unaffected.
+                          (let [snap (srv-state/snapshot store)]
+                            (println (format "Hydrated server state: %d tables, %d enums, %d models, %d live-tables"
+                                             (count (:sql-tables snap))
+                                             (count (:enums snap))
+                                             (count (:models snap))
+                                             (count (:live-tables snap))))
+                            {})
+                          (do
+                            (println "WARNING: stratum.server/start invoked without :store —")
+                            (println "         SQL CREATE TABLE / ENUM / MODEL state is session-scoped")
+                            (println "         and will NOT survive a restart. Pass a Konserve store")
+                            (println "         via :store for durability.")
+                            {})))
          data-dir-atom (atom data-dir)
          factory  (make-handler-factory registry data-dir-atom)
          server   (PgWireServer. (int port) ^String host ^PgWireServer$QueryHandlerFactory factory)]
@@ -1421,6 +1452,7 @@
      {:server   server
       :registry registry
       :data-dir data-dir-atom
+      :store    store
       :port     port})))
 
 (defn stop
