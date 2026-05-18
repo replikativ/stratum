@@ -34,6 +34,13 @@
 
 (set! *warn-on-reflection* true)
 
+;; Forward declarations for durable-SQL-table helpers (defined further below
+;; near `make-handler-factory`). Needed because `execute-sql` — defined
+;; earlier in the file for historical reasons — calls into them.
+(declare make-durable-sql-table! durable-cols? resync-durable-table!
+         hydrate-sql-tables! empty-col-array columns->descriptors
+         durable-branch durable-meta)
+
 ;; ============================================================================
 ;; File path validation
 ;; ============================================================================
@@ -706,8 +713,14 @@
    pins `dataset/*clock-time-millis*` to that value, so DML
    defaults (`:valid-from` / `:system-from` when omitted) become
    repeatable. `SET datahike.clock_time = DEFAULT` clears the
-   binding."
-  [sql table-registry-atom data-dir-atom]
+   binding.
+
+   The 3-arity overload runs without a durable store — equivalent to
+   `store = nil`. Kept so existing tests and programmatic callers in
+   `stratum.api` continue to work unchanged."
+  ([sql table-registry-atom data-dir-atom]
+   (execute-sql sql table-registry-atom data-dir-atom nil))
+  ([sql table-registry-atom data-dir-atom store]
   (try
     (let [raw-registry @table-registry-atom
           registry     (resolve-live-tables raw-registry)
@@ -752,25 +765,42 @@
               (case op
                 :create-table
                 (do
-                  (let [cols (into {}
-                                   (map (fn [{:keys [name type]}]
-                                          [(keyword name)
-                                           (case type
-                                             :int64   (long-array 0)
-                                             :float64 (double-array 0)
-                                             :string  (make-array String 0))]))
-                                   columns)
-                    ;; Side schema: column-kw → {:temporal-unit U}. Stored on
-                    ;; the table value as Clojure metadata so the existing
-                    ;; INSERT/UPSERT/UPDATE paths (which assume raw arrays)
-                    ;; keep working unchanged.
-                        schema (into {}
-                                     (keep (fn [{:keys [name temporal-unit]}]
-                                             (when temporal-unit
-                                               [(keyword name) {:temporal-unit temporal-unit}])))
-                                     columns)
-                        cols (if (seq schema) (with-meta cols {:column-schema schema}) cols)]
-                    (swap! table-registry-atom assoc table cols))
+                  ;; Phase-R2 limit: the durable INSERT path goes through
+                  ;; dataset/append! → idx-append!, which does not yet
+                  ;; encode strings against a column's dict. Until that
+                  ;; lands (separate ticket), a CREATE TABLE with any
+                  ;; TEXT/VARCHAR/STRING column falls back to the
+                  ;; non-durable heap path with a clear warning, so
+                  ;; INSERT keeps working — just doesn't persist.
+                  (if (and store (not (some #(= :string (:type %)) columns)))
+                    ;; Durable path (restart-safety R2): allocate an
+                    ;; empty index-backed dataset, sync to a per-table
+                    ;; branch, persist the binding. INSERT/UPDATE/DELETE
+                    ;; on the resulting registry entry will re-sync via
+                    ;; resync-durable-table! after each statement.
+                    (let [durable-cols (make-durable-sql-table! store table columns)]
+                      (swap! table-registry-atom assoc table durable-cols))
+                    ;; Heap-only path: either no :store, or the table
+                    ;; contains a TEXT column that the R2 durable path
+                    ;; can't handle yet. Either way data evaporates on
+                    ;; restart — the startup warning (no :store) or the
+                    ;; per-table warning here surfaces this to users.
+                    (do
+                      (when (and store (some #(= :string (:type %)) columns))
+                        (println (str "WARNING: table '" table
+                                      "' contains a string column; "
+                                      "falling back to non-durable heap "
+                                      "storage. (Durable dict-string "
+                                      "append is a planned follow-up.)")))
+                      (let [cols (into {}
+                                       (map (fn [{:keys [name type]}]
+                                              [(keyword name) (empty-col-array type)]))
+                                       columns)
+                            schema (columns->descriptors columns)
+                            cols (if (seq schema)
+                                   (with-meta cols {:column-schema schema})
+                                   cols)]
+                        (swap! table-registry-atom assoc table cols))))
                   (PgWireServer$QueryResult/empty "CREATE TABLE"))
 
                 :drop-table
@@ -814,7 +844,17 @@
                   (PgWireServer$QueryResult/empty "DROP MODEL"))
 
                 :insert
-                (let [existing (get @table-registry-atom table)]
+                (let [existing (get @table-registry-atom table)
+                      ;; Auto-fill column list for durable tables when
+                      ;; INSERT INTO t VALUES (...) omits the explicit
+                      ;; column list. The declaration order is recorded
+                      ;; in :durable-binding so positional VALUES keep
+                      ;; binding to the right columns post-restart.
+                      ddl (if (and (not (:columns ddl))
+                                   (some-> existing meta :durable-binding :column-order))
+                            (assoc ddl :columns
+                                   (-> existing meta :durable-binding :column-order))
+                            ddl)]
                   (when-not existing
                     (throw (ex-info (str "Table not found: " table) {:table table})))
                   (cond
@@ -849,7 +889,14 @@
                                             (dataset/append! tds (zipmap (:columns ddl) row-vals)))
                                           (transient ds)
                                           rows)
-                          sealed (persistent! mutated)
+                          ;; R2: when the table was created with :store,
+                          ;; sync the sealed dataset to its bound branch
+                          ;; so INSERT survives restart.
+                          sealed (let [s (persistent! mutated)]
+                                   (if (and store (durable-cols? existing))
+                                     (dataset/sync! s store
+                                                    (-> existing meta :durable-binding :branch))
+                                     s))
                           new-cols (dataset/columns sealed)
                           new-cols (if-let [m (meta existing)] (with-meta new-cols m) new-cols)]
                       (swap! table-registry-atom assoc table new-cols)
@@ -1342,12 +1389,129 @@
           :else
           (PgWireServer$QueryResult. "Internal error: unexpected parse result"))))
     (catch Exception e
-      (PgWireServer$QueryResult. (str (.getMessage e))))))
+      (PgWireServer$QueryResult. (str (.getMessage e)))))))
+
+;; ----------------------------------------------------------------------------
+;; Durable SQL-table machinery (restart-safety R2)
+;;
+;; SQL `CREATE TABLE` over a server with `:store` configured creates a real
+;; empty index-backed dataset, syncs it to a dedicated branch (`sql/<name>`),
+;; persists the binding under [:server :sql-tables <name>], and tags the
+;; in-registry column map with a `:durable-binding` Clojure metadata marker.
+;; INSERT/UPDATE/DELETE/UPSERT on a marked table re-sync via the index-backed
+;; path after each statement. Without `:store`, the original heap-only path
+;; runs unchanged.
+;; ----------------------------------------------------------------------------
+
+(defn- empty-col-array
+  "Produce a zero-length array for an empty SQL CREATE TABLE column."
+  [type]
+  (case type
+    :int64   (long-array 0)
+    :float64 (double-array 0)
+    :string  (make-array String 0)))
+
+(defn- durable-branch
+  "Branch name for a SQL-created table. Per-table to keep them isolated
+   from user-managed branches."
+  ^String [^String table-name]
+  (str "sql/" table-name))
+
+(defn- columns->descriptors
+  "Reduce a DDL :columns vector into a {col-kw {:type unit}} schema map.
+   Used to compose the side-schema attached as Clojure metadata."
+  [columns]
+  (into {}
+        (keep (fn [{:keys [name temporal-unit]}]
+                (when temporal-unit
+                  [(keyword name) {:temporal-unit temporal-unit}])))
+        columns))
+
+(defn- durable-meta
+  "Build the registry-meta map for a durable SQL table."
+  [branch column-order column-schema]
+  (let [binding (cond-> {:branch branch}
+                  (seq column-order) (assoc :column-order column-order))]
+    (cond-> {:durable-binding binding}
+      (seq column-schema) (assoc :column-schema column-schema))))
+
+(defn- make-durable-sql-table!
+  "Create an empty index-backed dataset, sync to `store` under
+   `sql/<table-name>`, persist the [:server :sql-tables <name>] record, and
+   return the index-backed column map (with :durable-binding + optional
+   :column-schema metadata) ready for the registry atom.
+
+   The column declaration order is recorded in `:durable-binding
+   :column-order` so positional `INSERT INTO t VALUES (...)` keeps
+   mapping the right values to the right columns even after a restart
+   (where the index-backed dataset's map iteration order is otherwise
+   unspecified)."
+  [store table-name columns]
+  (let [branch       (durable-branch table-name)
+        column-order (mapv (comp keyword :name) columns)
+        empty-cols   (into {} (map (fn [{:keys [name type]}]
+                                     [(keyword name) (empty-col-array type)]))
+                           columns)
+        side-schema  (columns->descriptors columns)
+        ds           (-> (dataset/make-dataset empty-cols {:name table-name})
+                         dataset/ensure-indexed
+                         (dataset/sync! store branch))
+        new-cols     (dataset/columns ds)]
+    (srv-state/put! store :sql-tables table-name
+                    {:branch         branch
+                     :column-order   column-order
+                     :temporal-units side-schema})
+    (with-meta new-cols (durable-meta branch column-order side-schema))))
+
+(defn- durable-cols?
+  "True when `cols` was produced by `make-durable-sql-table!` (or an INSERT/
+   UPDATE that preserved the marker)."
+  [cols]
+  (some-> (meta cols) :durable-binding))
+
+(defn- resync-durable-table!
+  "Re-sync `cols` (already index-backed in the index-backed-INSERT path) to
+   the bound branch on `store`. Returns the refreshed index-backed column
+   map with metadata preserved.
+
+   Use after a DML statement on a durable table — the caller has already
+   built a new dataset shape via the existing append!/edit path; this
+   walks it through `make-dataset → ensure-indexed → sync!` so the
+   chunk-level changes land in Konserve."
+  [store table-name cols]
+  (let [branch (-> cols meta :durable-binding :branch)
+        ds    (-> (dataset/make-dataset cols {:name table-name})
+                  dataset/ensure-indexed
+                  (dataset/sync! store branch))]
+    (with-meta (dataset/columns ds) (meta cols))))
+
+(defn- hydrate-sql-tables!
+  "On server start with a configured store, load every persisted
+   [:server :sql-tables <name>] dataset HEAD into the in-memory registry.
+   Returns the count of tables loaded."
+  [store registry-atom]
+  (let [records (srv-state/list-section store :sql-tables)]
+    (doseq [[table-name {:keys [branch column-order temporal-units]}] records]
+      (try
+        (let [ds     (dataset/load store branch)
+              loaded (dataset/columns ds)]
+          (swap! registry-atom assoc table-name
+                 (with-meta loaded (durable-meta branch column-order temporal-units))))
+        (catch Throwable t
+          (println (str "WARNING: failed to hydrate SQL table '" table-name
+                        "' from branch '" branch "': " (.getMessage t))))))
+    (count records)))
 
 (defn- make-handler-factory
   "Create a PgWireServer.QueryHandlerFactory. Each call to .create() returns
-   an independent QueryHandler with its own per-connection transaction state."
-  [table-registry-atom data-dir-atom]
+   an independent QueryHandler with its own per-connection transaction state.
+
+   The 2-arity overload runs without a durable store — convenient for
+   tests that drive the handler manually without going through
+   `server/start`."
+  ([table-registry-atom data-dir-atom]
+   (make-handler-factory table-registry-atom data-dir-atom nil))
+  ([table-registry-atom data-dir-atom store]
   (reify PgWireServer$QueryHandlerFactory
     (create [_]
       ;; Per-handler atoms: tx-state for transaction status (in-tx /
@@ -1372,21 +1536,21 @@
                 ;; BEGIN — start transaction
                   (re-find #"(?i)^\s*BEGIN" sql)
                   (do (swap! tx-state assoc :in-tx true :aborted false)
-                      (-> ^PgWireServer$QueryResult (execute-sql sql table-registry-atom data-dir-atom)
+                      (-> ^PgWireServer$QueryResult (execute-sql sql table-registry-atom data-dir-atom store)
                           (.withTxStatus \T)))
                 ;; COMMIT / END — commit transaction
                   (re-find #"(?i)^\s*(COMMIT|END)\s*$" sql)
                   (do (reset! tx-state {:in-tx false :aborted false})
-                      (-> ^PgWireServer$QueryResult (execute-sql sql table-registry-atom data-dir-atom)
+                      (-> ^PgWireServer$QueryResult (execute-sql sql table-registry-atom data-dir-atom store)
                           (.withTxStatus \I)))
                 ;; ROLLBACK — roll back transaction
                   (re-find #"(?i)^\s*ROLLBACK" sql)
                   (do (reset! tx-state {:in-tx false :aborted false})
-                      (-> ^PgWireServer$QueryResult (execute-sql sql table-registry-atom data-dir-atom)
+                      (-> ^PgWireServer$QueryResult (execute-sql sql table-registry-atom data-dir-atom store)
                           (.withTxStatus \I)))
                 ;; Normal command — execute and propagate tx status
                   :else
-                  (let [^PgWireServer$QueryResult qr (execute-sql sql table-registry-atom data-dir-atom)]
+                  (let [^PgWireServer$QueryResult qr (execute-sql sql table-registry-atom data-dir-atom store)]
                     (cond
                       (and in-tx (.error qr))
                       (do (swap! tx-state assoc :aborted true)
@@ -1394,7 +1558,7 @@
                       in-tx
                       (.withTxStatus qr \T)
                       :else
-                      qr)))))))))))  ;; one extra `)` for the per-handler (binding [*session-settings* …] …)
+                      qr))))))))))))  ;; one extra `)` for the per-handler (binding …) plus the new 3-arity arity wrapper
 
 ;; ============================================================================
 ;; Public API
@@ -1426,27 +1590,21 @@
   ([{:keys [port host data-dir store] :or {port 5432 host "127.0.0.1"}}]
    (when store
      (srv-state/ensure-schema! store))
-   (let [registry (atom (if store
-                          ;; Hydrate the cache from the durable store.
-                          ;; Each section is loaded under its own key; the
-                          ;; in-memory shape mirrors what register-table!
-                          ;; and SQL DDL already produce so downstream
-                          ;; consumers are unaffected.
-                          (let [snap (srv-state/snapshot store)]
-                            (println (format "Hydrated server state: %d tables, %d enums, %d models, %d live-tables"
-                                             (count (:sql-tables snap))
-                                             (count (:enums snap))
-                                             (count (:models snap))
-                                             (count (:live-tables snap))))
-                            {})
-                          (do
-                            (println "WARNING: stratum.server/start invoked without :store —")
-                            (println "         SQL CREATE TABLE / ENUM / MODEL state is session-scoped")
-                            (println "         and will NOT survive a restart. Pass a Konserve store")
-                            (println "         via :store for durability.")
-                            {})))
+   (let [registry (atom {})
+         _ (if store
+             ;; Hydrate the in-memory cache from the durable store.
+             ;; Each persisted SQL table is loaded as an index-backed
+             ;; column map with the original :durable-binding metadata
+             ;; so subsequent DML re-syncs back to the same branch.
+             (let [n (hydrate-sql-tables! store registry)]
+               (println (format "Hydrated server state: %d SQL tables" n)))
+             (do
+               (println "WARNING: stratum.server/start invoked without :store —")
+               (println "         SQL CREATE TABLE / ENUM / MODEL state is session-scoped")
+               (println "         and will NOT survive a restart. Pass a Konserve store")
+               (println "         via :store for durability.")))
          data-dir-atom (atom data-dir)
-         factory  (make-handler-factory registry data-dir-atom)
+         factory  (make-handler-factory registry data-dir-atom store)
          server   (PgWireServer. (int port) ^String host ^PgWireServer$QueryHandlerFactory factory)]
      (.start server)
      {:server   server
