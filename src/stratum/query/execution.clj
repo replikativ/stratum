@@ -416,7 +416,7 @@
                      :else val)]))
               decomposed))])))
 
-(declare combine-per-chunk-validity)
+(declare combine-per-chunk-validity any-pred-chunk-has-nulls?)
 
 (defn execute-chunked-fused
   "Execute fused filter+aggregate by streaming over aligned chunks.
@@ -551,7 +551,13 @@
           (concat (map #(get col-entries %) long-col-names)
                   (map #(get col-entries %) dbl-col-names))
           per-chunk-validity
-          (when (and (seq pred-col-entries-list) (pos? n-simd))
+          ;; Fast-path: ChunkStats.null-count == 0 across every
+          ;; pred col chunk → no NULLs anywhere → skip the per-chunk
+          ;; bitmap walk and route to the existing no-bitmap kernel.
+          ;; Saves ~3-4ms/query for dense data with many chunks
+          ;; (B1/B3/Q1.2 at 6M rows × 3 cols × 90 chunks).
+          (when (and (seq pred-col-entries-list) (pos? n-simd)
+                     (any-pred-chunk-has-nulls? pred-col-entries-list simd-chunks (long n-simd)))
             (combine-per-chunk-validity pred-col-entries-list simd-chunks chunk-lengths))]
 
       ;; SIMD processing for remaining chunks
@@ -642,16 +648,43 @@
                          simd-result)
                :count total-count})))))))
 
+(defn- any-pred-chunk-has-nulls?
+  "Cheap pre-check: do any of the relevant SIMD chunks across these
+   pred-col entries have `:null-count > 0` in their ChunkStats?
+   Allows the chunked SIMD path to skip the per-chunk validity walk
+   entirely when no predicate column carries NULLs in this query —
+   the dense case. Without this short-circuit, B1/B3/Q1.2 (filter +
+   sum-product, no NULLs in the bench data) paid ~3-4ms per query
+   walking 90 chunks × 3 cols and calling protocol-dispatched
+   `chunk-validity`."
+  [pred-cols-entries simd-chunks ^long n-simd]
+  (loop [col-idx 0]
+    (if (>= col-idx (count pred-cols-entries))
+      false
+      (let [entries (nth pred-cols-entries col-idx)]
+        (if (loop [s 0]
+              (if (>= s n-simd)
+                false
+                (let [c (int (nth simd-chunks s))
+                      ^ChunkEntry entry (nth entries c)
+                      stats (.stats entry)
+                      nc (long (or (:null-count stats) 0))]
+                  (if (pos? nc) true (recur (inc s))))))
+          true
+          (recur (inc col-idx)))))))
+
 (defn- combine-per-chunk-validity
   "For the chunked nullable dispatch: build a long[][] of per-chunk
    AND'd validity bitmaps across all predicate columns. The result
    is null when no chunk on any predicate column has nulls (route
    to the no-bitmap kernel). Otherwise `validity[c]` is nil for
    chunks where every pred col is all-valid at that chunk, or the
-   bitwise AND of the non-nil chunk bitmaps."
+   bitwise AND of the non-nil chunk bitmaps.
+
+   Callers should pre-filter via `any-pred-chunk-has-nulls?` when
+   they can — this function unconditionally allocates a long[][] and
+   walks every chunk."
   [pred-cols-entries simd-chunks chunk-lengths]
-  ;; Walk every chunk; for each, collect non-nil chunk validities
-  ;; from each pred col and AND them.
   (let [n-simd (count simd-chunks)
         validity-arr (make-array (Class/forName "[J") n-simd)
         any-nullable (volatile! false)]
@@ -738,7 +771,10 @@
           (concat (map #(get col-entries %) long-col-names)
                   (map #(get col-entries %) dbl-col-names))
           per-chunk-validity
-          (when (seq pred-col-entries-list)
+          ;; Fast-path short-circuit (see execute-chunked-fused for
+          ;; the same shape) — skip per-chunk bitmap walk on dense data.
+          (when (and (seq pred-col-entries-list) (pos? n-simd)
+                     (any-pred-chunk-has-nulls? pred-col-entries-list simd-chunks (long n-simd)))
             (combine-per-chunk-validity pred-col-entries-list simd-chunks chunk-lengths))
 
           stats-count (if classifications
