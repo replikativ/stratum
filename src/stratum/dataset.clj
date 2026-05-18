@@ -295,14 +295,34 @@
       ;; idx-append! would still skew, but those are bugs upstream
       ;; of the writer, not user-error).
       (doseq [[col-name _] columns-field]
-        (when (nil? (get row col-name))
+        (when-not (contains? row col-name)
           (throw (ex-info "append! requires values for all columns"
                           {:missing col-name
                            :columns (keys columns-field)
                            :hint (when bt-cfg
                                    "configured bitemporal axis columns are auto-stamped from tx-meta or now() — supply them in row-map or pass tx-meta")}))))
+      ;; R2.5: dict-string append. For each value, if the column is
+      ;; dict-encoded string, look up (and extend if absent) the
+      ;; transient forward map; pass the long code on to idx-append!.
+      ;; nil propagates straight through — idx/chunk handle the NULL
+      ;; sentinel themselves.
       (doseq [[col-name col-data] columns-field]
-        (idx/idx-append! (:index col-data) (get row col-name)))
+        (let [val (get row col-name)
+              encoded
+              (if (and (= :string (:dict-type col-data))
+                       (some? val)
+                       (string? val))
+                (let [^java.util.HashMap fwd (:dict-fwd col-data)
+                      ^java.util.ArrayList dict (:dict col-data)
+                      existing (.get fwd ^String val)]
+                  (if existing
+                    (long existing)
+                    (let [new-code (long (.size dict))]
+                      (.add dict ^String val)
+                      (.put fwd ^String val new-code)
+                      new-code)))
+                val)]
+          (idx/idx-append! (:index col-data) encoded)))
       (set! row-count-val (unchecked-inc row-count-val))
       this))
 
@@ -835,11 +855,37 @@
     (when edit
       (throw (IllegalStateException. "Already transient")))
     (validate-all-indices! columns-field "transient")
-    ;; Return a NEW transient dataset, leaving this persistent instance unchanged
+    ;; Return a NEW transient dataset, leaving this persistent instance unchanged.
+    ;;
+    ;; Dict-encoded string columns get two extra pieces of state for the
+    ;; duration of the transient session, both ephemeral:
+    ;;   :dict      String[] → java.util.ArrayList<String> so the dict
+    ;;              grows amortised-O(1) when append! sees a label not
+    ;;              already in it.
+    ;;   :dict-fwd  java.util.HashMap<String,Long> forward map for
+    ;;              constant-time encoding during append!. Built once
+    ;;              here and mutated by append!; never persisted.
+    ;; Alpha/bigram masks are dropped here — they're a function of :dict
+    ;; and the LIKE fast-path only runs on persistent datasets.
     (let [transient-columns
           (into {}
                 (map (fn [[col-name col-data]]
-                       [col-name (assoc col-data :index (idx/idx-transient (:index col-data)))]))
+                       [col-name
+                        (let [base (assoc col-data :index (idx/idx-transient (:index col-data)))]
+                          (if (and (= :string (:dict-type col-data))
+                                   (:dict col-data))
+                            (let [^"[Ljava.lang.String;" arr (:dict col-data)
+                                  n (alength arr)
+                                  al (java.util.ArrayList. n)
+                                  fwd (java.util.HashMap. n)]
+                              (dotimes [i n]
+                                (let [s (aget arr i)]
+                                  (.add al s)
+                                  (.put fwd s (long i))))
+                              (-> base
+                                  (assoc :dict al :dict-fwd fwd)
+                                  (dissoc :dict-alpha-masks :dict-bigram-masks)))
+                            base))]))
                 columns-field)]
       (StratumDataset. ds-name-field transient-columns schema-field row-count-val
                        ds-metadata-field (Object.) commit-info-field obj-meta)))
@@ -848,11 +894,25 @@
   (persistent [this]
     (when-not edit
       (throw (IllegalStateException. "Already persistent")))
-    ;; Seal all index columns persistent
+    ;; Seal all index columns persistent. For dict-encoded string
+    ;; columns whose ArrayList grew during transient appends, freeze
+    ;; the dict back to a String[] (the on-disk and read-path shape),
+    ;; drop the transient forward map, and regenerate the LIKE
+    ;; alpha/bigram masks from the new dict.
     (let [persistent-columns
           (into {}
                 (map (fn [[col-name col-data]]
-                       [col-name (assoc col-data :index (idx/idx-persistent! (:index col-data)))]))
+                       [col-name
+                        (let [base (assoc col-data :index (idx/idx-persistent! (:index col-data)))]
+                          (if (instance? java.util.ArrayList (:dict col-data))
+                            (let [^java.util.ArrayList al (:dict col-data)
+                                  arr (into-array String al)]
+                              (-> base
+                                  (assoc :dict arr
+                                         :dict-alpha-masks (ColumnOpsString/buildDictAlphaMasks arr)
+                                         :dict-bigram-masks (ColumnOpsString/buildDictBigramMasks arr))
+                                  (dissoc :dict-fwd)))
+                            base))]))
                 columns-field)]
       (set! columns-field persistent-columns)
       (set! edit nil)

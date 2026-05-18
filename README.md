@@ -156,8 +156,9 @@ Pass a Konserve store via `:store` (or the CLI `--data-dir`) to make those durab
 
 What's persisted:
 
-- **SQL CREATE TABLE** (with int/float/temporal columns; string columns currently fall back to non-durable heap storage with a per-table warning — dict-string append is a planned follow-up)
-- **INSERT / UPDATE / DELETE / UPSERT** — each statement re-syncs to a per-table branch
+- **SQL CREATE TABLE** — every column type (int, float, temporal, TEXT/VARCHAR, ENUM) lands as a real index-backed dataset
+- **CREATE TYPE … AS ENUM** — declarations + OIDs survive restart; INSERT validation enforces the declared label set against the live table
+- **INSERT / UPDATE / DELETE / UPSERT** — each statement re-syncs to a per-table branch; string columns encode through the column's dict, extending it amortised-O(1) when new labels appear
 - **CREATE MODEL** (isolation forest, plain-data serialization)
 - **register-live-table!** bindings whose Konserve store is the same as the server's `:store` (foreign-store live-tables stay session-scoped and emit a warning)
 

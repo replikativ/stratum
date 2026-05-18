@@ -262,6 +262,75 @@
 ;; ============================================================================
 ;; Defensive: registry-only and live-table from a foreign store
 
+;; ============================================================================
+;; R2.5: dict-string append — TEXT columns now survive restart
+
+(deftest text-column-survives-restart
+  (let [path (temp-dir)]
+    (try
+      (let [store (file-store-at path)]
+        (with-server [s {:port (next-port) :store store}]
+          (is (nil? (:error (run-sql s "CREATE TABLE pet (name TEXT, weight DOUBLE)"))))
+          (is (nil? (:error (run-sql s "INSERT INTO pet (name, weight) VALUES ('rex', 10.0)"))))
+          (is (nil? (:error (run-sql s "INSERT INTO pet (name, weight) VALUES ('mio', 5.5)"))))))
+      ;; Reopen — string column data must survive
+      (let [store (file-store-at path)]
+        (with-server [s {:port (next-port) :store store}]
+          (is (= [["mio" "5.5"] ["rex" "10.0"]]
+                 (:rows (run-sql s "SELECT name, weight FROM pet ORDER BY name")))
+              "TEXT column data must round-trip across restart")
+          ;; Append after restart — dict should extend cleanly
+          (is (nil? (:error (run-sql s "INSERT INTO pet (name, weight) VALUES ('rex', 11.0)"))))
+          (is (= [["mio" "5.5"] ["rex" "10.0"] ["rex" "11.0"]]
+                 (:rows (run-sql s "SELECT name, weight FROM pet ORDER BY name, weight"))))))
+      (finally (delete-dir path)))))
+
+(deftest enum-column-data-durable-after-r2-5
+  (let [path (temp-dir)]
+    (try
+      (let [store (file-store-at path)]
+        (with-server [s {:port (next-port) :store store}]
+          (run-sql s "CREATE TYPE mood AS ENUM ('sad','ok','happy')")
+          (run-sql s "CREATE TABLE pet (name TEXT, m mood)")
+          (is (nil? (:error (run-sql s "INSERT INTO pet (name, m) VALUES ('rex','happy')"))))
+          (is (nil? (:error (run-sql s "INSERT INTO pet (name, m) VALUES ('mio','sad')"))))))
+      ;; Reopen — enum column data must survive (full ENUM durability)
+      (let [store (file-store-at path)]
+        (with-server [s {:port (next-port) :store store}]
+          (is (= [["mio" "sad"] ["rex" "happy"]]
+                 (:rows (run-sql s "SELECT name, m FROM pet ORDER BY name")))
+              "ENUM column data persists end-to-end after R2.5")
+          ;; INSERT validation still enforced on the rehydrated table
+          (let [r (run-sql s "INSERT INTO pet (name, m) VALUES ('bad','grumpy')")]
+            (is (re-find #"invalid input value for enum mood" (or (:error r) ""))))))
+      (finally (delete-dir path)))))
+
+(deftest dict-extend-reuses-existing-codes
+  ;; Inserting an already-seen string must not duplicate it in the
+  ;; dict — the forward map should hit and reuse the existing code.
+  (let [path (temp-dir)]
+    (try
+      (let [store (file-store-at path)]
+        (with-server [s {:port (next-port) :store store}]
+          (run-sql s "CREATE TABLE t (name TEXT)")
+          (dotimes [_ 5] (run-sql s "INSERT INTO t (name) VALUES ('alice')"))
+          (run-sql s "INSERT INTO t (name) VALUES ('bob')")
+          (let [dict (-> @(:registry s) (get "t") :name :dict)]
+            ;; In transient mode mid-INSERT the dict is an ArrayList;
+            ;; resync-durable-table! flips it back to String[]. Either
+            ;; way the unique-label count is what we assert.
+            (is (= 2 (count (vec dict)))
+                "Dict must contain exactly 2 unique labels"))))
+      ;; Round-trip through restart for good measure
+      (let [store (file-store-at path)]
+        (with-server [s {:port (next-port) :store store}]
+          (is (= [["alice"] ["alice"] ["alice"] ["alice"] ["alice"] ["bob"]]
+                 (:rows (run-sql s "SELECT name FROM t ORDER BY name"))))))
+      (finally (delete-dir path)))))
+
+;; ============================================================================
+;; Defensive: registry-only and live-table from a foreign store
+
 (deftest foreign-store-live-table-not-persisted
   (let [path-server (temp-dir)
         path-foreign (temp-dir)]

@@ -799,34 +799,19 @@
                   ;; the user typed something we don't recognise).
                   (let [enums (get @table-registry-atom "__enums__")
                         columns (resolve-enum-columns columns enums)]
-                    ;; Phase-R2 limit: the durable INSERT path goes through
-                    ;; dataset/append! → idx-append!, which does not yet
-                    ;; encode strings against a column's dict. Until that
-                    ;; lands (separate ticket), a CREATE TABLE with any
-                    ;; TEXT/VARCHAR/STRING column (including any column
-                    ;; that resolved to an enum) falls back to the
-                    ;; non-durable heap path with a clear warning, so
-                    ;; INSERT keeps working — just doesn't persist.
-                  (if (and store (not (some #(= :string (:type %)) columns)))
-                    ;; Durable path (restart-safety R2): allocate an
-                    ;; empty index-backed dataset, sync to a per-table
-                    ;; branch, persist the binding. INSERT/UPDATE/DELETE
-                    ;; on the resulting registry entry will re-sync via
-                    ;; resync-durable-table! after each statement.
-                    (let [durable-cols (make-durable-sql-table! store table columns)]
-                      (swap! table-registry-atom assoc table durable-cols))
-                    ;; Heap-only path: either no :store, or the table
-                    ;; contains a TEXT column that the R2 durable path
-                    ;; can't handle yet. Either way data evaporates on
-                    ;; restart — the startup warning (no :store) or the
-                    ;; per-table warning here surfaces this to users.
-                    (do
-                      (when (and store (some #(= :string (:type %)) columns))
-                        (println (str "WARNING: table '" table
-                                      "' contains a string column; "
-                                      "falling back to non-durable heap "
-                                      "storage. (Durable dict-string "
-                                      "append is a planned follow-up.)")))
+                    (if store
+                      ;; Durable path (restart-safety R2 + R2.5): every
+                      ;; column type — int64, float64, dict-string,
+                      ;; enum, temporal — lands as an index-backed
+                      ;; dataset, syncs to a per-table branch, and
+                      ;; persists the binding. INSERT/UPDATE/DELETE
+                      ;; re-syncs via resync-durable-table! after each
+                      ;; statement; string columns encode through the
+                      ;; column's dict, extending it as needed.
+                      (let [durable-cols (make-durable-sql-table! store table columns)]
+                        (swap! table-registry-atom assoc table durable-cols))
+                      ;; No :store — original heap path. The startup
+                      ;; warning told the user this is session-scoped.
                       (let [cols (into {}
                                        (map (fn [{:keys [name type]}]
                                               [(keyword name) (empty-col-array type)]))
@@ -835,7 +820,7 @@
                             cols (if (seq schema)
                                    (with-meta cols {:column-schema schema})
                                    cols)]
-                        (swap! table-registry-atom assoc table cols)))))
+                        (swap! table-registry-atom assoc table cols))))
                   (PgWireServer$QueryResult/empty "CREATE TABLE"))
 
                 :drop-table
