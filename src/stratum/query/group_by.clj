@@ -1133,53 +1133,70 @@
 
 (defn decode-group-results
   "Decode Java Object[] = {long[] keys, double[] flatAccs} into Clojure result maps.
-   flatAccs has stride = numAggs*2 (sum+count per agg)."
-  [^objects result-pair group-cols ^longs group-muls aggs group-dicts]
-  (let [n-group (count group-cols)
-        ^longs keys (aget result-pair 0)
-        ^doubles flat-accs (aget result-pair 1)
-        n (alength keys)
-        n-aggs (count aggs)
-        stride (int (* 2 n-aggs))
-        ;; Pre-compute agg aliases and ops
-        agg-aliases (mapv #(or (:as %) (:op %)) aggs)
-        agg-ops (mapv :op aggs)]
-    (loop [i 0 results (transient [])]
-      (if (< i n)
-        (let [key (aget keys i)
-              base-offset (* i stride)
-              ;; Decode group key
-              group-vals (decode-key key group-muls n-group)
-              group-vals (if group-dicts
-                           (mapv (fn [v dict]
-                                   (if dict
-                                     (aget ^"[Ljava.lang.String;" dict (int (long v)))
-                                     v))
-                                 group-vals group-dicts)
-                           group-vals)
-              ;; Build result map in one shot
-              m (loop [j 0 m (transient (-> (into {} (map vector group-cols group-vals))
-                                            (assoc :_count (long (aget flat-accs (inc base-offset))))))]
-                  (if (< j n-aggs)
-                    (let [ab (+ base-offset (* j 2))
-                          cnt (long (aget flat-accs (inc ab)))
-                          op (nth agg-ops j)
-                          val (case op
-                                :count cnt
-                                :count-non-null (if (zero? cnt) 0 (long (aget flat-accs ab)))
-                                (:sum :sum-product) (if (zero? cnt) nil (aget flat-accs ab))
-                                (:min :max) (if (zero? cnt) nil (aget flat-accs ab))
-                                :avg (if (zero? cnt) nil
-                                         (/ (aget flat-accs ab) (double cnt)))
-                                (aget flat-accs ab))]
-                      (recur (inc j) (assoc! m (nth agg-aliases j) val)))
-                    (persistent! m)))]
-          (recur (inc i) (conj! results m)))
-        (persistent! results)))))
+
+   Two layouts are supported via the optional `marker?` flag:
+     - default (false): legacy stride = numAggs*2, `_count` reads agg-0's
+       count slot — used by the hash / partitioned kernels.
+     - true: F-006 stride = numAggs*2 + 1 with a per-group post-filter
+       row-count marker at offset numAggs*2. `_count` reads the marker,
+       guaranteeing all-NULL groups still appear in the output. Used by
+       the dense flat kernels which write the marker every filter pass."
+  ([result-pair group-cols group-muls aggs group-dicts]
+   (decode-group-results result-pair group-cols group-muls aggs group-dicts false))
+  ([^objects result-pair group-cols ^longs group-muls aggs group-dicts marker?]
+   (let [n-group (count group-cols)
+         ^longs keys (aget result-pair 0)
+         ^doubles flat-accs (aget result-pair 1)
+         n (alength keys)
+         n-aggs (count aggs)
+         stride (int (if marker? (+ (* 2 n-aggs) 1) (* 2 n-aggs)))
+         count-off (long (if marker? (* 2 n-aggs) 1))
+         ;; Pre-compute agg aliases and ops
+         agg-aliases (mapv #(or (:as %) (:op %)) aggs)
+         agg-ops (mapv :op aggs)]
+     (loop [i 0 results (transient [])]
+       (if (< i n)
+         (let [key (aget keys i)
+               base-offset (* i stride)
+               ;; Decode group key
+               group-vals (decode-key key group-muls n-group)
+               group-vals (if group-dicts
+                            (mapv (fn [v dict]
+                                    (if dict
+                                      (aget ^"[Ljava.lang.String;" dict (int (long v)))
+                                      v))
+                                  group-vals group-dicts)
+                            group-vals)
+               ;; Build result map in one shot
+               m (loop [j 0 m (transient (-> (into {} (map vector group-cols group-vals))
+                                             (assoc :_count (long (aget flat-accs (+ base-offset count-off))))))]
+                   (if (< j n-aggs)
+                     (let [ab (+ base-offset (* j 2))
+                           cnt (long (aget flat-accs (inc ab)))
+                           op (nth agg-ops j)
+                           val (case op
+                                 :count cnt
+                                 :count-non-null (if (zero? cnt) 0 (long (aget flat-accs ab)))
+                                 (:sum :sum-product) (if (zero? cnt) nil (aget flat-accs ab))
+                                 (:min :max) (if (zero? cnt) nil (aget flat-accs ab))
+                                 :avg (if (zero? cnt) nil
+                                          (/ (aget flat-accs ab) (double cnt)))
+                                 (aget flat-accs ab))]
+                       (recur (inc j) (assoc! m (nth agg-aliases j) val)))
+                     (persistent! m)))]
+           (recur (inc i) (conj! results m)))
+         (persistent! results))))))
 
 (defn compact-dense-flat-to-pair
   "Compact a flat dense accumulator array into [long[] keys, double[] accs] result pair.
-   Filters out groups where accs[key*acc-size + count-offset] <= 0."
+   Filters out groups where accs[key*acc-size + count-offset] <= 0.
+
+   F-006: callers pass the post-filter row-count marker as
+   `count-offset` (slot `numAggs*2` in the F-006 layout) so all-NULL
+   groups are still kept. Older sites that pass agg-0's count slot
+   (offset 1) keep their behaviour — groups with no non-NULL value for
+   agg-0 are dropped — but those callers no longer hit the dense agg
+   kernel; they target compact-dense-2d-to-pair (var/corr layout)."
   [^doubles flat-array ^long max-key ^long acc-size ^long count-offset]
   (let [key-list (java.util.ArrayList.)]
     (dotimes [k max-key]
@@ -1216,11 +1233,17 @@
 
 (defn decode-dense-group-results
   "Decode Java double[] (flat dense array) into Clojure result maps.
-   Compacts non-empty groups and delegates to decode-group-results."
+   Compacts non-empty groups and delegates to decode-group-results.
+
+   F-006: the Java kernel writes a per-group post-filter row count at
+   the marker slot (`numAggs*2`); compact filters on the marker so
+   all-NULL groups still appear in the result."
   [^doubles flat-array max-key group-cols ^longs group-muls aggs group-dicts]
-  (let [acc-size (int (* 2 (count aggs)))
-        pair (compact-dense-flat-to-pair flat-array (long max-key) acc-size 1)]
-    (decode-group-results pair group-cols group-muls aggs group-dicts)))
+  (let [n-aggs (count aggs)
+        acc-size (int (+ (* 2 n-aggs) 1))
+        marker-offset (long (* 2 n-aggs))
+        pair (compact-dense-flat-to-pair flat-array (long max-key) acc-size marker-offset)]
+    (decode-group-results pair group-cols group-muls aggs group-dicts true)))
 
 ;; ============================================================================
 ;; Columnar Result Format
@@ -1276,23 +1299,29 @@
 
 (defn decode-group-results-columnar
   "Decode Java Object[] = {long[] keys, double[] flatAccs} into columnar format.
-   Returns {:col1 array1 :col2 array2 ... :n-rows N}."
-  [^objects result-pair group-cols ^longs group-muls aggs group-dicts]
-  (let [^longs keys (aget result-pair 0)
-        ^doubles flat-accs (aget result-pair 1)
-        n (alength keys)
-        n-group (count group-cols)
-        n-aggs (count aggs)
-        stride (int (* 2 n-aggs))
-        ;; Decode group keys into per-column arrays
-        group-arrays (decode-group-key-columns keys group-muls n-group group-dicts)
-        ;; Decode agg results into per-column arrays
-        agg-arrays (decode-agg-columns flat-accs n stride aggs)
-        ;; Build result map: {col-keyword array ...}
-        agg-aliases (mapv #(or (:as %) (:op %)) aggs)]
-    (-> (into {} (map vector group-cols group-arrays))
-        (into (map vector agg-aliases agg-arrays))
-        (assoc :n-rows n))))
+   Returns {:col1 array1 :col2 array2 ... :n-rows N}.
+
+   F-006: when `marker?` is true the flat stride is `numAggs*2 + 1`
+   (the trailing slot is the per-group post-filter row count). When
+   false, legacy stride `numAggs*2` (hash / partitioned kernels)."
+  ([result-pair group-cols group-muls aggs group-dicts]
+   (decode-group-results-columnar result-pair group-cols group-muls aggs group-dicts false))
+  ([^objects result-pair group-cols ^longs group-muls aggs group-dicts marker?]
+   (let [^longs keys (aget result-pair 0)
+         ^doubles flat-accs (aget result-pair 1)
+         n (alength keys)
+         n-group (count group-cols)
+         n-aggs (count aggs)
+         stride (int (if marker? (+ (* 2 n-aggs) 1) (* 2 n-aggs)))
+         ;; Decode group keys into per-column arrays
+         group-arrays (decode-group-key-columns keys group-muls n-group group-dicts)
+         ;; Decode agg results into per-column arrays
+         agg-arrays (decode-agg-columns flat-accs n stride aggs)
+         ;; Build result map: {col-keyword array ...}
+         agg-aliases (mapv #(or (:as %) (:op %)) aggs)]
+     (-> (into {} (map vector group-cols group-arrays))
+         (into (map vector agg-aliases agg-arrays))
+         (assoc :n-rows n)))))
 
 (defn build-multi-key-lookup
   "Build a HashMap<Long, long[]> from compact multi-key hash lookup arrays.
@@ -1391,11 +1420,14 @@
 
 (defn decode-dense-group-results-columnar
   "Decode Java double[] (flat dense array) into columnar format.
-   Compacts non-empty groups and delegates to decode-group-results-columnar."
+   Compacts non-empty groups and delegates to decode-group-results-columnar.
+   F-006: filter on the group-marker slot, not agg-0's count."
   [^doubles flat-array max-key group-cols ^longs group-muls aggs group-dicts]
-  (let [acc-size (int (* 2 (count aggs)))
-        pair (compact-dense-flat-to-pair flat-array (long max-key) acc-size 1)]
-    (decode-group-results-columnar pair group-cols group-muls aggs group-dicts)))
+  (let [n-aggs (count aggs)
+        acc-size (int (+ (* 2 n-aggs) 1))
+        marker-offset (long (* 2 n-aggs))
+        pair (compact-dense-flat-to-pair flat-array (long max-key) acc-size marker-offset)]
+    (decode-group-results-columnar pair group-cols group-muls aggs group-dicts true)))
 
 ;; ============================================================================
 ;; Long[] Dense Group-By Decode
@@ -1450,77 +1482,97 @@
 
 (defn decode-group-results-long
   "Decode Java [long[] keys, long[] flatAccs] into Clojure result maps.
-   Type-preserving: SUM/MIN/MAX return Long values, not Double."
-  [^objects result-pair group-cols ^longs group-muls aggs group-dicts]
-  (let [n-group (count group-cols)
-        ^longs keys (aget result-pair 0)
-        ^longs flat-accs (aget result-pair 1)
-        n (alength keys)
-        n-aggs (count aggs)
-        stride (int (* 2 n-aggs))
-        agg-aliases (mapv #(or (:as %) (:op %)) aggs)
-        agg-ops (mapv :op aggs)]
-    (loop [i 0 results (transient [])]
-      (if (< i n)
-        (let [key (aget keys i)
-              base-offset (* i stride)
-              group-vals (decode-key key group-muls n-group)
-              group-vals (if group-dicts
-                           (mapv (fn [v dict]
-                                   (if dict
-                                     (aget ^"[Ljava.lang.String;" dict (int (long v)))
-                                     v))
-                                 group-vals group-dicts)
-                           group-vals)
-              m (loop [j 0 m (transient (-> (into {} (map vector group-cols group-vals))
-                                            (assoc :_count (aget flat-accs (inc base-offset)))))]
-                  (if (< j n-aggs)
-                    (let [ab (+ base-offset (* j 2))
-                          cnt (aget flat-accs (inc ab))
-                          op (nth agg-ops j)
-                          val (case op
-                                :count cnt
-                                (:sum :min :max) (if (zero? cnt) nil (aget flat-accs ab))
-                                :avg (if (zero? cnt) nil
-                                         (/ (double (aget flat-accs ab)) (double cnt)))
-                                (aget flat-accs ab))]
-                      (recur (inc j) (assoc! m (nth agg-aliases j) val)))
-                    (persistent! m)))]
-          (recur (inc i) (conj! results m)))
-        (persistent! results)))))
+   Type-preserving: SUM/MIN/MAX return Long values, not Double.
+
+   F-006: stride includes a post-filter row-count marker at offset
+   numAggs*2 when `marker?` is true; `_count` reads from the marker so
+   all-NULL groups still surface in the output. The default
+   (false) keeps the legacy `_count = agg-0 count` layout, used by
+   non-marker callers."
+  ([result-pair group-cols group-muls aggs group-dicts]
+   (decode-group-results-long result-pair group-cols group-muls aggs group-dicts false))
+  ([^objects result-pair group-cols ^longs group-muls aggs group-dicts marker?]
+   (let [n-group (count group-cols)
+         ^longs keys (aget result-pair 0)
+         ^longs flat-accs (aget result-pair 1)
+         n (alength keys)
+         n-aggs (count aggs)
+         stride (int (if marker? (+ (* 2 n-aggs) 1) (* 2 n-aggs)))
+         count-off (long (if marker? (* 2 n-aggs) 1))
+         agg-aliases (mapv #(or (:as %) (:op %)) aggs)
+         agg-ops (mapv :op aggs)]
+     (loop [i 0 results (transient [])]
+       (if (< i n)
+         (let [key (aget keys i)
+               base-offset (* i stride)
+               group-vals (decode-key key group-muls n-group)
+               group-vals (if group-dicts
+                            (mapv (fn [v dict]
+                                    (if dict
+                                      (aget ^"[Ljava.lang.String;" dict (int (long v)))
+                                      v))
+                                  group-vals group-dicts)
+                            group-vals)
+               m (loop [j 0 m (transient (-> (into {} (map vector group-cols group-vals))
+                                             (assoc :_count (aget flat-accs (+ base-offset count-off)))))]
+                   (if (< j n-aggs)
+                     (let [ab (+ base-offset (* j 2))
+                           cnt (aget flat-accs (inc ab))
+                           op (nth agg-ops j)
+                           val (case op
+                                 :count cnt
+                                 (:sum :min :max) (if (zero? cnt) nil (aget flat-accs ab))
+                                 :avg (if (zero? cnt) nil
+                                          (/ (double (aget flat-accs ab)) (double cnt)))
+                                 (aget flat-accs ab))]
+                       (recur (inc j) (assoc! m (nth agg-aliases j) val)))
+                     (persistent! m)))]
+           (recur (inc i) (conj! results m)))
+         (persistent! results))))))
 
 (defn decode-group-results-long-columnar
   "Decode Java [long[] keys, long[] flatAccs] into columnar format.
-   Returns {:col1 array1 :col2 array2 ... :n-rows N}."
-  [^objects result-pair group-cols ^longs group-muls aggs group-dicts]
-  (let [^longs keys (aget result-pair 0)
-        ^longs flat-accs (aget result-pair 1)
-        n (alength keys)
-        n-group (count group-cols)
-        n-aggs (count aggs)
-        stride (int (* 2 n-aggs))
-        group-arrays (decode-group-key-columns keys group-muls n-group group-dicts)
-        agg-arrays (decode-agg-columns-long flat-accs n stride aggs)
-        agg-aliases (mapv #(or (:as %) (:op %)) aggs)]
-    (-> (into {} (map vector group-cols group-arrays))
-        (into (map vector agg-aliases agg-arrays))
-        (assoc :n-rows n))))
+   Returns {:col1 array1 :col2 array2 ... :n-rows N}.
+
+   F-006: same marker?-aware shape as decode-group-results-columnar."
+  ([result-pair group-cols group-muls aggs group-dicts]
+   (decode-group-results-long-columnar result-pair group-cols group-muls aggs group-dicts false))
+  ([^objects result-pair group-cols ^longs group-muls aggs group-dicts marker?]
+   (let [^longs keys (aget result-pair 0)
+         ^longs flat-accs (aget result-pair 1)
+         n (alength keys)
+         n-group (count group-cols)
+         n-aggs (count aggs)
+         stride (int (if marker? (+ (* 2 n-aggs) 1) (* 2 n-aggs)))
+         group-arrays (decode-group-key-columns keys group-muls n-group group-dicts)
+         agg-arrays (decode-agg-columns-long flat-accs n stride aggs)
+         agg-aliases (mapv #(or (:as %) (:op %)) aggs)]
+     (-> (into {} (map vector group-cols group-arrays))
+         (into (map vector agg-aliases agg-arrays))
+         (assoc :n-rows n)))))
 
 (defn decode-dense-group-results-long
   "Decode Java long[] (flat dense array) into Clojure result maps.
-   Compacts non-empty groups, type-preserving Long results."
+   Compacts non-empty groups, type-preserving Long results.
+   F-006: filter on group-marker slot (`numAggs*2`) so all-NULL groups
+   remain in the output with NULL aggregates."
   [^longs flat-array max-key group-cols ^longs group-muls aggs group-dicts]
-  (let [acc-size (int (* 2 (count aggs)))
-        pair (compact-dense-long-to-pair flat-array (long max-key) acc-size 1)]
-    (decode-group-results-long pair group-cols group-muls aggs group-dicts)))
+  (let [n-aggs (count aggs)
+        acc-size (int (+ (* 2 n-aggs) 1))
+        marker-offset (long (* 2 n-aggs))
+        pair (compact-dense-long-to-pair flat-array (long max-key) acc-size marker-offset)]
+    (decode-group-results-long pair group-cols group-muls aggs group-dicts true)))
 
 (defn decode-dense-group-results-long-columnar
   "Decode Java long[] (flat dense array) into columnar format.
-   Compacts non-empty groups, type-preserving Long arrays."
+   Compacts non-empty groups, type-preserving Long arrays.
+   F-006: same marker-based compact as the row-form variant."
   [^longs flat-array max-key group-cols ^longs group-muls aggs group-dicts]
-  (let [acc-size (int (* 2 (count aggs)))
-        pair (compact-dense-long-to-pair flat-array (long max-key) acc-size 1)]
-    (decode-group-results-long-columnar pair group-cols group-muls aggs group-dicts)))
+  (let [n-aggs (count aggs)
+        acc-size (int (+ (* 2 n-aggs) 1))
+        marker-offset (long (* 2 n-aggs))
+        pair (compact-dense-long-to-pair flat-array (long max-key) acc-size marker-offset)]
+    (decode-group-results-long-columnar pair group-cols group-muls aggs group-dicts true)))
 
 (defn decode-dense-group-results-2d
   "Decode Java double[][] (per-key accumulator arrays) into Clojure result maps.
@@ -2816,17 +2868,22 @@
                          (int n-dbl) dbl-pred-types ^"[[D" dbl-cols dbl-lo dbl-hi
                          (int n-group) group-arrays group-muls
                          (int n-numeric) (int length) max-key-inc)
-                      ;; General path returns flat double[] — reshape to double[][] for CD decode
+                      ;; General path returns flat double[] — reshape to double[][] for CD decode.
+                      ;; F-006: flat-stride is `2*n + 1`, but the 2D
+                      ;; reshape only carries the per-agg slots (no
+                      ;; marker) so downstream `decode-dense-count-distinct-results`
+                      ;; sees the legacy layout it expects.
                         (let [^doubles flat (ColumnOps/fusedFilterGroupAggregateDenseParallel
                                              (int n-long) long-pred-types ^"[[J" long-cols long-lo long-hi
                                              (int n-dbl) dbl-pred-types ^"[[D" dbl-cols dbl-lo dbl-hi
                                              (int n-group) group-arrays group-muls
                                              (int n-numeric) numeric-agg-types ^"[[D" numeric-agg-cols ^"[[D" numeric-agg-col2s
                                              (int length) max-key-inc nan-safe)
+                              flat-stride (int (+ (* 2 n-numeric) 1))
                               acc-size (int (* 2 n-numeric))
                               result-2d ^"[[D" (make-array Double/TYPE (int max-key-inc) (int acc-size))]
                           (dotimes [k max-key-inc]
-                            (System/arraycopy flat (* k acc-size) (aget result-2d k) 0 acc-size))
+                            (System/arraycopy flat (* k flat-stride) (aget result-2d k) 0 acc-size))
                           result-2d))))
                 ;; Run each COUNT DISTINCT agg through dedicated Java path
                   cd-results

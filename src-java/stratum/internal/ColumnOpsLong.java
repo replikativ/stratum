@@ -526,7 +526,12 @@ public final class ColumnOpsLong {
             int numAggs, int[] aggTypes, long[][] aggCols,
             int start, int end, int maxKey) {
 
-        int accSize = numAggs * 2;
+        // F-006: extra slot per group at offset `numAggs*2` holds the
+        // post-filter row count, used by `compact-dense-long-to-pair`
+        // to keep all-NULL groups in the output. Per-agg count slots
+        // still mean "non-NULL count" for AVG correctness.
+        int accSize = numAggs * 2 + 1;
+        int markerSlot = numAggs * 2;
         long[] accs = new long[maxKey * accSize];
 
         // Initialize MIN to MAX_VALUE, MAX to MIN_VALUE+1
@@ -572,6 +577,9 @@ public final class ColumnOpsLong {
             }
 
             int base = key * accSize;
+            // F-006: post-filter row count for the group; needed so all-NULL
+            // groups still appear in the SQL output.
+            accs[base + markerSlot] += m;
             for (int a = 0; a < numAggs; a++) {
                 int off = base + a * 2;
                 switch (aggTypes[a]) {
@@ -639,7 +647,8 @@ public final class ColumnOpsLong {
                     numAggs, aggTypes, aggCols, length, maxKey);
         }
 
-        int accSize = numAggs * 2;
+        // F-006: accSize matches Range variant (`numAggs*2 + 1`).
+        int accSize = numAggs * 2 + 1;
         long perThreadMem = (long) maxKey * accSize * 8;
         boolean useMorsels = perThreadMem < 65536;
 
@@ -714,6 +723,9 @@ public final class ColumnOpsLong {
     /** Merge src long[] accumulators into dst. */
     private static void mergeLongAccs(long[] dst, long[] src, int maxKey, int accSize,
                                        int numAggs, int[] aggTypes) {
+        // F-006: accSize includes a marker slot at offset `numAggs*2`.
+        // Merge it additively even when no agg has non-NULL data.
+        int markerSlot = numAggs * 2;
         for (int k = 0; k < maxKey; k++) {
             int base = k * accSize;
             for (int a = 0; a < numAggs; a++) {
@@ -738,6 +750,7 @@ public final class ColumnOpsLong {
                         break;
                 }
             }
+            dst[base + markerSlot] += src[base + markerSlot];
         }
     }
 

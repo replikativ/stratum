@@ -2470,7 +2470,10 @@ public final class ColumnOps {
                     numAggs, aggTypes, aggCols, aggCol2s, length, maxKey, nanSafe);
         }
 
-        final int accSize = numAggs * 2;
+        // F-006: accSize matches Range variant — `numAggs * 2 + 1` to
+        // hold the per-group post-filter row count marker.
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
         final int flatLen = maxKey * accSize;
 
         // Limit threads so total accumulators fit in L3.
@@ -2541,6 +2544,8 @@ public final class ColumnOps {
                             }
                             accs[off + 1] += partial[off + 1];
                         }
+                        // F-006: marker is purely additive across morsels.
+                        accs[base + markerSlot] += partial[base + markerSlot];
                     }
                 }
                 return accs;
@@ -2586,6 +2591,8 @@ public final class ColumnOps {
                         double[] left = results[p * 2];
                         double[] right = results[p * 2 + 1];
                         if (!fHasMinMax) {
+                            // Flat-bulk merge sweeps every slot including
+                            // the F-006 marker.
                             for (int j = 0; j < flatLen; j++) left[j] += right[j];
                         } else {
                             for (int k = 0; k < maxKey; k++) {
@@ -2608,6 +2615,8 @@ public final class ColumnOps {
                                     }
                                     left[off + 1] += right[off + 1];
                                 }
+                                // F-006: additive merge of marker.
+                                left[base + markerSlot] += right[base + markerSlot];
                             }
                         }
                         results[p] = left;
@@ -2880,8 +2889,17 @@ public final class ColumnOps {
             int numAggs, int[] aggTypes, double[][] aggCols, double[][] aggCol2s,
             int start, int end, int maxKey, boolean nanSafe) {
 
-        final int accSize = numAggs * 2;
-        // Flat contiguous array: groups[key * accSize + a*2] = value, [key * accSize + a*2 + 1] = count
+        // F-006: group-exists marker. accSize includes one extra slot per
+        // group at offset `numAggs * 2`, incremented once per row that
+        // passes the filter (regardless of per-agg NULL state). The
+        // compact-fn checks this marker so SQL emits the group with NULL
+        // aggregates when every value in the group's agg column was NULL.
+        // Per-agg count slots still mean "non-NULL count for that agg",
+        // preserving AVG correctness.
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
+        // Flat contiguous array: groups[key * accSize + a*2] = value, [key * accSize + a*2 + 1] = count,
+        //                        groups[key * accSize + markerSlot] = post-filter row count.
         double[] groups = new double[maxKey * accSize];
         // Init MIN/MAX accumulators (SUM/COUNT default to 0.0 which is correct)
         for (int a = 0; a < numAggs; a++) {
@@ -2925,6 +2943,9 @@ public final class ColumnOps {
             assert key >= 0 && key < maxKey : "Dense key out of range: " + key + " (maxKey=" + maxKey + ")";
 
             int base = key * accSize;
+            // F-006: post-filter row count; lets the compact-fn keep the
+            // group even when every value for every agg column was NULL.
+            groups[base + markerSlot] += m;
             for (int a = 0; a < numAggs; a++) {
                 int off = base + a * 2;
                 switch (aggTypes[a]) {
@@ -3519,7 +3540,10 @@ public final class ColumnOps {
             int start, int end, int maxKey) {
 
         int mask = capacity - 1;
-        final int accSize = numAggs * 2;
+        // F-006: accSize includes a per-group marker slot at numAggs*2
+        // so all-NULL groups still appear in the join+group-by output.
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
         double[] groups = new double[maxKey * accSize];
         // Init MIN/MAX accumulators
         for (int a = 0; a < numAggs; a++) {
@@ -3569,6 +3593,9 @@ public final class ColumnOps {
 
                         // Accumulate fact-side values into flat array
                         int base0 = key * accSize;
+                        // F-006: bump per-group post-filter row count;
+                        // INNER join match counts as one row entering the group.
+                        groups[base0 + markerSlot] += 1;
                         for (int a = 0; a < numAggs; a++) {
                             int off = base0 + a * 2;
                             switch (aggTypes[a]) {
@@ -3649,7 +3676,9 @@ public final class ColumnOps {
                     numAggs, aggTypes, factAggCols, maxKey);
         }
         int threadRange = (probeLength + nThreads - 1) / nThreads;
-        final int accSize = numAggs * 2;
+        // F-006: matches Range variant.
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
 
         @SuppressWarnings("unchecked")
         Future<double[]>[] futures = new Future[nThreads];
@@ -3685,8 +3714,10 @@ public final class ColumnOps {
                 double[] partial = f.get();
                 for (int k = 0; k < maxKey; k++) {
                     int base0 = k * accSize;
-                    // Skip empty groups (count in slot 1 is zero)
-                    if (partial[base0 + 1] == 0.0) continue;
+                    // F-006: use marker (not agg-0 count) to detect "group touched
+                    // by this partial". A SUM-only path with all NULLs has agg-0
+                    // count == 0 yet the group exists.
+                    if (partial[base0 + markerSlot] == 0.0) continue;
                     for (int a = 0; a < numAggs; a++) {
                         int off = base0 + a * 2;
                         switch (aggTypes[a]) {
@@ -3699,6 +3730,7 @@ public final class ColumnOps {
                         }
                         merged[off + 1] += partial[off + 1];
                     }
+                    merged[base0 + markerSlot] += partial[base0 + markerSlot];
                 }
             }
         } catch (Exception e) {

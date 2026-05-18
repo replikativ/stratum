@@ -122,7 +122,12 @@ public final class ColumnOpsChunked {
             int[] chunkLengths, int startChunk, int endChunk, int maxChunkLen, int maxKey,
             boolean nanSafe, long[] nullSlots) {
 
-        final int accSize = numAggs * 2;
+        // F-006: accSize includes one trailing slot per group for the
+        // post-filter row count, so all-NULL groups survive the compact
+        // step downstream. Layout matches ColumnOps.fusedFilterGroup-
+        // AggregateDenseRange.
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
         double[] groups = new double[maxKey * accSize];
         // Init MIN to +Inf, MAX to -Inf
         for (int a = 0; a < numAggs; a++) {
@@ -253,6 +258,15 @@ public final class ColumnOpsChunked {
 
             if (validCount == 0) continue; // Skip chunk entirely
 
+            // F-006: bump per-group marker for every valid row before
+            // the agg passes. The agg passes themselves still skip
+            // NULL values for per-agg counts/sums, but the marker
+            // tracks "row matched filter and landed in group k".
+            for (int i = 0; i < len; i++) {
+                int k = rowKeys[i];
+                if (k >= 0) groups[k * accSize + markerSlot]++;
+            }
+
             // === Pass 2+: Per-agg-type accumulation using precomputed keys ===
             // Each inner loop has a single known agg type — no switch.
             // JIT compiles each loop body independently for perfect specialization.
@@ -311,7 +325,9 @@ public final class ColumnOpsChunked {
             int[] chunkLengths, int nChunks, int maxChunkLen, int maxKey,
             boolean nanSafe, long[] nullSlots) {
 
-        final int accSize = numAggs * 2;
+        // F-006: accSize matches Range variant.
+        final int accSize = numAggs * 2 + 1;
+        final int markerSlot = numAggs * 2;
 
         // Compute total row count for PARALLEL_THRESHOLD check
         int totalRows = 0;
@@ -372,6 +388,7 @@ public final class ColumnOpsChunked {
                     continue;
                 }
                 if (!hasMinMax) {
+                    // Flat bulk merge sweeps every slot including the F-006 marker.
                     for (int j = 0; j < flatLen; j++) merged[j] += partial[j];
                 } else {
                     for (int k = 0; k < maxKey; k++) {
@@ -394,6 +411,8 @@ public final class ColumnOpsChunked {
                             }
                             merged[off + 1] += partial[off + 1];
                         }
+                        // F-006: marker merges additively.
+                        merged[base + markerSlot] += partial[base + markerSlot];
                     }
                 }
             }

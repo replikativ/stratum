@@ -2663,10 +2663,14 @@
           result (q/q {:from data
                        :group [:g]
                        :agg [[:sum :v]]})]
-      ;; Group 1 has valid values (10+30=40), group 2 has only NaN → excluded
-      ;; NaN values are skipped in SUM (SQL NULL semantics)
-      (is (= 1 (count result)))
-      (is (== 40.0 (:sum (first result)))))))
+      ;; SQL 3VL: group 2 still appears in the output (every group whose
+      ;; rows passed the WHERE clause must be present), with `:sum nil`
+      ;; because every value was NULL. F-006 closure restored this
+      ;; behaviour; pre-fix the group disappeared silently.
+      (is (= 2 (count result)))
+      (let [by-g (into {} (map (juxt :g identity)) result)]
+        (is (== 40.0 (double (:sum (get by-g 1)))))
+        (is (nil? (:sum (get by-g 2))))))))
 
 ;; ============================================================================
 ;; Date/Time Arithmetic Tests
