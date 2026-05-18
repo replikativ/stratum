@@ -113,26 +113,70 @@
         inner))
 
     ;; Arithmetic: +, -, *, /, %
-    ;; Constant-fold when both sides are numeric literals (e.g. CAST date + interval)
+    ;; Constant-fold when both sides are numeric literals (e.g. CAST date + interval).
+    ;; Date/timestamp + INTERVAL → calendar-aware [:date-add]. DAY units
+    ;; stay on integer addition since DATE columns are epoch-days.
     (instance? Addition expr)
     (let [^Addition e expr
           l (translate-expr (.getLeftExpression e))
           r (translate-expr (.getRightExpression e))]
-      (if (and (number? l) (number? r))
+      (cond
+        ;; Marker on the right: `col + INTERVAL`
+        (and (vector? r) (= :interval (first r)))
+        (let [[_ unit n] r]
+          (cond
+            ;; Preserve the old constant-fold path when both sides
+            ;; are constants AND we're on the DAY fast path. Pre-fix
+            ;; `CAST('2001-01-12' AS DATE) + INTERVAL '30' DAY`
+            ;; folded to a single long; some WHERE-clause sites
+            ;; expect a literal there.
+            (and (= unit :days) (number? l) (number? n))
+            (+ (long l) (long n))
+            (= unit :days)  [:+ l n]
+            :else           [:date-add unit n l]))
+
+        ;; Marker on the left (commutative): `INTERVAL + col`
+        (and (vector? l) (= :interval (first l)))
+        (let [[_ unit n] l]
+          (cond
+            (and (= unit :days) (number? r) (number? n))
+            (+ (long r) (long n))
+            (= unit :days)  [:+ r n]
+            :else           [:date-add unit n r]))
+
+        ;; Constant-fold both-numeric
+        (and (number? l) (number? r))
         (if (or (float? l) (float? r) (instance? Double l) (instance? Double r))
           (+ (double l) (double r))
           (+ (long l) (long r)))
-        [:+ l r]))
+
+        :else [:+ l r]))
 
     (instance? Subtraction expr)
     (let [^Subtraction e expr
           l (translate-expr (.getLeftExpression e))
           r (translate-expr (.getRightExpression e))]
-      (if (and (number? l) (number? r))
+      (cond
+        ;; `col - INTERVAL` — negate the increment for date-add.
+        (and (vector? r) (= :interval (first r)))
+        (let [[_ unit n] r
+              neg (if (number? n) (- n) [:* -1 n])]
+          (cond
+            (and (= unit :days) (number? l) (number? n))
+            (- (long l) (long n))
+            (= unit :days)  [:- l n]
+            :else           [:date-add unit neg l]))
+
+        ;; `INTERVAL - col` is ill-formed semantically; fall through to
+        ;; the plain `[:- l r]` path which will error or coerce as
+        ;; usual.
+
+        (and (number? l) (number? r))
         (if (or (float? l) (float? r) (instance? Double l) (instance? Double r))
           (- (double l) (double r))
           (- (long l) (long r)))
-        [:- l r]))
+
+        :else [:- l r]))
 
     (instance? Multiplication expr)
     (let [^Multiplication e expr]
@@ -234,18 +278,32 @@
                                {:field field})))]
       [op col])
 
-    ;; INTERVAL expression — convert to epoch-day count for date arithmetic
+    ;; INTERVAL '<n>' UNIT — emit a marker that the +/- handlers
+    ;; rewrite into a [:date-add unit n col] call against the
+    ;; date/timestamp column on the other side. DAY units keep
+    ;; integer-add semantics (DATE columns are epoch-days, so +n is
+    ;; exactly +n days); calendar-aware units (MONTH/YEAR) route
+    ;; through the existing arrayDateAddMonths kernel so
+    ;; `Jan 31 + 1 MONTH = Feb 28/29` instead of the silently wrong
+    ;; +30 days the old `[:* n 30]` lowering produced.
     (instance? IntervalExpression expr)
     (let [^IntervalExpression ie expr
           n (if-let [e (.getExpression ie)]
               (translate-expr e)
               (Long/parseLong (str/replace (or (.getParameter ie) "0") "'" "")))
-          unit (some-> (.getIntervalType ie) str/upper-case str/trim)]
-      (case unit
-        ("DAY" "DAYS") n
-        ("MONTH" "MONTHS") [:* n 30]
-        ("YEAR" "YEARS") [:* n 365]
-        n))
+          unit (some-> (.getIntervalType ie) str/upper-case str/trim)
+          unit-kw (case unit
+                    ("DAY" "DAYS")               :days
+                    ("MONTH" "MONTHS")           :months
+                    ("YEAR" "YEARS")             :years
+                    ("HOUR" "HOURS")             :hours
+                    ("MINUTE" "MINUTES")         :minutes
+                    ("SECOND" "SECONDS")         :seconds
+                    ("MILLISECOND" "MILLISECONDS") :milliseconds
+                    ("MICROSECOND" "MICROSECONDS") :microseconds
+                    (throw (ex-info (str "Unsupported INTERVAL unit: " unit)
+                                    {:unit unit})))]
+      [:interval unit-kw n])
 
     ;; Comparison operators — used in CASE WHEN clauses
     (instance? EqualsTo expr)

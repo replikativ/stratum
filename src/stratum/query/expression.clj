@@ -375,7 +375,41 @@
         :minutes (ColumnOps/arrayDateAddSeconds long-data (long (* n 60)) (int length))
         :seconds (ColumnOps/arrayDateAddSeconds long-data (long n) (int length))
         :months  (ColumnOps/arrayDateAddMonths  long-data (int n) (int length))
-        :years   (ColumnOps/arrayDateAddMonths  long-data (int (* n 12)) (int length))))))
+        :years   (ColumnOps/arrayDateAddMonths  long-data (int (* n 12)) (int length)))
+      :days
+      ;; DATE column (epoch-days). DAY-unit arithmetic should never
+      ;; reach this branch — the SQL Addition handler routes
+      ;; INTERVAL '...' DAY through plain `[:+ ...]` so we only see
+      ;; calendar-aware units (MONTH/YEAR) here. arrayDateAddMonths
+      ;; expects epoch-seconds; convert via *86400 in/out (lossless
+      ;; for date-only columns — no time-of-day component).
+      (case unit
+        :months (let [secs (long-array length)
+                      _    (dotimes [i length]
+                             (let [d (aget long-data i)]
+                               (aset secs i (if (= d Long/MIN_VALUE)
+                                              Long/MIN_VALUE
+                                              (* d 86400)))))
+                      out  (ColumnOps/arrayDateAddMonths secs (int n) (int length))]
+                  (dotimes [i length]
+                    (let [s (aget out i)]
+                      (aset out i (if (= s Long/MIN_VALUE)
+                                    Long/MIN_VALUE
+                                    (Math/floorDiv s 86400)))))
+                  out)
+        :years  (let [secs (long-array length)
+                      _    (dotimes [i length]
+                             (let [d (aget long-data i)]
+                               (aset secs i (if (= d Long/MIN_VALUE)
+                                              Long/MIN_VALUE
+                                              (* d 86400)))))
+                      out  (ColumnOps/arrayDateAddMonths secs (int (* n 12)) (int length))]
+                  (dotimes [i length]
+                    (let [s (aget out i)]
+                      (aset out i (if (= s Long/MIN_VALUE)
+                                    Long/MIN_VALUE
+                                    (Math/floorDiv s 86400)))))
+                  out)))))
 
 ;; ============================================================================
 ;; Polymorphic expression evaluation (returns long[] or double[])

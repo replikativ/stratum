@@ -429,7 +429,19 @@
                       :minutes (+ v (* (long n) 60))
                       :seconds (+ v (long n))
                       :months  (let [^longs r (ColumnOps/arrayDateAddMonths (long-array [v]) (int n) 1)] (aget r 0))
-                      :years   (let [^longs r (ColumnOps/arrayDateAddMonths (long-array [v]) (int (* n 12)) 1)] (aget r 0))))))
+                      :years   (let [^longs r (ColumnOps/arrayDateAddMonths (long-array [v]) (int (* n 12)) 1)] (aget r 0)))
+                    :days
+                    ;; DATE column (epoch-days). DAY adds reach the
+                    ;; plain `[:+ ...]` path so they don't show up
+                    ;; here. MONTH/YEAR convert through seconds
+                    ;; (lossless: dates have no time-of-day).
+                    (case unit
+                      :months  (let [secs (long-array [(* v 86400)])
+                                     ^longs r (ColumnOps/arrayDateAddMonths secs (int n) 1)]
+                                 (Math/floorDiv (aget r 0) 86400))
+                      :years   (let [secs (long-array [(* v 86400)])
+                                     ^longs r (ColumnOps/arrayDateAddMonths secs (int (* n 12)) 1)]
+                                 (Math/floorDiv (aget r 0) 86400))))))
 
         :time-bucket
         (let [width (long (nth args 0))
