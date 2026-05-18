@@ -399,7 +399,23 @@
                       :hour   (* (Math/floorDiv v 3600) 3600)
                       :day    (* (Math/floorDiv v 86400) 86400)
                       :year   (let [^longs r (ColumnOps/arrayDateTruncYear (long-array [v]) 1)] (aget r 0))
-                      :month  (let [^longs r (ColumnOps/arrayDateTruncMonth (long-array [v]) 1)] (aget r 0))))))
+                      :month  (let [^longs r (ColumnOps/arrayDateTruncMonth (long-array [v]) 1)] (aget r 0)))
+                    :millis
+                    ;; Scalar :millis path: scale up to micros, dispatch
+                    ;; through the existing micros-kernel branches,
+                    ;; floor-divide back to millis.
+                    (case unit
+                      :millisecond v
+                      :second      (* (Math/floorDiv v 1000) 1000)
+                      :minute      (* (Math/floorDiv v 60000) 60000)
+                      :hour        (* (Math/floorDiv v 3600000) 3600000)
+                      :day         (* (Math/floorDiv v 86400000) 86400000)
+                      :year        (let [scaled (long-array [(* v 1000)])
+                                         ^longs r (ColumnOpsTemporal/arrayDateTruncYearMicros scaled 1)]
+                                     (Math/floorDiv (aget r 0) 1000))
+                      :month       (let [scaled (long-array [(* v 1000)])
+                                         ^longs r (ColumnOpsTemporal/arrayDateTruncMonthMicros scaled 1)]
+                                     (Math/floorDiv (aget r 0) 1000))))))
 
         :date-add
         (let [unit (nth args 0)
@@ -441,7 +457,23 @@
                                  (Math/floorDiv (aget r 0) 86400))
                       :years   (let [secs (long-array [(* v 86400)])
                                      ^longs r (ColumnOps/arrayDateAddMonths secs (int (* n 12)) 1)]
-                                 (Math/floorDiv (aget r 0) 86400))))))
+                                 (Math/floorDiv (aget r 0) 86400)))
+                    :millis
+                    ;; TIMESTAMP_MS column. Scale to micros, dispatch
+                    ;; through the existing micros branches, scale back.
+                    (case unit
+                      :microseconds (+ v (Math/floorDiv (long n) 1000))
+                      :milliseconds (+ v (long n))
+                      :seconds      (+ v (* (long n) 1000))
+                      :minutes      (+ v (* (long n) 60000))
+                      :hours        (+ v (* (long n) 3600000))
+                      :days         (+ v (* (long n) 86400000))
+                      :months       (let [scaled (long-array [(* v 1000)])
+                                          ^longs r (ColumnOpsTemporal/arrayDateAddMonthsMicros scaled (int n) 1)]
+                                      (Math/floorDiv (aget r 0) 1000))
+                      :years        (let [scaled (long-array [(* v 1000)])
+                                          ^longs r (ColumnOpsTemporal/arrayDateAddMonthsMicros scaled (int (* n 12)) 1)]
+                                      (Math/floorDiv (aget r 0) 1000))))))
 
         :time-bucket
         (let [width (long (nth args 0))
@@ -471,6 +503,15 @@
                               :minutes (* width 60)
                               :hours   (* width 3600)
                               :days    (* width 86400))
+                          shifted (- v origin)]
+                      (+ (* (Math/floorDiv shifted w) w) origin))
+                    :millis
+                    (let [w (case unit
+                              :milliseconds width
+                              :seconds      (* width 1000)
+                              :minutes      (* width 60000)
+                              :hours        (* width 3600000)
+                              :days         (* width 86400000))
                           shifted (- v origin)]
                       (+ (* (Math/floorDiv shifted w) w) origin))
                     :days

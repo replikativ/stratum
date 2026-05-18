@@ -349,7 +349,37 @@
         :second long-data
         (:millisecond :microsecond)
         (throw (ex-info "DATE_TRUNC sub-second unit requires :temporal-unit :micros column"
-                        {:unit unit :temporal-unit tu :col col-key}))))))
+                        {:unit unit :temporal-unit tu :col col-key})))
+      :millis
+      ;; TIMESTAMP_MS column. Scale up to micros (×1000), call the
+      ;; existing :micros kernel, scale result back down to millis
+      ;; (÷1000, floor-div to preserve NULL sentinel). Two passes,
+      ;; only fires on TIMESTAMP_MS queries — the existing :micros /
+      ;; :seconds hot paths are untouched.
+      (let [scaled (let [a (long-array length)]
+                     (dotimes [i length]
+                       (let [v (aget long-data i)]
+                         (aset a i (if (= v Long/MIN_VALUE)
+                                     Long/MIN_VALUE
+                                     (* v 1000)))))
+                     a)
+            ^longs out (case unit
+                         :year        (ColumnOpsTemporal/arrayDateTruncYearMicros   scaled (int length))
+                         :month       (ColumnOpsTemporal/arrayDateTruncMonthMicros  scaled (int length))
+                         :day         (ColumnOpsTemporal/arrayDateTruncDayMicros    scaled (int length))
+                         :hour        (ColumnOpsTemporal/arrayDateTruncHourMicros   scaled (int length))
+                         :minute      (ColumnOpsTemporal/arrayDateTruncMinuteMicros scaled (int length))
+                         :second      (ColumnOpsTemporal/arrayDateTruncSecondMicros scaled (int length))
+                         :millisecond (ColumnOpsTemporal/arrayDateTruncMilliMicros  scaled (int length))
+                         :microsecond
+                         (throw (ex-info "DATE_TRUNC microsecond requires :temporal-unit :micros column"
+                                         {:unit unit :temporal-unit tu :col col-key})))]
+        (dotimes [i length]
+          (let [v (aget out i)]
+            (aset out i (if (= v Long/MIN_VALUE)
+                          Long/MIN_VALUE
+                          (Math/floorDiv v 1000)))))
+        out))))
 
 (defn- eval-date-add-to-long
   "Evaluate date-add returning long[] directly. Scales the increment to
@@ -409,7 +439,34 @@
                       (aset out i (if (= s Long/MIN_VALUE)
                                     Long/MIN_VALUE
                                     (Math/floorDiv s 86400)))))
-                  out)))))
+                  out))
+      :millis
+      ;; TIMESTAMP_MS column. Same convert-call-convert pattern as
+      ;; date-trunc: scale to micros, dispatch through the existing
+      ;; micros kernels, scale back down to millis.
+      (let [scaled (let [a (long-array length)]
+                     (dotimes [i length]
+                       (let [v (aget long-data i)]
+                         (aset a i (if (= v Long/MIN_VALUE)
+                                     Long/MIN_VALUE
+                                     (* v 1000)))))
+                     a)
+            ^longs out
+            (case unit
+              :microseconds (ColumnOpsTemporal/arrayDateAddMicrosMicros scaled (long n) (int length))
+              :milliseconds (ColumnOpsTemporal/arrayDateAddMicrosMicros scaled (long (* n 1000)) (int length))
+              :seconds      (ColumnOpsTemporal/arrayDateAddMicrosMicros scaled (long (* n 1000000)) (int length))
+              :minutes      (ColumnOpsTemporal/arrayDateAddMicrosMicros scaled (long (* n 60000000)) (int length))
+              :hours        (ColumnOpsTemporal/arrayDateAddMicrosMicros scaled (long (* n 3600000000)) (int length))
+              :days         (ColumnOpsTemporal/arrayDateAddMicrosMicros scaled (long (* n 86400000000)) (int length))
+              :months       (ColumnOpsTemporal/arrayDateAddMonthsMicros scaled (int n) (int length))
+              :years        (ColumnOpsTemporal/arrayDateAddMonthsMicros scaled (int (* n 12)) (int length)))]
+        (dotimes [i length]
+          (let [v (aget out i)]
+            (aset out i (if (= v Long/MIN_VALUE)
+                          Long/MIN_VALUE
+                          (Math/floorDiv v 1000)))))
+        out))))
 
 ;; ============================================================================
 ;; Polymorphic expression evaluation (returns long[] or double[])
@@ -504,9 +561,48 @@
                            (dotimes [i length]
                              (aset ed-arr i (quot (aget long-data i) 86400000000)))
                            (ColumnOps/arrayExtractWeekOfYear ed-arr (int length))))
-         ;; :seconds (legacy): Y/M/D extract is wrong for seconds-based timestamps but
-         ;; current tests pass epoch-DAYS to year/month/day extraction. We honor the
-         ;; legacy contract: long-data is interpreted at face value by each kernel.
+         ;; TIMESTAMP_MS column. Scale up to micros, hit the existing
+         ;; :micros extract kernels. EXTRACT(MILLISECOND) returns the
+         ;; sub-second millisecond part; EXTRACT(MICROSECOND) from a
+         ;; millis-precision column is undefined (no sub-millisecond
+         ;; data) — throw clearly so the user casts to micros first.
+         :millis
+         (case op
+           :microsecond  (throw (ex-info "EXTRACT MICROSECOND requires :temporal-unit :micros column"
+                                         {:col col-key :temporal-unit tu}))
+           (let [scaled (let [a (long-array length)]
+                          (dotimes [i length]
+                            (let [v (aget long-data i)]
+                              (aset a i (if (= v Long/MIN_VALUE)
+                                          Long/MIN_VALUE
+                                          (* v 1000)))))
+                          a)]
+             (case op
+               :year         (ColumnOps/arrayExtractYear  (ColumnOpsTemporal/arrayDateTruncDayMicros scaled (int length))
+                                                          (int length))
+               :month        (ColumnOps/arrayExtractMonth (ColumnOpsTemporal/arrayDateTruncDayMicros scaled (int length))
+                                                          (int length))
+               :day          (ColumnOps/arrayExtractDay   (ColumnOpsTemporal/arrayDateTruncDayMicros scaled (int length))
+                                                          (int length))
+               :hour         (ColumnOpsTemporal/arrayExtractHourMicros        scaled (int length))
+               :minute       (ColumnOpsTemporal/arrayExtractMinuteMicros      scaled (int length))
+               :second       (ColumnOpsTemporal/arrayExtractSecondMicros      scaled (int length))
+               :millisecond  (ColumnOpsTemporal/arrayExtractMillisecondMicros scaled (int length))
+               :day-of-week  (let [r (double-array length)
+                                   ed-arr (ColumnOpsTemporal/arrayDateTruncDayMicros scaled (int length))]
+                               (dotimes [i length]
+                                 (aset r i (let [ed (quot (aget ed-arr i) 86400000000)
+                                                 d (mod (+ (mod ed 7) 10) 7)]
+                                             (double d))))
+                               r)
+               :week-of-year (let [ed-arr (long-array length)]
+                               (dotimes [i length]
+                                 (aset ed-arr i (quot (aget scaled i) 86400000000)))
+                               (ColumnOps/arrayExtractWeekOfYear ed-arr (int length))))))
+         ;; :seconds / :days / anything else (legacy): Y/M/D extract
+         ;; expects epoch-DAYS by historical contract; the existing
+         ;; tests pass that shape through here. We honor the legacy
+         ;; contract — long-data goes to each kernel at face value.
          (case op
            :year         (ColumnOps/arrayExtractYear         long-data (int length))
            :month        (ColumnOps/arrayExtractMonth        long-data (int length))
@@ -514,7 +610,7 @@
            :hour         (ColumnOps/arrayExtractHour         long-data (int length))
            :minute       (ColumnOps/arrayExtractMinute       long-data (int length))
            :second       (ColumnOps/arrayExtractSecond       long-data (int length))
-           :millisecond  (throw (ex-info "EXTRACT MILLISECOND requires :temporal-unit :micros column"
+           :millisecond  (throw (ex-info "EXTRACT MILLISECOND requires :temporal-unit :micros or :millis column"
                                          {:col col-key}))
            :microsecond  (throw (ex-info "EXTRACT MICROSECOND requires :temporal-unit :micros column"
                                          {:col col-key}))

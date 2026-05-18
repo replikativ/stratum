@@ -2490,6 +2490,23 @@
           (= t "TIMESTAMP WITHOUT TIME ZONE") (= t "TIMESTAMP WITH TIME ZONE"))
       {:type :int64 :temporal-unit :micros}
 
+      ;; DuckDB-style precision-tagged TIMESTAMP keywords. PG itself has
+      ;; only OID 1114 (micros); these route to specific :temporal-unit
+      ;; tags so date kernels operate at the right scale.
+      (or (= t "TIMESTAMP_S") (= t "TIMESTAMP_SEC"))
+      {:type :int64 :temporal-unit :seconds}
+
+      (= t "TIMESTAMP_MS")
+      {:type :int64 :temporal-unit :millis}
+
+      (= t "TIMESTAMP_NS")
+      (throw (ex-info
+              (str "TIMESTAMP_NS is not yet supported at the query layer "
+                   "— use TIMESTAMP (micros) or TIMESTAMP_MS. Parquet "
+                   "ingest preserves NS values at storage, but date kernels "
+                   "below microsecond precision are a planned follow-up.")
+              {:type-name type-str}))
+
       ;; Unknown type — leave it for the server to resolve. ENUM type
       ;; names (declared via CREATE TYPE … AS ENUM) are recognised
       ;; here as the *literal* identifier the user typed; the DDL

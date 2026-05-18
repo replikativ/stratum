@@ -686,15 +686,22 @@
 
           (instance? LogicalTypeAnnotation$TimestampLogicalTypeAnnotation annotation)
           (let [unit (.getUnit ^LogicalTypeAnnotation$TimestampLogicalTypeAnnotation annotation)]
+            ;; Step 3: preserve source precision instead of normalising
+            ;; to millis at ingest. Each precision keeps its raw long
+            ;; value and the column carries a :temporal-unit tag so
+            ;; downstream date kernels operate at the right scale.
+            ;; Pre-step-3, ts-micros and ts-nanos were divided in the
+            ;; per-row decoder, losing 3 / 6 digits of precision
+            ;; respectively (covered by the rewritten parquet test).
             (condp = unit
               LogicalTypeAnnotation$TimeUnit/MILLIS
-              {:datatype :int64 :decoder-kind :ts-millis}
+              {:datatype :int64 :decoder-kind :ts-millis :temporal-unit :millis}
 
               LogicalTypeAnnotation$TimeUnit/MICROS
-              {:datatype :int64 :decoder-kind :ts-micros :stats-divide 1000}
+              {:datatype :int64 :decoder-kind :ts-micros :temporal-unit :micros}
 
               LogicalTypeAnnotation$TimeUnit/NANOS
-              {:datatype :int64 :decoder-kind :ts-nanos :stats-divide 1000000}))
+              {:datatype :int64 :decoder-kind :ts-nanos :temporal-unit :nanos}))
 
           (instance? LogicalTypeAnnotation$TimeLogicalTypeAnnotation annotation)
           ;; Time MICROS / NANOS — keep raw, user interprets
@@ -1316,7 +1323,12 @@
         max-def (.getMaxDefinitionLevel cd)
         max-rep (.getMaxRepetitionLevel cd)
         bulk-eligible? (and (zero? max-def) (zero? max-rep)
-                            (#{:int64-raw :ts-millis :double :int32-raw} decoder-kind))]
+                            ;; Step 3: ts-micros / ts-nanos became
+                            ;; identity copies (precision preserved
+                            ;; via :temporal-unit tag on the column),
+                            ;; so they're bulk-eligible too.
+                            (#{:int64-raw :ts-millis :ts-micros :ts-nanos
+                               :double :int32-raw} decoder-kind))]
     (if bulk-eligible?
       ;; Bulk path: one synchronized read of the projected row group,
       ;; bulk-decode each page directly from its ByteBuffer.
@@ -1330,7 +1342,7 @@
                                                    (decode-typed-dict dp cd kind))
                           (bulk-decode-pages! pr out kind 0)))]
           (case decoder-kind
-            (:int64-raw :ts-millis)
+            (:int64-raw :ts-millis :ts-micros :ts-nanos)
             (let [out (long-array length)
                   end (do-bulk out :long)]
               (if (neg? (long end))
@@ -1427,11 +1439,14 @@
                 (.consume cr)
                 (recur (unchecked-inc i))))
 
+            ;; Step 3: ts-micros / ts-nanos are now identity copies —
+            ;; precision preserved, column metadata carries the
+            ;; :temporal-unit tag so kernels know how to interpret.
             :ts-micros
             (loop [i 0]
               (when (< i n)
                 (when (= max-def (.getCurrentDefinitionLevel cr))
-                  (aset out i (quot (.getLong cr) 1000)))
+                  (aset out i (.getLong cr)))
                 (.consume cr)
                 (recur (unchecked-inc i))))
 
@@ -1439,7 +1454,7 @@
             (loop [i 0]
               (when (< i n)
                 (when (= max-def (.getCurrentDefinitionLevel cr))
-                  (aset out i (quot (.getLong cr) 1000000)))
+                  (aset out i (.getLong cr)))
                 (.consume cr)
                 (recur (unchecked-inc i)))))
           out)
@@ -1702,9 +1717,16 @@
                                             (ColumnOpsString/buildDictBigramMasks dict)
                                             :stats-sum-incomplete? true
                                             :index pci})
-                                         {:type datatype :source :index
-                                          :stats-sum-incomplete? true
-                                          :index pci})]
+                                         (cond-> {:type datatype :source :index
+                                                  :stats-sum-incomplete? true
+                                                  :index pci}
+                                           ;; Step 3: TIMESTAMP columns
+                                           ;; carry the source precision
+                                           ;; tag so date kernels operate
+                                           ;; at the right scale.
+                                           (:temporal-unit spec)
+                                           (assoc :temporal-unit
+                                                  (:temporal-unit spec))))]
                                    [(keyword col-name) col-info])))
                           specs)
             ds-name (or name (str "parquet:" (.getName (java.io.File. path))))

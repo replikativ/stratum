@@ -351,7 +351,7 @@ All share copy-on-write semantics and can be branched together via Yggdrasil.
 - **Data**: CSV/Parquet import, dictionary-encoded strings, PostgreSQL NULL semantics, ad-hoc file queries, user-defined `ENUM` types (`CREATE TYPE … AS ENUM (…)` with INSERT validation + `pg_type`/`pg_enum` introspection)
 - **Integration**: tablecloth/tech.ml.dataset interop, Datahike, Yggdrasil
 - **Analytics**: Isolation forest anomaly detection (SQL model management, scoring, online rotation)
-- **Time-series**: microsecond-precision TIMESTAMP, RANGE-BETWEEN-INTERVAL frames, TIME_BUCKET, FIRST/LAST/NTH_VALUE, FILLS/LOCF, EMA, RLEID, q-style moving aggregates (MAVG/MSUM/MMIN/MMAX/MDEV), window-join (`wj`) and LATEST ON (DISTINCT ON) helpers
+- **Time-series**: microsecond-precision `TIMESTAMP` + DuckDB-style `TIMESTAMP_S` / `TIMESTAMP_MS` precision variants (engine ops route at the source scale; parquet ingest preserves source precision), RANGE-BETWEEN-INTERVAL frames, TIME_BUCKET, FIRST/LAST/NTH_VALUE, FILLS/LOCF, EMA, RLEID, q-style moving aggregates (MAVG/MSUM/MMIN/MMAX/MDEV), window-join (`wj`) and LATEST ON (DISTINCT ON) helpers
 
 ## Architecture
 
