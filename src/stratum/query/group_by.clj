@@ -3407,9 +3407,18 @@
                                                                   false))
                                                               aggs))
 
-                  ;; Call Java — dispatch between standard and var-width chunked path
+                  ;; Call Java — three paths:
+                  ;;   1. VARIANCE/CORR → variable-width accumulator path
+                  ;;   2. !nan-safe (no agg-col NULLs) → marker-free
+                  ;;      JIT-isolated kernel: drops the per-row marker
+                  ;;      write *and* the NaN guard from inner loops,
+                  ;;      eliminating the Q3-style tier-4 OSR bimodal
+                  ;;      observed when one method carried both the
+                  ;;      marker conditional and the agg loops.
+                  ;;   3. otherwise → standard with-marker kernel.
                         ^doubles result-flat
-                        (if has-var-aggs?
+                        (cond
+                          has-var-aggs?
                           (ColumnOpsChunked/fusedGroupAggregateDenseVarChunkedParallel
                            (int n-long) ^ints long-pred-types
                            ^"[[Ljava.lang.Object;" long-pred-arrs ^longs long-lo ^longs long-hi
@@ -3419,6 +3428,19 @@
                            (int n-aggs) ^ints agg-types ^"[[Ljava.lang.Object;" agg-col-arrs ^"[[Ljava.lang.Object;" agg-col2-arrs
                            ^booleans agg-col-is-long ^booleans agg-col2-is-long
                            ^ints chunk-lengths (int n-simd) (int max-chunk-len) (int max-key-inc) nan-safe nil)
+
+                          (not nan-safe)
+                          (ColumnOpsChunked/fusedGroupAggregateDenseChunkedNoMarkerParallel
+                           (int n-long) ^ints long-pred-types
+                           ^"[[Ljava.lang.Object;" long-pred-arrs ^longs long-lo ^longs long-hi
+                           (int n-dbl) ^ints dbl-pred-types
+                           ^"[[Ljava.lang.Object;" dbl-pred-arrs ^doubles dbl-lo ^doubles dbl-hi
+                           (int n-group) ^"[[Ljava.lang.Object;" group-col-arrs ^longs group-muls-arr ^longs group-offsets-arr
+                           (int n-aggs) ^ints agg-types ^"[[Ljava.lang.Object;" agg-col-arrs ^"[[Ljava.lang.Object;" agg-col2-arrs
+                           ^booleans agg-col-is-long ^booleans agg-col2-is-long
+                           ^ints chunk-lengths (int n-simd) (int max-chunk-len) (int max-key-inc) nil)
+
+                          :else
                           (ColumnOpsChunked/fusedGroupAggregateDenseChunkedParallel
                            (int n-long) ^ints long-pred-types
                            ^"[[Ljava.lang.Object;" long-pred-arrs ^longs long-lo ^longs long-hi
