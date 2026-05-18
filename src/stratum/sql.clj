@@ -14,6 +14,7 @@
             [stratum.query :as q]
             [stratum.csv :as csv]
             [stratum.parquet :as parquet]
+            [stratum.sql.enum-ddl :as enum-ddl]
             [stratum.sql.rewrite :as rewrite])
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.statement Statement]
@@ -2632,6 +2633,11 @@
       (or
         ;; Check system queries first (SET, SHOW, BEGIN, etc.)
        (check-system-query sql table-registry)
+
+       ;; CREATE TYPE ... AS ENUM — JSqlParser has no node for this, so
+       ;; we detect and parse it before reaching CCJSqlParserUtil.
+       (when (enum-ddl/create-type-enum? sql)
+         {:ddl (enum-ddl/parse-create-type-enum sql)})
 
 ;; Check pg_catalog queries
        (when (pg-catalog-table sql)
