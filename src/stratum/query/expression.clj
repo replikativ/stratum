@@ -849,31 +849,50 @@
                                       (:year :month :day :day-of-week :week-of-year) :days))]
           (case tu
             :micros
+            ;; F-031: per-row NULL guard. Inline micros extracts and the
+            ;; micros→days conversion (the latter feeds ColumnOpsLong
+            ;; extracts which themselves are NULL-safe under F-017; but
+            ;; floorDiv(Long.MIN_VALUE, ...) destroys the sentinel before
+            ;; it reaches them, so map sentinel→sentinel here too).
             (case op
               :hour         (let [r (long-array length)]
                               (dotimes [i length]
-                                (aset r i (quot (Math/floorMod (aget long-data i) 86400000000) 3600000000)))
+                                (let [v (aget long-data i)]
+                                  (aset r i (if (= v Long/MIN_VALUE) Long/MIN_VALUE
+                                                (quot (Math/floorMod v 86400000000) 3600000000)))))
                               r)
               :minute       (let [r (long-array length)]
                               (dotimes [i length]
-                                (aset r i (quot (Math/floorMod (aget long-data i) 3600000000) 60000000)))
+                                (let [v (aget long-data i)]
+                                  (aset r i (if (= v Long/MIN_VALUE) Long/MIN_VALUE
+                                                (quot (Math/floorMod v 3600000000) 60000000)))))
                               r)
               :second       (let [r (long-array length)]
                               (dotimes [i length]
-                                (aset r i (quot (Math/floorMod (aget long-data i) 60000000) 1000000)))
+                                (let [v (aget long-data i)]
+                                  (aset r i (if (= v Long/MIN_VALUE) Long/MIN_VALUE
+                                                (quot (Math/floorMod v 60000000) 1000000)))))
                               r)
               :millisecond  (let [r (long-array length)]
                               (dotimes [i length]
-                                (aset r i (quot (Math/floorMod (aget long-data i) 1000000) 1000)))
+                                (let [v (aget long-data i)]
+                                  (aset r i (if (= v Long/MIN_VALUE) Long/MIN_VALUE
+                                                (quot (Math/floorMod v 1000000) 1000)))))
                               r)
               :microsecond  (let [r (long-array length)]
                               (dotimes [i length]
-                                (aset r i (Math/floorMod (aget long-data i) 1000000)))
+                                (let [v (aget long-data i)]
+                                  (aset r i (if (= v Long/MIN_VALUE) Long/MIN_VALUE
+                                                (Math/floorMod v 1000000)))))
                               r)
               ;; Day/month/year: convert micros to days first
               (:year :month :day :day-of-week :week-of-year)
               (let [ed (long-array length)]
-                (dotimes [i length] (aset ed i (Math/floorDiv (aget long-data i) 86400000000)))
+                (dotimes [i length]
+                  (let [v (aget long-data i)]
+                    (aset ed i (if (= v Long/MIN_VALUE)
+                                 Long/MIN_VALUE
+                                 (Math/floorDiv v 86400000000)))))
                 (case op
                   :year         (ColumnOpsLong/arrayExtractYearLong ed (int length))
                   :month        (ColumnOpsLong/arrayExtractMonthLong ed (int length))
