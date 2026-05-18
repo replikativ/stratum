@@ -29,10 +29,21 @@
      :index          - PersistentColumnIndex (optional, if :source is :index)
      :dict           - String[] reverse dictionary (optional, for string columns)
      :dict-type      - :string (required if :dict present)
+     :validity       - long[] packed bitmap, present only when the data
+                       contains NULL sentinels; absent maps to the
+                       all-valid fast path
      :temporal-unit  - :days/:seconds/:millis/:micros (optional; tags long[]
                        columns as DATE or TIMESTAMP and selects the matching
-                       date kernels)"
-  [col-val]
+                       date kernels)
+
+  NULL opt-out: callers that know a column is non-nullable can pass
+  `:nullable? false` via the 2-arity form OR pre-normalise to
+  `{:type T :data arr}` (which already bypasses the sentinel scan,
+  because the passthrough branch trusts caller-supplied metadata).
+  Skipping the scan avoids an O(n) sweep at column registration;
+  downstream kernels then take the all-valid fast path."
+  ([col-val] (encode-column col-val nil))
+  ([col-val {:keys [nullable?] :or {nullable? true}}]
   (cond
     ;; Already normalized
     (and (map? col-val) (:type col-val) (or (:data col-val) (:index col-val)))
@@ -43,14 +54,18 @@
     ;; Returns nil bitmap when no NULLs present (the common case),
     ;; preserving the all-valid fast path.
     (instance? (Class/forName "[J") col-val)
-    (let [v (chunk/scan-validity col-val :int64 (alength ^longs col-val))]
+    (let [v (when nullable?
+              (chunk/scan-validity col-val :int64 (alength ^longs col-val)))]
       (cond-> {:type :int64 :data col-val}
+        (false? nullable?) (assoc :nullable? false)
         v (assoc :validity v)))
 
     ;; Raw double array — same lazy validity derivation.
     (instance? (Class/forName "[D") col-val)
-    (let [v (chunk/scan-validity col-val :float64 (alength ^doubles col-val))]
+    (let [v (when nullable?
+              (chunk/scan-validity col-val :float64 (alength ^doubles col-val)))]
       (cond-> {:type :float64 :data col-val}
+        (false? nullable?) (assoc :nullable? false)
         v (assoc :validity v)))
 
     ;; String array — dictionary-encode to long[] for SIMD group-by
@@ -113,4 +128,4 @@
 
     :else
     (throw (ex-info (str "Cannot detect column type for: " (type col-val))
-                    {:col-type (type col-val)}))))
+                    {:col-type (type col-val)})))))

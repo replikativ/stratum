@@ -4,6 +4,7 @@
    each `deftest` cites the closing finding ID so future refactors can
    trace which behaviour is being protected."
   (:require [clojure.test :refer [deftest testing is]]
+            [stratum.column :as column]
             [stratum.dataset :as ds]
             [stratum.chunk :as chunk]
             [stratum.index :as index]
@@ -286,6 +287,28 @@
       (is (not (chunk/validity-row-valid? validity 1)))
       (is (chunk/validity-row-valid? validity 0))
       (is (chunk/validity-row-valid? validity 2)))))
+
+(deftest nullable-false-opt-out
+  (testing "`:nullable? false` skips the validity scan at encode time"
+    (let [arr (long-array [1 2 3])
+          ;; Default scan: no NULLs → :validity is nil but the column
+          ;; still has the field-absent shape.
+          default (column/encode-column arr)
+          ;; Opt-out: stamps `:nullable? false` and never scans.
+          opt-out (column/encode-column arr {:nullable? false})]
+      (is (nil? (:validity default)) "no NULLs → no validity bitmap")
+      (is (= false (:nullable? opt-out)))
+      (is (nil? (:validity opt-out)))
+      ;; A NULL-bearing array still gets validity on the default path…
+      (let [null-arr (long-array [1 Long/MIN_VALUE 3])
+            scanned (column/encode-column null-arr)]
+        (is (some? (:validity scanned)))
+        ;; …but the opt-out skips even a NULL-bearing scan. Caller is
+        ;; promising "no NULLs here" — downstream kernels take the
+        ;; all-valid fast path. (Misuse would silently treat the
+        ;; sentinel as data; that's the caller's responsibility.)
+        (let [opt-null (column/encode-column null-arr {:nullable? false})]
+          (is (nil? (:validity opt-null))))))))
 
 (deftest f-044-idx-append-accepts-nil
   (testing "idx-append! handles nil values without NPE"
