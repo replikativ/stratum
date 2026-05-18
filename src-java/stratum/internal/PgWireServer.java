@@ -202,6 +202,13 @@ public final class PgWireServer {
             String[] lastParsedSql = new String[]{""};
             String[][] lastBoundParams = new String[][]{null};
             QueryResult[] cachedResult = new QueryResult[]{null};
+            // Per-portal result-column format codes (Bind → Describe/Execute). One of:
+            //   null       — client sent 0 codes (all text, default)
+            //   length 1   — broadcast to every result column
+            //   length N   — one per result column
+            // Step W1: captured & validated but only format 0 (text) is honoured;
+            // any binary request triggers ErrorResponse 0A000 at send time.
+            int[][] resultFormatCodes = new int[][]{null};
             // Transaction status for ReadyForQuery: 'I'=idle, 'T'=in tx, 'E'=error in tx
             char[] txStatus = new char[]{'I'};
 
@@ -221,10 +228,10 @@ public final class PgWireServer {
                     case 'Q' -> handleQuery(body, out, txStatus, handler);
                     case 'X' -> { return; } // Terminate
                     case 'P' -> handleParse(body, out, lastParsedSql);
-                    case 'B' -> handleBind(body, out, lastBoundParams);
-                    case 'D' -> handleDescribe(body, out, lastParsedSql, lastBoundParams, cachedResult, handler);
-                    case 'E' -> handleExecuteMsg(body, out, lastParsedSql, lastBoundParams, cachedResult, txStatus, handler);
-                    case 'S' -> handleSync(out, txStatus);
+                    case 'B' -> handleBind(body, out, lastBoundParams, resultFormatCodes);
+                    case 'D' -> handleDescribe(body, out, lastParsedSql, lastBoundParams, cachedResult, resultFormatCodes, handler);
+                    case 'E' -> handleExecuteMsg(body, out, lastParsedSql, lastBoundParams, cachedResult, resultFormatCodes, txStatus, handler);
+                    case 'S' -> handleSync(out, txStatus, resultFormatCodes);
                     case 'C' -> handleClose(body, out);
                     default -> {
                         sendError(out, "ERROR", "XX000", "Unsupported message type: " + (char) msgType);
@@ -323,9 +330,10 @@ public final class PgWireServer {
                 } else if (result.columnNames.length == 0) {
                     sendCommandComplete(out, result.commandTag);
                 } else {
-                    sendRowDescription(out, result.columnNames, result.columnOids);
+                    // Simple Query ('Q') always uses text format — no Bind step.
+                    sendRowDescription(out, result.columnNames, result.columnOids, null);
                     for (String[] row : result.rows) {
-                        sendDataRow(out, row);
+                        sendDataRow(out, row, null);
                     }
                     sendCommandComplete(out, result.commandTag);
                 }
@@ -443,15 +451,42 @@ public final class PgWireServer {
         out.flush();
     }
 
-    private void handleBind(byte[] body, DataOutputStream out, String[][] lastBoundParams) throws IOException {
+    private void handleBind(byte[] body, DataOutputStream out,
+                            String[][] lastBoundParams,
+                            int[][] resultFormatCodes) throws IOException {
         ByteBuffer buf = ByteBuffer.wrap(body);
         String portalName = readCString(buf);
         String stmtName = readCString(buf);
 
-        short numFormatCodes = buf.getShort();
-        for (int i = 0; i < numFormatCodes; i++) buf.getShort();
+        // Per-param format codes. Three valid shapes from the client:
+        //   0 codes  → all params are text
+        //   1 code   → broadcast to every param
+        //   N codes  → one per param
+        short numParamFormats = buf.getShort();
+        int[] paramFormats = new int[numParamFormats];
+        for (int i = 0; i < numParamFormats; i++) {
+            paramFormats[i] = buf.getShort() & 0xffff;
+        }
 
         short numParams = buf.getShort();
+
+        // Step W1: refuse binary inbound params loudly. W3 will add decoders.
+        int firstBinaryParam = -1;
+        for (int i = 0; i < numParams; i++) {
+            int fmt = paramFormatFor(paramFormats, i);
+            if (fmt != 0) { firstBinaryParam = i; break; }
+        }
+        if (firstBinaryParam >= 0) {
+            sendError(out, "ERROR", "0A000",
+                "Binary input parameter format not yet supported (param $"
+                    + (firstBinaryParam + 1) + "). Configure your client to send parameters as text.");
+            // Leave lastBoundParams[0] null so Execute is a no-op and the
+            // protocol stays in a consistent state until Sync.
+            lastBoundParams[0] = null;
+            resultFormatCodes[0] = null;
+            return;
+        }
+
         String[] params = new String[numParams];
         for (int i = 0; i < numParams; i++) {
             int paramLen = buf.getInt();
@@ -465,10 +500,20 @@ public final class PgWireServer {
         }
         lastBoundParams[0] = params;
 
+        // Per-result-column format codes (same 0/1/N shape as params). We
+        // store the raw int[] and resolve per column at Describe/Execute
+        // time, since the column count isn't known until then.
+        int[] resultFormats = null;
         if (buf.hasRemaining()) {
             short numResultFormats = buf.getShort();
-            for (int i = 0; i < numResultFormats; i++) buf.getShort(); // discard
+            if (numResultFormats > 0) {
+                resultFormats = new int[numResultFormats];
+                for (int i = 0; i < numResultFormats; i++) {
+                    resultFormats[i] = buf.getShort() & 0xffff;
+                }
+            }
         }
+        resultFormatCodes[0] = resultFormats;
 
         // BindComplete
         out.writeByte('2');
@@ -476,9 +521,50 @@ public final class PgWireServer {
         out.flush();
     }
 
+    /** Resolve the format code for a single param given the raw code array from Bind. */
+    private static int paramFormatFor(int[] formatCodes, int idx) {
+        if (formatCodes.length == 0) return 0;
+        if (formatCodes.length == 1) return formatCodes[0];
+        return idx < formatCodes.length ? formatCodes[idx] : 0;
+    }
+
+    /**
+     * Materialize a per-column format-code array of length {@code numCols} from
+     * the raw codes stored at Bind time. Handles the 0 / 1 / N shapes. Returns
+     * null when every resolved code is 0 (caller treats null as "all text").
+     */
+    private static int[] resolveResultFormats(int[] raw, int numCols) {
+        if (raw == null || raw.length == 0) return null;
+        int[] out = new int[numCols];
+        if (raw.length == 1) {
+            int v = raw[0];
+            if (v == 0) return null;
+            for (int i = 0; i < numCols; i++) out[i] = v;
+            return out;
+        }
+        boolean anyBinary = false;
+        for (int i = 0; i < numCols; i++) {
+            int v = i < raw.length ? raw[i] : 0;
+            out[i] = v;
+            if (v != 0) anyBinary = true;
+        }
+        return anyBinary ? out : null;
+    }
+
+    /** Returns the index of the first binary-formatted column, or -1 if all text. */
+    private static int firstBinaryColumn(int[] formats) {
+        if (formats == null) return -1;
+        for (int i = 0; i < formats.length; i++) {
+            if (formats[i] != 0) return i;
+        }
+        return -1;
+    }
+
     private void handleDescribe(byte[] body, DataOutputStream out,
                                 String[] lastParsedSql, String[][] lastBoundParams,
-                                QueryResult[] cachedResult, QueryHandler handler) throws IOException {
+                                QueryResult[] cachedResult,
+                                int[][] resultFormatCodes,
+                                QueryHandler handler) throws IOException {
         ByteBuffer buf = ByteBuffer.wrap(body);
         byte descType = buf.get(); // 'S' = statement, 'P' = portal
         String name = readCString(buf);
@@ -531,7 +617,22 @@ public final class PgWireServer {
                 out.writeByte('n'); // NoData
                 out.writeInt(4);
             } else {
-                sendRowDescription(out, result.columnNames, result.columnOids);
+                int[] formats = resolveResultFormats(resultFormatCodes[0], result.columnNames.length);
+                int binaryCol = firstBinaryColumn(formats);
+                if (binaryCol >= 0) {
+                    // Refuse early — better than advertising a format in
+                    // RowDescription that we'll then refuse at Execute. Drop the
+                    // cached result so Execute doesn't re-stream the same rows.
+                    cachedResult[0] = null;
+                    sendError(out, "ERROR", "0A000",
+                        "Binary result format not yet supported for column "
+                            + (binaryCol + 1) + " ("
+                            + result.columnNames[binaryCol]
+                            + ", OID=" + result.columnOids[binaryCol]
+                            + "). Configure your client to request text format.");
+                } else {
+                    sendRowDescription(out, result.columnNames, result.columnOids, formats);
+                }
             }
         } catch (Exception e) {
             cachedResult[0] = null;
@@ -543,7 +644,9 @@ public final class PgWireServer {
 
     private void handleExecuteMsg(byte[] body, DataOutputStream out,
                                   String[] lastParsedSql, String[][] lastBoundParams,
-                                  QueryResult[] cachedResult, char[] txStatus,
+                                  QueryResult[] cachedResult,
+                                  int[][] resultFormatCodes,
+                                  char[] txStatus,
                                   QueryHandler handler) throws IOException {
         // If Describe already ran and cached the result, reuse it (avoid double-execution)
         QueryResult result = cachedResult[0];
@@ -578,23 +681,41 @@ public final class PgWireServer {
             } else if (result.columnNames.length == 0) {
                 sendCommandComplete(out, result.commandTag);
             } else {
-                // Describe already sent RowDescription — don't repeat it
-                if (!describedAlready) {
-                    sendRowDescription(out, result.columnNames, result.columnOids);
+                int[] formats = resolveResultFormats(resultFormatCodes[0], result.columnNames.length);
+                int binaryCol = firstBinaryColumn(formats);
+                if (binaryCol >= 0) {
+                    // Step W1: outbound binary not yet implemented. Reject loudly
+                    // *before* sending any DataRow so the protocol stays consistent.
+                    sendError(out, "ERROR", "0A000",
+                        "Binary result format not yet supported for column "
+                            + (binaryCol + 1) + " ("
+                            + result.columnNames[binaryCol]
+                            + ", OID=" + result.columnOids[binaryCol]
+                            + "). Configure your client to request text format.");
+                } else {
+                    // Describe already sent RowDescription — don't repeat it
+                    if (!describedAlready) {
+                        sendRowDescription(out, result.columnNames, result.columnOids, formats);
+                    }
+                    for (String[] row : result.rows) {
+                        sendDataRow(out, row, formats);
+                    }
+                    sendCommandComplete(out, result.commandTag);
                 }
-                for (String[] row : result.rows) {
-                    sendDataRow(out, row);
-                }
-                sendCommandComplete(out, result.commandTag);
             }
         } else {
             sendCommandComplete(out, "SELECT 0");
         }
         lastBoundParams[0] = null;
+        resultFormatCodes[0] = null;
         out.flush();
     }
 
-    private void handleSync(DataOutputStream out, char[] txStatus) throws IOException {
+    private void handleSync(DataOutputStream out, char[] txStatus,
+                            int[][] resultFormatCodes) throws IOException {
+        // Sync ends the current Extended-Query cycle — clear any stray format
+        // state so the next Bind starts from a clean slate.
+        resultFormatCodes[0] = null;
         sendReadyForQuery(out, txStatus[0]);
     }
 
@@ -630,7 +751,14 @@ public final class PgWireServer {
         out.flush();
     }
 
-    private void sendRowDescription(DataOutputStream out, String[] names, int[] oids) throws IOException {
+    /**
+     * Emit a RowDescription. {@code formats} may be null (all text) or a
+     * fully resolved per-column array (length == names.length) — see
+     * {@link #resolveResultFormats}. The caller is responsible for refusing
+     * binary requests when no encoder is wired up.
+     */
+    private void sendRowDescription(DataOutputStream out, String[] names, int[] oids,
+                                    int[] formats) throws IOException {
         int bodyLen = 2; // field count (int16)
         byte[][] nameBytes = new byte[names.length][];
         for (int i = 0; i < names.length; i++) {
@@ -656,12 +784,18 @@ public final class PgWireServer {
             out.writeInt(oids[i]);          // type OID
             out.writeShort(typeSize(oids[i])); // type size
             out.writeInt(-1);               // type modifier
-            out.writeShort(0);              // format code (text)
+            int fmt = (formats == null) ? 0 : formats[i];
+            out.writeShort(fmt);            // format code (0=text, 1=binary)
         }
         out.flush();
     }
 
-    private void sendDataRow(DataOutputStream out, String[] values) throws IOException {
+    /**
+     * Emit a DataRow. {@code formats} may be null (all text) or a fully
+     * resolved per-column array. Step W1 only supports format 0 (text);
+     * callers must refuse binary requests before reaching this method.
+     */
+    private void sendDataRow(DataOutputStream out, String[] values, int[] formats) throws IOException {
         int bodyLen = 2; // column count (int16)
         byte[][] valBytes = new byte[values.length][];
         for (int i = 0; i < values.length; i++) {

@@ -412,3 +412,175 @@
         ;; Verify SUM values (last column in each row)
         (is (= "20" (last (first rows))))
         (is (= "15" (last (second rows))))))))
+
+;; ============================================================================
+;; Step W1 — format-code plumbing
+;; ============================================================================
+
+(defn- send-bind-fmt!
+  "Bind with explicit per-param and per-result format codes (each a vector
+   of int16 codes, 0=text, 1=binary)."
+  [{:keys [^DataOutputStream out]} param-fmts params result-fmts]
+  (let [baos (ByteArrayOutputStream.)
+        dos  (DataOutputStream. baos)]
+    (.writeByte dos 0)                     ;; unnamed portal
+    (.writeByte dos 0)                     ;; unnamed statement
+    (.writeShort dos (count param-fmts))
+    (doseq [f param-fmts] (.writeShort dos (int f)))
+    (.writeShort dos (count params))
+    (doseq [p params]
+      (if (nil? p)
+        (.writeInt dos -1)
+        (let [b (.getBytes (str p) StandardCharsets/UTF_8)]
+          (.writeInt dos (count b))
+          (.write dos b))))
+    (.writeShort dos (count result-fmts))
+    (doseq [f result-fmts] (.writeShort dos (int f)))
+    (.flush dos)
+    (let [body (.toByteArray baos)]
+      (.writeByte out (int \B))
+      (.writeInt  out (+ 4 (count body)))
+      (.write     out body)
+      (.flush     out))))
+
+(defn- decode-row-description-fmts
+  "Parse a RowDescription body into a vector of [name oid format] tuples."
+  [^bytes body]
+  (let [buf (ByteBuffer/wrap body)
+        n   (.getShort buf)]
+    (mapv (fn [_]
+            (let [sb (StringBuilder.)]
+              (loop []
+                (let [b (.get buf)]
+                  (when-not (zero? b)
+                    (.append sb (char (bit-and (int b) 0xFF)))
+                    (recur))))
+              (let [_   (.getInt   buf)   ;; table OID
+                    _   (.getShort buf)   ;; attr number
+                    oid (.getInt   buf)   ;; type OID
+                    _   (.getShort buf)   ;; type size
+                    _   (.getInt   buf)   ;; type modifier
+                    fmt (.getShort buf)]
+                [(str sb) oid fmt])))
+          (range n))))
+
+(defn- find-error
+  "Return {:code :message} from the first ErrorResponse ('E') in a drain
+   result, or nil if none."
+  [drained]
+  (when-let [e (some #(when (= \E (:type %)) %) (:messages drained))]
+    (let [buf (ByteBuffer/wrap ^bytes (:body e))
+          fields (loop [acc {}]
+                   (let [b (.get buf)]
+                     (if (zero? b)
+                       acc
+                       (let [sb (StringBuilder.)]
+                         (loop []
+                           (let [c (.get buf)]
+                             (when-not (zero? c)
+                               (.append sb (char (bit-and (int c) 0xFF)))
+                               (recur))))
+                         (recur (assoc acc (char b) (str sb)))))))]
+      {:code (get fields \C) :message (get fields \M)})))
+
+(deftest w1-result-format-text-broadcast-test
+  (testing "Bind with single result-format code = 0 broadcasts text to all columns"
+    (with-conn [c (srv-port)]
+      (send-parse!   c "SELECT price, quantity FROM orders WHERE price > $1")
+      ;; 1 param format code (text) + 1 result format code (text, broadcast)
+      (send-bind-fmt! c [0] ["50.0"] [0])
+      (send-describe-portal! c)
+      (send-execute! c)
+      (send-sync!    c)
+      (let [result (drain-rfq c)
+            rd-body (:body (first (filter #(= \T (:type %)) (:messages result))))
+            cols    (decode-row-description-fmts rd-body)
+            rows    (decode-data-rows result)]
+        (is (= 2 (count cols)))
+        (is (every? #(zero? (nth % 2)) cols)
+            "every column's format code must be 0 (text)")
+        (is (= 3 (count rows))
+            "rows still arrive correctly when format codes are explicit text")))))
+
+(deftest w1-result-format-binary-rejected-test
+  (testing "Bind requesting binary result format triggers ErrorResponse 0A000 and connection stays usable"
+    (with-conn [c (srv-port)]
+      (send-parse!   c "SELECT price FROM orders WHERE price > $1")
+      ;; Single result format code = 1 → broadcast binary request
+      (send-bind-fmt! c [0] ["50.0"] [1])
+      (send-execute! c)
+      (send-sync!    c)
+      (let [result (drain-rfq c)
+            err    (find-error result)
+            types  (mapv :type (:messages result))]
+        (is (some? err) "ErrorResponse expected")
+        (is (= "0A000" (:code err)) "feature_not_supported code expected")
+        (is (re-find #"[Bb]inary result format" (:message err)) "message must mention binary result format")
+        (is (not (some #{\D} types)) "no DataRow must be emitted when binary is refused"))
+      ;; Connection must remain usable for the next query
+      (send-query! c "SELECT COUNT(*) FROM orders")
+      (let [rows (decode-data-rows (drain-rfq c))]
+        (is (= "5" (ffirst rows)) "connection remains functional after binary-format error")))))
+
+(deftest w1-param-format-binary-rejected-test
+  (testing "Bind with binary input format triggers ErrorResponse 0A000 and connection stays usable"
+    (with-conn [c (srv-port)]
+      (send-parse!   c "SELECT COUNT(*) FROM orders WHERE price > $1")
+      ;; Param format = 1 (binary) — refused before any param byte is decoded
+      (send-bind-fmt! c [1] ["100.0"] [])
+      ;; Sync still required to bring the protocol back to ReadyForQuery
+      (send-sync!    c)
+      (let [result (drain-rfq c)
+            err    (find-error result)]
+        (is (some? err) "ErrorResponse expected for binary input param")
+        (is (= "0A000" (:code err)))
+        (is (re-find #"[Bb]inary input parameter" (:message err))))
+      ;; Connection must remain usable
+      (send-query! c "SELECT COUNT(*) FROM orders")
+      (let [rows (decode-data-rows (drain-rfq c))]
+        (is (= "5" (ffirst rows)) "connection remains functional after binary-param error")))))
+
+(deftest w1-describe-rejects-binary-before-row-description-test
+  (testing "Describe with binary result format refuses at Describe time (no RowDescription)"
+    (with-conn [c (srv-port)]
+      (send-parse!   c "SELECT price FROM orders WHERE price > $1")
+      (send-bind-fmt! c [0] ["50.0"] [1])  ;; binary requested
+      (send-describe-portal! c)
+      (send-execute! c)
+      (send-sync!    c)
+      (let [result (drain-rfq c)
+            err    (find-error result)
+            types  (mapv :type (:messages result))]
+        (is (some? err))
+        (is (= "0A000" (:code err)))
+        ;; Critical: no RowDescription must be emitted when we refuse
+        (is (not (some #{\T} types))
+            "RowDescription must not be sent when Describe refuses binary")
+        (is (not (some #{\D} types))
+            "no DataRow must follow a binary refusal")))))
+
+(deftest w1-mixed-result-format-per-column-test
+  (testing "Per-column result format codes: all 0 succeeds, any 1 triggers 0A000"
+    (with-conn [c (srv-port)]
+      ;; Query with two output columns — first per-column format request, all text
+      (send-parse!   c "SELECT price, quantity FROM orders WHERE price > $1")
+      (send-bind-fmt! c [0] ["50.0"] [0 0])
+      (send-describe-portal! c)
+      (send-execute! c)
+      (send-sync!    c)
+      (let [result (drain-rfq c)
+            rd-body (:body (first (filter #(= \T (:type %)) (:messages result))))
+            cols    (decode-row-description-fmts rd-body)]
+        (is (= [0 0] (mapv #(nth % 2) cols))
+            "explicit per-column text codes echo back as text")))
+    (with-conn [c (srv-port)]
+      ;; Now mix: column 1 text, column 2 binary → must refuse
+      (send-parse!   c "SELECT price, quantity FROM orders WHERE price > $1")
+      (send-bind-fmt! c [0] ["50.0"] [0 1])
+      (send-execute! c)
+      (send-sync!    c)
+      (let [err (find-error (drain-rfq c))]
+        (is (some? err))
+        (is (= "0A000" (:code err)))
+        (is (re-find #"column 2" (:message err))
+            "error message must identify the offending column (1-based)")))))
