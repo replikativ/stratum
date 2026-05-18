@@ -44,7 +44,12 @@
 
 (defn- get-long-column
   "Extract a long[] from a materialized column map. Doubles are converted to
-   longs (rounded toward zero). Throws on missing or unsupported type."
+   longs (rounded toward zero). Throws on missing or unsupported type.
+
+   F-018: NaN timestamps map to Long.MIN_VALUE so ColumnOpsAsof
+   (asofJoinPartitioned / asofJoinSinglePartition) skips the row —
+   plain `(long NaN)` is 0, which is a perfectly valid timestamp and
+   would match the closest real-value row on the other side."
   ^longs [columns col-key]
   (let [info (get columns col-key)]
     (when-not info
@@ -57,7 +62,9 @@
         (let [^doubles src d
               n (alength src)
               out (long-array n)]
-          (dotimes [i n] (aset out i (long (aget src i))))
+          (dotimes [i n]
+            (let [v (aget src i)]
+              (aset out i (if (Double/isNaN v) Long/MIN_VALUE (long v)))))
           out)
         :else
         (throw (ex-info "ASOF match-condition column must be long[] or double[]"
