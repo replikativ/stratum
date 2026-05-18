@@ -180,13 +180,20 @@
          (ColumnOps/arrayMaxLong arr (int build-length))])
 
       (and (= :float64 ctype) (expr/double-array? data))
+      ;; Skip NaN sentinels so the pushed-down range stays finite. PG
+      ;; semantics: NULL is excluded from min/max — and IEEE's
+      ;; Math.min(NaN, x) = Math.max(NaN, x) = NaN, which would push
+      ;; `:gte NaN` / `:lte NaN` onto the probe side and silently filter
+      ;; every row out (x >= NaN is always false). F-024-adjacent.
       (let [^doubles arr data
             n (int build-length)]
-        (loop [i 1, mn (aget arr 0), mx (aget arr 0)]
+        (loop [i 0, mn Double/POSITIVE_INFINITY, mx Double/NEGATIVE_INFINITY, seen? false]
           (if (>= i n)
-            [mn mx]
+            (when seen? [mn mx])
             (let [v (aget arr i)]
-              (recur (inc i) (Math/min mn v) (Math/max mx v))))))
+              (if (Double/isNaN v)
+                (recur (inc i) mn mx seen?)
+                (recur (inc i) (Math/min mn v) (Math/max mx v) true))))))
 
       :else nil)))
 

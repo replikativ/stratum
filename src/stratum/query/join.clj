@@ -180,11 +180,22 @@
        (when-not col-info
          (throw (ex-info (str "Join key column not found: " col-name)
                          {:column col-name :available (keys columns)})))
+       ;; F-024: float64 single-col join key must map NaN to
+       ;; Long.MIN_VALUE — the sentinel hashJoinBuild / hashJoinProbe /
+       ;; asofJoinPartitioned use to skip NULL keys. Plain
+       ;; `Double/doubleToRawLongBits NaN` is 0x7FF8000000000000L, which
+       ;; collides with no real value but does NOT match the skip
+       ;; sentinel, so two NaN-key rows from opposite sides would have
+       ;; joined to each other. extract-key-col-arrays already does this
+       ;; for the multi-col path; mirror it here.
        (if (= :float64 (:type col-info))
          (let [^doubles d (:data col-info)
                out (long-array length)]
            (dotimes [i length]
-             (aset out i (Double/doubleToRawLongBits (aget d i))))
+             (let [v (aget d i)]
+               (aset out i (if (Double/isNaN v)
+                             Long/MIN_VALUE
+                             (Double/doubleToRawLongBits v)))))
            out)
          (:data col-info)))
      ;; Multi-column: composite key via multiplier encoding
