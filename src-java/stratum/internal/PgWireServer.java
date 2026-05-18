@@ -222,6 +222,10 @@ public final class PgWireServer {
             // Per-connection extended query protocol state
             String[] lastParsedSql = new String[]{""};
             String[][] lastBoundParams = new String[][]{null};
+            // Param type OIDs from the most recent Parse — needed at Bind
+            // time to dispatch binary decoders. Length-0 array means "no
+            // type hints sent" (the client expects server-side inference).
+            int[][] paramTypeOIDs = new int[][]{new int[0]};
             QueryResult[] cachedResult = new QueryResult[]{null};
             // Per-portal result-column format codes (Bind → Describe/Execute). One of:
             //   null       — client sent 0 codes (all text, default)
@@ -248,8 +252,8 @@ public final class PgWireServer {
                 switch (msgType) {
                     case 'Q' -> handleQuery(body, out, txStatus, handler);
                     case 'X' -> { return; } // Terminate
-                    case 'P' -> handleParse(body, out, lastParsedSql);
-                    case 'B' -> handleBind(body, out, lastBoundParams, resultFormatCodes);
+                    case 'P' -> handleParse(body, out, lastParsedSql, paramTypeOIDs);
+                    case 'B' -> handleBind(body, out, lastBoundParams, resultFormatCodes, paramTypeOIDs);
                     case 'D' -> handleDescribe(body, out, lastParsedSql, lastBoundParams, cachedResult, resultFormatCodes, handler);
                     case 'E' -> handleExecuteMsg(body, out, lastParsedSql, lastBoundParams, cachedResult, resultFormatCodes, txStatus, handler);
                     case 'S' -> handleSync(out, txStatus, resultFormatCodes);
@@ -460,11 +464,22 @@ public final class PgWireServer {
     // Extended Query protocol
     // ========================================================================
 
-    private void handleParse(byte[] body, DataOutputStream out, String[] lastParsedSql) throws IOException {
+    private void handleParse(byte[] body, DataOutputStream out,
+                             String[] lastParsedSql, int[][] paramTypeOIDs) throws IOException {
         ByteBuffer buf = ByteBuffer.wrap(body);
         String stmtName = readCString(buf);
         String query = readCString(buf);
         lastParsedSql[0] = query;
+
+        // Param type OIDs declared by the client. A 0 in any slot means
+        // "unspecified" — the server is free to infer the type. Stratum
+        // doesn't do inference for binary inputs, so an unspecified type
+        // combined with a binary format request at Bind time is rejected
+        // with 0A000 (W3).
+        short numParamOids = buf.getShort();
+        int[] oids = new int[numParamOids];
+        for (int i = 0; i < numParamOids; i++) oids[i] = buf.getInt();
+        paramTypeOIDs[0] = oids;
 
         // ParseComplete
         out.writeByte('1');
@@ -474,7 +489,8 @@ public final class PgWireServer {
 
     private void handleBind(byte[] body, DataOutputStream out,
                             String[][] lastBoundParams,
-                            int[][] resultFormatCodes) throws IOException {
+                            int[][] resultFormatCodes,
+                            int[][] paramTypeOIDs) throws IOException {
         ByteBuffer buf = ByteBuffer.wrap(body);
         String portalName = readCString(buf);
         String stmtName = readCString(buf);
@@ -490,22 +506,39 @@ public final class PgWireServer {
         }
 
         short numParams = buf.getShort();
+        int[] paramOids = paramTypeOIDs[0];
 
-        // Step W1: refuse binary inbound params loudly. W3 will add decoders.
-        int firstBinaryParam = -1;
+        // Validate every param's (format, type-OID) up-front before we read
+        // any bytes. Refusing late means we'd have to drain the rest of the
+        // message; refusing early keeps the protocol predictable.
         for (int i = 0; i < numParams; i++) {
             int fmt = paramFormatFor(paramFormats, i);
-            if (fmt != 0) { firstBinaryParam = i; break; }
-        }
-        if (firstBinaryParam >= 0) {
-            sendError(out, "ERROR", "0A000",
-                "Binary input parameter format not yet supported (param $"
-                    + (firstBinaryParam + 1) + "). Configure your client to send parameters as text.");
-            // Leave lastBoundParams[0] null so Execute is a no-op and the
-            // protocol stays in a consistent state until Sync.
-            lastBoundParams[0] = null;
-            resultFormatCodes[0] = null;
-            return;
+            if (fmt == 0) continue;                              // text — always fine
+            if (fmt != 1) {
+                sendError(out, "ERROR", "0A000",
+                    "Unknown wire format code " + fmt + " for param $" + (i + 1) + ".");
+                lastBoundParams[0] = null;
+                resultFormatCodes[0] = null;
+                return;
+            }
+            int oid = (i < paramOids.length) ? paramOids[i] : 0;
+            if (oid == 0) {
+                sendError(out, "ERROR", "0A000",
+                    "Binary input for param $" + (i + 1)
+                        + " requires a type OID at Parse time, but the client did not declare one. "
+                        + "Either send the param as text, or declare its type in the Parse message.");
+                lastBoundParams[0] = null;
+                resultFormatCodes[0] = null;
+                return;
+            }
+            if (!PgBinaryCodec.supportsBinaryInput(oid)) {
+                sendError(out, "ERROR", "0A000",
+                    "Binary input format not supported for param $" + (i + 1)
+                        + " (OID=" + oid + "). Send this parameter as text.");
+                lastBoundParams[0] = null;
+                resultFormatCodes[0] = null;
+                return;
+            }
         }
 
         String[] params = new String[numParams];
@@ -516,7 +549,26 @@ public final class PgWireServer {
             } else {
                 byte[] paramBytes = new byte[paramLen];
                 buf.get(paramBytes);
-                params[i] = new String(paramBytes, StandardCharsets.UTF_8);
+                int fmt = paramFormatFor(paramFormats, i);
+                if (fmt == 0) {
+                    params[i] = new String(paramBytes, StandardCharsets.UTF_8);
+                } else {
+                    // Binary — decode through PgBinaryCodec, then render as a
+                    // text fragment for the existing substituteParams pass.
+                    int oid = paramOids[i];
+                    try {
+                        Object decoded = PgBinaryCodec.decode(oid, paramBytes);
+                        params[i] = binaryToSqlText(oid, decoded);
+                    } catch (Exception ex) {
+                        sendError(out, "ERROR", "22P03",
+                            "Could not decode binary input for param $" + (i + 1)
+                                + " (OID=" + oid + "): "
+                                + (ex.getMessage() != null ? ex.getMessage() : ex.getClass().getSimpleName()));
+                        lastBoundParams[0] = null;
+                        resultFormatCodes[0] = null;
+                        return;
+                    }
+                }
             }
         }
         lastBoundParams[0] = params;
@@ -547,6 +599,56 @@ public final class PgWireServer {
         if (formatCodes.length == 0) return 0;
         if (formatCodes.length == 1) return formatCodes[0];
         return idx < formatCodes.length ? formatCodes[idx] : 0;
+    }
+
+    /**
+     * Convert a binary-decoded parameter value into the SQL text fragment
+     * that {@link #substituteParams} will splice into the prepared SQL.
+     *
+     * <p>The existing text-substitution path treats values as either
+     * "numeric" (inlined verbatim) or "string" (single-quoted, with escapes).
+     * Binary-decoded values must round-trip through that same path, so we
+     * pick the formatting carefully:
+     *
+     * <ul>
+     *   <li>Numeric types render as their decimal representation so
+     *       {@code isNumeric()} catches them.</li>
+     *   <li>DATE/TIMESTAMP render as ISO-8601 strings, so the text path
+     *       quotes them and JSqlParser parses them as date/timestamp
+     *       literals against the column type.</li>
+     *   <li>UUID / JSONB / TEXT render as plain strings (quoted by
+     *       {@code substituteParams}).</li>
+     *   <li>BOOL renders as {@code TRUE}/{@code FALSE} — uppercase so the
+     *       text path treats them as bare SQL keywords (not numeric and not
+     *       string-quoted; but it's also fine if they were quoted, since
+     *       most parsers accept {@code 'true'} as a bool literal).</li>
+     * </ul>
+     */
+    private static String binaryToSqlText(int oid, Object v) {
+        if (v == null) return null;
+        return switch (oid) {
+            case OID_BOOL -> ((Boolean) v) ? "true" : "false";
+            case OID_DATE ->
+                java.time.LocalDate.ofEpochDay(((Number) v).longValue()).toString();
+            case OID_TIMESTAMP, OID_TIMESTAMPTZ ->
+                formatTimestampMicros(((Number) v).longValue());
+            case OID_NUMERIC -> ((java.math.BigDecimal) v).toPlainString();
+            default -> v.toString();
+        };
+    }
+
+    /**
+     * Format Unix-epoch microseconds as a SQL TIMESTAMP literal body
+     * (no surrounding quotes; the substitute pass adds them).
+     * Format: {@code YYYY-MM-DD HH:MM:SS[.ffffff]} (space separator, no
+     * timezone) — matches what JSqlParser accepts for TIMESTAMP literals.
+     */
+    private static String formatTimestampMicros(long micros) {
+        long secs = Math.floorDiv(micros, 1_000_000L);
+        long us   = Math.floorMod(micros, 1_000_000L);
+        java.time.LocalDateTime ldt =
+            java.time.LocalDateTime.ofEpochSecond(secs, (int) (us * 1000L), java.time.ZoneOffset.UTC);
+        return ldt.toLocalDate() + " " + ldt.toLocalTime();
     }
 
     /**

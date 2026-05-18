@@ -443,6 +443,50 @@
       (.write     out body)
       (.flush     out))))
 
+(defn- send-parse-typed!
+  "Parse with explicit param-type OIDs (a vector of int32 OIDs)."
+  [{:keys [^DataOutputStream out]} ^String sql param-oids]
+  (let [sql-b (.getBytes sql StandardCharsets/UTF_8)
+        baos  (ByteArrayOutputStream.)
+        dos   (DataOutputStream. baos)]
+    (.writeByte dos 0)                  ;; unnamed statement
+    (.write     dos sql-b)
+    (.writeByte dos 0)
+    (.writeShort dos (count param-oids))
+    (doseq [oid param-oids] (.writeInt dos (int oid)))
+    (.flush dos)
+    (let [body (.toByteArray baos)]
+      (.writeByte out (int \P))
+      (.writeInt  out (+ 4 (count body)))
+      (.write     out body)
+      (.flush     out))))
+
+(defn- send-bind-binary!
+  "Bind that sends each param as raw binary bytes (param-fmts = [1 1 ...]).
+   Each param in `bin-params` is a byte[] (or nil for SQL NULL)."
+  [{:keys [^DataOutputStream out]} bin-params result-fmts]
+  (let [baos (ByteArrayOutputStream.)
+        dos  (DataOutputStream. baos)]
+    (.writeByte dos 0)                     ;; unnamed portal
+    (.writeByte dos 0)                     ;; unnamed statement
+    (.writeShort dos (count bin-params))
+    (doseq [_ bin-params] (.writeShort dos 1))  ;; all binary
+    (.writeShort dos (count bin-params))
+    (doseq [p bin-params]
+      (if (nil? p)
+        (.writeInt dos -1)
+        (let [^bytes b p]
+          (.writeInt dos (alength b))
+          (.write dos b))))
+    (.writeShort dos (count result-fmts))
+    (doseq [f result-fmts] (.writeShort dos (int f)))
+    (.flush dos)
+    (let [body (.toByteArray baos)]
+      (.writeByte out (int \B))
+      (.writeInt  out (+ 4 (count body)))
+      (.write     out body)
+      (.flush     out))))
+
 (defn- decode-row-description-fmts
   "Parse a RowDescription body into a vector of [name oid format] tuples."
   [^bytes body]
@@ -502,19 +546,19 @@
         (is (= 3 (count rows))
             "rows still arrive correctly when format codes are explicit text")))))
 
-(deftest w1-param-format-binary-rejected-test
-  (testing "Bind with binary input format triggers ErrorResponse 0A000 and connection stays usable (until W3 lands)"
+(deftest w3-param-format-binary-without-oid-rejected-test
+  (testing "Bind with binary input format but no declared type OID at Parse → ErrorResponse 0A000"
     (with-conn [c (srv-port)]
+      ;; send-parse! declares 0 param type OIDs — binary input requires a type
       (send-parse!   c "SELECT COUNT(*) FROM orders WHERE price > $1")
-      ;; Param format = 1 (binary) — refused before any param byte is decoded
       (send-bind-fmt! c [1] ["100.0"] [])
-      ;; Sync still required to bring the protocol back to ReadyForQuery
       (send-sync!    c)
       (let [result (drain-rfq c)
             err    (find-error result)]
-        (is (some? err) "ErrorResponse expected for binary input param")
+        (is (some? err) "ErrorResponse expected for binary input without OID")
         (is (= "0A000" (:code err)))
-        (is (re-find #"[Bb]inary input parameter" (:message err))))
+        (is (re-find #"requires a type OID" (:message err))
+            "error must mention the missing type OID"))
       ;; Connection must remain usable
       (send-query! c "SELECT COUNT(*) FROM orders")
       (let [rows (decode-data-rows (drain-rfq c))]
@@ -604,6 +648,101 @@
                             rows)]
           (is (= [100.0 200.0 500.0] decoded)
               "binary-decoded FLOAT8 values match the rows"))))))
+
+;; ============================================================================
+;; Step W3 — inbound binary decoders
+;; ============================================================================
+
+(deftest w3-binary-int8-param-roundtrip-test
+  (testing "Binary INT8 param decodes correctly when its type OID is declared at Parse"
+    (with-conn [c (srv-port)]
+      ;; quantity > 5 → row 5 (q=5 strict-gt fails) wait: orders quantities are 1,2,5,10,20
+      ;; quantity > 5: 10 + 20 = 30 rows-count = 2. Test SUM(price) WHERE quantity > $1.
+      (send-parse-typed! c "SELECT SUM(price) AS t FROM orders WHERE quantity > $1"
+                         [PgWireServer/OID_INT8])
+      (let [bin (byte-array 8)]
+        ;; Encode 5 as 8-byte big-endian
+        (aset-byte bin 7 (byte 5))
+        (send-bind-binary! c [bin] [0])
+        (send-execute! c)
+        (send-sync!    c)
+        (let [rows (decode-data-rows (drain-rfq c))]
+          ;; quantity > 5 → quantities 10, 20 → prices 200.0 + 500.0 = 700.0
+          (is (= "700.0" (ffirst rows))
+              "binary INT8 param 5 should select prices for quantity > 5"))))))
+
+(deftest w3-binary-float8-param-roundtrip-test
+  (testing "Binary FLOAT8 param decodes correctly"
+    (with-conn [c (srv-port)]
+      (send-parse-typed! c "SELECT COUNT(*) FROM orders WHERE price > $1"
+                         [PgWireServer/OID_FLOAT8])
+      ;; Encode 100.0 as 8-byte big-endian IEEE 754
+      (let [bits (Double/doubleToRawLongBits 100.0)
+            bin  (byte-array 8)]
+        (dotimes [i 8]
+          (aset-byte bin i (byte (bit-and (unsigned-bit-shift-right bits (* 8 (- 7 i))) 0xff))))
+        (send-bind-binary! c [bin] [0])
+        (send-execute! c)
+        (send-sync!    c)
+        (let [rows (decode-data-rows (drain-rfq c))]
+          ;; price > 100.0 → prices 200, 500 → count = 2
+          (is (= "2" (ffirst rows))))))))
+
+(deftest w3-binary-text-param-roundtrip-test
+  (testing "Binary TEXT param decodes correctly"
+    (with-conn [c (srv-port)]
+      (send-parse-typed! c "SELECT SUM(price) FROM orders WHERE region = $1"
+                         [PgWireServer/OID_TEXT])
+      (let [bin (.getBytes "N" StandardCharsets/UTF_8)]
+        (send-bind-binary! c [bin] [0])
+        (send-execute! c)
+        (send-sync!    c)
+        (let [rows (decode-data-rows (drain-rfq c))]
+          ;; region = N: prices 10 + 50 = 60.0
+          (is (= "60.0" (ffirst rows))))))))
+
+(deftest w3-binary-mixed-formats-param-test
+  (testing "Mixed binary + text param formats both decode correctly"
+    (with-conn [c (srv-port)]
+      ;; param 1 binary INT8, param 2 text
+      (send-parse-typed! c "SELECT COUNT(*) FROM orders WHERE quantity > $1 AND region = $2"
+                         [PgWireServer/OID_INT8 PgWireServer/OID_TEXT])
+      (let [bin1 (byte-array 8)]
+        (aset-byte bin1 7 (byte 1))  ;; quantity > 1
+        (let [baos (ByteArrayOutputStream.)
+              dos  (DataOutputStream. baos)]
+          (.writeByte dos 0) (.writeByte dos 0)
+          (.writeShort dos 2)
+          (.writeShort dos 1) (.writeShort dos 0)  ;; param 1 binary, param 2 text
+          (.writeShort dos 2)
+          (.writeInt dos 8) (.write dos bin1)
+          (let [region-bytes (.getBytes "S" StandardCharsets/UTF_8)]
+            (.writeInt dos (alength region-bytes))
+            (.write dos region-bytes))
+          (.writeShort dos 0)  ;; no result formats
+          (.flush dos)
+          (let [body (.toByteArray baos)]
+            (.writeByte (:out c) (int \B))
+            (.writeInt  (:out c) (+ 4 (count body)))
+            (.write     (:out c) body)
+            (.flush     (:out c))))
+        (send-execute! c)
+        (send-sync!    c)
+        (let [rows (decode-data-rows (drain-rfq c))]
+          ;; quantity > 1 AND region = S: (5,S) (10,S) → 2
+          (is (= "2" (ffirst rows))))))))
+
+(deftest w3-binary-param-unsupported-oid-rejected-test
+  (testing "Binary input for an OID we don't decode → 0A000 with a clear message"
+    (with-conn [c (srv-port)]
+      ;; INT2VECTOR (22) — declared but not supported
+      (send-parse-typed! c "SELECT 1 WHERE $1 IS NOT NULL" [22])
+      (send-bind-binary! c [(byte-array 2)] [])
+      (send-sync! c)
+      (let [err (find-error (drain-rfq c))]
+        (is (some? err))
+        (is (= "0A000" (:code err)))
+        (is (re-find #"OID=22" (:message err)))))))
 
 (deftest w2-binary-mixed-row-test
   (testing "Per-column mix: column 1 text, column 2 binary — both work in the same row"
