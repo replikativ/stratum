@@ -287,9 +287,14 @@
         (set! capacity new-capacity)
         (set! dirty true)))
 
+    ;; F-044: nil maps to the per-type sentinel so callers don't need
+    ;; to encode NULL manually. The downstream `col-persistent!` scans
+    ;; for sentinels and rebuilds the validity bitmap.
     (case datatype
-      :float64 (aset ^doubles data (int idx) (double val))
-      :int64 (aset ^longs data (int idx) (long val)))
+      :float64 (aset ^doubles data (int idx)
+                     (if (nil? val) Double/NaN (double val)))
+      :int64   (aset ^longs data (int idx)
+                     (if (nil? val) Long/MIN_VALUE (long val))))
     ;; Update length if we wrote beyond current length
     (when (>= idx length)
       (set! length (long (inc idx))))

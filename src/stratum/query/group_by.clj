@@ -578,17 +578,32 @@
                                col-ref (first pred)
                                op (second pred)
                                pred-args (subvec pred 2)
+                               col-data (when (keyword? col-ref) (get col-arrays col-ref))
                                pv (if (keyword? col-ref)
-                                    (aget-col (get col-arrays col-ref) i)
+                                    (aget-col col-data i)
                                     (eval-agg-expr col-ref col-arrays i))
-                               match? (case op
-                                        :lt  (< pv (double (first pred-args)))
-                                        :gt  (> pv (double (first pred-args)))
-                                        :lte (<= pv (double (first pred-args)))
-                                        :gte (>= pv (double (first pred-args)))
-                                        :eq  (== pv (double (first pred-args)))
-                                        :neq (not (== pv (double (first pred-args))))
-                                        false)]
+                               ;; F-038 (scalar path): SQL 3VL — NULL LHS
+                               ;; makes every comparison UNKNOWN → WHEN
+                               ;; branch does not match. `:neq` would
+                               ;; otherwise return true on (not (== NaN x))
+                               ;; and incorrectly fire on NULL rows.
+                               ;; `aget-col` reads long Long.MIN_VALUE as
+                               ;; -9.22e18 (a finite double) so the NaN
+                               ;; check alone misses it; add the explicit
+                               ;; long-sentinel check on the source array.
+                               pv-null? (or (Double/isNaN pv)
+                                            (and col-data
+                                                 (expr/long-array? col-data)
+                                                 (= (aget ^longs col-data (int i)) Long/MIN_VALUE)))
+                               match? (and (not pv-null?)
+                                           (case op
+                                             :lt  (< pv (double (first pred-args)))
+                                             :gt  (> pv (double (first pred-args)))
+                                             :lte (<= pv (double (first pred-args)))
+                                             :gte (>= pv (double (first pred-args)))
+                                             :eq  (== pv (double (first pred-args)))
+                                             :neq (not (== pv (double (first pred-args))))
+                                             false))]
                            (when match?
                              (eval-agg-expr (:val branch) col-arrays i)))))
                      branches)

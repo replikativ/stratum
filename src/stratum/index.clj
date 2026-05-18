@@ -596,45 +596,52 @@
   (idx-append! [this val]
     (when-not edit
       (throw (IllegalStateException. "Cannot mutate persistent index. Call idx-transient first.")))
+    ;; F-044: nil maps to the per-type NULL sentinel for stats; the
+    ;; chunk write-value! has the same convention, so both sides stay
+    ;; consistent. `update-stats-append` detects sentinel and bumps
+    ;; null-count without disturbing sum/min/max.
+    (let [stat-val (if (nil? val)
+                     (case datatype
+                       :int64   (double Long/MIN_VALUE)
+                       :float64 Double/NaN)
+                     (double val))]
+      (let [last-entry (last (pss/slice tree nil nil))]
+        (if (and last-entry
+                 (< (chunk/chunk-length (.chunk ^ChunkEntry last-entry))
+                    chunk-size))
+          (let [^ChunkEntry entry last-entry
+                local-idx (chunk/chunk-length (.chunk entry))
+                chunk (let [c (.chunk entry)]
+                        (if (chunk/col-transient? c)
+                          c
+                          (-> (chunk/col-fork c) chunk/col-transient)))]
 
-    (let [last-entry (last (pss/slice tree nil nil))]
-      (if (and last-entry
-               (< (chunk/chunk-length (.chunk ^ChunkEntry last-entry))
-                  chunk-size))
-        (let [^ChunkEntry entry last-entry
-              local-idx (chunk/chunk-length (.chunk entry))
-              ;; Lazy fork: if chunk is still persistent, fork + make transient
-              chunk (let [c (.chunk entry)]
-                      (if (chunk/col-transient? c)
-                        c
-                        (-> (chunk/col-fork c) chunk/col-transient)))]
+            (chunk/write-value! chunk local-idx val)
 
-          (chunk/write-value! chunk local-idx val)
+            (let [new-stats (stats/update-stats-append (.stats entry) stat-val)
+                  new-entry (->ChunkEntry (.chunk-id entry) chunk new-stats)]
 
-          (let [new-stats (stats/update-stats-append (.stats entry) (double val))
-                new-entry (->ChunkEntry (.chunk-id entry) chunk new-stats)]
+              (swap! dirty-chunks clojure.core/conj (.chunk-id entry))
 
-            (swap! dirty-chunks clojure.core/conj (.chunk-id entry))
+              (set! tree (pss/replace tree entry new-entry))
+              (set! total-length (unchecked-inc total-length))
 
-            (set! tree (pss/replace tree entry new-entry))
+              this))
+
+          (let [new-id [next-chunk-id]
+                _ (set! next-chunk-id (unchecked-inc next-chunk-id))
+                new-chunk (-> (chunk/make-chunk datatype 1)
+                              chunk/col-transient)
+                _ (chunk/write-value! new-chunk 0 val)
+                new-stats (stats/update-stats-append stats/empty-stats stat-val)
+                new-entry (->ChunkEntry new-id new-chunk new-stats)]
+
+            (swap! dirty-chunks clojure.core/conj new-id)
+
+            (set! tree (conj! tree new-entry))
             (set! total-length (unchecked-inc total-length))
 
-            this))
-
-        (let [new-id [next-chunk-id]
-              _ (set! next-chunk-id (unchecked-inc next-chunk-id))
-              new-chunk (-> (chunk/make-chunk datatype 1)
-                            chunk/col-transient)
-              _ (chunk/write-value! new-chunk 0 val)
-              new-stats (stats/update-stats-append stats/empty-stats (double val))
-              new-entry (->ChunkEntry new-id new-chunk new-stats)]
-
-          (swap! dirty-chunks clojure.core/conj new-id)
-
-          (set! tree (conj! tree new-entry))
-          (set! total-length (unchecked-inc total-length))
-
-          this))))
+            this)))))
 
   (idx-append-chunk! [this new-chunk]
     (when-not edit
