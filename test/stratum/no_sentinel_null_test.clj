@@ -62,9 +62,9 @@
       (let [arr (long-array [1 Long/MIN_VALUE 2])
             normalized (column/encode-column arr {:no-sentinel-null? true})]
         (srv/register-table! s "t"
-                              (with-meta {:id normalized}
-                                {:column-schema {:id {:no-sentinel-null? true
-                                                      :unsigned-width 64}}})))
+                             (with-meta {:id normalized}
+                               {:column-schema {:id {:no-sentinel-null? true
+                                                     :unsigned-width 64}}})))
       (let [^PgWireServer$QueryResult qr
             (@(requiring-resolve 'stratum.server/execute-sql)
              "SELECT id FROM t" (:registry s) (:data-dir s) (:store s))

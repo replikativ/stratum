@@ -303,8 +303,8 @@
                          (eval-agg-expr (nth args 1) col-arrays i))
         ;; Date extraction — requires reading the long value from the column
         (:year :month :day :hour :minute :second :millisecond :microsecond
-         :nanosecond
-         :day-of-week :iso-day-of-week :week-of-year :quarter)
+               :nanosecond
+               :day-of-week :iso-day-of-week :week-of-year :quarter)
         (let [col-key (nth args 0)
               col-data (get col-arrays col-key)
               v (long (if (expr/long-array? col-data)
@@ -314,7 +314,7 @@
                      (case (:op expr)
                        (:hour :minute :second :millisecond :microsecond :nanosecond) :seconds
                        (:year :month :day :day-of-week :iso-day-of-week
-                        :week-of-year :quarter) :days))
+                              :week-of-year :quarter) :days))
               ;; Convert the per-row scalar to canonical day/sec for the inner formula.
               ed (long (case tu
                          :days    v
@@ -386,12 +386,12 @@
             :day-of-week     (double (mod (+ (mod ed 7) 11) 7))
             :iso-day-of-week (double (inc (mod (+ (mod ed 7) 10) 7)))
             :quarter         (let [m (let [z (+ ed 719468)
-                                            era (quot (if (>= z 0) z (- z 146096)) 146097)
-                                            doe (- z (* era 146097))
-                                            yoe (quot (- doe (quot doe 1460) (- (quot doe 36524)) (quot doe 146096)) 365)
-                                            doy (- doe (+ (* 365 yoe) (quot yoe 4) (- (quot yoe 100))))
-                                            mp (quot (+ (* 5 doy) 2) 153)]
-                                        (+ mp (if (< mp 10) 3 -9)))]
+                                           era (quot (if (>= z 0) z (- z 146096)) 146097)
+                                           doe (- z (* era 146097))
+                                           yoe (quot (- doe (quot doe 1460) (- (quot doe 36524)) (quot doe 146096)) 365)
+                                           doy (- doe (+ (* 365 yoe) (quot yoe 4) (- (quot yoe 100))))
+                                           mp (quot (+ (* 5 doy) 2) 153)]
+                                       (+ mp (if (< mp 10) 3 -9)))]
                                (double (inc (quot (dec m) 3))))
             :week-of-year (double 1)))
         ;; Date/time arithmetic (scalar path)

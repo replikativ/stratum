@@ -59,8 +59,8 @@
 
 (deftest parser-or-replace
   (is (:or-replace?
-        (enum-ddl/parse-create-type-enum
-         "CREATE OR REPLACE TYPE mood AS ENUM ('a','b')"))))
+       (enum-ddl/parse-create-type-enum
+        "CREATE OR REPLACE TYPE mood AS ENUM ('a','b')"))))
 
 (deftest parser-strips-schema-qualifier
   (is (= "mood"

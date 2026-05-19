@@ -2896,78 +2896,78 @@
                           (rescale-decimal-literals inner-q table-registry))
                 r)
               :else r))]
-  (post-rescale
-  (try
+    (post-rescale
+     (try
     ;; Check for EXPLAIN prefix
-    (if-let [[opts inner-sql] (parse-explain-prefix sql)]
-      (let [result (parse-sql inner-sql table-registry)]
-        (cond
-          (:error result)  result
-          (:system result) {:explain {:options opts
-                                      :inner   {:system true :tag (:tag result)}}}
-          (:query result)  {:explain {:options opts
-                                      :inner   {:query (:query result)}}}
-          :else result))
+       (if-let [[opts inner-sql] (parse-explain-prefix sql)]
+         (let [result (parse-sql inner-sql table-registry)]
+           (cond
+             (:error result)  result
+             (:system result) {:explain {:options opts
+                                         :inner   {:system true :tag (:tag result)}}}
+             (:query result)  {:explain {:options opts
+                                         :inner   {:query (:query result)}}}
+             :else result))
 
       ;; Normal parsing
-      (or
+         (or
         ;; Check system queries first (SET, SHOW, BEGIN, etc.)
-       (check-system-query sql table-registry)
+          (check-system-query sql table-registry)
 
        ;; CREATE TYPE ... AS ENUM — JSqlParser has no node for this, so
        ;; we detect and parse it before reaching CCJSqlParserUtil.
-       (when (enum-ddl/create-type-enum? sql)
-         {:ddl (enum-ddl/parse-create-type-enum sql)})
+          (when (enum-ddl/create-type-enum? sql)
+            {:ddl (enum-ddl/parse-create-type-enum sql)})
 
 ;; Check pg_catalog queries
-       (when (pg-catalog-table sql)
-         (handle-pg-catalog sql table-registry))
+          (when (pg-catalog-table sql)
+            (handle-pg-catalog sql table-registry))
 
         ;; Pre-parse rewrite for non-standard syntax (ASOF JOIN, ...) and
         ;; parse with JSqlParser.
-       (let [{rewritten-sql :sql asof-markers :asof-markers
-              period :period erase? :erase?}
-             (rewrite/preprocess-sql sql)
-             sql rewritten-sql  ;; shadow: downstream uses rewritten form
-             stmt (CCJSqlParserUtil/parse ^String sql)
+          (let [{rewritten-sql :sql asof-markers :asof-markers
+                 period :period erase? :erase?}
+                (rewrite/preprocess-sql sql)
+                sql rewritten-sql  ;; shadow: downstream uses rewritten form
+                stmt (CCJSqlParserUtil/parse ^String sql)
              ;; FOR PORTION OF VALID_TIME (SQL:2011) lowers to a temporal
              ;; slice attached to the DDL map; INSERT/UPDATE/DELETE
              ;; translators below pick it up via `assoc-period`. ERASE
              ;; flag is attached to DELETE so server.clj routes it as a
              ;; physical purge regardless of bitemporal status.
-             assoc-period (fn [result]
-                            (cond-> result
-                              (and period (:ddl result))
-                              (assoc-in [:ddl :period] period)
-                              (and erase? (:ddl result))
-                              (assoc-in [:ddl :erase?] true)))]
-         (cond
-           (instance? PlainSelect stmt)
-           (let [^PlainSelect select stmt
+                assoc-period (fn [result]
+                               (cond-> result
+                                 (and period (:ddl result))
+                                 (assoc-in [:ddl :period] period)
+                                 (and erase? (:ddl result))
+                                 (assoc-in [:ddl :erase?] true)))]
+            (cond
+              (instance? PlainSelect stmt)
+              (let [^PlainSelect select stmt
                   ;; Handle CTEs: WITH cte AS (SELECT ...) SELECT ...
                   ;; CTEs are materialized and added to the table registry
-                 enriched-registry
-                 (if-let [with-items (.getWithItemsList select)]
-                   (reduce (fn [reg ^WithItem wi]
-                             (let [cte-name (.getAliasName wi)
-                                   inner-select (.getPlainSelect (.getSelect wi))
-                                   cte-query (translate-select inner-select reg)
-                                   cte-result (q/q cte-query)
-                                   cte-cols (q/results->columns cte-result)]
-                               (assoc reg cte-name cte-cols)))
-                           table-registry
-                           with-items)
-                   table-registry)]
+                    enriched-registry
+                    (if-let [with-items (.getWithItemsList select)]
+                      (reduce (fn [reg ^WithItem wi]
+                                (let [cte-name (.getAliasName wi)
+                                      inner-select (.getPlainSelect (.getSelect wi))
+                                      cte-query (translate-select inner-select reg)
+                                      cte-result (q/q cte-query)
+                                      cte-cols (q/results->columns cte-result)]
+                                  (assoc reg cte-name cte-cols)))
+                              table-registry
+                              with-items)
+                      table-registry)]
               ;; Check for VERSION() etc.
-             (or (handle-version-query select)
+                (or (handle-version-query select)
 
                   ;; Check for "SHOW TABLES" style
-                 (when-let [from (.getFromItem select)]
-                   (when (and (instance? Table from)
-                              (let [name (.getName ^Table from)]
-                                (or (= name "pg_tables")
-                                    (= name "tables"))))
-                     (handle-show-tables enriched-registry)))
+                    (when-let [from (.getFromItem select)]
+                      (when (and (instance? Table from)
+                                 (let [name (.getName ^Table from)]
+                                   (or (= name "pg_tables")
+                                       (= name "tables"))))
+                        (handle-show-tables enriched-registry)))
 
                   ;; Check for table functions (read_csv, read_parquet)
                   ;; Note: JSqlParser parses read_csv('path') as a table name string,
@@ -2982,82 +2982,82 @@
                   ;; but preserves string literals — deferred until
                   ;; we have another preprocessor with the same
                   ;; need (single-use edge case in practice).
-                 (let [table-func (when-let [[_ func path]
-                                             (re-find #"(?i)\bFROM\s+(read_csv|read_parquet)\s*\(\s*'([^']+)'\s*\)" sql)]
-                                    (validate-file-path path)
-                                    [(str func "(" path ")") (.toLowerCase ^String func) path])]
-                   (when table-func
-                     (let [[full-name func-name path] table-func
-                           table-data (case func-name
-                                        "read_csv"     (csv/from-csv path)
-                                        "read_parquet" (parquet/parquet-dataset path))
+                    (let [table-func (when-let [[_ func path]
+                                                (re-find #"(?i)\bFROM\s+(read_csv|read_parquet)\s*\(\s*'([^']+)'\s*\)" sql)]
+                                       (validate-file-path path)
+                                       [(str func "(" path ")") (.toLowerCase ^String func) path])]
+                      (when table-func
+                        (let [[full-name func-name path] table-func
+                              table-data (case func-name
+                                           "read_csv"     (csv/from-csv path)
+                                           "read_parquet" (parquet/parquet-dataset path))
                             ;; Re-parse with the table data in registry
-                           fixed-sql (.replace ^String sql ^String full-name "__file_table__")
-                           fixed-registry (assoc enriched-registry "__file_table__" table-data)]
-                       {:query (translate-select
-                                ^PlainSelect (CCJSqlParserUtil/parse ^String fixed-sql)
-                                fixed-registry
-                                asof-markers)})))
+                              fixed-sql (.replace ^String sql ^String full-name "__file_table__")
+                              fixed-registry (assoc enriched-registry "__file_table__" table-data)]
+                          {:query (translate-select
+                                   ^PlainSelect (CCJSqlParserUtil/parse ^String fixed-sql)
+                                   fixed-registry
+                                   asof-markers)})))
 
                   ;; Normal SELECT translation
-                 {:query (translate-select select enriched-registry asof-markers)}))
+                    {:query (translate-select select enriched-registry asof-markers)}))
 
             ;; UNION / UNION ALL / INTERSECT / EXCEPT
-           (instance? SetOperationList stmt)
-           (let [^SetOperationList sol stmt
-                 selects (.getSelects sol)
-                 operations (.getOperations sol)
-                 sub-queries (mapv (fn [^net.sf.jsqlparser.statement.select.Select s]
-                                     (if (instance? PlainSelect s)
-                                       (translate-select ^PlainSelect s table-registry)
-                                       (throw (ex-info "Non-PlainSelect in set operation not supported"
-                                                       {:type (type s)}))))
-                                   selects)
+              (instance? SetOperationList stmt)
+              (let [^SetOperationList sol stmt
+                    selects (.getSelects sol)
+                    operations (.getOperations sol)
+                    sub-queries (mapv (fn [^net.sf.jsqlparser.statement.select.Select s]
+                                        (if (instance? PlainSelect s)
+                                          (translate-select ^PlainSelect s table-registry)
+                                          (throw (ex-info "Non-PlainSelect in set operation not supported"
+                                                          {:type (type s)}))))
+                                      selects)
                   ;; Determine operation type from first operation
-                 first-op (first operations)
-                 op-type (cond
-                           (instance? IntersectOp first-op) :intersect
-                           (or (instance? ExceptOp first-op)
-                               (instance? MinusOp first-op)) :except
-                           :else :union)
-                 all? (and (= :union op-type)
-                           (every? (fn [op] (and (instance? UnionOp op) (.isAll ^UnionOp op)))
-                                   operations))]
-             {:query {:_set-op {:op op-type :queries sub-queries :all? all?}}})
+                    first-op (first operations)
+                    op-type (cond
+                              (instance? IntersectOp first-op) :intersect
+                              (or (instance? ExceptOp first-op)
+                                  (instance? MinusOp first-op)) :except
+                              :else :union)
+                    all? (and (= :union op-type)
+                              (every? (fn [op] (and (instance? UnionOp op) (.isAll ^UnionOp op)))
+                                      operations))]
+                {:query {:_set-op {:op op-type :queries sub-queries :all? all?}}})
 
            ;; CREATE TABLE
-           (instance? CreateTable stmt)
-           (translate-create-table stmt)
+              (instance? CreateTable stmt)
+              (translate-create-table stmt)
 
            ;; INSERT INTO
-           (instance? Insert stmt)
-           (assoc-period (translate-insert stmt))
+              (instance? Insert stmt)
+              (assoc-period (translate-insert stmt))
 
            ;; UPDATE
-           (instance? Update stmt)
-           (assoc-period (translate-update stmt))
+              (instance? Update stmt)
+              (assoc-period (translate-update stmt))
 
            ;; DELETE
-           (instance? Delete stmt)
-           (assoc-period (translate-delete stmt))
+              (instance? Delete stmt)
+              (assoc-period (translate-delete stmt))
 
            ;; DROP TABLE
-           (instance? Drop stmt)
-           (let [^Drop d stmt]
-             (when (= "TABLE" (.getType d))
-               {:ddl {:op :drop-table :table (str (.getName d))}}))
+              (instance? Drop stmt)
+              (let [^Drop d stmt]
+                (when (= "TABLE" (.getType d))
+                  {:ddl {:op :drop-table :table (str (.getName d))}}))
 
-           :else
-           {:error (str "Unsupported SQL statement type: " (type stmt))}))))
+              :else
+              {:error (str "Unsupported SQL statement type: " (type stmt))}))))
 
-    (catch clojure.lang.ExceptionInfo e
+       (catch clojure.lang.ExceptionInfo e
       ;; Preserve sqlstate and other ex-data set by translation helpers
       ;; (e.g., :sqlstate "0A000" for feature_not_supported errors).
-      (let [data (ex-data e)]
-        (cond-> {:error (.getMessage e)}
-          (:sqlstate data) (assoc :sqlstate (:sqlstate data)))))
-    (catch Exception e
-      {:error (.getMessage e)})))))
+         (let [data (ex-data e)]
+           (cond-> {:error (.getMessage e)}
+             (:sqlstate data) (assoc :sqlstate (:sqlstate data)))))
+       (catch Exception e
+         {:error (.getMessage e)})))))
 
 ;; ============================================================================
 ;; Result formatting for pgwire
@@ -3343,66 +3343,66 @@
    for the standard caller pattern."
   ([results] (format-results results nil))
   ([results column-meta]
-  (cond
+   (cond
     ;; System query with pre-formatted result
-    (and (:system results) (:result results))
-    (let [{:keys [columns oids rows]} (:result results)
-          tag (:tag results)]
-      (PgWireServer$QueryResult.
-       (into-array String columns)
-       (int-array oids)
-       (into-array (Class/forName "[Ljava.lang.String;")
-                   (mapv #(into-array String %) rows))
-       (str tag)))
+     (and (:system results) (:result results))
+     (let [{:keys [columns oids rows]} (:result results)
+           tag (:tag results)]
+       (PgWireServer$QueryResult.
+        (into-array String columns)
+        (int-array oids)
+        (into-array (Class/forName "[Ljava.lang.String;")
+                    (mapv #(into-array String %) rows))
+        (str tag)))
 
     ;; System query with no result (SET, BEGIN, etc.)
-    (:system results)
-    (PgWireServer$QueryResult/empty (str (:tag results)))
+     (:system results)
+     (PgWireServer$QueryResult/empty (str (:tag results)))
 
     ;; Error
-    (:error results)
-    (PgWireServer$QueryResult. ^String (:error results))
+     (:error results)
+     (PgWireServer$QueryResult. ^String (:error results))
 
     ;; Columnar result format
-    (and (map? results) (:n-rows results))
-    (let [n-rows (long (:n-rows results))
-          col-keys (vec (remove #{:n-rows} (keys results)))
-          col-names (mapv name col-keys)
+     (and (map? results) (:n-rows results))
+     (let [n-rows (long (:n-rows results))
+           col-keys (vec (remove #{:n-rows} (keys results)))
+           col-names (mapv name col-keys)
           ;; Step 4a: prefer declared per-column OID; fall back to
           ;; array-shape inference (the pre-step-4a behaviour).
-          oids (int-array (map (fn [k]
-                                 (let [arr (get results k)]
-                                   (or (meta->oid (get column-meta k))
-                                       (cond
-                                         (instance? (Class/forName "[J") arr) OID_INT8
-                                         (instance? (Class/forName "[D") arr) OID_FLOAT8
+           oids (int-array (map (fn [k]
+                                  (let [arr (get results k)]
+                                    (or (meta->oid (get column-meta k))
+                                        (cond
+                                          (instance? (Class/forName "[J") arr) OID_INT8
+                                          (instance? (Class/forName "[D") arr) OID_FLOAT8
                                          ;; Step 7b/8b/8c/UUID: reference-typed array (Interval[],
                                          ;; BigInteger[], BigDecimal[], UUID[], or Object[] of
                                          ;; those). Infer the wire OID from the first non-nil
                                          ;; element so register-table! callers don't have to
                                          ;; declare column metadata for these passthrough types.
-                                         (and (some-> arr class .isArray)
-                                              (not (.isPrimitive (.getComponentType (class arr))))
-                                              (pos? (alength ^objects arr)))
-                                         (let [probe (some identity (seq ^objects arr))]
-                                           (cond
-                                             (instance? Interval probe)              OID_INTERVAL
-                                             (instance? java.math.BigInteger probe)  OID_NUMERIC
-                                             (instance? java.math.BigDecimal probe)  OID_NUMERIC
-                                             (instance? java.util.UUID probe)        OID_UUID
-                                             :else OID_TEXT))
-                                         :else OID_TEXT))))
-                               col-keys))
+                                          (and (some-> arr class .isArray)
+                                               (not (.isPrimitive (.getComponentType (class arr))))
+                                               (pos? (alength ^objects arr)))
+                                          (let [probe (some identity (seq ^objects arr))]
+                                            (cond
+                                              (instance? Interval probe)              OID_INTERVAL
+                                              (instance? java.math.BigInteger probe)  OID_NUMERIC
+                                              (instance? java.math.BigDecimal probe)  OID_NUMERIC
+                                              (instance? java.util.UUID probe)        OID_UUID
+                                              :else OID_TEXT))
+                                          :else OID_TEXT))))
+                                col-keys))
           ;; Step W2: build text rows and typed rows in a single pass so
           ;; the wire layer can switch per-column on the requested format.
-          row-pairs (for [i (range n-rows)]
-                      (mapv (fn [k]
-                              (let [arr (get results k)
-                                    cm  (get column-meta k)]
-                                (cond
-                                  (instance? (Class/forName "[J") arr)
-                                  (let [v (aget ^longs arr (int i))]
-                                    (cond
+           row-pairs (for [i (range n-rows)]
+                       (mapv (fn [k]
+                               (let [arr (get results k)
+                                     cm  (get column-meta k)]
+                                 (cond
+                                   (instance? (Class/forName "[J") arr)
+                                   (let [v (aget ^longs arr (int i))]
+                                     (cond
                                       ;; Step 8 sentinel opt-out: when the
                                       ;; column promises no implicit sentinel
                                       ;; NULL, every bit pattern (including
@@ -3410,83 +3410,83 @@
                                       ;; NULL detection — if it's tracked at
                                       ;; all — must come from an explicit
                                       ;; validity bitmap, not from the data.
-                                      (:no-sentinel-null? cm)
-                                      [(value->string v cm) (value->typed v cm)]
-                                      (= v Long/MIN_VALUE)
-                                      [nil nil]
-                                      :else
-                                      [(value->string v cm) (value->typed v cm)]))
-                                  (instance? (Class/forName "[D") arr)
-                                  (let [v (aget ^doubles arr (int i))]
-                                    (if (Double/isNaN v)
-                                      [nil nil]
-                                      [(value->string v cm) (value->typed v cm)]))
-                                  (instance? (Class/forName "[Ljava.lang.String;") arr)
-                                  (let [v (aget ^"[Ljava.lang.String;" arr (int i))]
-                                    [v v])
+                                       (:no-sentinel-null? cm)
+                                       [(value->string v cm) (value->typed v cm)]
+                                       (= v Long/MIN_VALUE)
+                                       [nil nil]
+                                       :else
+                                       [(value->string v cm) (value->typed v cm)]))
+                                   (instance? (Class/forName "[D") arr)
+                                   (let [v (aget ^doubles arr (int i))]
+                                     (if (Double/isNaN v)
+                                       [nil nil]
+                                       [(value->string v cm) (value->typed v cm)]))
+                                   (instance? (Class/forName "[Ljava.lang.String;") arr)
+                                   (let [v (aget ^"[Ljava.lang.String;" arr (int i))]
+                                     [v v])
                                   ;; Step 7b: generic reference array — render via toString,
                                   ;; keep the raw value as the typed payload for binary encoding.
-                                  (and (some-> arr class .isArray)
-                                       (not (.isPrimitive (.getComponentType (class arr)))))
-                                  (let [v (aget ^objects arr (int i))]
-                                    (if (nil? v)
-                                      [nil nil]
-                                      [(.toString ^Object v) v]))
-                                  :else
-                                  (let [v (nth (seq arr) i)]
-                                    [(value->string v cm) (value->typed v cm)]))))
-                            col-keys))
-          rows (into-array (Class/forName "[Ljava.lang.String;")
-                           (for [pair-row row-pairs]
-                             (into-array String (map first pair-row))))
-          typed-rows (into-array (Class/forName "[Ljava.lang.Object;")
-                                 (for [pair-row row-pairs]
-                                   (into-array Object (map second pair-row))))]
-      (PgWireServer$QueryResult.
-       (into-array String col-names)
-       oids
-       rows
-       typed-rows
-       (str "SELECT " n-rows)))
+                                   (and (some-> arr class .isArray)
+                                        (not (.isPrimitive (.getComponentType (class arr)))))
+                                   (let [v (aget ^objects arr (int i))]
+                                     (if (nil? v)
+                                       [nil nil]
+                                       [(.toString ^Object v) v]))
+                                   :else
+                                   (let [v (nth (seq arr) i)]
+                                     [(value->string v cm) (value->typed v cm)]))))
+                             col-keys))
+           rows (into-array (Class/forName "[Ljava.lang.String;")
+                            (for [pair-row row-pairs]
+                              (into-array String (map first pair-row))))
+           typed-rows (into-array (Class/forName "[Ljava.lang.Object;")
+                                  (for [pair-row row-pairs]
+                                    (into-array Object (map second pair-row))))]
+       (PgWireServer$QueryResult.
+        (into-array String col-names)
+        oids
+        rows
+        typed-rows
+        (str "SELECT " n-rows)))
 
     ;; Vector of maps (standard Stratum result)
-    (sequential? results)
-    (if (empty? results)
-      (PgWireServer$QueryResult.
-       (into-array String [])
-       (int-array [])
-       (into-array (Class/forName "[Ljava.lang.String;") [])
-       (into-array (Class/forName "[Ljava.lang.Object;") [])
-       "SELECT 0")
-      (let [first-row (first results)
+     (sequential? results)
+     (if (empty? results)
+       (PgWireServer$QueryResult.
+        (into-array String [])
+        (int-array [])
+        (into-array (Class/forName "[Ljava.lang.String;") [])
+        (into-array (Class/forName "[Ljava.lang.Object;") [])
+        "SELECT 0")
+       (let [first-row (first results)
             ;; Filter out internal engine keys (starting with _) before serializing
-            col-keys (vec (filter #(not (str/starts-with? (name %) "_")) (keys first-row)))
-            col-names (mapv name col-keys)
-            oids (int-array (map #(infer-oid (get first-row %) (get column-meta %)) col-keys))
-            rows (into-array (Class/forName "[Ljava.lang.String;")
-                             (mapv (fn [row]
-                                     (into-array String
-                                                 (mapv #(value->string (get row %)
-                                                                       (get column-meta %))
-                                                       col-keys)))
-                                   results))
-            typed-rows (into-array (Class/forName "[Ljava.lang.Object;")
-                                   (mapv (fn [row]
-                                           (into-array Object
-                                                       (mapv #(value->typed (get row %)
-                                                                            (get column-meta %))
-                                                             col-keys)))
-                                         results))]
-        (PgWireServer$QueryResult.
-         (into-array String col-names)
-         oids
-         rows
-         typed-rows
-         (str "SELECT " (count results)))))
+             col-keys (vec (filter #(not (str/starts-with? (name %) "_")) (keys first-row)))
+             col-names (mapv name col-keys)
+             oids (int-array (map #(infer-oid (get first-row %) (get column-meta %)) col-keys))
+             rows (into-array (Class/forName "[Ljava.lang.String;")
+                              (mapv (fn [row]
+                                      (into-array String
+                                                  (mapv #(value->string (get row %)
+                                                                        (get column-meta %))
+                                                        col-keys)))
+                                    results))
+             typed-rows (into-array (Class/forName "[Ljava.lang.Object;")
+                                    (mapv (fn [row]
+                                            (into-array Object
+                                                        (mapv #(value->typed (get row %)
+                                                                             (get column-meta %))
+                                                              col-keys)))
+                                          results))]
+         (PgWireServer$QueryResult.
+          (into-array String col-names)
+          oids
+          rows
+          typed-rows
+          (str "SELECT " (count results)))))
 
     ;; Single map (non-grouped aggregate)
-    (map? results)
-    (format-results [results] column-meta)
+     (map? results)
+     (format-results [results] column-meta)
 
-    :else
-    (PgWireServer$QueryResult. (str "Unexpected result type: " (type results))))))
+     :else
+     (PgWireServer$QueryResult. (str "Unexpected result type: " (type results))))))

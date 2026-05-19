@@ -93,7 +93,7 @@
 (deftest date-roundtrip
   (doseq [unix-days [0 10957 20000 -1000 19479]]  ;; 19479 = 2023-04-01
     (is (= unix-days (PgBinaryCodec/decodeDate
-                       (PgBinaryCodec/encodeDate unix-days))))))
+                      (PgBinaryCodec/encodeDate unix-days))))))
 
 ;; ---------------------------------------------------------------------------
 ;; TIMESTAMP — PG epoch in micros = 946684800000000
@@ -105,7 +105,7 @@
 (deftest timestamp-roundtrip
   (doseq [unix-micros [0 946684800000000 1700000000000000 -1234567]]
     (is (= unix-micros (PgBinaryCodec/decodeTimestamp
-                         (PgBinaryCodec/encodeTimestamp unix-micros))))))
+                        (PgBinaryCodec/encodeTimestamp unix-micros))))))
 
 ;; ---------------------------------------------------------------------------
 ;; UUID

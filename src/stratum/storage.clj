@@ -232,53 +232,53 @@
   [store]
   (with-storage-lock store
     (fn []
-    (let [;; 1. Find all branches and their HEAD commits
-          branches (or (list-dataset-branches store) #{})
+      (let [;; 1. Find all branches and their HEAD commits
+            branches (or (list-dataset-branches store) #{})
 
         ;; 2. Walk parent chains to find all reachable dataset commits
-          reachable-ds-commits
-          (loop [queue (vec (keep #(load-dataset-head store %) branches))
-                 visited #{}]
-            (if (empty? queue)
-              visited
-              (let [[current & rest] queue]
-                (if (or (nil? current) (visited current))
-                  (recur (vec rest) visited)
-                  (let [snapshot (load-dataset-commit store current)
-                        parents (when snapshot (seq (:parents snapshot)))]
-                    (recur (into (vec rest) parents)
-                           (conj visited current)))))))
+            reachable-ds-commits
+            (loop [queue (vec (keep #(load-dataset-head store %) branches))
+                   visited #{}]
+              (if (empty? queue)
+                visited
+                (let [[current & rest] queue]
+                  (if (or (nil? current) (visited current))
+                    (recur (vec rest) visited)
+                    (let [snapshot (load-dataset-commit store current)
+                          parents (when snapshot (seq (:parents snapshot)))]
+                      (recur (into (vec rest) parents)
+                             (conj visited current)))))))
 
         ;; 3. Collect reachable index commits from dataset snapshots
-          reachable-idx-commits (collect-live-index-commits store reachable-ds-commits)
+            reachable-idx-commits (collect-live-index-commits store reachable-ds-commits)
 
         ;; 4. Collect reachable PSS node addresses from index snapshots
-          reachable-pss-addrs (collect-live-pss-addresses store reachable-idx-commits)
+            reachable-pss-addrs (collect-live-pss-addresses store reachable-idx-commits)
 
         ;; 5. List ALL stored keys
-          all-pss-addrs (list-all-flat-uuid-keys store)
-          all-idx-commits (list-all-keys-by-prefix store :indices :commits)
-          all-ds-commits (list-all-keys-by-prefix store :datasets :commits)
+            all-pss-addrs (list-all-flat-uuid-keys store)
+            all-idx-commits (list-all-keys-by-prefix store :indices :commits)
+            all-ds-commits (list-all-keys-by-prefix store :datasets :commits)
 
         ;; 6. Compute dead sets
-          dead-pss-addrs (set/difference all-pss-addrs reachable-pss-addrs)
-          dead-idx-commits (set/difference all-idx-commits reachable-idx-commits)
-          dead-ds-commits (set/difference all-ds-commits reachable-ds-commits)]
+            dead-pss-addrs (set/difference all-pss-addrs reachable-pss-addrs)
+            dead-idx-commits (set/difference all-idx-commits reachable-idx-commits)
+            dead-ds-commits (set/difference all-ds-commits reachable-ds-commits)]
 
     ;; 7. Sweep
-      (doseq [addr dead-pss-addrs]
-        (k/dissoc store addr {:sync? true}))
-      (doseq [idx-uuid dead-idx-commits]
-        (k/dissoc store [:indices :commits idx-uuid] {:sync? true}))
-      (doseq [ds-uuid dead-ds-commits]
-        (k/dissoc store [:datasets :commits ds-uuid] {:sync? true}))
+        (doseq [addr dead-pss-addrs]
+          (k/dissoc store addr {:sync? true}))
+        (doseq [idx-uuid dead-idx-commits]
+          (k/dissoc store [:indices :commits idx-uuid] {:sync? true}))
+        (doseq [ds-uuid dead-ds-commits]
+          (k/dissoc store [:datasets :commits ds-uuid] {:sync? true}))
 
-      {:deleted-pss-nodes (count dead-pss-addrs)
-       :deleted-index-commits (count dead-idx-commits)
-       :deleted-dataset-commits (count dead-ds-commits)
-       :kept-pss-nodes (count reachable-pss-addrs)
-       :kept-index-commits (count reachable-idx-commits)
-       :kept-dataset-commits (count reachable-ds-commits)}))))
+        {:deleted-pss-nodes (count dead-pss-addrs)
+         :deleted-index-commits (count dead-idx-commits)
+         :deleted-dataset-commits (count dead-ds-commits)
+         :kept-pss-nodes (count reachable-pss-addrs)
+         :kept-index-commits (count reachable-idx-commits)
+         :kept-dataset-commits (count reachable-ds-commits)}))))
 
 ;; ============================================================================
 ;; Temporal Lookups

@@ -39,10 +39,10 @@
     (srv/register-table!
      s "ids"
      {:id (into-array BigInteger
-                       [(BigInteger. "1")
-                        (BigInteger. "170141183460469231731687303715884105727")
-                        (BigInteger. "-170141183460469231731687303715884105728")
-                        (BigInteger. "99999999999999999999999999999999")])})
+                      [(BigInteger. "1")
+                       (BigInteger. "170141183460469231731687303715884105727")
+                       (BigInteger. "-170141183460469231731687303715884105728")
+                       (BigInteger. "99999999999999999999999999999999")])})
     (let [^PgWireServer$QueryResult qr (run-select s "SELECT id FROM ids")]
       (is (nil? (.error qr)) (str "HUGEINT SELECT errored: " (.error qr)))
       (is (= [OID_NUMERIC] (vec (.columnOids qr))))
@@ -72,10 +72,10 @@
     (srv/register-table!
      s "amounts"
      {:amt (into-array BigDecimal
-                        [(BigDecimal. "1.00")
-                         (BigDecimal. "1234567890123456789.123456789012345678")
-                         (BigDecimal. "-99999999999999999999.99")
-                         (BigDecimal. "0.000000000000000001")])})
+                       [(BigDecimal. "1.00")
+                        (BigDecimal. "1234567890123456789.123456789012345678")
+                        (BigDecimal. "-99999999999999999999.99")
+                        (BigDecimal. "0.000000000000000001")])})
     (let [^PgWireServer$QueryResult qr (run-select s "SELECT amt FROM amounts")]
       (is (nil? (.error qr)) (str "DECIMAL128 SELECT errored: " (.error qr)))
       (is (= [OID_NUMERIC] (vec (.columnOids qr))))
@@ -91,8 +91,8 @@
     (srv/register-table!
      s "t"
      {:v (into-array BigDecimal
-                      [(BigDecimal. "0.0000001")
-                       (BigDecimal. "10000000000000000000")])})
+                     [(BigDecimal. "0.0000001")
+                      (BigDecimal. "10000000000000000000")])})
     (let [^PgWireServer$QueryResult qr (run-select s "SELECT v FROM t")
           rows (mapv vec (vec (.rows qr)))]
       (is (not-any? #(re-find #"E" (first %)) rows))
@@ -134,8 +134,8 @@
 (deftest hugeint-via-object-array
   (with-server [s {:port 0}]
     (srv/register-table! s "t"
-                          {:id (object-array [(BigInteger. "42")
-                                              (BigInteger. "10000000000000000000")])})
+                         {:id (object-array [(BigInteger. "42")
+                                             (BigInteger. "10000000000000000000")])})
     (let [^PgWireServer$QueryResult qr (run-select s "SELECT id FROM t")]
       (is (nil? (.error qr)))
       (is (= [OID_NUMERIC] (vec (.columnOids qr))))

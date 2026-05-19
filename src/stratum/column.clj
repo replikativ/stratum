@@ -85,10 +85,10 @@
   ([col-val] (encode-column col-val nil))
   ([col-val {:keys [nullable? no-sentinel-null? validity]
              :or {nullable? true no-sentinel-null? false}}]
-  (cond
+   (cond
     ;; Already normalized
-    (and (map? col-val) (:type col-val) (or (:data col-val) (:index col-val)))
-    col-val
+     (and (map? col-val) (:type col-val) (or (:data col-val) (:index col-val)))
+     col-val
 
     ;; Raw long array — scan once for Long.MIN_VALUE sentinels so the
     ;; downstream kernels can dispatch to their Nullable siblings.
@@ -102,61 +102,61 @@
     ;; bitmap supplied by the caller (or assumed all-valid).
     ;; Kernels still see the column as int64; they're safe as long as
     ;; the caller's promise (no implicit sentinel NULLs) holds.
-    (instance? (Class/forName "[J") col-val)
-    (let [v (cond
-              no-sentinel-null? validity                ;; trust caller
-              nullable? (cached-scan-validity col-val :int64
-                                              (alength ^longs col-val))
-              :else nil)]
-      (cond-> {:type :int64 :data col-val}
-        (false? nullable?)         (assoc :nullable? false)
-        no-sentinel-null?          (assoc :no-sentinel-null? true)
-        v                          (assoc :validity v)))
+     (instance? (Class/forName "[J") col-val)
+     (let [v (cond
+               no-sentinel-null? validity                ;; trust caller
+               nullable? (cached-scan-validity col-val :int64
+                                               (alength ^longs col-val))
+               :else nil)]
+       (cond-> {:type :int64 :data col-val}
+         (false? nullable?)         (assoc :nullable? false)
+         no-sentinel-null?          (assoc :no-sentinel-null? true)
+         v                          (assoc :validity v)))
 
     ;; Raw double array — same lazy validity derivation.
-    (instance? (Class/forName "[D") col-val)
-    (let [v (when nullable?
-              (cached-scan-validity col-val :float64 (alength ^doubles col-val)))]
-      (cond-> {:type :float64 :data col-val}
-        (false? nullable?) (assoc :nullable? false)
-        v (assoc :validity v)))
+     (instance? (Class/forName "[D") col-val)
+     (let [v (when nullable?
+               (cached-scan-validity col-val :float64 (alength ^doubles col-val)))]
+       (cond-> {:type :float64 :data col-val}
+         (false? nullable?) (assoc :nullable? false)
+         v (assoc :validity v)))
 
     ;; String array — dictionary-encode to long[] for SIMD group-by
     ;; NULL strings (nil) are encoded as Long.MIN_VALUE sentinel (same as int64 NULL)
-    (instance? (Class/forName "[Ljava.lang.String;") col-val)
-    (let [^"[Ljava.lang.String;" strings col-val
-          n (alength strings)]
-      (if (zero? n)
+     (instance? (Class/forName "[Ljava.lang.String;") col-val)
+     (let [^"[Ljava.lang.String;" strings col-val
+           n (alength strings)]
+       (if (zero? n)
         ;; Empty string array — preserve dict metadata so schema stays correct
-        {:type :int64 :data (long-array 0) :dict (make-array String 0) :dict-type :string}
-        (let [dict-map (java.util.HashMap.)
-              encoded (long-array n)
-              next-id (long-array 1)] ;; mutable counter
-          (dotimes [i n]
-            (let [s (aget strings i)]
-              (if (nil? s)
+         {:type :int64 :data (long-array 0) :dict (make-array String 0) :dict-type :string}
+         (let [dict-map (java.util.HashMap.)
+               encoded (long-array n)
+               next-id (long-array 1)] ;; mutable counter
+           (dotimes [i n]
+             (let [s (aget strings i)]
+               (if (nil? s)
                 ;; NULL string → Long.MIN_VALUE sentinel
-                (aset encoded i Long/MIN_VALUE)
-                (let [id (.get dict-map s)]
-                  (if id
-                    (aset encoded i (long id))
-                    (let [new-id (aget next-id 0)]
-                      (.put dict-map s new-id)
-                      (aset encoded i new-id)
-                      (aset next-id 0 (inc new-id))))))))
+                 (aset encoded i Long/MIN_VALUE)
+                 (let [id (.get dict-map s)]
+                   (if id
+                     (aset encoded i (long id))
+                     (let [new-id (aget next-id 0)]
+                       (.put dict-map s new-id)
+                       (aset encoded i new-id)
+                       (aset next-id 0 (inc new-id))))))))
           ;; Build reverse dict: int → String
-          (let [dict-size (aget next-id 0)
-                reverse-dict (make-array String dict-size)]
-            (doseq [^java.util.Map$Entry e (.entrySet dict-map)]
-              (when-let [k (.getKey e)]
-                (aset ^"[Ljava.lang.String;" reverse-dict (int (long (.getValue e))) k)))
+           (let [dict-size (aget next-id 0)
+                 reverse-dict (make-array String dict-size)]
+             (doseq [^java.util.Map$Entry e (.entrySet dict-map)]
+               (when-let [k (.getKey e)]
+                 (aset ^"[Ljava.lang.String;" reverse-dict (int (long (.getValue e))) k)))
             ;; nil strings became Long.MIN_VALUE sentinels above; derive
             ;; validity so downstream Nullable kernels see the NULL set.
-            (let [v (chunk/scan-validity encoded :int64 n)]
-              (cond-> {:type :int64 :data encoded :dict reverse-dict :dict-type :string
-                       :dict-alpha-masks (ColumnOpsString/buildDictAlphaMasks reverse-dict)
-                       :dict-bigram-masks (ColumnOpsString/buildDictBigramMasks reverse-dict)}
-                v (assoc :validity v)))))))
+             (let [v (chunk/scan-validity encoded :int64 n)]
+               (cond-> {:type :int64 :data encoded :dict reverse-dict :dict-type :string
+                        :dict-alpha-masks (ColumnOpsString/buildDictAlphaMasks reverse-dict)
+                        :dict-bigram-masks (ColumnOpsString/buildDictBigramMasks reverse-dict)}
+                 v (assoc :validity v)))))))
 
     ;; Step 7 / 8b / 8c / UUID: typed reference arrays carrying values
     ;; the engine doesn't operate on directly (Interval, BigInteger,
@@ -165,57 +165,57 @@
     ;; their value class's toString in format-results. Filters,
     ;; aggregates, and group-by over these columns aren't supported —
     ;; this branch only enables the SELECT-passthrough capability.
-    (and (some-> col-val class .isArray)
-         (not (.isPrimitive (.getComponentType (class col-val))))
-         (let [ct (.getComponentType (class col-val))]
-           (or (= ct stratum.internal.Interval)
-               (= ct java.math.BigInteger)
-               (= ct java.math.BigDecimal)
-               (= ct java.util.UUID)
+     (and (some-> col-val class .isArray)
+          (not (.isPrimitive (.getComponentType (class col-val))))
+          (let [ct (.getComponentType (class col-val))]
+            (or (= ct stratum.internal.Interval)
+                (= ct java.math.BigInteger)
+                (= ct java.math.BigDecimal)
+                (= ct java.util.UUID)
                ;; Object[] whose first element is one of the above —
                ;; covers (object-array [(BigInteger. "…")]) form.
-               (and (= ct Object)
-                    (pos? (alength ^objects col-val))
-                    (let [first-non-nil (some identity (seq col-val))]
-                      (or (instance? stratum.internal.Interval first-non-nil)
-                          (instance? java.math.BigInteger first-non-nil)
-                          (instance? java.math.BigDecimal first-non-nil)
-                          (instance? java.util.UUID first-non-nil)))))))
-    (let [ct (.getComponentType (class col-val))
-          probe (when (and (= ct Object) (pos? (alength ^objects col-val)))
-                  (some identity (seq col-val)))
-          kind (cond
-                 (or (= ct stratum.internal.Interval)
-                     (instance? stratum.internal.Interval probe))   :interval
-                 (or (= ct java.math.BigInteger)
-                     (instance? java.math.BigInteger probe))        :hugeint
-                 (or (= ct java.math.BigDecimal)
-                     (instance? java.math.BigDecimal probe))        :decimal128
-                 (or (= ct java.util.UUID)
-                     (instance? java.util.UUID probe))              :uuid)]
-      {:type kind :data col-val})
+                (and (= ct Object)
+                     (pos? (alength ^objects col-val))
+                     (let [first-non-nil (some identity (seq col-val))]
+                       (or (instance? stratum.internal.Interval first-non-nil)
+                           (instance? java.math.BigInteger first-non-nil)
+                           (instance? java.math.BigDecimal first-non-nil)
+                           (instance? java.util.UUID first-non-nil)))))))
+     (let [ct (.getComponentType (class col-val))
+           probe (when (and (= ct Object) (pos? (alength ^objects col-val)))
+                   (some identity (seq col-val)))
+           kind (cond
+                  (or (= ct stratum.internal.Interval)
+                      (instance? stratum.internal.Interval probe))   :interval
+                  (or (= ct java.math.BigInteger)
+                      (instance? java.math.BigInteger probe))        :hugeint
+                  (or (= ct java.math.BigDecimal)
+                      (instance? java.math.BigDecimal probe))        :decimal128
+                  (or (= ct java.util.UUID)
+                      (instance? java.util.UUID probe))              :uuid)]
+       {:type kind :data col-val})
 
     ;; Stratum index - preserve as index source for chunk-streaming
-    (satisfies? index/IColumnIndex col-val)
-    (let [dt (index/idx-datatype col-val)]
-      {:type dt :source :index :index col-val})
+     (satisfies? index/IColumnIndex col-val)
+     (let [dt (index/idx-datatype col-val)]
+       {:type dt :source :index :index col-val})
 
     ;; Collection of strings (e.g., vector) — convert to String[] then dict-encode
-    (and (sequential? col-val)
-         (string? (first col-val)))
-    (encode-column (into-array String col-val))
+     (and (sequential? col-val)
+          (string? (first col-val)))
+     (encode-column (into-array String col-val))
 
     ;; Collection of numbers — infer type and convert to array
-    (and (sequential? col-val)
-         (number? (first col-val)))
-    (let [first-val (first col-val)]
-      (if (or (instance? Double first-val)
-              (instance? Float first-val))
+     (and (sequential? col-val)
+          (number? (first col-val)))
+     (let [first-val (first col-val)]
+       (if (or (instance? Double first-val)
+               (instance? Float first-val))
         ;; Floating point - convert to double[]
-        {:type :float64 :data (double-array col-val)}
+         {:type :float64 :data (double-array col-val)}
         ;; Integer - convert to long[]
-        {:type :int64 :data (long-array col-val)}))
+         {:type :int64 :data (long-array col-val)}))
 
-    :else
-    (throw (ex-info (str "Cannot detect column type for: " (type col-val))
-                    {:col-type (type col-val)})))))
+     :else
+     (throw (ex-info (str "Cannot detect column type for: " (type col-val))
+                     {:col-type (type col-val)})))))

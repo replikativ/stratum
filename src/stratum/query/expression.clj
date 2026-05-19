@@ -653,7 +653,7 @@
                                  (case op
                                    (:hour :minute :second :millisecond :microsecond) :seconds
                                    (:year :month :day :day-of-week :iso-day-of-week
-                                    :week-of-year :quarter) :days))]
+                                          :week-of-year :quarter) :days))]
        (case tu
          :micros
          (case op
