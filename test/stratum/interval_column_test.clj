@@ -123,3 +123,60 @@
         enc (column/encode-column arr)]
     (is (= :interval (:type enc))
         "Object[] whose first element is an Interval is also accepted")))
+
+;; ---------------------------------------------------------------------------
+;; Step 7b — engine integration for SELECT col passthrough
+
+(require '[stratum.server :as srv])
+
+(deftest interval-select-passthrough-no-filter
+  (testing "SELECT col FROM t (no WHERE) — engine returns INTERVAL column unchanged"
+    (let [server (srv/start {:port 0})]
+      (try
+        (srv/register-table! server "durations"
+                             {:idx (long-array [1 2 3 4])
+                              :dur (into-array Interval
+                                               [(Interval. 0 1 0)
+                                                (Interval. 0 5 0)
+                                                (Interval. 0 0 1)
+                                                (Interval. 3600000000 0 0)])})
+        (let [^PgWireServer$QueryResult qr
+              (@(requiring-resolve 'stratum.server/execute-sql)
+               "SELECT dur FROM durations"
+               (:registry server) (:data-dir server) (:store server))]
+          (is (nil? (.error qr))
+              (str "INTERVAL SELECT errored: " (.error qr)))
+          (is (= [PgWireServer/OID_INTERVAL] (vec (.columnOids qr)))
+              "OID 1186 advertised for INTERVAL column")
+          (let [rows (mapv vec (vec (.rows qr)))]
+            (is (= 4 (count rows)))
+            (is (some #{["1 day"]}    rows))
+            (is (some #{["5 days"]}   rows))
+            (is (some #{["1 mon"]}    rows))
+            (is (some #{["01:00:00"]} rows))))
+        (finally (srv/stop server))))))
+
+(deftest interval-select-with-where-filter
+  (testing "SELECT col FROM t WHERE other-col > N — engine scatter-gather over INTERVAL column"
+    (let [server (srv/start {:port 0})]
+      (try
+        (srv/register-table! server "durations"
+                             {:idx (long-array [1 2 3 4])
+                              :dur (into-array Interval
+                                               [(Interval. 0 1 0)
+                                                (Interval. 0 5 0)
+                                                (Interval. 0 0 1)
+                                                (Interval. 3600000000 0 0)])})
+        (let [^PgWireServer$QueryResult qr
+              (@(requiring-resolve 'stratum.server/execute-sql)
+               "SELECT dur FROM durations WHERE idx > 2"
+               (:registry server) (:data-dir server) (:store server))]
+          (is (nil? (.error qr))
+              (str "WHERE over INTERVAL columns errored: " (.error qr)))
+          (let [rows (mapv vec (vec (.rows qr)))]
+            (is (= 2 (count rows))
+                "idx > 2 selects rows 3 and 4")
+            ;; idx=3 → 1 mon, idx=4 → 1h
+            (is (some #{["1 mon"]}    rows))
+            (is (some #{["01:00:00"]} rows))))
+        (finally (srv/stop server))))))

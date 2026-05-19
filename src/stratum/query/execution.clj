@@ -844,14 +844,27 @@
 (defn aget-col-decoded
   "Read element i from a column, decoding dict-encoded strings back to String."
   [col-data col-info ^long i]
-  (if (expr/long-array? col-data)
+  (cond
+    (expr/long-array? col-data)
     (let [v (aget ^longs col-data i)]
       (cond
         (= v Long/MIN_VALUE) nil
         (:dict col-info) (aget ^"[Ljava.lang.String;" (:dict col-info) (int v))
         :else v))
+
+    (expr/double-array? col-data)
     (let [v (aget ^doubles col-data i)]
-      (if (Double/isNaN v) nil v))))
+      (if (Double/isNaN v) nil v))
+
+    ;; Step 7b: generic reference-array passthrough (Interval[], etc.).
+    ;; Returns the value as-is so row-oriented output renders via toString.
+    (and (some-> col-data class .isArray)
+         (not (.isPrimitive (.getComponentType (class col-data)))))
+    (aget ^objects col-data i)
+
+    :else
+    (throw (ex-info "aget-col-decoded: unsupported column type"
+                    {:class (class col-data)}))))
 
 (defn execute-projection
   "Execute a projection (SELECT) query.
@@ -905,11 +918,30 @@
                           (dotimes [i n] (aset out i (aget ^doubles src-data (int (nth match-indices i)))))
                           (assoc! result k out))
 
-                        :else
+                        (instance? (Class/forName "[Ljava.lang.String;") src-data)
                         (let [out (make-array String n)]
                           (dotimes [i n] (aset ^"[Ljava.lang.String;" out i
                                                (aget ^"[Ljava.lang.String;" src-data (int (nth match-indices i)))))
-                          (assoc! result k out))))
+                          (assoc! result k out))
+
+                        ;; Step 7b: generic reference-array passthrough
+                        ;; (Interval[] / Object[] / any non-primitive
+                        ;; backing). Allocates a fresh same-component-type
+                        ;; array via reflection on the source's component
+                        ;; class. SELECT-only path; aggregates and
+                        ;; predicates over these columns still error
+                        ;; further upstream.
+                        (and (some-> src-data class .isArray)
+                             (not (.isPrimitive (.getComponentType (class src-data)))))
+                        (let [comp-type (.getComponentType (class src-data))
+                              ^objects out (make-array comp-type n)]
+                          (dotimes [i n]
+                            (aset out i (aget ^objects src-data (int (nth match-indices i)))))
+                          (assoc! result k out))
+
+                        :else
+                        (throw (ex-info "execute-projection: unsupported source array type"
+                                        {:class (class src-data) :col k}))))
                     ;; No filtering — return source array directly
                     (assoc! result k src-data)))
                 ;; Expression column — evaluate for all rows

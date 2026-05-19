@@ -96,6 +96,9 @@
 (def ^:private long-array-class    (Class/forName "[J"))
 (def ^:private double-array-class  (Class/forName "[D"))
 (def ^:private string-array-class  (Class/forName "[Ljava.lang.String;"))
+;; Step 7b: generic Object[] backing for passthrough types (INTERVAL,
+;; future struct columns) — see alength-any / copy-prefix.
+(def ^:private object-array-class  (Class/forName "[Ljava.lang.Object;"))
 
 (defn- alength-any
   "Length of a typed Java array. Throws on unsupported types so the
@@ -105,6 +108,11 @@
     (instance? long-array-class arr)   (alength ^longs arr)
     (instance? double-array-class arr) (alength ^doubles arr)
     (instance? string-array-class arr) (alength ^"[Ljava.lang.String;" arr)
+    ;; Object[] / any non-primitive reference array (e.g., Interval[]):
+    ;; `(class arr).isArray()` plus a non-primitive component type.
+    (and (some-> arr class .isArray)
+         (not (.isPrimitive (.getComponentType (class arr)))))
+    (alength ^objects arr)
     :else (throw (ex-info "alength-any: unsupported array type"
                           {:class (class arr)}))))
 
@@ -120,6 +128,11 @@
     (java.util.Arrays/copyOfRange ^doubles arr 0 (int n))
     (instance? string-array-class arr)
     (java.util.Arrays/copyOfRange ^"[Ljava.lang.String;" arr 0 (int n))
+    ;; Object[] / Interval[] / any reference array — Arrays/copyOfRange
+    ;; preserves the component type via Object[] form.
+    (and (some-> arr class .isArray)
+         (not (.isPrimitive (.getComponentType (class arr)))))
+    (java.util.Arrays/copyOfRange ^objects arr 0 (int n))
     :else (throw (ex-info "copy-prefix: unsupported array type"
                           {:class (class arr)}))))
 

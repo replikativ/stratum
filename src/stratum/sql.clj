@@ -3344,6 +3344,14 @@
                                        (cond
                                          (instance? (Class/forName "[J") arr) OID_INT8
                                          (instance? (Class/forName "[D") arr) OID_FLOAT8
+                                         ;; Step 7b: Interval[] / Object[] of Interval → OID 1186.
+                                         ;; The engine's SELECT passthrough preserves the
+                                         ;; backing array; we infer the wire OID from a sample.
+                                         (and (some-> arr class .isArray)
+                                              (not (.isPrimitive (.getComponentType (class arr))))
+                                              (pos? (alength ^objects arr))
+                                              (instance? Interval (aget ^objects arr 0)))
+                                         OID_INTERVAL
                                          :else OID_TEXT))))
                                col-keys))
           ;; Step W2: build text rows and typed rows in a single pass so
@@ -3366,6 +3374,14 @@
                                   (instance? (Class/forName "[Ljava.lang.String;") arr)
                                   (let [v (aget ^"[Ljava.lang.String;" arr (int i))]
                                     [v v])
+                                  ;; Step 7b: generic reference array — render via toString,
+                                  ;; keep the raw value as the typed payload for binary encoding.
+                                  (and (some-> arr class .isArray)
+                                       (not (.isPrimitive (.getComponentType (class arr)))))
+                                  (let [v (aget ^objects arr (int i))]
+                                    (if (nil? v)
+                                      [nil nil]
+                                      [(.toString ^Object v) v]))
                                   :else
                                   (let [v (nth (seq arr) i)]
                                     [(value->string v cm) (value->typed v cm)]))))
