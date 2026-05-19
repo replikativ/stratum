@@ -145,23 +145,42 @@
                        :dict-bigram-masks (ColumnOpsString/buildDictBigramMasks reverse-dict)}
                 v (assoc :validity v)))))))
 
-    ;; Step 7: Interval[] — a column of stratum.internal.Interval values
-    ;; (PG's 16-byte interval primitive). Pass through as a typed Object[]
-    ;; with `:type :interval` so format-results can pick the right OID and
-    ;; render via Interval.toString. Filters and aggregates over INTERVAL
-    ;; columns aren't yet supported — this branch only enables the SELECT
-    ;; passthrough path.
-    (instance? (Class/forName "[Lstratum.internal.Interval;") col-val)
-    {:type :interval :data col-val}
-
-    ;; Object[] whose first non-nil element is an Interval — accept the
-    ;; same way, normalising the array class. Used by `(object-array …)`
-    ;; in user code where the precise array type isn't pinned.
-    (and (instance? (Class/forName "[Ljava.lang.Object;") col-val)
-         (let [^"[Ljava.lang.Object;" arr col-val]
-           (and (pos? (alength arr))
-                (instance? stratum.internal.Interval (aget arr 0)))))
-    {:type :interval :data col-val}
+    ;; Step 7 / 8b / 8c / UUID: typed reference arrays carrying values
+    ;; the engine doesn't operate on directly (Interval, BigInteger,
+    ;; BigDecimal, UUID, etc.). They flow through SELECT via the
+    ;; Object[] passthrough path (query/execution.clj) and render via
+    ;; their value class's toString in format-results. Filters,
+    ;; aggregates, and group-by over these columns aren't supported —
+    ;; this branch only enables the SELECT-passthrough capability.
+    (and (some-> col-val class .isArray)
+         (not (.isPrimitive (.getComponentType (class col-val))))
+         (let [ct (.getComponentType (class col-val))]
+           (or (= ct stratum.internal.Interval)
+               (= ct java.math.BigInteger)
+               (= ct java.math.BigDecimal)
+               (= ct java.util.UUID)
+               ;; Object[] whose first element is one of the above —
+               ;; covers (object-array [(BigInteger. "…")]) form.
+               (and (= ct Object)
+                    (pos? (alength ^objects col-val))
+                    (let [first-non-nil (some identity (seq col-val))]
+                      (or (instance? stratum.internal.Interval first-non-nil)
+                          (instance? java.math.BigInteger first-non-nil)
+                          (instance? java.math.BigDecimal first-non-nil)
+                          (instance? java.util.UUID first-non-nil)))))))
+    (let [ct (.getComponentType (class col-val))
+          probe (when (and (= ct Object) (pos? (alength ^objects col-val)))
+                  (some identity (seq col-val)))
+          kind (cond
+                 (or (= ct stratum.internal.Interval)
+                     (instance? stratum.internal.Interval probe))   :interval
+                 (or (= ct java.math.BigInteger)
+                     (instance? java.math.BigInteger probe))        :hugeint
+                 (or (= ct java.math.BigDecimal)
+                     (instance? java.math.BigDecimal probe))        :decimal128
+                 (or (= ct java.util.UUID)
+                     (instance? java.util.UUID probe))              :uuid)]
+      {:type kind :data col-val})
 
     ;; Stratum index - preserve as index source for chunk-streaming
     (satisfies? index/IColumnIndex col-val)

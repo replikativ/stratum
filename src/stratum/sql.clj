@@ -3068,6 +3068,8 @@
 (def ^:private ^:const OID_FLOAT8 701)
 (def ^:private ^:const OID_TEXT 25)
 (def ^:private ^:const OID_INTERVAL 1186)
+(def ^:private ^:const OID_NUMERIC 1700)
+(def ^:private ^:const OID_UUID 2950)
 
 (defn- value->string
   "Convert a Clojure value to a string for pgwire text format. The
@@ -3103,6 +3105,10 @@
                             (if (Double/isNaN d) nil (str d)))
      (instance? Float v) (let [f (float v)]
                            (if (Float/isNaN f) nil (str f)))
+     ;; Step 8c: BigDecimal — use toPlainString so big/small values
+     ;; don't surface in scientific notation (str on a BigDecimal can
+     ;; emit `1E+10` for example, which is wrong for the wire path).
+     (instance? java.math.BigDecimal v) (.toPlainString ^java.math.BigDecimal v)
      :else (str v))))
 
 (defn- value->typed
@@ -3193,14 +3199,20 @@
    (or (meta->oid col-meta)
        (cond
          (nil? v) OID_TEXT
+         ;; Reference-typed values matched FIRST so (integer? v) doesn't
+         ;; capture BigInteger and (number? v) doesn't capture BigDecimal.
+         ;; Step 7: Interval → OID 1186.
+         (instance? Interval v) OID_INTERVAL
+         ;; Step 8b: BigInteger → NUMERIC (no native int128 OID in PG).
+         (instance? java.math.BigInteger v) OID_NUMERIC
+         ;; Step 8c: BigDecimal → NUMERIC.
+         (instance? java.math.BigDecimal v) OID_NUMERIC
+         ;; UUID — emit the canonical OID 2950.
+         (instance? java.util.UUID v) OID_UUID
          (instance? Long v) OID_INT8
          (integer? v) OID_INT8
          (instance? Double v) OID_FLOAT8
          (float? v) OID_FLOAT8
-         ;; Step 7: bare Interval values surface as OID 1186 even without
-         ;; explicit :interval? metadata (e.g., from a register-table!
-         ;; column whose schema wasn't pre-declared).
-         (instance? Interval v) OID_INTERVAL
          :else OID_TEXT))))
 
 (defn- ^:private agg-spec-input-col
@@ -3364,14 +3376,21 @@
                                        (cond
                                          (instance? (Class/forName "[J") arr) OID_INT8
                                          (instance? (Class/forName "[D") arr) OID_FLOAT8
-                                         ;; Step 7b: Interval[] / Object[] of Interval → OID 1186.
-                                         ;; The engine's SELECT passthrough preserves the
-                                         ;; backing array; we infer the wire OID from a sample.
+                                         ;; Step 7b/8b/8c/UUID: reference-typed array (Interval[],
+                                         ;; BigInteger[], BigDecimal[], UUID[], or Object[] of
+                                         ;; those). Infer the wire OID from the first non-nil
+                                         ;; element so register-table! callers don't have to
+                                         ;; declare column metadata for these passthrough types.
                                          (and (some-> arr class .isArray)
                                               (not (.isPrimitive (.getComponentType (class arr))))
-                                              (pos? (alength ^objects arr))
-                                              (instance? Interval (aget ^objects arr 0)))
-                                         OID_INTERVAL
+                                              (pos? (alength ^objects arr)))
+                                         (let [probe (some identity (seq ^objects arr))]
+                                           (cond
+                                             (instance? Interval probe)              OID_INTERVAL
+                                             (instance? java.math.BigInteger probe)  OID_NUMERIC
+                                             (instance? java.math.BigDecimal probe)  OID_NUMERIC
+                                             (instance? java.util.UUID probe)        OID_UUID
+                                             :else OID_TEXT))
                                          :else OID_TEXT))))
                                col-keys))
           ;; Step W2: build text rows and typed rows in a single pass so

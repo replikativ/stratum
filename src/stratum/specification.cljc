@@ -39,21 +39,33 @@
    #(instance? (Class/forName "[Ljava.lang.String;") %)])
 
 (def SIntervalArray
-  "Step 7: Interval[] or Object[] of stratum.internal.Interval values.
-   Accepts both the precisely-typed array (preferred) and Object[]
-   from `(object-array …)` whose first element is an Interval."
-  [:fn {:error/message "must be an Interval[] or Object[]-of-Interval"}
-   #(or (instance? (Class/forName "[Lstratum.internal.Interval;") %)
-        (and (instance? (Class/forName "[Ljava.lang.Object;") %)
-             (let [^"[Ljava.lang.Object;" arr %]
-               (and (pos? (alength arr))
-                    (instance? stratum.internal.Interval (aget arr 0))))))])
+  "Step 7 / 8b / 8c / UUID: typed reference array whose element type
+   is one of the passthrough column types (Interval, BigInteger,
+   BigDecimal, UUID), or an Object[] containing such values. The
+   engine treats these uniformly via the Object[] passthrough path."
+  [:fn {:error/message "must be a typed reference array (Interval[] / BigInteger[] / BigDecimal[] / UUID[]) or Object[] of those"}
+   #(and (some-> ^Object % class .isArray)
+         (let [c (class %)
+               ct (.getComponentType c)]
+           (and (not (.isPrimitive ct))
+                (or (= ct stratum.internal.Interval)
+                    (= ct java.math.BigInteger)
+                    (= ct java.math.BigDecimal)
+                    (= ct java.util.UUID)
+                    (and (= ct Object)
+                         (pos? (alength ^objects %))
+                         (let [^"[Ljava.lang.Object;" arr %
+                               first-non-nil (some identity (seq arr))]
+                           (or (instance? stratum.internal.Interval first-non-nil)
+                               (instance? java.math.BigInteger first-non-nil)
+                               (instance? java.math.BigDecimal first-non-nil)
+                               (instance? java.util.UUID first-non-nil))))))))])
 
 (def SEncodedColumn
   "Pre-encoded column {:type T :data arr :dict String[] (optional)}.
    Also accepts index-mode: {:type T :index PersistentColumnIndex :dict ...}."
   [:map {:closed false}
-   [:type [:enum :int64 :float64 :interval]]
+   [:type [:enum :int64 :float64 :interval :hugeint :decimal128 :uuid]]
    [:data {:optional true} :any]])
 
 (def SIndex
