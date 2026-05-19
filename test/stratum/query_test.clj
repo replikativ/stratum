@@ -1721,13 +1721,19 @@
       (is (== 45.0 (:s (first result)))))))
 
 (deftest date-extract-day-of-week-test
-  (testing "Day of week extraction (0=Monday)"
-    ;; 2023-06-15 is Thursday = 3
+  (testing "Day of week extraction — PG/DuckDB convention (Sunday=0..Saturday=6)"
+    ;; 2023-06-15 is Thursday = 4 (Sun=0, Mon=1, Tue=2, Wed=3, Thu=4).
+    ;; Pre-step-4b this returned 3 (Stratum's Mon=0..Sun=6); now
+    ;; matches PG/DuckDB. ISODOW returns 4 too (Mon=1..Sun=7 → Thu=4).
     (let [epoch-day (long (.toEpochDay (java.time.LocalDate/of 2023 6 15)))
           data {:d (long-array [epoch-day])}
           result (q/q {:from data
-                       :select [[:as [:day-of-week :d] :dow]]})]
-      (is (== 3.0 (:dow (first result)))))))
+                       :select [[:as [:day-of-week :d] :dow]
+                                [:as [:iso-day-of-week :d] :isodow]]})]
+      (is (== 4.0 (:dow (first result)))
+          "DOW: Thursday → 4 in Sun=0..Sat=6 convention")
+      (is (== 4.0 (:isodow (first result)))
+          "ISODOW: Thursday → 4 in Mon=1..Sun=7 convention"))))
 
 (deftest date-extract-in-group-by-test
   (testing "Date extraction used in group-by expression"

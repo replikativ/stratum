@@ -38,11 +38,34 @@
   [:fn {:error/message "must be a String[]"}
    #(instance? (Class/forName "[Ljava.lang.String;") %)])
 
+(def SIntervalArray
+  "Step 7 / 8b / 8c / UUID: typed reference array whose element type
+   is one of the passthrough column types (Interval, BigInteger,
+   BigDecimal, UUID), or an Object[] containing such values. The
+   engine treats these uniformly via the Object[] passthrough path."
+  [:fn {:error/message "must be a typed reference array (Interval[] / BigInteger[] / BigDecimal[] / UUID[]) or Object[] of those"}
+   #(and (some-> ^Object % class .isArray)
+         (let [c (class %)
+               ct (.getComponentType c)]
+           (and (not (.isPrimitive ct))
+                (or (= ct stratum.internal.Interval)
+                    (= ct java.math.BigInteger)
+                    (= ct java.math.BigDecimal)
+                    (= ct java.util.UUID)
+                    (and (= ct Object)
+                         (pos? (alength ^objects %))
+                         (let [^"[Ljava.lang.Object;" arr %
+                               first-non-nil (some identity (seq arr))]
+                           (or (instance? stratum.internal.Interval first-non-nil)
+                               (instance? java.math.BigInteger first-non-nil)
+                               (instance? java.math.BigDecimal first-non-nil)
+                               (instance? java.util.UUID first-non-nil))))))))])
+
 (def SEncodedColumn
   "Pre-encoded column {:type T :data arr :dict String[] (optional)}.
    Also accepts index-mode: {:type T :index PersistentColumnIndex :dict ...}."
   [:map {:closed false}
-   [:type [:enum :int64 :float64]]
+   [:type [:enum :int64 :float64 :interval :hugeint :decimal128 :uuid]]
    [:data {:optional true} :any]])
 
 (def SIndex
@@ -51,10 +74,10 @@
    #(= "stratum.index.PersistentColumnIndex" (.getName (class %)))])
 
 (def SColumnData
-  "Column data: double[], long[], String[], PersistentColumnIndex,
+  "Column data: double[], long[], String[], Interval[], PersistentColumnIndex,
    pre-encoded {:type T :data arr}, or Clojure sequential (auto-converted)."
-  [:or {:error/message "must be double[], long[], String[], PersistentColumnIndex, {:type :data} map, or sequential collection"}
-   SDoubleArray SLongArray SStringArray SIndex SEncodedColumn
+  [:or {:error/message "must be double[], long[], String[], Interval[], PersistentColumnIndex, {:type :data} map, or sequential collection"}
+   SDoubleArray SLongArray SStringArray SIntervalArray SIndex SEncodedColumn
    sequential?])
 
 (def SColumnMap

@@ -2204,6 +2204,114 @@ public final class ColumnOps {
         return r;
     }
 
+    /** DATE_TRUNC to week (ISO 8601: Monday). Returns the Monday of the week
+     *  the input falls into. F-017: preserve NULL. Step 4b. */
+    public static long[] arrayDateTruncWeek(long[] epochSeconds, int length) {
+        long[] r = new long[length];
+        for (int i = 0; i < length; i++) {
+            long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Long.MIN_VALUE; continue; }
+            long epochDays = Math.floorDiv(s, 86400L);
+            // 1970-01-01 is Thursday → ((d % 7) + 10) % 7 gives 0=Mon..6=Sun
+            long dow = ((epochDays % 7) + 10) % 7;
+            r[i] = (epochDays - dow) * 86400L;
+        }
+        return r;
+    }
+
+    /** DATE_TRUNC to quarter (Jan 1, Apr 1, Jul 1, Oct 1). Step 4b. */
+    public static long[] arrayDateTruncQuarter(long[] epochSeconds, int length) {
+        long[] r = new long[length];
+        long[] ymd = new long[3];
+        for (int i = 0; i < length; i++) {
+            long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Long.MIN_VALUE; continue; }
+            long epochDays = Math.floorDiv(s, 86400L);
+            civilFromDays(epochDays, ymd);
+            long qStartMonth = ((ymd[1] - 1) / 3) * 3 + 1;  // 1, 4, 7, 10
+            r[i] = civilToDays(ymd[0], qStartMonth, 1) * 86400L;
+        }
+        return r;
+    }
+
+    /** DATE_TRUNC to decade (year - year%10). Step 4b. */
+    public static long[] arrayDateTruncDecade(long[] epochSeconds, int length) {
+        long[] r = new long[length];
+        long[] ymd = new long[3];
+        for (int i = 0; i < length; i++) {
+            long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Long.MIN_VALUE; continue; }
+            long epochDays = Math.floorDiv(s, 86400L);
+            civilFromDays(epochDays, ymd);
+            long decYear = ymd[0] - Math.floorMod(ymd[0], 10);
+            r[i] = civilToDays(decYear, 1, 1) * 86400L;
+        }
+        return r;
+    }
+
+    /** DATE_TRUNC to century. Following DuckDB / PG: century N is years
+     *  (100N-99) .. 100N — so year 2026 belongs to century 21, which starts
+     *  at 2001-01-01. Step 4b. */
+    public static long[] arrayDateTruncCentury(long[] epochSeconds, int length) {
+        long[] r = new long[length];
+        long[] ymd = new long[3];
+        for (int i = 0; i < length; i++) {
+            long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Long.MIN_VALUE; continue; }
+            long epochDays = Math.floorDiv(s, 86400L);
+            civilFromDays(epochDays, ymd);
+            // Floor to the start of the century: years 2001..2100 → 2001
+            long centStart = ((ymd[0] - 1) / 100) * 100 + 1;
+            r[i] = civilToDays(centStart, 1, 1) * 86400L;
+        }
+        return r;
+    }
+
+    /** DATE_TRUNC to millennium. Millennium N is years (1000N-999) .. 1000N.
+     *  Step 4b. */
+    public static long[] arrayDateTruncMillennium(long[] epochSeconds, int length) {
+        long[] r = new long[length];
+        long[] ymd = new long[3];
+        for (int i = 0; i < length; i++) {
+            long s = epochSeconds[i];
+            if (s == Long.MIN_VALUE) { r[i] = Long.MIN_VALUE; continue; }
+            long epochDays = Math.floorDiv(s, 86400L);
+            civilFromDays(epochDays, ymd);
+            long milStart = ((ymd[0] - 1) / 1000) * 1000 + 1;
+            r[i] = civilToDays(milStart, 1, 1) * 86400L;
+        }
+        return r;
+    }
+
+    /** Extract day-of-week, DuckDB / PG convention (Sunday=0..Saturday=6).
+     *  Step 4b — distinct from arrayExtractDayOfWeek (which was 0=Mon, 6=Sun)
+     *  and from arrayExtractIsoDayOfWeek (Monday=1..Sunday=7). */
+    public static double[] arrayExtractPgDayOfWeek(long[] epochDays, int length) {
+        double[] r = new double[length];
+        for (int i = 0; i < length; i++) {
+            long v = epochDays[i];
+            if (v == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }
+            // Stratum's existing kernel returns 0=Mon..6=Sun; PG wants
+            // Sunday=0..Saturday=6. Shift: Sunday(6)→0, Monday(0)→1,
+            // ..., Saturday(5)→6 — i.e. `(dow + 1) % 7`.
+            long dow = ((v % 7) + 10) % 7;     // 0=Mon..6=Sun
+            r[i] = (double) ((dow + 1) % 7);   // 0=Sun..6=Sat
+        }
+        return r;
+    }
+
+    /** Extract ISO 8601 day-of-week (Monday=1..Sunday=7). Step 4b. */
+    public static double[] arrayExtractIsoDayOfWeek(long[] epochDays, int length) {
+        double[] r = new double[length];
+        for (int i = 0; i < length; i++) {
+            long v = epochDays[i];
+            if (v == Long.MIN_VALUE) { r[i] = Double.NaN; continue; }
+            long dow = ((v % 7) + 10) % 7;     // 0=Mon..6=Sun
+            r[i] = (double) (dow + 1);         // 1=Mon..7=Sun
+        }
+        return r;
+    }
+
     /** DATE_ADD days: add N days (as seconds). F-017: preserve NULL. */
     public static long[] arrayDateAddDays(long[] epochSeconds, long nDays, int length) {
         long[] r = new long[length];

@@ -302,7 +302,9 @@
         :pow   (Math/pow (eval-agg-expr (nth args 0) col-arrays i)
                          (eval-agg-expr (nth args 1) col-arrays i))
         ;; Date extraction — requires reading the long value from the column
-        (:year :month :day :hour :minute :second :millisecond :microsecond :day-of-week :week-of-year)
+        (:year :month :day :hour :minute :second :millisecond :microsecond
+               :nanosecond
+               :day-of-week :iso-day-of-week :week-of-year :quarter)
         (let [col-key (nth args 0)
               col-data (get col-arrays col-key)
               v (long (if (expr/long-array? col-data)
@@ -310,19 +312,22 @@
                         (long (aget ^doubles col-data i))))
               tu (or (and expr/*columns-meta* (get-in expr/*columns-meta* [col-key :temporal-unit]))
                      (case (:op expr)
-                       (:hour :minute :second :millisecond :microsecond) :seconds
-                       (:year :month :day :day-of-week :week-of-year) :days))
+                       (:hour :minute :second :millisecond :microsecond :nanosecond) :seconds
+                       (:year :month :day :day-of-week :iso-day-of-week
+                              :week-of-year :quarter) :days))
               ;; Convert the per-row scalar to canonical day/sec for the inner formula.
               ed (long (case tu
                          :days    v
                          :seconds (Math/floorDiv v 86400)
                          :millis  (Math/floorDiv v 86400000)
-                         :micros  (Math/floorDiv v 86400000000)))
+                         :micros  (Math/floorDiv v 86400000000)
+                         :nanos   (Math/floorDiv v 86400000000000)))
               ;; sub-day micros remainder (only used for hour/min/sec/ms/us with :micros)
               tod-us (long (case tu
                              :micros  (Math/floorMod v 86400000000)
                              :millis  (* (Math/floorMod v 86400000) 1000)
                              :seconds (* (Math/floorMod v 86400) 1000000)
+                             :nanos   (Math/floorDiv (Math/floorMod v 86400000000000) 1000)
                              :days    0))]
           (case (:op expr)
             :year   (let [z (+ ed 719468)
@@ -349,27 +354,45 @@
                           mp (quot (+ (* 5 doy) 2) 153)]
                       (double (+ (- doy (quot (+ (* 153 mp) 2) 5)) 1)))
             :hour        (case tu
-                           (:micros :millis) (double (quot tod-us 3600000000))
+                           (:micros :millis :nanos) (double (quot tod-us 3600000000))
                            :seconds (double (quot (mod (+ (mod v 86400) 86400) 86400) 3600))
                            :days    (double 0))
             :minute      (case tu
-                           (:micros :millis) (double (quot (mod tod-us 3600000000) 60000000))
+                           (:micros :millis :nanos) (double (quot (mod tod-us 3600000000) 60000000))
                            :seconds (double (quot (mod (mod (+ (mod v 86400) 86400) 86400) 3600) 60))
                            :days    (double 0))
             :second      (case tu
-                           (:micros :millis) (double (quot (mod tod-us 60000000) 1000000))
+                           (:micros :millis :nanos) (double (quot (mod tod-us 60000000) 1000000))
                            :seconds (double (mod (mod (+ (mod v 86400) 86400) 86400) 60))
                            :days    (double 0))
             :millisecond (case tu
                            :micros  (double (quot (mod tod-us 1000000) 1000))
                            :millis  (double (mod (Math/floorMod v 86400000) 1000))
-                           (throw (ex-info "MILLISECOND requires :temporal-unit :micros or :millis"
+                           :nanos   (double (Math/floorMod (Math/floorDiv v 1000000) 1000))
+                           (throw (ex-info "MILLISECOND requires :temporal-unit :micros, :millis or :nanos"
                                            {:tu tu})))
             :microsecond (case tu
                            :micros  (double (mod tod-us 1000000))
-                           (throw (ex-info "MICROSECOND requires :temporal-unit :micros"
+                           :nanos   (double (Math/floorMod (Math/floorDiv v 1000) 1000000))
+                           (throw (ex-info "MICROSECOND requires :temporal-unit :micros or :nanos"
                                            {:tu tu})))
-            :day-of-week (double (mod (+ (mod ed 7) 10) 7))
+            :nanosecond  (case tu
+                           :nanos   (double (Math/floorMod v 1000000000))
+                           (throw (ex-info "NANOSECOND requires :temporal-unit :nanos"
+                                           {:tu tu})))
+            ;; Step 4b: DOW (PG / DuckDB Sun=0..Sat=6); ISODOW
+            ;; (ISO 8601 Mon=1..Sun=7). Pre-step-4b returned Stratum's
+            ;; Mon=0..Sun=6 — mismatched both PG and ISO conventions.
+            :day-of-week     (double (mod (+ (mod ed 7) 11) 7))
+            :iso-day-of-week (double (inc (mod (+ (mod ed 7) 10) 7)))
+            :quarter         (let [m (let [z (+ ed 719468)
+                                           era (quot (if (>= z 0) z (- z 146096)) 146097)
+                                           doe (- z (* era 146097))
+                                           yoe (quot (- doe (quot doe 1460) (- (quot doe 36524)) (quot doe 146096)) 365)
+                                           doy (- doe (+ (* 365 yoe) (quot yoe 4) (- (quot yoe 100))))
+                                           mp (quot (+ (* 5 doy) 2) 153)]
+                                       (+ mp (if (< mp 10) 3 -9)))]
+                               (double (inc (quot (dec m) 3))))
             :week-of-year (double 1)))
         ;; Date/time arithmetic (scalar path)
         :date-trunc
@@ -391,7 +414,13 @@
                       :hour        (* (Math/floorDiv v 3600000000) 3600000000)
                       :day         (* (Math/floorDiv v 86400000000) 86400000000)
                       :year        (let [^longs r (ColumnOpsTemporal/arrayDateTruncYearMicros (long-array [v]) 1)] (aget r 0))
-                      :month       (let [^longs r (ColumnOpsTemporal/arrayDateTruncMonthMicros (long-array [v]) 1)] (aget r 0)))
+                      :month       (let [^longs r (ColumnOpsTemporal/arrayDateTruncMonthMicros (long-array [v]) 1)] (aget r 0))
+                      ;; Step 4b
+                      :week        (let [^longs r (ColumnOpsTemporal/arrayDateTruncWeekMicros       (long-array [v]) 1)] (aget r 0))
+                      :quarter     (let [^longs r (ColumnOpsTemporal/arrayDateTruncQuarterMicros    (long-array [v]) 1)] (aget r 0))
+                      :decade      (let [^longs r (ColumnOpsTemporal/arrayDateTruncDecadeMicros     (long-array [v]) 1)] (aget r 0))
+                      :century     (let [^longs r (ColumnOpsTemporal/arrayDateTruncCenturyMicros    (long-array [v]) 1)] (aget r 0))
+                      :millennium  (let [^longs r (ColumnOpsTemporal/arrayDateTruncMillenniumMicros (long-array [v]) 1)] (aget r 0)))
                     :seconds
                     (case unit
                       :second v
@@ -399,7 +428,49 @@
                       :hour   (* (Math/floorDiv v 3600) 3600)
                       :day    (* (Math/floorDiv v 86400) 86400)
                       :year   (let [^longs r (ColumnOps/arrayDateTruncYear (long-array [v]) 1)] (aget r 0))
-                      :month  (let [^longs r (ColumnOps/arrayDateTruncMonth (long-array [v]) 1)] (aget r 0))))))
+                      :month  (let [^longs r (ColumnOps/arrayDateTruncMonth (long-array [v]) 1)] (aget r 0))
+                      ;; Step 4b
+                      :week        (let [^longs r (ColumnOps/arrayDateTruncWeek       (long-array [v]) 1)] (aget r 0))
+                      :quarter     (let [^longs r (ColumnOps/arrayDateTruncQuarter    (long-array [v]) 1)] (aget r 0))
+                      :decade      (let [^longs r (ColumnOps/arrayDateTruncDecade     (long-array [v]) 1)] (aget r 0))
+                      :century     (let [^longs r (ColumnOps/arrayDateTruncCentury    (long-array [v]) 1)] (aget r 0))
+                      :millennium  (let [^longs r (ColumnOps/arrayDateTruncMillennium (long-array [v]) 1)] (aget r 0)))
+                    :millis
+                    ;; Scalar :millis path: scale up to micros, dispatch
+                    ;; through the existing micros-kernel branches,
+                    ;; floor-divide back to millis.
+                    (case unit
+                      :millisecond v
+                      :second      (* (Math/floorDiv v 1000) 1000)
+                      :minute      (* (Math/floorDiv v 60000) 60000)
+                      :hour        (* (Math/floorDiv v 3600000) 3600000)
+                      :day         (* (Math/floorDiv v 86400000) 86400000)
+                      :year        (let [scaled (long-array [(* v 1000)])
+                                         ^longs r (ColumnOpsTemporal/arrayDateTruncYearMicros scaled 1)]
+                                     (Math/floorDiv (aget r 0) 1000))
+                      :month       (let [scaled (long-array [(* v 1000)])
+                                         ^longs r (ColumnOpsTemporal/arrayDateTruncMonthMicros scaled 1)]
+                                     (Math/floorDiv (aget r 0) 1000)))
+                    :nanos
+                    ;; Step 4c. Scalar :nanos path: sub-second trunc is
+                    ;; pure mod arithmetic; calendar-aware units ÷1000
+                    ;; → micros, hit kernel, ×1000 back. The unit list
+                    ;; mirrors the :micros branch so DATE_TRUNC works
+                    ;; uniformly on a TIMESTAMP_NS column.
+                    (case unit
+                      :nanosecond  v
+                      :microsecond (* (Math/floorDiv v 1000) 1000)
+                      :millisecond (* (Math/floorDiv v 1000000) 1000000)
+                      :second      (* (Math/floorDiv v 1000000000) 1000000000)
+                      :minute      (* (Math/floorDiv v 60000000000) 60000000000)
+                      :hour        (* (Math/floorDiv v 3600000000000) 3600000000000)
+                      :day         (* (Math/floorDiv v 86400000000000) 86400000000000)
+                      :year        (let [scaled (long-array [(Math/floorDiv v 1000)])
+                                         ^longs r (ColumnOpsTemporal/arrayDateTruncYearMicros scaled 1)]
+                                     (* (aget r 0) 1000))
+                      :month       (let [scaled (long-array [(Math/floorDiv v 1000)])
+                                         ^longs r (ColumnOpsTemporal/arrayDateTruncMonthMicros scaled 1)]
+                                     (* (aget r 0) 1000))))))
 
         :date-add
         (let [unit (nth args 0)
@@ -429,7 +500,56 @@
                       :minutes (+ v (* (long n) 60))
                       :seconds (+ v (long n))
                       :months  (let [^longs r (ColumnOps/arrayDateAddMonths (long-array [v]) (int n) 1)] (aget r 0))
-                      :years   (let [^longs r (ColumnOps/arrayDateAddMonths (long-array [v]) (int (* n 12)) 1)] (aget r 0))))))
+                      :years   (let [^longs r (ColumnOps/arrayDateAddMonths (long-array [v]) (int (* n 12)) 1)] (aget r 0)))
+                    :days
+                    ;; DATE column (epoch-days). DAY adds reach the
+                    ;; plain `[:+ ...]` path so they don't show up
+                    ;; here. MONTH/YEAR convert through seconds
+                    ;; (lossless: dates have no time-of-day).
+                    (case unit
+                      :months  (let [secs (long-array [(* v 86400)])
+                                     ^longs r (ColumnOps/arrayDateAddMonths secs (int n) 1)]
+                                 (Math/floorDiv (aget r 0) 86400))
+                      :years   (let [secs (long-array [(* v 86400)])
+                                     ^longs r (ColumnOps/arrayDateAddMonths secs (int (* n 12)) 1)]
+                                 (Math/floorDiv (aget r 0) 86400)))
+                    :millis
+                    ;; TIMESTAMP_MS column. Scale to micros, dispatch
+                    ;; through the existing micros branches, scale back.
+                    (case unit
+                      :microseconds (+ v (Math/floorDiv (long n) 1000))
+                      :milliseconds (+ v (long n))
+                      :seconds      (+ v (* (long n) 1000))
+                      :minutes      (+ v (* (long n) 60000))
+                      :hours        (+ v (* (long n) 3600000))
+                      :days         (+ v (* (long n) 86400000))
+                      :months       (let [scaled (long-array [(* v 1000)])
+                                          ^longs r (ColumnOpsTemporal/arrayDateAddMonthsMicros scaled (int n) 1)]
+                                      (Math/floorDiv (aget r 0) 1000))
+                      :years        (let [scaled (long-array [(* v 1000)])
+                                          ^longs r (ColumnOpsTemporal/arrayDateAddMonthsMicros scaled (int (* n 12)) 1)]
+                                      (Math/floorDiv (aget r 0) 1000)))
+                    :nanos
+                    ;; Step 4c. Scalar :nanos add: sub-second deltas
+                    ;; are pure long adds; calendar-aware deltas go
+                    ;; through ÷1000 / kernel / ×1000 with the
+                    ;; remainder preserved.
+                    (case unit
+                      :nanoseconds  (+ v (long n))
+                      :microseconds (+ v (* (long n) 1000))
+                      :milliseconds (+ v (* (long n) 1000000))
+                      :seconds      (+ v (* (long n) 1000000000))
+                      :minutes      (+ v (* (long n) 60000000000))
+                      :hours        (+ v (* (long n) 3600000000000))
+                      :days         (+ v (* (long n) 86400000000000))
+                      :months       (let [scaled (long-array [(Math/floorDiv v 1000)])
+                                          rem    (Math/floorMod v 1000)
+                                          ^longs r (ColumnOpsTemporal/arrayDateAddMonthsMicros scaled (int n) 1)]
+                                      (+ (* (aget r 0) 1000) rem))
+                      :years        (let [scaled (long-array [(Math/floorDiv v 1000)])
+                                          rem    (Math/floorMod v 1000)
+                                          ^longs r (ColumnOpsTemporal/arrayDateAddMonthsMicros scaled (int (* n 12)) 1)]
+                                      (+ (* (aget r 0) 1000) rem))))))
 
         :time-bucket
         (let [width (long (nth args 0))
@@ -459,6 +579,15 @@
                               :minutes (* width 60)
                               :hours   (* width 3600)
                               :days    (* width 86400))
+                          shifted (- v origin)]
+                      (+ (* (Math/floorDiv shifted w) w) origin))
+                    :millis
+                    (let [w (case unit
+                              :milliseconds width
+                              :seconds      (* width 1000)
+                              :minutes      (* width 60000)
+                              :hours        (* width 3600000)
+                              :days         (* width 86400000))
                           shifted (- v origin)]
                       (+ (* (Math/floorDiv shifted w) w) origin))
                     :days

@@ -362,17 +362,17 @@
 
 (defspec each-pred-type-matches-clojure-reference 50
   (prop/for-all [{:keys [data validity lo hi]} gen-spec]
-    (let [col (long-array data)
-          bm (build-bitmap validity)]
-      (every? true?
-              (for [[op pred-type] [[:range ColumnOps/PRED_RANGE]
-                                    [:lt ColumnOps/PRED_LT]
-                                    [:gt ColumnOps/PRED_GT]
-                                    [:eq ColumnOps/PRED_EQ]
-                                    [:lte ColumnOps/PRED_LTE]
-                                    [:gte ColumnOps/PRED_GTE]
-                                    [:neq ColumnOps/PRED_NEQ]
-                                    [:not-range ColumnOps/PRED_NOT_RANGE]]]
-                (let [expected (clojure-ref-count data validity op lo hi)
-                      actual (pred-count-nullable col pred-type lo hi bm)]
-                  (= expected actual)))))))
+                (let [col (long-array data)
+                      bm (build-bitmap validity)]
+                  (every? true?
+                          (for [[op pred-type] [[:range ColumnOps/PRED_RANGE]
+                                                [:lt ColumnOps/PRED_LT]
+                                                [:gt ColumnOps/PRED_GT]
+                                                [:eq ColumnOps/PRED_EQ]
+                                                [:lte ColumnOps/PRED_LTE]
+                                                [:gte ColumnOps/PRED_GTE]
+                                                [:neq ColumnOps/PRED_NEQ]
+                                                [:not-range ColumnOps/PRED_NOT_RANGE]]]
+                            (let [expected (clojure-ref-count data validity op lo hi)
+                                  actual (pred-count-nullable col pred-type lo hi bm)]
+                              (= expected actual)))))))

@@ -51,55 +51,55 @@
 
 (defspec int64-chunk-validity-matches-sentinels 200
   (prop/for-all [{:keys [data expected-validity]} gen-int64-data]
-    (let [arr (long-array data)
-          c (chunk/chunk-from-array arr)
-          v (chunk/chunk-validity c)
-          n (chunk/chunk-length c)]
-      (and
+                (let [arr (long-array data)
+                      c (chunk/chunk-from-array arr)
+                      v (chunk/chunk-validity c)
+                      n (chunk/chunk-length c)]
+                  (and
         ;; Fast-path: nil iff there are no nulls in the data
-        (= (every? identity expected-validity)
-           (nil? v))
+                   (= (every? identity expected-validity)
+                      (nil? v))
         ;; Bitmap matches expected per-row when materialised
-        (= expected-validity (bitmap->vec v n))))))
+                   (= expected-validity (bitmap->vec v n))))))
 
 (defspec float64-chunk-validity-matches-sentinels 200
   (prop/for-all [{:keys [data expected-validity]} gen-float64-data]
-    (let [arr (double-array data)
-          c (chunk/chunk-from-array arr)
-          v (chunk/chunk-validity c)
-          n (chunk/chunk-length c)]
-      (and
-        (= (every? identity expected-validity)
-           (nil? v))
-        (= expected-validity (bitmap->vec v n))))))
+                (let [arr (double-array data)
+                      c (chunk/chunk-from-array arr)
+                      v (chunk/chunk-validity c)
+                      n (chunk/chunk-length c)]
+                  (and
+                   (= (every? identity expected-validity)
+                      (nil? v))
+                   (= expected-validity (bitmap->vec v n))))))
 
 (defspec serialization-round-trip-preserves-bitmap 100
   (prop/for-all [{:keys [data expected-validity]} gen-int64-data]
-    (let [c (chunk/chunk-from-array (long-array data))
-          restored (chunk/chunk-from-bytes (chunk/chunk-to-bytes c))
-          v (chunk/chunk-validity restored)
-          n (chunk/chunk-length restored)]
-      (= expected-validity (bitmap->vec v n)))))
+                (let [c (chunk/chunk-from-array (long-array data))
+                      restored (chunk/chunk-from-bytes (chunk/chunk-to-bytes c))
+                      v (chunk/chunk-validity restored)
+                      n (chunk/chunk-length restored)]
+                  (= expected-validity (bitmap->vec v n)))))
 
 (defspec serialization-round-trip-preserves-bitmap-double 100
   (prop/for-all [{:keys [data expected-validity]} gen-float64-data]
-    (let [c (chunk/chunk-from-array (double-array data))
-          restored (chunk/chunk-from-bytes (chunk/chunk-to-bytes c))
-          v (chunk/chunk-validity restored)
-          n (chunk/chunk-length restored)]
-      (= expected-validity (bitmap->vec v n)))))
+                (let [c (chunk/chunk-from-array (double-array data))
+                      restored (chunk/chunk-from-bytes (chunk/chunk-to-bytes c))
+                      v (chunk/chunk-validity restored)
+                      n (chunk/chunk-length restored)]
+                  (= expected-validity (bitmap->vec v n)))))
 
 (defspec transient-write-then-persistent-rebuilds-validity 100
   (prop/for-all [{:keys [data expected-validity]} gen-int64-data]
-    (let [;; Start with all-zeros, transient-write each row, then persistent.
-          c (-> (chunk/make-chunk :int64 (count data))
-                (chunk/col-transient))
-          _ (dotimes [i (count data)]
-              (chunk/write-long! c i (nth data i)))
-          _ (chunk/col-persistent! c)
-          v (chunk/chunk-validity c)
-          n (chunk/chunk-length c)]
-      (= expected-validity (bitmap->vec v n)))))
+                (let [;; Start with all-zeros, transient-write each row, then persistent.
+                      c (-> (chunk/make-chunk :int64 (count data))
+                            (chunk/col-transient))
+                      _ (dotimes [i (count data)]
+                          (chunk/write-long! c i (nth data i)))
+                      _ (chunk/col-persistent! c)
+                      v (chunk/chunk-validity c)
+                      n (chunk/chunk-length c)]
+                  (= expected-validity (bitmap->vec v n)))))
 
 ;; ============================================================================
 ;; Explicit unit tests (corner cases + regression locks)

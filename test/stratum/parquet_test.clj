@@ -476,7 +476,7 @@
         (finally (.delete path))))))
 
 (deftest parquet-dataset-timestamp-units-test
-  (testing "Timestamp{Millis|Micros|Nanos} all normalize to epoch-millis"
+  (testing "Timestamp{Millis|Micros|Nanos} preserve source precision (step 3)"
     (let [path (temp-parquet "ds-ts")
           schema "message t {
                     required int64 t_millis (TIMESTAMP(MILLIS,true));
@@ -491,9 +491,14 @@
         (write-parquet! path schema rows)
         (let [ds (parquet/parquet-dataset (.getAbsolutePath path))
               [r] (q/q {:from ds :select [:t_millis :t_micros :t_nanos]})]
-          (is (= 1700000000000 (long (:t_millis r))))
-          (is (= 1700000000000 (long (:t_micros r))))
-          (is (= 1700000000000 (long (:t_nanos r)))))
+          ;; Pre-step-3 these all normalised to 1_700_000_000_000 (ms),
+          ;; silently losing 3 / 6 digits of precision. The fix
+          ;; preserves source precision; column metadata carries the
+          ;; :temporal-unit tag so date kernels operate at the right
+          ;; scale.
+          (is (= 1700000000000       (long (:t_millis r))))
+          (is (= 1700000000000000    (long (:t_micros r))))
+          (is (= 1700000000000000000 (long (:t_nanos r)))))
         (finally (.delete path))))))
 
 (deftest parquet-dataset-uuid-test

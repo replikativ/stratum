@@ -133,6 +133,39 @@ clj -M:olap asof         # ASOF JOIN tier only (3 canonical shapes)
 (st/q {:from ds :agg [[:avg :age]]})
 ```
 
+## Server-side durability
+
+By default, a Stratum PgWire server starts with an empty in-memory registry — convenient for ad-hoc demos and read-only queries against pre-indexed files (`--index`), but SQL `CREATE TABLE`, `INSERT`/`UPDATE`/`DELETE`, `CREATE MODEL`, and `register-live-table!` bindings live only in heap and evaporate on restart.
+
+Pass a Konserve store via `:store` (or the CLI `--data-dir`) to make those durable:
+
+```clojure
+(require '[stratum.server :as srv]
+         '[konserve.filestore :as kfile])
+
+(def store
+  (kfile/connect-fs-store "/var/lib/stratum/server"
+                          {:sync? true}))
+
+(def server (srv/start {:port 5432 :store store}))
+
+;; CREATE TABLE foo (id INT, price DOUBLE);
+;; INSERT INTO foo VALUES (1, 9.5);
+;; — stop the server, restart, foo still has its rows
+```
+
+What's persisted:
+
+- **SQL CREATE TABLE** — every column type (int, float, temporal, TEXT/VARCHAR, ENUM) lands as a real index-backed dataset
+- **CREATE TYPE … AS ENUM** — declarations + OIDs survive restart; INSERT validation enforces the declared label set against the live table
+- **INSERT / UPDATE / DELETE / UPSERT** — each statement re-syncs to a per-table branch; string columns encode through the column's dict, extending it amortised-O(1) when new labels appear
+- **CREATE MODEL** (isolation forest, plain-data serialization)
+- **register-live-table!** bindings whose Konserve store is the same as the server's `:store` (foreign-store live-tables stay session-scoped and emit a warning)
+
+What stays transient (matches PostgreSQL semantics): per-connection transaction state, prepared statements, cursors, session settings (`SET …`).
+
+Without `:store` the server prints a startup warning naming the surprise — programmatic users who manage their own datasets with `dataset/sync!` are unaffected and run as before.
+
 ## Snapshots and Branching
 
 Every Stratum dataset is a copy-on-write value. Fork one in O(1) to create an isolated branch - modifications only touch the changed chunks, everything else is structurally shared. Persist snapshots to named branches, load them back, or time-travel to any previous commit.
@@ -237,6 +270,36 @@ Allen interval predicates (`OVERLAPS`, `CONTAINS`, `PRECEDES`, `MEETS`, …) and
 
 **Other**: EXPLAIN, SELECT DISTINCT, LIMIT/OFFSET, IS NULL/IS NOT NULL
 
+### PostgreSQL Wire Protocol — Binary Format
+
+Stratum's pgwire server implements the v3 protocol's binary format (format
+code 1) symmetrically — both inbound (Bind) and outbound (RowDescription /
+DataRow) — for every OID it tags on the wire:
+
+| OID | Type | Inbound | Outbound |
+|---|---|---|---|
+| 16 | BOOL | ✓ | ✓ |
+| 20 / 21 / 23 | INT8 / INT2 / INT4 | ✓ | ✓ |
+| 25 / 1043 / 19 | TEXT / VARCHAR / NAME | ✓ | ✓ |
+| 700 / 701 | FLOAT4 / FLOAT8 | ✓ | ✓ |
+| 1082 | DATE (PG epoch shift handled at codec boundary) | ✓ | ✓ |
+| 1114 / 1184 | TIMESTAMP / TIMESTAMPTZ (Stratum :seconds / :millis / :micros / :nanos units normalize to micros for the wire) | ✓ | ✓ |
+| 1186 | INTERVAL (16-byte fixed: int64 micros + int32 days + int32 months) | ✓ | ✓ |
+| 1700 | NUMERIC (base-10000 ndigits/weight/sign/dscale) | ✓ | ✓ |
+| 2950 | UUID (16 BE bytes) | ✓ | ✓ |
+| 3802 | JSONB (version byte 0x01 + UTF-8) | ✓ | ✓ |
+
+Clients select per-column format via the Bind message. Stratum advertises
+the chosen format in RowDescription and emits matching binary bytes in
+DataRow. Inbound binary params require the type OID declared at Parse
+time — Stratum doesn't infer types from raw bytes.
+
+Failure modes are loud: unknown format codes, binary requests for
+unsupported OIDs, and malformed binary payloads all produce ErrorResponse
+`0A000` (`feature_not_supported`) or `22P03`
+(`invalid_binary_representation`) with a message identifying the
+offending column or param.
+
 ## Clojure Data Science Integration
 
 Stratum datasets work directly with [tablecloth](https://github.com/scicloj/tablecloth) and [tech.ml.dataset](https://github.com/techascent/tech.ml.dataset):
@@ -309,16 +372,16 @@ All share copy-on-write semantics and can be branched together via Yggdrasil.
 
 ## Features
 
-- **SQL**: PostgreSQL wire protocol (v3), full DML, CTEs, window functions, joins, subqueries
+- **SQL**: PostgreSQL wire protocol (v3) with **symmetric binary protocol support** (format codes 0/1 on every tagged OID: INT2/4/8, FLOAT4/8, BOOL, TEXT, DATE, TIMESTAMP(TZ), NUMERIC, UUID, JSONB), full DML, CTEs, window functions, joins, subqueries
 - **Query planner**: cost-based IR planner with predicate pushdown, top-N rewrite, window-having pushdown, NDV-based join cardinality, operator fusion, column pruning
 - **Performance**: SIMD filter/aggregate/group-by via Java Vector API, fused single-pass execution, zone map pruning, parallel execution
-- **Persistence**: O(1) CoW snapshots, branching, time-travel, lazy loading from storage
+- **Persistence**: O(1) CoW snapshots, branching, time-travel, lazy loading from storage; SQL `CREATE TABLE`/`INSERT`/`CREATE MODEL` + live-table bindings survive restart when the server is started with `:store`
 - **Audit**: content-addressed `:crypto-hash?` commits, `stratum.audit/verify-chain` for tamper detection (shallow + deep PSS-tree walks), `IAuditable` protocol for embedding into larger storage substrates ([doc/audit.md](doc/audit.md))
 - **Bitemporal**: SQL:2011 valid- and system-time axes, `FOR PORTION OF VALID_TIME` DML, `FOR (VALID|SYSTEM)_TIME AS OF` time-travel reads, Allen interval predicates ([doc/temporal-design.md](doc/temporal-design.md))
-- **Data**: CSV/Parquet import, dictionary-encoded strings, PostgreSQL NULL semantics, ad-hoc file queries
+- **Data**: CSV/Parquet import, dictionary-encoded strings, PostgreSQL NULL semantics, ad-hoc file queries, user-defined `ENUM` types (`CREATE TYPE … AS ENUM (…)` with INSERT validation + `pg_type`/`pg_enum` introspection), `DECIMAL(p,s)` / `NUMERIC(p,s)` for p ≤ 18 (int64-backed unscaled storage, HALF_EVEN coercion, PG-OID 1700 on the wire), DuckDB-style unsigned integers `UTINYINT` / `USMALLINT` / `UINTEGER` / `UBIGINT` (int64-backed with bit reinterpretation for `UBIGINT`, INSERT range-checked with SQLSTATE 22003 on overflow, mapped to PG INT2/INT8/NUMERIC on the wire. `UBIGINT` literals exceeding `Long.MAX_VALUE` must use string-quoted form due to JSqlParser limits; the exact value `2^63` collides with the long NULL sentinel and round-trips as NULL — documented limitation), passthrough column support for `HUGEINT` (`BigInteger[]`), `DECIMAL128` (`BigDecimal[]`, up to precision 38), and `UUID` (`java.util.UUID[]`) registered via `register-table!` — SELECT and wire output (text + binary for UUID via OID 2950, NUMERIC text for HUGEINT/DECIMAL128); WHERE/GROUP BY/aggregates over these columns aren't yet supported
 - **Integration**: tablecloth/tech.ml.dataset interop, Datahike, Yggdrasil
 - **Analytics**: Isolation forest anomaly detection (SQL model management, scoring, online rotation)
-- **Time-series**: microsecond-precision TIMESTAMP, RANGE-BETWEEN-INTERVAL frames, TIME_BUCKET, FIRST/LAST/NTH_VALUE, FILLS/LOCF, EMA, RLEID, q-style moving aggregates (MAVG/MSUM/MMIN/MMAX/MDEV), window-join (`wj`) and LATEST ON (DISTINCT ON) helpers
+- **Time-series**: microsecond-precision `TIMESTAMP` + DuckDB-style `TIMESTAMP_S` / `TIMESTAMP_MS` precision variants (engine ops route at the source scale; parquet ingest preserves source precision), RANGE-BETWEEN-INTERVAL frames, TIME_BUCKET, FIRST/LAST/NTH_VALUE, FILLS/LOCF, EMA, RLEID, q-style moving aggregates (MAVG/MSUM/MMIN/MMAX/MDEV), window-join (`wj`) and LATEST ON (DISTINCT ON) helpers
 
 ## Architecture
 

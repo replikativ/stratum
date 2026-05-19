@@ -14,7 +14,9 @@
             [stratum.query :as q]
             [stratum.csv :as csv]
             [stratum.parquet :as parquet]
-            [stratum.sql.rewrite :as rewrite])
+            [stratum.sql.enum-ddl :as enum-ddl]
+            [stratum.sql.rewrite :as rewrite]
+            [stratum.util.decimal :as decimal])
   (:import [net.sf.jsqlparser.parser CCJSqlParserUtil]
            [net.sf.jsqlparser.statement Statement]
            [net.sf.jsqlparser.statement.select
@@ -44,7 +46,7 @@
            [net.sf.jsqlparser.statement.insert InsertConflictAction InsertConflictTarget ConflictActionType]
            [net.sf.jsqlparser.statement.drop Drop]
            [net.sf.jsqlparser.statement.select Values]
-           [stratum.internal PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler]))
+           [stratum.internal PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler Interval]))
 
 (set! *warn-on-reflection* true)
 
@@ -112,26 +114,70 @@
         inner))
 
     ;; Arithmetic: +, -, *, /, %
-    ;; Constant-fold when both sides are numeric literals (e.g. CAST date + interval)
+    ;; Constant-fold when both sides are numeric literals (e.g. CAST date + interval).
+    ;; Date/timestamp + INTERVAL → calendar-aware [:date-add]. DAY units
+    ;; stay on integer addition since DATE columns are epoch-days.
     (instance? Addition expr)
     (let [^Addition e expr
           l (translate-expr (.getLeftExpression e))
           r (translate-expr (.getRightExpression e))]
-      (if (and (number? l) (number? r))
+      (cond
+        ;; Marker on the right: `col + INTERVAL`
+        (and (vector? r) (= :interval (first r)))
+        (let [[_ unit n] r]
+          (cond
+            ;; Preserve the old constant-fold path when both sides
+            ;; are constants AND we're on the DAY fast path. Pre-fix
+            ;; `CAST('2001-01-12' AS DATE) + INTERVAL '30' DAY`
+            ;; folded to a single long; some WHERE-clause sites
+            ;; expect a literal there.
+            (and (= unit :days) (number? l) (number? n))
+            (+ (long l) (long n))
+            (= unit :days)  [:+ l n]
+            :else           [:date-add unit n l]))
+
+        ;; Marker on the left (commutative): `INTERVAL + col`
+        (and (vector? l) (= :interval (first l)))
+        (let [[_ unit n] l]
+          (cond
+            (and (= unit :days) (number? r) (number? n))
+            (+ (long r) (long n))
+            (= unit :days)  [:+ r n]
+            :else           [:date-add unit n r]))
+
+        ;; Constant-fold both-numeric
+        (and (number? l) (number? r))
         (if (or (float? l) (float? r) (instance? Double l) (instance? Double r))
           (+ (double l) (double r))
           (+ (long l) (long r)))
-        [:+ l r]))
+
+        :else [:+ l r]))
 
     (instance? Subtraction expr)
     (let [^Subtraction e expr
           l (translate-expr (.getLeftExpression e))
           r (translate-expr (.getRightExpression e))]
-      (if (and (number? l) (number? r))
+      (cond
+        ;; `col - INTERVAL` — negate the increment for date-add.
+        (and (vector? r) (= :interval (first r)))
+        (let [[_ unit n] r
+              neg (if (number? n) (- n) [:* -1 n])]
+          (cond
+            (and (= unit :days) (number? l) (number? n))
+            (- (long l) (long n))
+            (= unit :days)  [:- l n]
+            :else           [:date-add unit neg l]))
+
+        ;; `INTERVAL - col` is ill-formed semantically; fall through to
+        ;; the plain `[:- l r]` path which will error or coerce as
+        ;; usual.
+
+        (and (number? l) (number? r))
         (if (or (float? l) (float? r) (instance? Double l) (instance? Double r))
           (- (double l) (double r))
           (- (long l) (long r)))
-        [:- l r]))
+
+        :else [:- l r]))
 
     (instance? Multiplication expr)
     (let [^Multiplication e expr]
@@ -213,7 +259,9 @@
 
     ;; EXTRACT(field FROM col) — emit the granular op (:hour, :year, etc.).
     ;; Recognized fields: year, month, day, hour, minute, second,
-    ;; millisecond, microsecond, day-of-week (DOW), week-of-year (WEEK).
+    ;; millisecond, microsecond, day-of-week (PG/DuckDB convention
+    ;; Sunday=0..Saturday=6), ISO day-of-week (Monday=1..Sunday=7),
+    ;; week-of-year, quarter, decade, century, millennium.
     (instance? ExtractExpression expr)
     (let [^ExtractExpression ee expr
           field (some-> (.getName ee) str/upper-case str/trim)
@@ -227,24 +275,49 @@
                "SECOND" :second
                "MILLISECOND" :millisecond
                "MICROSECOND" :microsecond
-               ("DOW" "ISODOW" "DAYOFWEEK") :day-of-week
+               ;; Step 4b: DOW (Sun=0..Sat=6, PG/DuckDB) and ISODOW
+               ;; (Mon=1..Sun=7) are distinct conventions. Pre-step-4b
+               ;; both were aliased to `:day-of-week` which returned
+               ;; Stratum's idiosyncratic Monday=0..Sunday=6 — broken
+               ;; for any client expecting either PG or ISO output.
+               ("DOW" "DAYOFWEEK")           :day-of-week
+               "ISODOW"                      :iso-day-of-week
                ("WEEK" "ISOWEEK" "WEEKOFYEAR") :week-of-year
+               "QUARTER"                     :quarter
+               "DECADE"                      :decade
+               "CENTURY"                     :century
+               "MILLENNIUM"                  :millennium
+               "NANOSECOND"                  :nanosecond
                (throw (ex-info (str "Unsupported EXTRACT field: " field)
                                {:field field})))]
       [op col])
 
-    ;; INTERVAL expression — convert to epoch-day count for date arithmetic
+    ;; INTERVAL '<n>' UNIT — emit a marker that the +/- handlers
+    ;; rewrite into a [:date-add unit n col] call against the
+    ;; date/timestamp column on the other side. DAY units keep
+    ;; integer-add semantics (DATE columns are epoch-days, so +n is
+    ;; exactly +n days); calendar-aware units (MONTH/YEAR) route
+    ;; through the existing arrayDateAddMonths kernel so
+    ;; `Jan 31 + 1 MONTH = Feb 28/29` instead of the silently wrong
+    ;; +30 days the old `[:* n 30]` lowering produced.
     (instance? IntervalExpression expr)
     (let [^IntervalExpression ie expr
           n (if-let [e (.getExpression ie)]
               (translate-expr e)
               (Long/parseLong (str/replace (or (.getParameter ie) "0") "'" "")))
-          unit (some-> (.getIntervalType ie) str/upper-case str/trim)]
-      (case unit
-        ("DAY" "DAYS") n
-        ("MONTH" "MONTHS") [:* n 30]
-        ("YEAR" "YEARS") [:* n 365]
-        n))
+          unit (some-> (.getIntervalType ie) str/upper-case str/trim)
+          unit-kw (case unit
+                    ("DAY" "DAYS")               :days
+                    ("MONTH" "MONTHS")           :months
+                    ("YEAR" "YEARS")             :years
+                    ("HOUR" "HOURS")             :hours
+                    ("MINUTE" "MINUTES")         :minutes
+                    ("SECOND" "SECONDS")         :seconds
+                    ("MILLISECOND" "MILLISECONDS") :milliseconds
+                    ("MICROSECOND" "MICROSECONDS") :microseconds
+                    (throw (ex-info (str "Unsupported INTERVAL unit: " unit)
+                                    {:unit unit})))]
+      [:interval unit-kw n])
 
     ;; Comparison operators — used in CASE WHEN clauses
     (instance? EqualsTo expr)
@@ -1206,8 +1279,14 @@
                    "YEAR" :year "MONTH" :month "DAY" :day
                    "HOUR" :hour "MINUTE" :minute "SECOND" :second
                    "MILLISECOND" :millisecond "MICROSECOND" :microsecond
-                   "DOW" :day-of-week "ISODOW" :day-of-week "DAYOFWEEK" :day-of-week
+                   ;; Step 4b: see translate-expr ExtractExpression for
+                   ;; DOW vs ISODOW semantics.
+                   "DOW" :day-of-week "DAYOFWEEK" :day-of-week
+                   "ISODOW" :iso-day-of-week
                    "WEEK" :week-of-year "ISOWEEK" :week-of-year "WEEKOFYEAR" :week-of-year
+                   "QUARTER" :quarter "DECADE" :decade
+                   "CENTURY" :century "MILLENNIUM" :millennium
+                   "NANOSECOND" :nanosecond
                    (throw (ex-info (str "Unsupported EXTRACT field: " field)
                                    {:field field})))]
           [op (second params)])
@@ -2198,6 +2277,7 @@
 (def ^:private pg-type-oids
   "Common PostgreSQL type OIDs."
   {:int8 20
+   :int2 21
    :int4 23
    :float8 701
    :float4 700
@@ -2206,6 +2286,8 @@
    :bool 16
    :date 1082
    :timestamp 1114
+   :interval 1186
+   :numeric 1700
    :oid 26
    :name 19})
 
@@ -2225,6 +2307,10 @@
       (or (.contains sql-lower "pg_namespace")
           (.contains sql-lower "pg_catalog.pg_namespace"))
       :pg_namespace
+
+      (or (.contains sql-lower "pg_enum")
+          (.contains sql-lower "pg_catalog.pg_enum"))
+      :pg_enum
 
       (or (.contains sql-lower "pg_type")
           (.contains sql-lower "pg_catalog.pg_type"))
@@ -2282,19 +2368,46 @@
      :tag (str "SELECT " (count rows))}))
 
 (defn- handle-pg-type
-  "Return minimal pg_type rows for type introspection."
-  []
-  (let [rows [["20" "int8" "8"]
+  "Return pg_type rows for type introspection. The base set covers the
+   wire-protocol-relevant builtin OIDs; user-declared ENUM types
+   (registered under `__enums__` in the table-registry) are appended
+   with their allocated OIDs and `typlen = 4` so clients (psql `\\dT`,
+   Odoo, pgjdbc introspection) see them."
+  [table-registry]
+  (let [base [["20" "int8" "8"]
               ["23" "int4" "4"]
               ["701" "float8" "8"]
               ["25" "text" "-1"]
               ["1043" "varchar" "-1"]
               ["16" "bool" "1"]
               ["1082" "date" "4"]
-              ["1114" "timestamp" "8"]]]
+              ["1114" "timestamp" "8"]]
+        enums (get table-registry "__enums__")
+        enum-rows (mapv (fn [[type-name {:keys [oid]}]]
+                          [(str oid) type-name "4"])
+                        (sort-by first enums))
+        rows (into base enum-rows)]
     {:system true
      :result {:columns ["oid" "typname" "typlen"]
               :oids [(:oid pg-type-oids) (:name pg-type-oids) (:int4 pg-type-oids)]
+              :rows rows}
+     :tag (str "SELECT " (count rows))}))
+
+(defn- handle-pg-enum
+  "Return pg_enum rows for ENUM introspection. One row per (enum,
+   label) pair carrying `enumtypid` (the enum's allocated OID),
+   `enumsortorder` (the declaration index as float4, matching PG
+   semantics), and `enumlabel` (the value). Empty when no ENUM types
+   are declared."
+  [table-registry]
+  (let [enums (get table-registry "__enums__")
+        rows (vec
+              (for [[type-name {:keys [oid values-ordered]}] (sort-by first enums)
+                    [idx label] (map-indexed vector values-ordered)]
+                [(str oid) (str (double (inc idx))) label]))]
+    {:system true
+     :result {:columns ["enumtypid" "enumsortorder" "enumlabel"]
+              :oids [(:oid pg-type-oids) (:float4 pg-type-oids) (:name pg-type-oids)]
               :rows rows}
      :tag (str "SELECT " (count rows))}))
 
@@ -2345,7 +2458,8 @@
     :pg_database (handle-pg-database)
     :pg_class (handle-pg-class table-registry)
     :pg_namespace (handle-pg-namespace)
-    :pg_type (handle-pg-type)
+    :pg_type (handle-pg-type table-registry)
+    :pg_enum (handle-pg-enum table-registry)
     :pg_attribute (handle-pg-attribute table-registry)
     :pg_tables (handle-pg-tables table-registry)
     :information_schema {:system true
@@ -2382,9 +2496,48 @@
           (= t "TINYINT") (= t "INT4") (= t "INT8") (= t "SERIAL"))
       {:type :int64}
 
-      (or (= t "DOUBLE") (= t "FLOAT") (= t "REAL") (= t "NUMERIC")
-          (= t "DECIMAL") (= t "DOUBLE PRECISION") (= t "FLOAT8") (= t "FLOAT4"))
+      ;; Step 6: DuckDB-style unsigned integer types. Stratum stores all
+      ;; integers as int64, so unsigned types share the same backing
+      ;; representation but carry a `:unsigned-width` tag (8/16/32/64
+      ;; bits) so the INSERT path can range-check and the wire layer
+      ;; can map to an OID PG clients recognise (INT2 for u8/u16, INT8
+      ;; for u32, NUMERIC for u64 — PG lacks native unsigned types, so
+      ;; we pick the smallest signed container that fits the unsigned
+      ;; range, falling through to NUMERIC for u64 which exceeds INT8).
+      (= t "UTINYINT")  {:type :int64 :unsigned-width 8}
+      (= t "USMALLINT") {:type :int64 :unsigned-width 16}
+      (or (= t "UINTEGER") (= t "UINT") (= t "UINT4"))
+      {:type :int64 :unsigned-width 32}
+      ;; Step 8a: UBIGINT — DuckDB's PhysicalType::UINT64. Stored as
+      ;; int64 with reinterpretation: bit pattern is the same, but
+      ;; values are read as unsigned via Long.toUnsignedString /
+      ;; Long.parseUnsignedLong. Wire-renders as NUMERIC because PG
+      ;; INT8 max (2^63-1) is too small for u64.
+      (or (= t "UBIGINT") (= t "UINT8"))
+      {:type :int64 :unsigned-width 64}
+
+      (or (= t "DOUBLE") (= t "FLOAT") (= t "REAL")
+          (= t "DOUBLE PRECISION") (= t "FLOAT8") (= t "FLOAT4"))
       {:type :float64}
+
+      ;; Step 5: DECIMAL(p,s) / NUMERIC(p,s) — int64-backed for p ≤ 18.
+      ;; Bare `NUMERIC` and `DECIMAL` (no precision/scale) are rejected
+      ;; per the open-question agreement — PG's unconstrained-NUMERIC
+      ;; would need BigDecimal-as-storage (step 8 territory).
+      (let [d (decimal/parse-decimal-type type-str)]
+        (cond
+          (= d :unconstrained)
+          (throw (ex-info
+                  (str "Bare NUMERIC / DECIMAL is not supported — specify "
+                       "(precision, scale), e.g. DECIMAL(10,2). "
+                       "Unconstrained NUMERIC requires BigDecimal-backed "
+                       "storage (planned step 8).")
+                  {:type-name type-str}))
+          (map? d)
+          (do (decimal/validate-precision! (:precision d) (:scale d))
+              true)))
+      (let [{:keys [precision scale]} (decimal/parse-decimal-type type-str)]
+        {:type :int64 :decimal? true :precision precision :scale scale})
 
       (or (= t "VARCHAR") (= t "TEXT") (= t "CHAR") (= t "STRING")
           (.startsWith t "VARCHAR(") (.startsWith t "CHAR("))
@@ -2399,7 +2552,24 @@
           (= t "TIMESTAMP WITHOUT TIME ZONE") (= t "TIMESTAMP WITH TIME ZONE"))
       {:type :int64 :temporal-unit :micros}
 
-      :else {:type :string})))
+      ;; DuckDB-style precision-tagged TIMESTAMP keywords. PG itself has
+      ;; only OID 1114 (micros); these route to specific :temporal-unit
+      ;; tags so date kernels operate at the right scale.
+      (or (= t "TIMESTAMP_S") (= t "TIMESTAMP_SEC"))
+      {:type :int64 :temporal-unit :seconds}
+
+      (= t "TIMESTAMP_MS")
+      {:type :int64 :temporal-unit :millis}
+
+      (= t "TIMESTAMP_NS")
+      {:type :int64 :temporal-unit :nanos}
+
+      ;; Unknown type — leave it for the server to resolve. ENUM type
+      ;; names (declared via CREATE TYPE … AS ENUM) are recognised
+      ;; here as the *literal* identifier the user typed; the DDL
+      ;; descriptor carries it forward and the server's :create-table
+      ;; handler resolves it against the enum registry.
+      :else {:type :unknown :type-name type-str})))
 
 (defn- translate-create-table
   "Translate a JSqlParser CreateTable into a DDL descriptor.
@@ -2416,18 +2586,48 @@
                               (cond-> {:name (.getColumnName cd)
                                        :type (:type type-info)}
                                 (:temporal-unit type-info)
-                                (assoc :temporal-unit (:temporal-unit type-info)))))
+                                (assoc :temporal-unit (:temporal-unit type-info))
+                                ;; Step 5: DECIMAL precision/scale ride along
+                                ;; in the column descriptor and end up in the
+                                ;; table's :column-schema metadata.
+                                (:decimal? type-info)
+                                (assoc :decimal? true
+                                       :precision (:precision type-info)
+                                       :scale (:scale type-info))
+                                ;; Step 6: unsigned-width (8/16/32) rides
+                                ;; along so range checks and OID mapping
+                                ;; have the metadata they need.
+                                (:unsigned-width type-info)
+                                (assoc :unsigned-width (:unsigned-width type-info))
+                                ;; Pass through the literal SQL type name
+                                ;; for any unrecognised type. The server
+                                ;; resolves these against its enum
+                                ;; registry; absence here means the user
+                                ;; named a type that no CREATE TYPE
+                                ;; declared.
+                                (:type-name type-info)
+                                (assoc :type-name (:type-name type-info)))))
                           col-defs)}}))
 
 (defn- parse-insert-value
-  "Convert a JSqlParser expression from INSERT VALUES to a Clojure value."
+  "Convert a JSqlParser expression from INSERT VALUES to a Clojure value.
+
+   Step 5: `DoubleValue` is returned as a `BigDecimal` parsed from the
+   token's textual form (`.toString`) so trailing-zero precision
+   (`1.10`) is preserved end-to-end. Server-side INSERT coercion then
+   scales the BigDecimal to the column's target scale when the column
+   is DECIMAL; non-DECIMAL int64/float64 targets coerce back to
+   Long/Double as before."
   [expr]
   (cond
     (instance? LongValue expr)
     (.getValue ^LongValue expr)
 
     (instance? DoubleValue expr)
-    (.getValue ^DoubleValue expr)
+    ;; Re-parse from the textual representation rather than going
+    ;; through the double — preserves any trailing zeros that the
+    ;; double would discard.
+    (java.math.BigDecimal. (.toString ^DoubleValue expr))
 
     (instance? StringValue expr)
     (.getValue ^StringValue expr)
@@ -2441,7 +2641,10 @@
           inner (parse-insert-value (.getExpression se))]
       (when inner
         (if (= sign \-)
-          (if (instance? Long inner) (- (long inner)) (- (double inner)))
+          (cond
+            (instance? Long inner)               (- (long inner))
+            (instance? java.math.BigDecimal inner) (.negate ^java.math.BigDecimal inner)
+            :else                                 (- (double inner)))
           inner)))
 
     :else
@@ -2602,6 +2805,70 @@
         :else
         [default rest-sql]))))
 
+(defn- column-decimal-meta
+  "If `col-key` references a registered DECIMAL column, return its
+   `{:precision :scale}` map. Else nil. Step 5b helper used by the
+   literal-rescale pass."
+  [registry col-key]
+  (some (fn [[_ tcols]]
+          (when-let [schema (some-> tcols meta :column-schema)]
+            (when-let [cm (get schema col-key)]
+              (when (:decimal? cm) cm))))
+        registry))
+
+(defn- ^:private rescale-literal-for-decimal
+  "Convert a numeric literal to the int64 unscaled representation at
+   `scale`. Used at parse time so the predicate / arithmetic long
+   fast path works against DECIMAL columns without BigDecimal at
+   each row."
+  [v ^long scale]
+  (cond
+    (or (instance? Long v) (instance? Integer v))
+    (try (Math/multiplyExact (long v) (decimal/pow10 scale))
+         (catch ArithmeticException _
+           (throw (ex-info (str "DECIMAL literal " v " overflows int64 at scale " scale)
+                           {:literal v :scale scale}))))
+    (instance? java.math.BigDecimal v)
+    (decimal/bigdec->unscaled-long v scale "decimal literal in WHERE/SELECT")
+    (or (instance? Double v) (instance? Float v))
+    (decimal/bigdec->unscaled-long
+     (java.math.BigDecimal. (str v)) scale "decimal literal in WHERE/SELECT")
+    :else v))
+
+(defn- rescale-decimal-literals
+  "Walk a translated query and rewrite any `[OP col-kw lit]` /
+   `[OP lit col-kw]` where col-kw is a DECIMAL column: rescale lit
+   to the column's unscaled-long form. Leaves other shapes alone
+   (col-vs-col, lit-vs-lit, non-decimal columns, expression
+   sub-trees) so the existing long fast path works correctly.
+
+   In-scope shapes: binary comparison (`= != < <= > >=`), binary
+   arithmetic (`+ - * /`). Out of scope for this pass: `:in`,
+   `:between`, `:like`, function applications. Those still produce
+   the correct answer at low scale columns (Double comparison
+   would float-promote and may be slightly off — documented as a
+   step-5b limitation in `decimal_test.clj`)."
+  [query registry]
+  (let [decimal-binary-ops #{:= :!= :< :<= :> :>= :+ :- :* :/}]
+    (clojure.walk/postwalk
+     (fn [form]
+       (if (and (vector? form)
+                (= 3 (count form))
+                (decimal-binary-ops (first form)))
+         (let [[op a b] form]
+           (cond
+             (and (keyword? a) (number? b))
+             (if-let [cm (column-decimal-meta registry a)]
+               [op a (rescale-literal-for-decimal b (:scale cm))]
+               form)
+             (and (keyword? b) (number? a))
+             (if-let [cm (column-decimal-meta registry b)]
+               [op (rescale-literal-for-decimal a (:scale cm)) b]
+               form)
+             :else form))
+         form))
+     query)))
+
 (defn parse-sql
   "Parse a SQL string and translate to a Stratum query map.
 
@@ -2616,72 +2883,91 @@
      {:options {:analyze? bool :format :text | :json}
       :inner   {:query <map>} | {:system true :tag <str>}}"
   [sql table-registry]
-  (try
+  (letfn [(post-rescale [r]
+            ;; Step 5b: rescale literals in DECIMAL comparisons /
+            ;; arithmetic so the long fast path sees correctly-scaled
+            ;; values. No-op for non-DECIMAL queries.
+            (cond
+              (:query r)
+              (assoc r :query (rescale-decimal-literals (:query r) table-registry))
+              (:explain r)
+              (if-let [inner-q (get-in r [:explain :inner :query])]
+                (assoc-in r [:explain :inner :query]
+                          (rescale-decimal-literals inner-q table-registry))
+                r)
+              :else r))]
+    (post-rescale
+     (try
     ;; Check for EXPLAIN prefix
-    (if-let [[opts inner-sql] (parse-explain-prefix sql)]
-      (let [result (parse-sql inner-sql table-registry)]
-        (cond
-          (:error result)  result
-          (:system result) {:explain {:options opts
-                                      :inner   {:system true :tag (:tag result)}}}
-          (:query result)  {:explain {:options opts
-                                      :inner   {:query (:query result)}}}
-          :else result))
+       (if-let [[opts inner-sql] (parse-explain-prefix sql)]
+         (let [result (parse-sql inner-sql table-registry)]
+           (cond
+             (:error result)  result
+             (:system result) {:explain {:options opts
+                                         :inner   {:system true :tag (:tag result)}}}
+             (:query result)  {:explain {:options opts
+                                         :inner   {:query (:query result)}}}
+             :else result))
 
       ;; Normal parsing
-      (or
+         (or
         ;; Check system queries first (SET, SHOW, BEGIN, etc.)
-       (check-system-query sql table-registry)
+          (check-system-query sql table-registry)
+
+       ;; CREATE TYPE ... AS ENUM — JSqlParser has no node for this, so
+       ;; we detect and parse it before reaching CCJSqlParserUtil.
+          (when (enum-ddl/create-type-enum? sql)
+            {:ddl (enum-ddl/parse-create-type-enum sql)})
 
 ;; Check pg_catalog queries
-       (when (pg-catalog-table sql)
-         (handle-pg-catalog sql table-registry))
+          (when (pg-catalog-table sql)
+            (handle-pg-catalog sql table-registry))
 
         ;; Pre-parse rewrite for non-standard syntax (ASOF JOIN, ...) and
         ;; parse with JSqlParser.
-       (let [{rewritten-sql :sql asof-markers :asof-markers
-              period :period erase? :erase?}
-             (rewrite/preprocess-sql sql)
-             sql rewritten-sql  ;; shadow: downstream uses rewritten form
-             stmt (CCJSqlParserUtil/parse ^String sql)
+          (let [{rewritten-sql :sql asof-markers :asof-markers
+                 period :period erase? :erase?}
+                (rewrite/preprocess-sql sql)
+                sql rewritten-sql  ;; shadow: downstream uses rewritten form
+                stmt (CCJSqlParserUtil/parse ^String sql)
              ;; FOR PORTION OF VALID_TIME (SQL:2011) lowers to a temporal
              ;; slice attached to the DDL map; INSERT/UPDATE/DELETE
              ;; translators below pick it up via `assoc-period`. ERASE
              ;; flag is attached to DELETE so server.clj routes it as a
              ;; physical purge regardless of bitemporal status.
-             assoc-period (fn [result]
-                            (cond-> result
-                              (and period (:ddl result))
-                              (assoc-in [:ddl :period] period)
-                              (and erase? (:ddl result))
-                              (assoc-in [:ddl :erase?] true)))]
-         (cond
-           (instance? PlainSelect stmt)
-           (let [^PlainSelect select stmt
+                assoc-period (fn [result]
+                               (cond-> result
+                                 (and period (:ddl result))
+                                 (assoc-in [:ddl :period] period)
+                                 (and erase? (:ddl result))
+                                 (assoc-in [:ddl :erase?] true)))]
+            (cond
+              (instance? PlainSelect stmt)
+              (let [^PlainSelect select stmt
                   ;; Handle CTEs: WITH cte AS (SELECT ...) SELECT ...
                   ;; CTEs are materialized and added to the table registry
-                 enriched-registry
-                 (if-let [with-items (.getWithItemsList select)]
-                   (reduce (fn [reg ^WithItem wi]
-                             (let [cte-name (.getAliasName wi)
-                                   inner-select (.getPlainSelect (.getSelect wi))
-                                   cte-query (translate-select inner-select reg)
-                                   cte-result (q/q cte-query)
-                                   cte-cols (q/results->columns cte-result)]
-                               (assoc reg cte-name cte-cols)))
-                           table-registry
-                           with-items)
-                   table-registry)]
+                    enriched-registry
+                    (if-let [with-items (.getWithItemsList select)]
+                      (reduce (fn [reg ^WithItem wi]
+                                (let [cte-name (.getAliasName wi)
+                                      inner-select (.getPlainSelect (.getSelect wi))
+                                      cte-query (translate-select inner-select reg)
+                                      cte-result (q/q cte-query)
+                                      cte-cols (q/results->columns cte-result)]
+                                  (assoc reg cte-name cte-cols)))
+                              table-registry
+                              with-items)
+                      table-registry)]
               ;; Check for VERSION() etc.
-             (or (handle-version-query select)
+                (or (handle-version-query select)
 
                   ;; Check for "SHOW TABLES" style
-                 (when-let [from (.getFromItem select)]
-                   (when (and (instance? Table from)
-                              (let [name (.getName ^Table from)]
-                                (or (= name "pg_tables")
-                                    (= name "tables"))))
-                     (handle-show-tables enriched-registry)))
+                    (when-let [from (.getFromItem select)]
+                      (when (and (instance? Table from)
+                                 (let [name (.getName ^Table from)]
+                                   (or (= name "pg_tables")
+                                       (= name "tables"))))
+                        (handle-show-tables enriched-registry)))
 
                   ;; Check for table functions (read_csv, read_parquet)
                   ;; Note: JSqlParser parses read_csv('path') as a table name string,
@@ -2696,82 +2982,82 @@
                   ;; but preserves string literals — deferred until
                   ;; we have another preprocessor with the same
                   ;; need (single-use edge case in practice).
-                 (let [table-func (when-let [[_ func path]
-                                             (re-find #"(?i)\bFROM\s+(read_csv|read_parquet)\s*\(\s*'([^']+)'\s*\)" sql)]
-                                    (validate-file-path path)
-                                    [(str func "(" path ")") (.toLowerCase ^String func) path])]
-                   (when table-func
-                     (let [[full-name func-name path] table-func
-                           table-data (case func-name
-                                        "read_csv"     (csv/from-csv path)
-                                        "read_parquet" (parquet/parquet-dataset path))
+                    (let [table-func (when-let [[_ func path]
+                                                (re-find #"(?i)\bFROM\s+(read_csv|read_parquet)\s*\(\s*'([^']+)'\s*\)" sql)]
+                                       (validate-file-path path)
+                                       [(str func "(" path ")") (.toLowerCase ^String func) path])]
+                      (when table-func
+                        (let [[full-name func-name path] table-func
+                              table-data (case func-name
+                                           "read_csv"     (csv/from-csv path)
+                                           "read_parquet" (parquet/parquet-dataset path))
                             ;; Re-parse with the table data in registry
-                           fixed-sql (.replace ^String sql ^String full-name "__file_table__")
-                           fixed-registry (assoc enriched-registry "__file_table__" table-data)]
-                       {:query (translate-select
-                                ^PlainSelect (CCJSqlParserUtil/parse ^String fixed-sql)
-                                fixed-registry
-                                asof-markers)})))
+                              fixed-sql (.replace ^String sql ^String full-name "__file_table__")
+                              fixed-registry (assoc enriched-registry "__file_table__" table-data)]
+                          {:query (translate-select
+                                   ^PlainSelect (CCJSqlParserUtil/parse ^String fixed-sql)
+                                   fixed-registry
+                                   asof-markers)})))
 
                   ;; Normal SELECT translation
-                 {:query (translate-select select enriched-registry asof-markers)}))
+                    {:query (translate-select select enriched-registry asof-markers)}))
 
             ;; UNION / UNION ALL / INTERSECT / EXCEPT
-           (instance? SetOperationList stmt)
-           (let [^SetOperationList sol stmt
-                 selects (.getSelects sol)
-                 operations (.getOperations sol)
-                 sub-queries (mapv (fn [^net.sf.jsqlparser.statement.select.Select s]
-                                     (if (instance? PlainSelect s)
-                                       (translate-select ^PlainSelect s table-registry)
-                                       (throw (ex-info "Non-PlainSelect in set operation not supported"
-                                                       {:type (type s)}))))
-                                   selects)
+              (instance? SetOperationList stmt)
+              (let [^SetOperationList sol stmt
+                    selects (.getSelects sol)
+                    operations (.getOperations sol)
+                    sub-queries (mapv (fn [^net.sf.jsqlparser.statement.select.Select s]
+                                        (if (instance? PlainSelect s)
+                                          (translate-select ^PlainSelect s table-registry)
+                                          (throw (ex-info "Non-PlainSelect in set operation not supported"
+                                                          {:type (type s)}))))
+                                      selects)
                   ;; Determine operation type from first operation
-                 first-op (first operations)
-                 op-type (cond
-                           (instance? IntersectOp first-op) :intersect
-                           (or (instance? ExceptOp first-op)
-                               (instance? MinusOp first-op)) :except
-                           :else :union)
-                 all? (and (= :union op-type)
-                           (every? (fn [op] (and (instance? UnionOp op) (.isAll ^UnionOp op)))
-                                   operations))]
-             {:query {:_set-op {:op op-type :queries sub-queries :all? all?}}})
+                    first-op (first operations)
+                    op-type (cond
+                              (instance? IntersectOp first-op) :intersect
+                              (or (instance? ExceptOp first-op)
+                                  (instance? MinusOp first-op)) :except
+                              :else :union)
+                    all? (and (= :union op-type)
+                              (every? (fn [op] (and (instance? UnionOp op) (.isAll ^UnionOp op)))
+                                      operations))]
+                {:query {:_set-op {:op op-type :queries sub-queries :all? all?}}})
 
            ;; CREATE TABLE
-           (instance? CreateTable stmt)
-           (translate-create-table stmt)
+              (instance? CreateTable stmt)
+              (translate-create-table stmt)
 
            ;; INSERT INTO
-           (instance? Insert stmt)
-           (assoc-period (translate-insert stmt))
+              (instance? Insert stmt)
+              (assoc-period (translate-insert stmt))
 
            ;; UPDATE
-           (instance? Update stmt)
-           (assoc-period (translate-update stmt))
+              (instance? Update stmt)
+              (assoc-period (translate-update stmt))
 
            ;; DELETE
-           (instance? Delete stmt)
-           (assoc-period (translate-delete stmt))
+              (instance? Delete stmt)
+              (assoc-period (translate-delete stmt))
 
            ;; DROP TABLE
-           (instance? Drop stmt)
-           (let [^Drop d stmt]
-             (when (= "TABLE" (.getType d))
-               {:ddl {:op :drop-table :table (str (.getName d))}}))
+              (instance? Drop stmt)
+              (let [^Drop d stmt]
+                (when (= "TABLE" (.getType d))
+                  {:ddl {:op :drop-table :table (str (.getName d))}}))
 
-           :else
-           {:error (str "Unsupported SQL statement type: " (type stmt))}))))
+              :else
+              {:error (str "Unsupported SQL statement type: " (type stmt))}))))
 
-    (catch clojure.lang.ExceptionInfo e
+       (catch clojure.lang.ExceptionInfo e
       ;; Preserve sqlstate and other ex-data set by translation helpers
       ;; (e.g., :sqlstate "0A000" for feature_not_supported errors).
-      (let [data (ex-data e)]
-        (cond-> {:error (.getMessage e)}
-          (:sqlstate data) (assoc :sqlstate (:sqlstate data)))))
-    (catch Exception e
-      {:error (.getMessage e)})))
+         (let [data (ex-data e)]
+           (cond-> {:error (.getMessage e)}
+             (:sqlstate data) (assoc :sqlstate (:sqlstate data)))))
+       (catch Exception e
+         {:error (.getMessage e)})))))
 
 ;; ============================================================================
 ;; Result formatting for pgwire
@@ -2781,113 +3067,426 @@
 (def ^:private ^:const OID_INT8 20)
 (def ^:private ^:const OID_FLOAT8 701)
 (def ^:private ^:const OID_TEXT 25)
+(def ^:private ^:const OID_INTERVAL 1186)
+(def ^:private ^:const OID_NUMERIC 1700)
+(def ^:private ^:const OID_UUID 2950)
 
 (defn- value->string
-  "Convert a Clojure value to a string for pgwire text format."
-  [v]
+  "Convert a Clojure value to a string for pgwire text format. The
+   2-arity form takes per-column metadata so DECIMAL columns can
+   render their int64 unscaled value as `BigDecimal.toPlainString()`
+   at the declared scale — without meta the value would land as a
+   plain long string (`12345` instead of `123.45`).
+
+   Aggregation outputs (SUM/MIN/MAX) come back as Double from the
+   engine; when the engine-supplied meta tags them as DECIMAL we
+   round-trip via the unscaled long path. Sums > 2^53 lose precision
+   in the Double round-trip — documented step-5c limitation; fixed
+   when SUM returns a typed long result."
+  ([v] (value->string v nil))
+  ([v col-meta]
+   (cond
+     (nil? v) nil
+     ;; Step 5: DECIMAL column rendering — Long input.
+     (and (:decimal? col-meta) (instance? Long v))
+     (decimal/unscaled-long->plain-string (long v) (:scale col-meta))
+     ;; Step 5c: DECIMAL aggregation result — Double input. Convert
+     ;; via Math/round to recover the unscaled long, then render.
+     (and (:decimal? col-meta) (instance? Double v))
+     (let [d (double v)]
+       (if (Double/isNaN d)
+         nil
+         (decimal/unscaled-long->plain-string (Math/round d) (:scale col-meta))))
+     ;; Step 8a: UBIGINT — render via unsigned-string so negative
+     ;; long bit-patterns surface as their 0..2^64-1 form.
+     (and (= 64 (:unsigned-width col-meta)) (instance? Long v))
+     (Long/toUnsignedString (long v))
+     (instance? Double v) (let [d (double v)]
+                            (if (Double/isNaN d) nil (str d)))
+     (instance? Float v) (let [f (float v)]
+                           (if (Float/isNaN f) nil (str f)))
+     ;; Step 8c: BigDecimal — use toPlainString so big/small values
+     ;; don't surface in scientific notation (str on a BigDecimal can
+     ;; emit `1E+10` for example, which is wrong for the wire path).
+     (instance? java.math.BigDecimal v) (.toPlainString ^java.math.BigDecimal v)
+     :else (str v))))
+
+(defn- value->typed
+  "Step W2: convert a Clojure value to the raw Java representation that
+   `stratum.internal.PgBinaryCodec/encode` expects for the column's OID.
+
+   The wire layer reads from `typedRows` when the client requests binary
+   output for a column. Rules mirror `value->string`:
+
+     - DECIMAL Long → BigDecimal at declared scale
+     - DECIMAL Double → BigDecimal via Math/round + declared scale
+       (same precision caveat as text mode: aggregate sums > 2^53
+       lose precision through Double; fixed when SUM returns long)
+     - TIMESTAMP_MS → multiply by 1000 to reach micros (PG binary unit)
+     - TIMESTAMP_NS → divide by 1000 to reach micros
+     - TIMESTAMP_S  → multiply by 1_000_000 to reach micros
+     - DATE (:days), :micros TIMESTAMP, ENUM string, INT8/FLOAT8/TEXT
+       all pass through unchanged
+     - Double NaN → nil (wire NULL)"
+  [v col-meta]
   (cond
     (nil? v) nil
-    (instance? Double v) (let [d (double v)]
-                           (if (Double/isNaN d) nil (str d)))
-    (instance? Float v) (let [f (float v)]
-                          (if (Float/isNaN f) nil (str f)))
-    :else (str v)))
+    ;; Step 5 DECIMAL — Long unscaled.
+    (and (:decimal? col-meta) (instance? Long v))
+    (decimal/unscaled-long->bigdec (long v) (:scale col-meta))
+    ;; Step 5c DECIMAL — Double agg result.
+    (and (:decimal? col-meta) (instance? Double v))
+    (let [d (double v)]
+      (when-not (Double/isNaN d)
+        (decimal/unscaled-long->bigdec (Math/round d) (:scale col-meta))))
+    ;; Step 8a UBIGINT — wire OID is NUMERIC (1700) since values can
+    ;; exceed INT8 range. Convert the reinterpreted long to a
+    ;; BigDecimal-of-BigInteger that the NUMERIC encoder accepts.
+    (and (= 64 (:unsigned-width col-meta)) (instance? Long v))
+    (java.math.BigDecimal.
+     (java.math.BigInteger. (Long/toUnsignedString (long v))))
+    ;; TIMESTAMP unit normalization — PG binary wants micros.
+    (and (instance? Long v) (= :millis (:temporal-unit col-meta)))
+    (Long/valueOf (* (long v) 1000))
+    (and (instance? Long v) (= :nanos (:temporal-unit col-meta)))
+    (Long/valueOf (quot (long v) 1000))
+    (and (instance? Long v) (= :seconds (:temporal-unit col-meta)))
+    (Long/valueOf (* (long v) 1000000))
+    ;; Floats: NaN → nil, otherwise pass through as java.lang.Double/Float.
+    (instance? Double v) (let [d (double v)] (when-not (Double/isNaN d) v))
+    (instance? Float v)  (let [f (float v)]  (when-not (Float/isNaN f) v))
+    :else v))
+
+(defn- meta->oid
+  "Resolve a Postgres OID from per-column metadata. Returns nil when the
+   metadata doesn't pin a type, in which case the caller falls back to
+   value-based inference. Pulled out as a helper so the columnar and
+   row-form result paths share one resolver."
+  [{:keys [temporal-unit enum-oid decimal? unsigned-width interval?] :as col-meta}]
+  (cond
+    enum-oid     (int enum-oid)
+    ;; Step 5: DECIMAL / NUMERIC → OID 1700.
+    decimal?     (:numeric pg-type-oids)
+    ;; Step 7: INTERVAL — fixed 16-byte primitive (months/days/micros).
+    interval?    (:interval pg-type-oids)
+    ;; Step 6 / 8a: unsigned integers — PG has no native unsigned
+    ;; types, so we map to the smallest signed container that fits the
+    ;; unsigned range. u8/u16 fit into INT2; u32 needs INT8; u64
+    ;; exceeds INT8's signed range and falls through to NUMERIC.
+    (= 8  unsigned-width) (:int2 pg-type-oids)
+    (= 16 unsigned-width) (:int2 pg-type-oids)
+    (= 32 unsigned-width) (:int8 pg-type-oids)
+    (= 64 unsigned-width) (:numeric pg-type-oids)
+    ;; Date column — stored as epoch-days.
+    (= :days temporal-unit) (:date pg-type-oids)
+    ;; TIMESTAMP family (seconds/millis/micros/nanos). PG only has OID
+    ;; 1114 for timestamp; the precision tag is for the engine, not
+    ;; the wire. Clients see "timestamp" and the value in the column's
+    ;; native unit — same wire shape as DuckDB's PG extension.
+    (#{:seconds :millis :micros :nanos} temporal-unit)
+    (:timestamp pg-type-oids)
+    :else nil))
 
 (defn- infer-oid
-  "Infer PostgreSQL OID from a result value."
-  [v]
+  "Infer PostgreSQL OID for a result column. Prefers explicit per-column
+   metadata (DDL-declared type) when provided; falls back to value-based
+   inference (single value sample) when meta is absent or doesn't pin a
+   type — preserves the pre-step-4a behaviour for computed columns,
+   CASTs, expressions, and other outputs that aren't simple column
+   references."
+  ([v] (infer-oid v nil))
+  ([v col-meta]
+   (or (meta->oid col-meta)
+       (cond
+         (nil? v) OID_TEXT
+         ;; Reference-typed values matched FIRST so (integer? v) doesn't
+         ;; capture BigInteger and (number? v) doesn't capture BigDecimal.
+         ;; Step 7: Interval → OID 1186.
+         (instance? Interval v) OID_INTERVAL
+         ;; Step 8b: BigInteger → NUMERIC (no native int128 OID in PG).
+         (instance? java.math.BigInteger v) OID_NUMERIC
+         ;; Step 8c: BigDecimal → NUMERIC.
+         (instance? java.math.BigDecimal v) OID_NUMERIC
+         ;; UUID — emit the canonical OID 2950.
+         (instance? java.util.UUID v) OID_UUID
+         (instance? Long v) OID_INT8
+         (integer? v) OID_INT8
+         (instance? Double v) OID_FLOAT8
+         (float? v) OID_FLOAT8
+         :else OID_TEXT))))
+
+(defn- ^:private agg-spec-input-col
+  "Pull the input column keyword out of an agg spec. Examples:
+     [:sum :price]                → :price
+     [:as [:sum :price] :total]   → :price
+     [:count :*]                  → :*
+   Returns nil for shapes we don't recognise (computed agg, function
+   call etc.) — those columns fall back to value-inference at output."
+  [agg-spec]
   (cond
-    (nil? v) OID_TEXT
-    (instance? Long v) OID_INT8
-    (integer? v) OID_INT8
-    (instance? Double v) OID_FLOAT8
-    (float? v) OID_FLOAT8
-    :else OID_TEXT))
+    (not (vector? agg-spec)) nil
+    (= :as (first agg-spec)) (recur (second agg-spec))
+    (and (= 2 (count agg-spec)) (keyword? (second agg-spec)))
+    (second agg-spec)
+    :else nil))
+
+(defn- agg-spec-output-keys
+  "Derive the candidate result-map key(s) for an agg spec. The query
+   engine names a single agg by the op kw (`:sum`) but disambiguates
+   duplicate ops as `:op_col` (`:sum_qty`, `:sum_price`). We emit both
+   candidates so the format-results meta lookup hits whichever key
+   the engine ended up using. An explicit `:as alias` wrapper wins."
+  [agg-spec]
+  (cond
+    (not (vector? agg-spec)) []
+    (= :as (first agg-spec)) [(nth agg-spec 2)]
+    (and (= 2 (count agg-spec)) (keyword? (second agg-spec)))
+    [(first agg-spec)
+     (keyword (str (name (first agg-spec)) "_" (name (second agg-spec))))]
+    :else [(first agg-spec)]))
+
+(defn- agg-spec-op
+  "Strip any `:as` wrapper and return the underlying op kw."
+  [agg-spec]
+  (if (and (vector? agg-spec) (= :as (first agg-spec)))
+    (recur (second agg-spec))
+    (when (vector? agg-spec) (first agg-spec))))
+
+(defn output-column-meta
+  "Step 5c: walk a translated query's `:agg` and `:select` and build
+   `{output-col-kw <col-meta>}` for any output column that should
+   carry an input column's DECIMAL precision/scale metadata.
+
+   Rules
+     SUM(dec_col), MIN(dec_col), MAX(dec_col) → preserve (p,s)
+     AVG(dec_col)                              → DOUBLE (no DEC meta)
+     Plain SELECT dec_col                      → preserve (p,s)
+     [:as dec_col alias]                       → alias gets (p,s)
+     Computed expressions, CASTs               → no meta (value-infer)
+
+   Step 5c does not yet flow precision through arithmetic; that lands
+   in a future sub-step. For now this covers the most common pattern
+   (`SELECT SUM(price), MIN(price), MAX(price) FROM t`) where the
+   user expects DECIMAL rendering on the wire."
+  [query registry]
+  (let [;; Reuse column-decimal-meta defined above to look up a
+        ;; col-kw's DECIMAL spec from the registry.
+        agg-meta (into {}
+                       (mapcat (fn [spec]
+                                 (let [outputs (agg-spec-output-keys spec)
+                                       in-col  (agg-spec-input-col spec)
+                                       op      (agg-spec-op spec)
+                                       dec-cm  (when (and in-col (not= in-col :*))
+                                                 (column-decimal-meta registry in-col))]
+                                   (when (and (seq outputs) dec-cm
+                                              (#{:sum :min :max} op))
+                                     (map (fn [k] [k dec-cm]) outputs)))))
+                       (:agg query []))
+        sel-meta (into {}
+                       (keep (fn [spec]
+                               (cond
+                                 ;; bare column reference
+                                 (keyword? spec)
+                                 (when-let [cm (column-decimal-meta registry spec)]
+                                   [spec cm])
+                                 ;; aliased column reference `[:as :col :alias]`
+                                 (and (vector? spec)
+                                      (= :as (first spec))
+                                      (keyword? (second spec)))
+                                 (when-let [cm (column-decimal-meta registry (second spec))]
+                                   [(nth spec 2) cm])
+                                 :else nil)))
+                       (:select query []))]
+    (merge sel-meta agg-meta)))
+
+(defn collect-column-meta
+  "Walk every registered table and merge their :column-schema metadata
+   into a single map keyed by column-keyword. Enum-typed columns get an
+   `:enum-oid` field resolved from the server's `__enums__` registry.
+
+   Used at format-results time: when an output column's keyword matches
+   a registered column with declared metadata, we know its source
+   :temporal-unit / :enum-of and can emit the right PG OID. Outputs
+   that don't match a registered column (computed expressions, CASTs,
+   aliases) fall back to value-based OID inference. This is best-effort
+   — same-named columns across tables collide; the user-visible result
+   is still correct because the engine itself has type info,
+   format-results only feeds the wire-protocol type tag."
+  [registry]
+  (let [enums (get registry "__enums__")]
+    (reduce (fn [acc [tname tcols]]
+              (if (str/starts-with? (str tname) "__")
+                acc
+                (if-let [schema (some-> tcols meta :column-schema)]
+                  (merge acc
+                         (reduce-kv (fn [m col-kw col-spec]
+                                      (assoc m col-kw
+                                             (cond-> col-spec
+                                               (:enum-of col-spec)
+                                               (assoc :enum-oid
+                                                      (get-in enums [(:enum-of col-spec) :oid])))))
+                                    {}
+                                    schema))
+                  acc)))
+            {}
+            registry)))
 
 (defn format-results
-  "Format Stratum query results into a PgWireServer.QueryResult."
-  [results]
-  (cond
+  "Format Stratum query results into a PgWireServer.QueryResult.
+
+   The 2-arity form takes an optional `column-meta` map
+   `{col-kw {:temporal-unit ... :enum-of ... :enum-oid ...}}` so
+   declared per-column types surface as the correct PG OID on the
+   wire (DATE / TIMESTAMP / ENUM) instead of `OID_INT8` /
+   `OID_TEXT`. Columns absent from the map fall back to value-based
+   inference — the pre-step-4a behaviour. See `collect-column-meta`
+   for the standard caller pattern."
+  ([results] (format-results results nil))
+  ([results column-meta]
+   (cond
     ;; System query with pre-formatted result
-    (and (:system results) (:result results))
-    (let [{:keys [columns oids rows]} (:result results)
-          tag (:tag results)]
-      (PgWireServer$QueryResult.
-       (into-array String columns)
-       (int-array oids)
-       (into-array (Class/forName "[Ljava.lang.String;")
-                   (mapv #(into-array String %) rows))
-       (str tag)))
+     (and (:system results) (:result results))
+     (let [{:keys [columns oids rows]} (:result results)
+           tag (:tag results)]
+       (PgWireServer$QueryResult.
+        (into-array String columns)
+        (int-array oids)
+        (into-array (Class/forName "[Ljava.lang.String;")
+                    (mapv #(into-array String %) rows))
+        (str tag)))
 
     ;; System query with no result (SET, BEGIN, etc.)
-    (:system results)
-    (PgWireServer$QueryResult/empty (str (:tag results)))
+     (:system results)
+     (PgWireServer$QueryResult/empty (str (:tag results)))
 
     ;; Error
-    (:error results)
-    (PgWireServer$QueryResult. ^String (:error results))
+     (:error results)
+     (PgWireServer$QueryResult. ^String (:error results))
 
     ;; Columnar result format
-    (and (map? results) (:n-rows results))
-    (let [n-rows (long (:n-rows results))
-          col-keys (vec (remove #{:n-rows} (keys results)))
-          col-names (mapv name col-keys)
-          ;; Infer OIDs from first row values
-          oids (int-array (map (fn [k]
-                                 (let [arr (get results k)]
-                                   (cond
-                                     (instance? (Class/forName "[J") arr) OID_INT8
-                                     (instance? (Class/forName "[D") arr) OID_FLOAT8
-                                     :else OID_TEXT)))
-                               col-keys))
-          rows (into-array (Class/forName "[Ljava.lang.String;")
-                           (for [i (range n-rows)]
-                             (into-array String
-                                         (for [k col-keys]
-                                           (let [arr (get results k)]
-                                             (cond
-                                               (instance? (Class/forName "[J") arr)
-                                               (let [v (aget ^longs arr (int i))]
-                                                 (if (= v Long/MIN_VALUE) nil (str v)))
-                                               (instance? (Class/forName "[D") arr)
-                                               (let [v (aget ^doubles arr (int i))]
-                                                 (if (Double/isNaN v) nil (str v)))
-                                               (instance? (Class/forName "[Ljava.lang.String;") arr)
-                                               (aget ^"[Ljava.lang.String;" arr (int i))
-                                               :else (str (nth (seq arr) i))))))))]
-      (PgWireServer$QueryResult.
-       (into-array String col-names)
-       oids
-       rows
-       (str "SELECT " n-rows)))
+     (and (map? results) (:n-rows results))
+     (let [n-rows (long (:n-rows results))
+           col-keys (vec (remove #{:n-rows} (keys results)))
+           col-names (mapv name col-keys)
+          ;; Step 4a: prefer declared per-column OID; fall back to
+          ;; array-shape inference (the pre-step-4a behaviour).
+           oids (int-array (map (fn [k]
+                                  (let [arr (get results k)]
+                                    (or (meta->oid (get column-meta k))
+                                        (cond
+                                          (instance? (Class/forName "[J") arr) OID_INT8
+                                          (instance? (Class/forName "[D") arr) OID_FLOAT8
+                                         ;; Step 7b/8b/8c/UUID: reference-typed array (Interval[],
+                                         ;; BigInteger[], BigDecimal[], UUID[], or Object[] of
+                                         ;; those). Infer the wire OID from the first non-nil
+                                         ;; element so register-table! callers don't have to
+                                         ;; declare column metadata for these passthrough types.
+                                          (and (some-> arr class .isArray)
+                                               (not (.isPrimitive (.getComponentType (class arr))))
+                                               (pos? (alength ^objects arr)))
+                                          (let [probe (some identity (seq ^objects arr))]
+                                            (cond
+                                              (instance? Interval probe)              OID_INTERVAL
+                                              (instance? java.math.BigInteger probe)  OID_NUMERIC
+                                              (instance? java.math.BigDecimal probe)  OID_NUMERIC
+                                              (instance? java.util.UUID probe)        OID_UUID
+                                              :else OID_TEXT))
+                                          :else OID_TEXT))))
+                                col-keys))
+          ;; Step W2: build text rows and typed rows in a single pass so
+          ;; the wire layer can switch per-column on the requested format.
+           row-pairs (for [i (range n-rows)]
+                       (mapv (fn [k]
+                               (let [arr (get results k)
+                                     cm  (get column-meta k)]
+                                 (cond
+                                   (instance? (Class/forName "[J") arr)
+                                   (let [v (aget ^longs arr (int i))]
+                                     (cond
+                                      ;; Step 8 sentinel opt-out: when the
+                                      ;; column promises no implicit sentinel
+                                      ;; NULL, every bit pattern (including
+                                      ;; Long.MIN_VALUE) is a valid value.
+                                      ;; NULL detection — if it's tracked at
+                                      ;; all — must come from an explicit
+                                      ;; validity bitmap, not from the data.
+                                       (:no-sentinel-null? cm)
+                                       [(value->string v cm) (value->typed v cm)]
+                                       (= v Long/MIN_VALUE)
+                                       [nil nil]
+                                       :else
+                                       [(value->string v cm) (value->typed v cm)]))
+                                   (instance? (Class/forName "[D") arr)
+                                   (let [v (aget ^doubles arr (int i))]
+                                     (if (Double/isNaN v)
+                                       [nil nil]
+                                       [(value->string v cm) (value->typed v cm)]))
+                                   (instance? (Class/forName "[Ljava.lang.String;") arr)
+                                   (let [v (aget ^"[Ljava.lang.String;" arr (int i))]
+                                     [v v])
+                                  ;; Step 7b: generic reference array — render via toString,
+                                  ;; keep the raw value as the typed payload for binary encoding.
+                                   (and (some-> arr class .isArray)
+                                        (not (.isPrimitive (.getComponentType (class arr)))))
+                                   (let [v (aget ^objects arr (int i))]
+                                     (if (nil? v)
+                                       [nil nil]
+                                       [(.toString ^Object v) v]))
+                                   :else
+                                   (let [v (nth (seq arr) i)]
+                                     [(value->string v cm) (value->typed v cm)]))))
+                             col-keys))
+           rows (into-array (Class/forName "[Ljava.lang.String;")
+                            (for [pair-row row-pairs]
+                              (into-array String (map first pair-row))))
+           typed-rows (into-array (Class/forName "[Ljava.lang.Object;")
+                                  (for [pair-row row-pairs]
+                                    (into-array Object (map second pair-row))))]
+       (PgWireServer$QueryResult.
+        (into-array String col-names)
+        oids
+        rows
+        typed-rows
+        (str "SELECT " n-rows)))
 
     ;; Vector of maps (standard Stratum result)
-    (sequential? results)
-    (if (empty? results)
-      (PgWireServer$QueryResult.
-       (into-array String [])
-       (int-array [])
-       (into-array (Class/forName "[Ljava.lang.String;") [])
-       "SELECT 0")
-      (let [first-row (first results)
+     (sequential? results)
+     (if (empty? results)
+       (PgWireServer$QueryResult.
+        (into-array String [])
+        (int-array [])
+        (into-array (Class/forName "[Ljava.lang.String;") [])
+        (into-array (Class/forName "[Ljava.lang.Object;") [])
+        "SELECT 0")
+       (let [first-row (first results)
             ;; Filter out internal engine keys (starting with _) before serializing
-            col-keys (vec (filter #(not (str/starts-with? (name %) "_")) (keys first-row)))
-            col-names (mapv name col-keys)
-            oids (int-array (map #(infer-oid (get first-row %)) col-keys))
-            rows (into-array (Class/forName "[Ljava.lang.String;")
-                             (mapv (fn [row]
-                                     (into-array String
-                                                 (mapv #(value->string (get row %)) col-keys)))
-                                   results))]
-        (PgWireServer$QueryResult.
-         (into-array String col-names)
-         oids
-         rows
-         (str "SELECT " (count results)))))
+             col-keys (vec (filter #(not (str/starts-with? (name %) "_")) (keys first-row)))
+             col-names (mapv name col-keys)
+             oids (int-array (map #(infer-oid (get first-row %) (get column-meta %)) col-keys))
+             rows (into-array (Class/forName "[Ljava.lang.String;")
+                              (mapv (fn [row]
+                                      (into-array String
+                                                  (mapv #(value->string (get row %)
+                                                                        (get column-meta %))
+                                                        col-keys)))
+                                    results))
+             typed-rows (into-array (Class/forName "[Ljava.lang.Object;")
+                                    (mapv (fn [row]
+                                            (into-array Object
+                                                        (mapv #(value->typed (get row %)
+                                                                             (get column-meta %))
+                                                              col-keys)))
+                                          results))]
+         (PgWireServer$QueryResult.
+          (into-array String col-names)
+          oids
+          rows
+          typed-rows
+          (str "SELECT " (count results)))))
 
     ;; Single map (non-grouped aggregate)
-    (map? results)
-    (format-results [results])
+     (map? results)
+     (format-results [results] column-meta)
 
-    :else
-    (PgWireServer$QueryResult. (str "Unexpected result type: " (type results)))))
+     :else
+     (PgWireServer$QueryResult. (str "Unexpected result type: " (type results))))))

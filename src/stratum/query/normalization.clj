@@ -77,8 +77,11 @@
             (:second)       {:op :second       :args args}
             (:millisecond)  {:op :millisecond  :args args}
             (:microsecond)  {:op :microsecond  :args args}
-            (:day-of-week)  {:op :day-of-week  :args args}
-            (:week-of-year) {:op :week-of-year :args args}
+            (:nanosecond)   {:op :nanosecond   :args args}
+            (:day-of-week)     {:op :day-of-week     :args args}
+            (:iso-day-of-week) {:op :iso-day-of-week :args args}
+            (:week-of-year)    {:op :week-of-year    :args args}
+            (:quarter)         {:op :quarter         :args args}
             (:date-trunc)    {:op :date-trunc    :args args}
             (:date-add)      {:op :date-add      :args args}
             (:date-diff)     {:op :date-diff     :args args}
