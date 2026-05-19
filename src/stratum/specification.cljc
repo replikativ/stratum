@@ -38,11 +38,22 @@
   [:fn {:error/message "must be a String[]"}
    #(instance? (Class/forName "[Ljava.lang.String;") %)])
 
+(def SIntervalArray
+  "Step 7: Interval[] or Object[] of stratum.internal.Interval values.
+   Accepts both the precisely-typed array (preferred) and Object[]
+   from `(object-array …)` whose first element is an Interval."
+  [:fn {:error/message "must be an Interval[] or Object[]-of-Interval"}
+   #(or (instance? (Class/forName "[Lstratum.internal.Interval;") %)
+        (and (instance? (Class/forName "[Ljava.lang.Object;") %)
+             (let [^"[Ljava.lang.Object;" arr %]
+               (and (pos? (alength arr))
+                    (instance? stratum.internal.Interval (aget arr 0))))))])
+
 (def SEncodedColumn
   "Pre-encoded column {:type T :data arr :dict String[] (optional)}.
    Also accepts index-mode: {:type T :index PersistentColumnIndex :dict ...}."
   [:map {:closed false}
-   [:type [:enum :int64 :float64]]
+   [:type [:enum :int64 :float64 :interval]]
    [:data {:optional true} :any]])
 
 (def SIndex
@@ -51,10 +62,10 @@
    #(= "stratum.index.PersistentColumnIndex" (.getName (class %)))])
 
 (def SColumnData
-  "Column data: double[], long[], String[], PersistentColumnIndex,
+  "Column data: double[], long[], String[], Interval[], PersistentColumnIndex,
    pre-encoded {:type T :data arr}, or Clojure sequential (auto-converted)."
-  [:or {:error/message "must be double[], long[], String[], PersistentColumnIndex, {:type :data} map, or sequential collection"}
-   SDoubleArray SLongArray SStringArray SIndex SEncodedColumn
+  [:or {:error/message "must be double[], long[], String[], Interval[], PersistentColumnIndex, {:type :data} map, or sequential collection"}
+   SDoubleArray SLongArray SStringArray SIntervalArray SIndex SEncodedColumn
    sequential?])
 
 (def SColumnMap

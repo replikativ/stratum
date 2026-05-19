@@ -46,7 +46,7 @@
            [net.sf.jsqlparser.statement.insert InsertConflictAction InsertConflictTarget ConflictActionType]
            [net.sf.jsqlparser.statement.drop Drop]
            [net.sf.jsqlparser.statement.select Values]
-           [stratum.internal PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler]))
+           [stratum.internal PgWireServer PgWireServer$QueryResult PgWireServer$QueryHandler Interval]))
 
 (set! *warn-on-reflection* true)
 
@@ -2286,6 +2286,7 @@
    :bool 16
    :date 1082
    :timestamp 1114
+   :interval 1186
    :numeric 1700
    :oid 26
    :name 19})
@@ -3058,6 +3059,7 @@
 (def ^:private ^:const OID_INT8 20)
 (def ^:private ^:const OID_FLOAT8 701)
 (def ^:private ^:const OID_TEXT 25)
+(def ^:private ^:const OID_INTERVAL 1186)
 
 (defn- value->string
   "Convert a Clojure value to a string for pgwire text format. The
@@ -3136,11 +3138,13 @@
    metadata doesn't pin a type, in which case the caller falls back to
    value-based inference. Pulled out as a helper so the columnar and
    row-form result paths share one resolver."
-  [{:keys [temporal-unit enum-oid decimal? unsigned-width] :as col-meta}]
+  [{:keys [temporal-unit enum-oid decimal? unsigned-width interval?] :as col-meta}]
   (cond
     enum-oid     (int enum-oid)
     ;; Step 5: DECIMAL / NUMERIC → OID 1700.
     decimal?     (:numeric pg-type-oids)
+    ;; Step 7: INTERVAL — fixed 16-byte primitive (months/days/micros).
+    interval?    (:interval pg-type-oids)
     ;; Step 6: unsigned integers — PG has no native unsigned types, so
     ;; we map to the smallest signed container that fits the unsigned
     ;; range. u8/u16 fit comfortably into INT2; u32 needs INT8.
@@ -3173,6 +3177,10 @@
          (integer? v) OID_INT8
          (instance? Double v) OID_FLOAT8
          (float? v) OID_FLOAT8
+         ;; Step 7: bare Interval values surface as OID 1186 even without
+         ;; explicit :interval? metadata (e.g., from a register-table!
+         ;; column whose schema wasn't pre-declared).
+         (instance? Interval v) OID_INTERVAL
          :else OID_TEXT))))
 
 (defn- ^:private agg-spec-input-col

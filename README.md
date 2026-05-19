@@ -284,6 +284,7 @@ DataRow) — for every OID it tags on the wire:
 | 700 / 701 | FLOAT4 / FLOAT8 | ✓ | ✓ |
 | 1082 | DATE (PG epoch shift handled at codec boundary) | ✓ | ✓ |
 | 1114 / 1184 | TIMESTAMP / TIMESTAMPTZ (Stratum :seconds / :millis / :micros / :nanos units normalize to micros for the wire) | ✓ | ✓ |
+| 1186 | INTERVAL (16-byte fixed: int64 micros + int32 days + int32 months) | ✓ | ✓ |
 | 1700 | NUMERIC (base-10000 ndigits/weight/sign/dscale) | ✓ | ✓ |
 | 2950 | UUID (16 BE bytes) | ✓ | ✓ |
 | 3802 | JSONB (version byte 0x01 + UTF-8) | ✓ | ✓ |

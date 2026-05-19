@@ -145,6 +145,24 @@
                        :dict-bigram-masks (ColumnOpsString/buildDictBigramMasks reverse-dict)}
                 v (assoc :validity v)))))))
 
+    ;; Step 7: Interval[] — a column of stratum.internal.Interval values
+    ;; (PG's 16-byte interval primitive). Pass through as a typed Object[]
+    ;; with `:type :interval` so format-results can pick the right OID and
+    ;; render via Interval.toString. Filters and aggregates over INTERVAL
+    ;; columns aren't yet supported — this branch only enables the SELECT
+    ;; passthrough path.
+    (instance? (Class/forName "[Lstratum.internal.Interval;") col-val)
+    {:type :interval :data col-val}
+
+    ;; Object[] whose first non-nil element is an Interval — accept the
+    ;; same way, normalising the array class. Used by `(object-array …)`
+    ;; in user code where the precise array type isn't pinned.
+    (and (instance? (Class/forName "[Ljava.lang.Object;") col-val)
+         (let [^"[Ljava.lang.Object;" arr col-val]
+           (and (pos? (alength arr))
+                (instance? stratum.internal.Interval (aget arr 0)))))
+    {:type :interval :data col-val}
+
     ;; Stratum index - preserve as index source for chunk-streaming
     (satisfies? index/IColumnIndex col-val)
     (let [dt (index/idx-datatype col-val)]

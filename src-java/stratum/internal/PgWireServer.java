@@ -42,6 +42,7 @@ public final class PgWireServer {
     public static final int OID_TIMESTAMP = 1114;
     public static final int OID_TIMESTAMPTZ = 1184;
     public static final int OID_NUMERIC   = 1700;
+    public static final int OID_INTERVAL  = 1186;
     public static final int OID_UUID      = 2950;
     public static final int OID_JSONB     = 3802;
 
@@ -633,6 +634,12 @@ public final class PgWireServer {
             case OID_TIMESTAMP, OID_TIMESTAMPTZ ->
                 formatTimestampMicros(((Number) v).longValue());
             case OID_NUMERIC -> ((java.math.BigDecimal) v).toPlainString();
+            // Interval values stringify to PG's "1 year 2 mons 3 days 04:05:06"
+            // form, which JSqlParser doesn't accept as a bare literal. The
+            // substituteParams pass quotes non-numeric values as SQL strings,
+            // and SQL parsers commonly accept '1 year 2 mons …' as an
+            // interval string. Callers wrap it in INTERVAL ... if needed.
+            case OID_INTERVAL -> v.toString();
             default -> v.toString();
         };
     }

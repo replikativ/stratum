@@ -64,6 +64,7 @@ public final class PgBinaryCodec {
                  PgWireServer.OID_TIMESTAMP,
                  PgWireServer.OID_TIMESTAMPTZ,
                  PgWireServer.OID_NUMERIC,
+                 PgWireServer.OID_INTERVAL,
                  PgWireServer.OID_UUID,
                  PgWireServer.OID_JSONB -> true;
             default -> false;
@@ -107,6 +108,7 @@ public final class PgBinaryCodec {
             case PgWireServer.OID_TIMESTAMP,
                  PgWireServer.OID_TIMESTAMPTZ -> encodeTimestamp(((Number) value).longValue());
             case PgWireServer.OID_NUMERIC   -> encodeNumeric(asBigDecimal(value));
+            case PgWireServer.OID_INTERVAL  -> encodeInterval((Interval) value);
             case PgWireServer.OID_UUID      -> encodeUuid(value);
             case PgWireServer.OID_JSONB     -> encodeJsonb(value.toString());
             default -> throw new IllegalArgumentException(
@@ -413,10 +415,37 @@ public final class PgBinaryCodec {
             case PgWireServer.OID_TIMESTAMP,
                  PgWireServer.OID_TIMESTAMPTZ -> decodeTimestamp(payload);
             case PgWireServer.OID_NUMERIC   -> decodeNumeric(payload);
+            case PgWireServer.OID_INTERVAL  -> decodeInterval(payload);
             case PgWireServer.OID_UUID      -> decodeUuid(payload);
             case PgWireServer.OID_JSONB     -> decodeJsonb(payload);
             default -> throw new IllegalArgumentException("No binary decoder for OID " + oid);
         };
+    }
+
+    // -------------------------------------------------------------------
+    // INTERVAL — PG 16-byte fixed layout: int64 micros, int32 days, int32 months
+    // (matches src/backend/utils/adt/timestamp.c interval_send/recv and
+    // src/include/datatype/timestamp.h Interval struct).
+    // -------------------------------------------------------------------
+
+    public static byte[] encodeInterval(Interval iv) {
+        if (iv == null) throw new IllegalArgumentException("encodeInterval(null)");
+        ByteBuffer bb = ByteBuffer.allocate(16);
+        bb.putLong(iv.micros);
+        bb.putInt(iv.days);
+        bb.putInt(iv.months);
+        return bb.array();
+    }
+
+    public static Interval decodeInterval(byte[] b) {
+        if (b.length != 16) {
+            throw new IllegalArgumentException("INTERVAL length " + b.length + " (expected 16)");
+        }
+        ByteBuffer bb = ByteBuffer.wrap(b);
+        long micros = bb.getLong();
+        int days    = bb.getInt();
+        int months  = bb.getInt();
+        return new Interval(micros, days, months);
     }
 
     // -------------------------------------------------------------------
