@@ -44,7 +44,7 @@
          empty-col-array columns->descriptors
          durable-branch durable-meta
          resolve-enum-columns validate-enum-rows!
-         coerce-rows-for-decimals)
+         coerce-rows-for-decimals check-unsigned-rows!)
 
 ;; ============================================================================
 ;; File path validation
@@ -894,6 +894,10 @@
                       ;; No-op when the table has no DECIMAL columns.
                       col-order (or (:columns ddl) (vec (keys existing)))
                       schema    (:column-schema (meta existing))
+                      ;; Step 6: range-check unsigned columns BEFORE the
+                      ;; decimal coercion. Out-of-range values must surface
+                      ;; before any partial conversion lands.
+                      rows      (check-unsigned-rows! rows col-order schema table)
                       rows      (coerce-rows-for-decimals rows col-order schema table)
                       ddl       (assoc ddl :rows rows)]
                   ;; ENUM validation: for each enum-typed column,
@@ -1504,24 +1508,80 @@
     rows
     (mapv #(coerce-row-for-decimals % col-order column-schema table-name) rows)))
 
+;; ---------------------------------------------------------------------------
+;; Step 6: Unsigned integer range-checking on INSERT.
+
+(defn- ^:private unsigned-max
+  "Inclusive upper bound for an unsigned-width column. UTINYINT=255,
+   USMALLINT=65535, UINTEGER=4294967295."
+  ^long [^long width]
+  (case width
+    8  255
+    16 65535
+    32 4294967295))
+
+(defn- check-unsigned-row!
+  "Validate that every unsigned column's value in `row` fits its
+   declared range. Throws ex-info with sqlstate 22003 (numeric value out
+   of range) when a value falls outside [0, max] for its width. NULL
+   values pass through (range constraint applies only to non-NULL)."
+  [row col-order column-schema table-name]
+  (doseq [[col-kw v] (map vector col-order row)]
+    (when-let [width (get-in column-schema [col-kw :unsigned-width])]
+      (when (some? v)
+        (let [n (cond
+                  (instance? Long v)    (long v)
+                  (instance? Integer v) (long v)
+                  (instance? Short v)   (long v)
+                  (instance? Byte v)    (long v)
+                  (string? v)           (try (Long/parseLong v)
+                                             (catch NumberFormatException _ nil))
+                  :else nil)]
+          (cond
+            (nil? n)
+            (throw (ex-info (str "Value " v " is not a valid integer for "
+                                 table-name "." (name col-kw)
+                                 " (UINT" width ")")
+                            {:sqlstate "22003"
+                             :column col-kw :value v}))
+            (or (neg? n) (> n (unsigned-max width)))
+            (throw (ex-info (str "Value " n " out of range for "
+                                 table-name "." (name col-kw)
+                                 " (UINT" width "; valid range 0.."
+                                 (unsigned-max width) ")")
+                            {:sqlstate "22003"
+                             :column col-kw :value n :width width})))))))
+  row)
+
+(defn- check-unsigned-rows!
+  "Validate every row against the table's unsigned-width columns. No-op
+   when the table has no unsigned columns."
+  [rows col-order column-schema table-name]
+  (if-not (some #(get-in column-schema [% :unsigned-width]) col-order)
+    rows
+    (mapv #(check-unsigned-row! % col-order column-schema table-name) rows)))
+
 (defn- columns->descriptors
   "Reduce a DDL :columns vector into a {col-kw <descriptor>} schema map.
    Used to compose the side-schema attached as Clojure metadata so
    downstream INSERT/UPDATE handlers can see per-column policy
    without re-reading the parser output. Captures `:temporal-unit`
-   (DATE/TIMESTAMP precision), `:enum-of` (declared enum name), and
-   `:decimal? :precision :scale` (step 5 — DECIMAL/NUMERIC tagging)."
+   (DATE/TIMESTAMP precision), `:enum-of` (declared enum name),
+   `:decimal? :precision :scale` (step 5 — DECIMAL/NUMERIC tagging),
+   and `:unsigned-width` (step 6 — UTINYINT/USMALLINT/UINTEGER)."
   [columns]
   (into {}
-        (keep (fn [{:keys [name temporal-unit enum-of decimal? precision scale]}]
-                (when (or temporal-unit enum-of decimal?)
+        (keep (fn [{:keys [name temporal-unit enum-of decimal? precision scale
+                           unsigned-width]}]
+                (when (or temporal-unit enum-of decimal? unsigned-width)
                   [(keyword name)
                    (cond-> {}
-                     temporal-unit (assoc :temporal-unit temporal-unit)
-                     enum-of       (assoc :enum-of enum-of)
-                     decimal?      (assoc :decimal? true
-                                          :precision precision
-                                          :scale scale))])))
+                     temporal-unit  (assoc :temporal-unit temporal-unit)
+                     enum-of        (assoc :enum-of enum-of)
+                     decimal?       (assoc :decimal? true
+                                           :precision precision
+                                           :scale scale)
+                     unsigned-width (assoc :unsigned-width unsigned-width))])))
         columns))
 
 (defn- durable-meta

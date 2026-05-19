@@ -2277,6 +2277,7 @@
 (def ^:private pg-type-oids
   "Common PostgreSQL type OIDs."
   {:int8 20
+   :int2 21
    :int4 23
    :float8 701
    :float4 700
@@ -2494,6 +2495,18 @@
           (= t "TINYINT") (= t "INT4") (= t "INT8") (= t "SERIAL"))
       {:type :int64}
 
+      ;; Step 6: DuckDB-style unsigned integer types. Stratum stores all
+      ;; integers as int64, so unsigned types share the same backing
+      ;; representation but carry a `:unsigned-width` tag (8/16/32 bits)
+      ;; so the INSERT path can range-check and the wire layer can map to
+      ;; an OID PG clients recognise (INT2 for u8/u16, INT8 for u32 — PG
+      ;; lacks native unsigned types, so we pick the smallest signed
+      ;; container that fits the unsigned range).
+      (= t "UTINYINT")  {:type :int64 :unsigned-width 8}
+      (= t "USMALLINT") {:type :int64 :unsigned-width 16}
+      (or (= t "UINTEGER") (= t "UINT") (= t "UINT4"))
+      {:type :int64 :unsigned-width 32}
+
       (or (= t "DOUBLE") (= t "FLOAT") (= t "REAL")
           (= t "DOUBLE PRECISION") (= t "FLOAT8") (= t "FLOAT4"))
       {:type :float64}
@@ -2572,6 +2585,11 @@
                                 (assoc :decimal? true
                                        :precision (:precision type-info)
                                        :scale (:scale type-info))
+                                ;; Step 6: unsigned-width (8/16/32) rides
+                                ;; along so range checks and OID mapping
+                                ;; have the metadata they need.
+                                (:unsigned-width type-info)
+                                (assoc :unsigned-width (:unsigned-width type-info))
                                 ;; Pass through the literal SQL type name
                                 ;; for any unrecognised type. The server
                                 ;; resolves these against its enum
@@ -3118,11 +3136,17 @@
    metadata doesn't pin a type, in which case the caller falls back to
    value-based inference. Pulled out as a helper so the columnar and
    row-form result paths share one resolver."
-  [{:keys [temporal-unit enum-oid decimal?] :as col-meta}]
+  [{:keys [temporal-unit enum-oid decimal? unsigned-width] :as col-meta}]
   (cond
     enum-oid     (int enum-oid)
     ;; Step 5: DECIMAL / NUMERIC → OID 1700.
     decimal?     (:numeric pg-type-oids)
+    ;; Step 6: unsigned integers — PG has no native unsigned types, so
+    ;; we map to the smallest signed container that fits the unsigned
+    ;; range. u8/u16 fit comfortably into INT2; u32 needs INT8.
+    (= 8  unsigned-width) (:int2 pg-type-oids)
+    (= 16 unsigned-width) (:int2 pg-type-oids)
+    (= 32 unsigned-width) (:int8 pg-type-oids)
     ;; Date column — stored as epoch-days.
     (= :days temporal-unit) (:date pg-type-oids)
     ;; TIMESTAMP family (seconds/millis/micros/nanos). PG only has OID
