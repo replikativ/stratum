@@ -270,6 +270,35 @@ Allen interval predicates (`OVERLAPS`, `CONTAINS`, `PRECEDES`, `MEETS`, …) and
 
 **Other**: EXPLAIN, SELECT DISTINCT, LIMIT/OFFSET, IS NULL/IS NOT NULL
 
+### PostgreSQL Wire Protocol — Binary Format
+
+Stratum's pgwire server implements the v3 protocol's binary format (format
+code 1) symmetrically — both inbound (Bind) and outbound (RowDescription /
+DataRow) — for every OID it tags on the wire:
+
+| OID | Type | Inbound | Outbound |
+|---|---|---|---|
+| 16 | BOOL | ✓ | ✓ |
+| 20 / 21 / 23 | INT8 / INT2 / INT4 | ✓ | ✓ |
+| 25 / 1043 / 19 | TEXT / VARCHAR / NAME | ✓ | ✓ |
+| 700 / 701 | FLOAT4 / FLOAT8 | ✓ | ✓ |
+| 1082 | DATE (PG epoch shift handled at codec boundary) | ✓ | ✓ |
+| 1114 / 1184 | TIMESTAMP / TIMESTAMPTZ (Stratum :seconds / :millis / :micros / :nanos units normalize to micros for the wire) | ✓ | ✓ |
+| 1700 | NUMERIC (base-10000 ndigits/weight/sign/dscale) | ✓ | ✓ |
+| 2950 | UUID (16 BE bytes) | ✓ | ✓ |
+| 3802 | JSONB (version byte 0x01 + UTF-8) | ✓ | ✓ |
+
+Clients select per-column format via the Bind message. Stratum advertises
+the chosen format in RowDescription and emits matching binary bytes in
+DataRow. Inbound binary params require the type OID declared at Parse
+time — Stratum doesn't infer types from raw bytes.
+
+Failure modes are loud: unknown format codes, binary requests for
+unsupported OIDs, and malformed binary payloads all produce ErrorResponse
+`0A000` (`feature_not_supported`) or `22P03`
+(`invalid_binary_representation`) with a message identifying the
+offending column or param.
+
 ## Clojure Data Science Integration
 
 Stratum datasets work directly with [tablecloth](https://github.com/scicloj/tablecloth) and [tech.ml.dataset](https://github.com/techascent/tech.ml.dataset):
@@ -342,7 +371,7 @@ All share copy-on-write semantics and can be branched together via Yggdrasil.
 
 ## Features
 
-- **SQL**: PostgreSQL wire protocol (v3), full DML, CTEs, window functions, joins, subqueries
+- **SQL**: PostgreSQL wire protocol (v3) with **symmetric binary protocol support** (format codes 0/1 on every tagged OID: INT2/4/8, FLOAT4/8, BOOL, TEXT, DATE, TIMESTAMP(TZ), NUMERIC, UUID, JSONB), full DML, CTEs, window functions, joins, subqueries
 - **Query planner**: cost-based IR planner with predicate pushdown, top-N rewrite, window-having pushdown, NDV-based join cardinality, operator fusion, column pruning
 - **Performance**: SIMD filter/aggregate/group-by via Java Vector API, fused single-pass execution, zone map pruning, parallel execution
 - **Persistence**: O(1) CoW snapshots, branching, time-travel, lazy loading from storage; SQL `CREATE TABLE`/`INSERT`/`CREATE MODEL` + live-table bindings survive restart when the server is started with `:store`

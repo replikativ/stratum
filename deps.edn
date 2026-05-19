@@ -143,7 +143,10 @@
                 ;; Kindly for notebook rendering hints
                 org.scicloj/kindly {:mvn/version "4-beta23"}
                 ;; Yggdrasil for CoW protocol compliance (optional, test-only)
-                org.replikativ/yggdrasil {:mvn/version "0.2.20"}}
+                org.replikativ/yggdrasil {:mvn/version "0.2.20"}
+                ;; pgjdbc — end-to-end validation that Stratum's pgwire (binary + text)
+                ;; works against a real PostgreSQL client. Test-only.
+                org.postgresql/postgresql {:mvn/version "42.7.4"}}
    :jvm-opts ["--add-modules=jdk.incubator.vector"
               "--enable-native-access=ALL-UNNAMED"
               "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
@@ -157,7 +160,8 @@
                 org.clojure/test.check {:mvn/version "1.1.1"}
                 techascent/tech.ml.dataset {:mvn/version "7.037"}
                 scicloj/tablecloth {:mvn/version "7.062"}
-                org.scicloj/kindly {:mvn/version "4-beta23"}}
+                org.scicloj/kindly {:mvn/version "4-beta23"}
+                org.postgresql/postgresql {:mvn/version "42.7.4"}}
    :jvm-opts ["--add-modules=jdk.incubator.vector"
               "--enable-native-access=ALL-UNNAMED"
               "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
