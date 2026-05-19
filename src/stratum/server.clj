@@ -1509,49 +1509,91 @@
     (mapv #(coerce-row-for-decimals % col-order column-schema table-name) rows)))
 
 ;; ---------------------------------------------------------------------------
-;; Step 6: Unsigned integer range-checking on INSERT.
+;; Step 6 / 8a: Unsigned integer range-checking on INSERT.
+;;
+;; UTINYINT (u8), USMALLINT (u16), and UINTEGER (u32) fit comfortably
+;; inside an int64 with positive arithmetic. UBIGINT (u64) requires
+;; BigInteger range checks because the upper bound 2^64-1 exceeds
+;; Long/MAX_VALUE; we store the value as its bit-reinterpreted long
+;; (so 2^64-1 becomes -1L, etc.) and rely on `Long.toUnsignedString`
+;; on the read side.
+
+(def ^:private ^java.math.BigInteger U64-MAX
+  (.subtract (.shiftLeft java.math.BigInteger/ONE 64) java.math.BigInteger/ONE))
 
 (defn- ^:private unsigned-max
-  "Inclusive upper bound for an unsigned-width column. UTINYINT=255,
-   USMALLINT=65535, UINTEGER=4294967295."
-  ^long [^long width]
+  "Inclusive upper bound for an unsigned-width column. Returns long for
+   widths ≤ 32 and BigInteger for width 64."
+  [^long width]
   (case width
     8  255
     16 65535
-    32 4294967295))
+    32 4294967295
+    64 U64-MAX))
+
+(defn- ^:private coerce-to-bigint
+  "Best-effort coercion of an INSERT value to BigInteger for range
+   checking. Returns nil if the value isn't an integer at all."
+  ^java.math.BigInteger [v]
+  (cond
+    (instance? java.math.BigInteger v) v
+    (instance? java.math.BigDecimal v) (.toBigIntegerExact ^java.math.BigDecimal v)
+    (instance? Long v)    (java.math.BigInteger/valueOf (long v))
+    (instance? Integer v) (java.math.BigInteger/valueOf (long v))
+    (instance? Short v)   (java.math.BigInteger/valueOf (long v))
+    (instance? Byte v)    (java.math.BigInteger/valueOf (long v))
+    (string? v) (try (java.math.BigInteger. ^String v)
+                     (catch NumberFormatException _ nil))
+    :else nil))
 
 (defn- check-unsigned-row!
   "Validate that every unsigned column's value in `row` fits its
    declared range. Throws ex-info with sqlstate 22003 (numeric value out
    of range) when a value falls outside [0, max] for its width. NULL
-   values pass through (range constraint applies only to non-NULL)."
+   values pass through (range constraint applies only to non-NULL).
+
+   For UBIGINT (width 64), values > Long/MAX_VALUE are rewritten in
+   place as their bit-reinterpreted long (via BigInteger.longValue())
+   so the column's int64 backing stores the correct unsigned bit
+   pattern. Smaller widths leave the value unchanged."
   [row col-order column-schema table-name]
-  (doseq [[col-kw v] (map vector col-order row)]
-    (when-let [width (get-in column-schema [col-kw :unsigned-width])]
-      (when (some? v)
-        (let [n (cond
-                  (instance? Long v)    (long v)
-                  (instance? Integer v) (long v)
-                  (instance? Short v)   (long v)
-                  (instance? Byte v)    (long v)
-                  (string? v)           (try (Long/parseLong v)
-                                             (catch NumberFormatException _ nil))
-                  :else nil)]
-          (cond
-            (nil? n)
-            (throw (ex-info (str "Value " v " is not a valid integer for "
-                                 table-name "." (name col-kw)
-                                 " (UINT" width ")")
-                            {:sqlstate "22003"
-                             :column col-kw :value v}))
-            (or (neg? n) (> n (unsigned-max width)))
-            (throw (ex-info (str "Value " n " out of range for "
-                                 table-name "." (name col-kw)
-                                 " (UINT" width "; valid range 0.."
-                                 (unsigned-max width) ")")
-                            {:sqlstate "22003"
-                             :column col-kw :value n :width width})))))))
-  row)
+  (mapv (fn [col-kw v]
+          (if-let [width (get-in column-schema [col-kw :unsigned-width])]
+            (if (nil? v)
+              v
+              (let [n (coerce-to-bigint v)
+                    max-val (unsigned-max width)]
+                (cond
+                  (nil? n)
+                  (throw (ex-info (str "Value " v " is not a valid integer for "
+                                       table-name "." (name col-kw)
+                                       " (U" (case (long width)
+                                               8 "TINY" 16 "SMALL"
+                                               32 "" 64 "BIG")
+                                       "INT)")
+                                  {:sqlstate "22003"
+                                   :column col-kw :value v}))
+                  (or (neg? (.signum ^java.math.BigInteger n))
+                      (pos? (.compareTo ^java.math.BigInteger n
+                                        ^java.math.BigInteger
+                                        (if (instance? java.math.BigInteger max-val)
+                                          max-val
+                                          (java.math.BigInteger/valueOf (long max-val))))))
+                  (throw (ex-info (str "Value " n " out of range for "
+                                       table-name "." (name col-kw)
+                                       " (u" width "; valid range 0.."
+                                       max-val ")")
+                                  {:sqlstate "22003"
+                                   :column col-kw :value n :width width}))
+                  ;; UBIGINT: rewrite to the bit-reinterpreted long so
+                  ;; storage stays int64. .longValue() truncates the
+                  ;; high bits — fine because we've already validated
+                  ;; the BigInteger fits in 64 bits.
+                  (= 64 width) (.longValue ^java.math.BigInteger n)
+                  :else v)))
+            v))
+        col-order
+        row))
 
 (defn- check-unsigned-rows!
   "Validate every row against the table's unsigned-width columns. No-op

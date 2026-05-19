@@ -2498,15 +2498,23 @@
 
       ;; Step 6: DuckDB-style unsigned integer types. Stratum stores all
       ;; integers as int64, so unsigned types share the same backing
-      ;; representation but carry a `:unsigned-width` tag (8/16/32 bits)
-      ;; so the INSERT path can range-check and the wire layer can map to
-      ;; an OID PG clients recognise (INT2 for u8/u16, INT8 for u32 — PG
-      ;; lacks native unsigned types, so we pick the smallest signed
-      ;; container that fits the unsigned range).
+      ;; representation but carry a `:unsigned-width` tag (8/16/32/64
+      ;; bits) so the INSERT path can range-check and the wire layer
+      ;; can map to an OID PG clients recognise (INT2 for u8/u16, INT8
+      ;; for u32, NUMERIC for u64 — PG lacks native unsigned types, so
+      ;; we pick the smallest signed container that fits the unsigned
+      ;; range, falling through to NUMERIC for u64 which exceeds INT8).
       (= t "UTINYINT")  {:type :int64 :unsigned-width 8}
       (= t "USMALLINT") {:type :int64 :unsigned-width 16}
       (or (= t "UINTEGER") (= t "UINT") (= t "UINT4"))
       {:type :int64 :unsigned-width 32}
+      ;; Step 8a: UBIGINT — DuckDB's PhysicalType::UINT64. Stored as
+      ;; int64 with reinterpretation: bit pattern is the same, but
+      ;; values are read as unsigned via Long.toUnsignedString /
+      ;; Long.parseUnsignedLong. Wire-renders as NUMERIC because PG
+      ;; INT8 max (2^63-1) is too small for u64.
+      (or (= t "UBIGINT") (= t "UINT8"))
+      {:type :int64 :unsigned-width 64}
 
       (or (= t "DOUBLE") (= t "FLOAT") (= t "REAL")
           (= t "DOUBLE PRECISION") (= t "FLOAT8") (= t "FLOAT4"))
@@ -3087,6 +3095,10 @@
        (if (Double/isNaN d)
          nil
          (decimal/unscaled-long->plain-string (Math/round d) (:scale col-meta))))
+     ;; Step 8a: UBIGINT — render via unsigned-string so negative
+     ;; long bit-patterns surface as their 0..2^64-1 form.
+     (and (= 64 (:unsigned-width col-meta)) (instance? Long v))
+     (Long/toUnsignedString (long v))
      (instance? Double v) (let [d (double v)]
                             (if (Double/isNaN d) nil (str d)))
      (instance? Float v) (let [f (float v)]
@@ -3121,6 +3133,12 @@
     (let [d (double v)]
       (when-not (Double/isNaN d)
         (decimal/unscaled-long->bigdec (Math/round d) (:scale col-meta))))
+    ;; Step 8a UBIGINT — wire OID is NUMERIC (1700) since values can
+    ;; exceed INT8 range. Convert the reinterpreted long to a
+    ;; BigDecimal-of-BigInteger that the NUMERIC encoder accepts.
+    (and (= 64 (:unsigned-width col-meta)) (instance? Long v))
+    (java.math.BigDecimal.
+     (java.math.BigInteger. (Long/toUnsignedString (long v))))
     ;; TIMESTAMP unit normalization — PG binary wants micros.
     (and (instance? Long v) (= :millis (:temporal-unit col-meta)))
     (Long/valueOf (* (long v) 1000))
@@ -3145,12 +3163,14 @@
     decimal?     (:numeric pg-type-oids)
     ;; Step 7: INTERVAL — fixed 16-byte primitive (months/days/micros).
     interval?    (:interval pg-type-oids)
-    ;; Step 6: unsigned integers — PG has no native unsigned types, so
-    ;; we map to the smallest signed container that fits the unsigned
-    ;; range. u8/u16 fit comfortably into INT2; u32 needs INT8.
+    ;; Step 6 / 8a: unsigned integers — PG has no native unsigned
+    ;; types, so we map to the smallest signed container that fits the
+    ;; unsigned range. u8/u16 fit into INT2; u32 needs INT8; u64
+    ;; exceeds INT8's signed range and falls through to NUMERIC.
     (= 8  unsigned-width) (:int2 pg-type-oids)
     (= 16 unsigned-width) (:int2 pg-type-oids)
     (= 32 unsigned-width) (:int8 pg-type-oids)
+    (= 64 unsigned-width) (:numeric pg-type-oids)
     ;; Date column — stored as epoch-days.
     (= :days temporal-unit) (:date pg-type-oids)
     ;; TIMESTAMP family (seconds/millis/micros/nanos). PG only has OID

@@ -27,6 +27,7 @@
 
 (def OID_INT2 21)
 (def OID_INT8 20)
+(def OID_NUMERIC 1700)
 
 ;; ---------------------------------------------------------------------------
 ;; DDL recognition
@@ -129,3 +130,94 @@
     (let [{:keys [error]} (run-sql s "INSERT INTO t VALUES (NULL)")]
       (is (nil? error)
           "NULL must always be accepted, even on unsigned columns"))))
+
+;; ---------------------------------------------------------------------------
+;; Step 8a — UBIGINT (unsigned 64-bit)
+
+(deftest ddl-ubigint-renders-as-numeric
+  (with-server [s {:port 0}]
+    (run-sql s "CREATE TABLE t (id UBIGINT)")
+    (run-sql s "INSERT INTO t VALUES (42)")
+    (let [{:keys [oids rows]} (run-sql s "SELECT id FROM t")]
+      (is (= [OID_NUMERIC] oids)
+          "UBIGINT renders as PG NUMERIC since u64 exceeds INT8 signed range")
+      (is (= [["42"]] rows)))))
+
+(deftest ubigint-stores-max-u64
+  (testing "UBIGINT accepts 2^64-1 — the maximum unsigned value.
+            Note: JSqlParser can't lex integer literals > Long.MAX_VALUE,
+            so use string-literal form. Stratum's INSERT path accepts a
+            string into a numeric column via the unsigned range check."
+    (with-server [s {:port 0}]
+      (run-sql s "CREATE TABLE t (id UBIGINT)")
+      (let [{:keys [error]} (run-sql s "INSERT INTO t VALUES ('18446744073709551615')")]
+        (is (nil? error)
+            (str "UBIGINT max should INSERT: " error)))
+      (let [{:keys [rows]} (run-sql s "SELECT id FROM t")]
+        (is (= [["18446744073709551615"]] rows)
+            "UBIGINT max round-trips through unsigned rendering")))))
+
+(deftest ubigint-stores-above-int64-max
+  (testing "UBIGINT accepts values > Long/MAX_VALUE via string literal.
+            Skips 2^63 exactly: its int64 bit pattern is Long/MIN_VALUE,
+            which Stratum currently uses as the long-column NULL sentinel.
+            See ubigint-cannot-store-exact-2-63 below."
+    (with-server [s {:port 0}]
+      (run-sql s "CREATE TABLE t (id UBIGINT)")
+      ;; 2^63 + 1 = 9223372036854775809 — one past the sentinel collision
+      (let [{:keys [error]} (run-sql s "INSERT INTO t VALUES ('9223372036854775809')")]
+        (is (nil? error)
+            (str "9223372036854775809 should INSERT: " error)))
+      (let [{:keys [rows]} (run-sql s "SELECT id FROM t")]
+        (is (= [["9223372036854775809"]] rows))))))
+
+(deftest ubigint-cannot-store-exact-2-63
+  (testing "Documented limitation: 2^63 (= 9223372036854775808) has int64 bit pattern
+            Long.MIN_VALUE, which Stratum reserves as the NULL sentinel for long
+            columns. UBIGINT values at exactly 2^63 round-trip as NULL.
+            Proper fix requires explicit validity bitmap independent of the
+            stored bit pattern — significant existing-system refactor."
+    (with-server [s {:port 0}]
+      (run-sql s "CREATE TABLE t (id UBIGINT)")
+      (let [{:keys [error]} (run-sql s "INSERT INTO t VALUES ('9223372036854775808')")]
+        (is (nil? error) "2^63 is in range — INSERT must succeed"))
+      (let [{:keys [rows]} (run-sql s "SELECT id FROM t")]
+        ;; Documented as a known limitation: surfaces as NULL because the
+        ;; bit pattern collides with the sentinel.
+        (is (= [[nil]] rows)
+            "Round-trip surfaces as NULL — see docstring")))))
+
+(deftest ubigint-negative-rejected
+  (with-server [s {:port 0}]
+    (run-sql s "CREATE TABLE t (id UBIGINT)")
+    (let [{:keys [error]} (run-sql s "INSERT INTO t VALUES (-1)")]
+      (is (some? error))
+      (is (re-find #"out of range" error)
+          "Negative value into UBIGINT must surface as a range error"))))
+
+(deftest ubigint-overflow-rejected
+  (with-server [s {:port 0}]
+    (run-sql s "CREATE TABLE t (id UBIGINT)")
+    ;; 2^64 = 18446744073709551616 (one past UBIGINT max)
+    (let [{:keys [error]} (run-sql s "INSERT INTO t VALUES ('18446744073709551616')")]
+      (is (some? error))
+      (is (re-find #"out of range" error)))))
+
+(deftest ubigint-mixed-with-other-unsigned
+  (testing "A table can mix UBIGINT and smaller unsigned types"
+    (with-server [s {:port 0}]
+      (run-sql s "CREATE TABLE t (tiny UTINYINT, big UBIGINT)")
+      (run-sql s "INSERT INTO t VALUES (255, '18446744073709551615'), (0, '0')")
+      (let [{:keys [oids rows]} (run-sql s "SELECT tiny, big FROM t")]
+        (is (= [OID_INT2 OID_NUMERIC] oids))
+        (is (= [["255" "18446744073709551615"]
+                ["0" "0"]]
+               rows))))))
+
+(deftest ubigint-accepts-small-numeric-literal
+  (testing "Values that fit in Long can still use bare integer literals"
+    (with-server [s {:port 0}]
+      (run-sql s "CREATE TABLE t (id UBIGINT)")
+      (run-sql s "INSERT INTO t VALUES (42), (1000000)")
+      (let [{:keys [rows]} (run-sql s "SELECT id FROM t")]
+        (is (= [["42"] ["1000000"]] rows))))))
