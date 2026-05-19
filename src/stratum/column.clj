@@ -83,7 +83,8 @@
   Skipping the scan avoids an O(n) sweep at column registration;
   downstream kernels then take the all-valid fast path."
   ([col-val] (encode-column col-val nil))
-  ([col-val {:keys [nullable?] :or {nullable? true}}]
+  ([col-val {:keys [nullable? no-sentinel-null? validity]
+             :or {nullable? true no-sentinel-null? false}}]
   (cond
     ;; Already normalized
     (and (map? col-val) (:type col-val) (or (:data col-val) (:index col-val)))
@@ -93,12 +94,24 @@
     ;; downstream kernels can dispatch to their Nullable siblings.
     ;; Returns nil bitmap when no NULLs present (the common case),
     ;; preserving the all-valid fast path.
+    ;;
+    ;; Step 8 sentinel opt-out: callers that need to STORE
+    ;; `Long.MIN_VALUE` as a genuine value (e.g., a UBIGINT column
+    ;; holding 2^63) pass `:no-sentinel-null? true`. The scan is
+    ;; skipped — NULL must then be tracked via an explicit `:validity`
+    ;; bitmap supplied by the caller (or assumed all-valid).
+    ;; Kernels still see the column as int64; they're safe as long as
+    ;; the caller's promise (no implicit sentinel NULLs) holds.
     (instance? (Class/forName "[J") col-val)
-    (let [v (when nullable?
-              (cached-scan-validity col-val :int64 (alength ^longs col-val)))]
+    (let [v (cond
+              no-sentinel-null? validity                ;; trust caller
+              nullable? (cached-scan-validity col-val :int64
+                                              (alength ^longs col-val))
+              :else nil)]
       (cond-> {:type :int64 :data col-val}
-        (false? nullable?) (assoc :nullable? false)
-        v (assoc :validity v)))
+        (false? nullable?)         (assoc :nullable? false)
+        no-sentinel-null?          (assoc :no-sentinel-null? true)
+        v                          (assoc :validity v)))
 
     ;; Raw double array — same lazy validity derivation.
     (instance? (Class/forName "[D") col-val)

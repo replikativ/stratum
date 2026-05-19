@@ -848,6 +848,10 @@
     (expr/long-array? col-data)
     (let [v (aget ^longs col-data i)]
       (cond
+        ;; Step 8 sentinel opt-out: column promises every bit pattern
+        ;; (including Long.MIN_VALUE) is a valid value; NULL — if
+        ;; tracked at all — lives in an explicit validity bitmap.
+        (:no-sentinel-null? col-info) v
         (= v Long/MIN_VALUE) nil
         (:dict col-info) (aget ^"[Ljava.lang.String;" (:dict col-info) (int v))
         :else v))

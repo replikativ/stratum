@@ -3402,8 +3402,19 @@
                                 (cond
                                   (instance? (Class/forName "[J") arr)
                                   (let [v (aget ^longs arr (int i))]
-                                    (if (= v Long/MIN_VALUE)
+                                    (cond
+                                      ;; Step 8 sentinel opt-out: when the
+                                      ;; column promises no implicit sentinel
+                                      ;; NULL, every bit pattern (including
+                                      ;; Long.MIN_VALUE) is a valid value.
+                                      ;; NULL detection — if it's tracked at
+                                      ;; all — must come from an explicit
+                                      ;; validity bitmap, not from the data.
+                                      (:no-sentinel-null? cm)
+                                      [(value->string v cm) (value->typed v cm)]
+                                      (= v Long/MIN_VALUE)
                                       [nil nil]
+                                      :else
                                       [(value->string v cm) (value->typed v cm)]))
                                   (instance? (Class/forName "[D") arr)
                                   (let [v (aget ^doubles arr (int i))]
