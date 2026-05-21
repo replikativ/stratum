@@ -1636,24 +1636,6 @@ public final class ColumnOps {
         return ColumnOpsString.arrayStringLikeFast(codes, dict, pattern, length);
     }
 
-    /** Convert SQL LIKE pattern to Java regex. */
-    static String likeToRegex(String pattern) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < pattern.length(); i++) {
-            char c = pattern.charAt(i);
-            if (c == '%') {
-                sb.append(".*");
-            } else if (c == '_') {
-                sb.append('.');
-            } else if (".^$|()[]{}\\+*?".indexOf(c) >= 0) {
-                sb.append('\\').append(c);
-            } else {
-                sb.append(c);
-            }
-        }
-        return sb.toString();
-    }
-
     /** LIKE predicate on raw String[] column. Returns 1/0 mask.
      *  Delegates to ColumnOpsExt for fast-path detection. */
     public static long[] arrayRawStringLike(String[] strings, String pattern, int length) {

@@ -100,3 +100,12 @@
   (testing "ILIKE honours the ESCAPE clause"
     ;; case-insensitive literal "100%"
     (is (= 1 (count-where "s ILIKE '100\\%' ESCAPE '\\'")))))
+
+(deftest escape-dangling-error-test
+  (testing "a malformed escape sequence is rejected at parse time (strict)"
+    ;; `\a` is not a valid escape sequence — `\` must quote %, _, or itself.
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (count-where "s LIKE 'a\\b' ESCAPE '\\'")))
+    ;; a trailing (dangling) escape character is likewise invalid.
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (count-where "s LIKE 'abc\\' ESCAPE '\\'")))))

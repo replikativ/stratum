@@ -688,6 +688,36 @@
 ;; Predicate (WHERE/HAVING) translation
 ;; ============================================================================
 
+(defn- validate-like-escape
+  "Validate a SQL `LIKE ... ESCAPE` clause. `escape` is the translated
+   escape expression, `pattern` the translated LIKE pattern. Returns the
+   one-character escape string on success.
+
+   Strict (matching DuckDB / PostgreSQL): throws if the escape is not a
+   single-character string, or if `pattern` contains an escape character
+   not followed by `%`, `_`, or the escape character itself."
+  [escape pattern]
+  (when-not (and (string? escape) (= 1 (count ^String escape)))
+    (throw (ex-info "LIKE ESCAPE must be a single-character string literal"
+                    {:escape escape})))
+  (when (string? pattern)
+    (let [ec (.charAt ^String escape 0)
+          ^String p pattern
+          n  (.length p)]
+      (loop [i 0]
+        (when (< i n)
+          (if (= (.charAt p i) ec)
+            (let [j (inc i)]
+              (if (and (< j n)
+                       (let [c (.charAt p j)]
+                         (or (= c \%) (= c \_) (= c ec))))
+                (recur (+ i 2))
+                (throw (ex-info (str "Invalid LIKE pattern: escape character '" ec
+                                     "' must be followed by '%', '_', or itself")
+                                {:pattern pattern :escape escape}))))
+            (recur (inc i)))))))
+  escape)
+
 (defn- translate-predicate
   "Translate a JSqlParser Expression tree to Stratum predicate(s).
    Returns a vector of predicates (flattened ANDs)."
@@ -787,12 +817,16 @@
     (let [^LikeExpression e expr
           col (translate-expr (.getLeftExpression e))
           pattern (translate-expr (.getRightExpression e))
-          case-insensitive? (.isCaseInsensitive e)]
+          case-insensitive? (.isCaseInsensitive e)
+          escape-expr (.getEscape e)
+          escape (when escape-expr
+                   (validate-like-escape (translate-expr escape-expr) pattern))
+          mk (fn [op] (if escape [op col pattern escape] [op col pattern]))]
       (cond
-        (and case-insensitive? (.isNot e)) [[:not-ilike col pattern]]
-        case-insensitive? [[:ilike col pattern]]
-        (.isNot e) [[:not-like col pattern]]
-        :else [[:like col pattern]]))
+        (and case-insensitive? (.isNot e)) [(mk :not-ilike)]
+        case-insensitive? [(mk :ilike)]
+        (.isNot e) [(mk :not-like)]
+        :else [(mk :like)]))
 
     ;; EXISTS / NOT EXISTS
     (instance? ExistsExpression expr)

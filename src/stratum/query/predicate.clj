@@ -302,6 +302,13 @@
           (let [col-key (first pred)
                 col-info (get columns col-key)
                 pattern (nth pred 2)
+                ;; Optional SQL `LIKE ... ESCAPE` character (4th slot, nil
+                ;; when absent). Passed to Java as a code point, -1 = none.
+                escape  (nth pred 3 nil)
+                esc-i   (int (if escape (int (.charAt ^String (str escape) 0)) -1))
+                esc-ci  (int (if escape
+                               (int (Character/toLowerCase (.charAt ^String (str escape) 0)))
+                               -1))
                 mask-name (keyword (str "__str_" i))
                 mask (cond
                        ;; Dict-encoded string column
@@ -326,15 +333,16 @@
                                               (aset r j 1)))
                                           r))]
                          (case op
-                           :like (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern) (int length) alpha-masks bigram-masks)
-                           :not-like (flip-not (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern) (int length) alpha-masks bigram-masks))
+                           :like (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern) esc-i (int length) alpha-masks bigram-masks)
+                           :not-like (flip-not (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern) esc-i (int length) alpha-masks bigram-masks))
                            :ilike (let [ldict (into-array String (map #(.toLowerCase ^String %) dict))]
-                                    (ColumnOpsString/arrayStringLikeFastMasked codes ldict (.toLowerCase (str pattern)) (int length) alpha-masks bigram-masks))
+                                    (ColumnOpsString/arrayStringLikeFastMasked codes ldict (.toLowerCase (str pattern)) esc-ci (int length) alpha-masks bigram-masks))
                            :not-ilike (let [ldict (into-array String (map #(.toLowerCase ^String %) dict))]
-                                        (flip-not (ColumnOpsString/arrayStringLikeFastMasked codes ldict (.toLowerCase (str pattern)) (int length) alpha-masks bigram-masks)))
-                           :contains (ColumnOpsString/arrayStringLikeFastMasked codes dict (str "%" pattern "%") (int length) alpha-masks bigram-masks)
-                           :starts-with (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern "%") (int length) alpha-masks bigram-masks)
-                           :ends-with (ColumnOpsString/arrayStringLikeFastMasked codes dict (str "%" pattern) (int length) alpha-masks bigram-masks)))
+                                        (flip-not (ColumnOpsString/arrayStringLikeFastMasked codes ldict (.toLowerCase (str pattern)) esc-ci (int length) alpha-masks bigram-masks)))
+                           ;; contains/starts-with/ends-with have no ESCAPE clause
+                           :contains (ColumnOpsString/arrayStringLikeFastMasked codes dict (str "%" pattern "%") (int -1) (int length) alpha-masks bigram-masks)
+                           :starts-with (ColumnOpsString/arrayStringLikeFastMasked codes dict (str pattern "%") (int -1) (int length) alpha-masks bigram-masks)
+                           :ends-with (ColumnOpsString/arrayStringLikeFastMasked codes dict (str "%" pattern) (int -1) (int length) alpha-masks bigram-masks)))
                        ;; Not dict-encoded — cannot handle as string pred
                        :else
                        (throw (ex-info (str "String predicate requires dict-encoded column. Use encode-column first.")

@@ -204,13 +204,18 @@
               (nil-safe-arith (first e)
                               (eval-val (nth e 1))
                               (eval-val (nth e 2)))))
-          (like-match [s pattern]
+          (like-match [s pattern escape]
             (when (and (some? s) (some? pattern))
-              (let [regex (-> (str pattern)
-                              (java.util.regex.Pattern/quote)
-                              (.replace "%" "\\E.*\\Q")
-                              (.replace "_" "\\E.\\Q"))]
-                (boolean (re-matches (re-pattern (str "(?s)" regex)) (str s))))))
+              ;; Shares the LIKE→regex compiler with the SIMD path so the
+              ;; two can never disagree; `escape` (4th pred slot) honors the
+              ;; SQL `LIKE ... ESCAPE` clause. DOTALL: `_`/`%` span newlines.
+              (let [esc (int (if escape
+                               (int (.charAt ^String (str escape) 0))
+                               -1))
+                    re  (java.util.regex.Pattern/compile
+                         (stratum.internal.ColumnOpsString/likeToRegex (str pattern) esc)
+                         java.util.regex.Pattern/DOTALL)]
+                (.matches (.matcher re (str s))))))
           (eval1 [pred]
             (case (first pred)
               :and  (every? eval1 (rest pred))
@@ -256,10 +261,10 @@
                              (and (some? v) (some? lo) (some? hi)
                                   (or (< (double v) (double lo))
                                       (> (double v) (double hi)))))
-              :like     (like-match (eval-val (nth pred 1)) (nth pred 2))
+              :like     (like-match (eval-val (nth pred 1)) (nth pred 2) (nth pred 3 nil))
               :not-like (let [v (eval-val (nth pred 1))]
                           ;; NOT LIKE NULL → UNKNOWN → false (3VL).
-                          (and (some? v) (not (like-match v (nth pred 2)))))
+                          (and (some? v) (not (like-match v (nth pred 2) (nth pred 3 nil)))))
               :contains    (let [v (eval-val (nth pred 1)) p (str (nth pred 2))]
                              (and (some? v) (.contains (str v) p)))
               :starts-with (let [v (eval-val (nth pred 1)) p (str (nth pred 2))]
