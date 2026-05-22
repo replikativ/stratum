@@ -2288,6 +2288,14 @@
              ")")))
     :else (pr-str x)))
 
+(defn- format-like-escape
+  "Render an ` ESCAPE 'c'` suffix for a LIKE-family predicate that carries
+   an escape character (4th slot), or the empty string when absent."
+  [pred]
+  (if-let [esc (nth pred 3 nil)]
+    (str " ESCAPE " (format-val esc))
+    ""))
+
 (defn- format-pred
   "Format a normalized predicate vector to a SQL-like string."
   [pred]
@@ -2313,10 +2321,10 @@
                        " IN " (format-val (nth pred 2)) ")")
       :not-in     (str "(" (format-col-or-expr (first pred))
                        " NOT IN " (format-val (nth pred 2)) ")")
-      :like       (str "(" (format-col-or-expr (first pred)) " LIKE "       (format-val (nth pred 2)) ")")
-      :not-like   (str "(" (format-col-or-expr (first pred)) " NOT LIKE "   (format-val (nth pred 2)) ")")
-      :ilike      (str "(" (format-col-or-expr (first pred)) " ILIKE "      (format-val (nth pred 2)) ")")
-      :not-ilike  (str "(" (format-col-or-expr (first pred)) " NOT ILIKE "  (format-val (nth pred 2)) ")")
+      :like       (str "(" (format-col-or-expr (first pred)) " LIKE "       (format-val (nth pred 2)) (format-like-escape pred) ")")
+      :not-like   (str "(" (format-col-or-expr (first pred)) " NOT LIKE "   (format-val (nth pred 2)) (format-like-escape pred) ")")
+      :ilike      (str "(" (format-col-or-expr (first pred)) " ILIKE "      (format-val (nth pred 2)) (format-like-escape pred) ")")
+      :not-ilike  (str "(" (format-col-or-expr (first pred)) " NOT ILIKE "  (format-val (nth pred 2)) (format-like-escape pred) ")")
       :is-null      (str "(" (format-col-or-expr (first pred)) " IS NULL)")
       :is-not-null  (str "(" (format-col-or-expr (first pred)) " IS NOT NULL)")
       :contains     (str "(" (format-col-or-expr (first pred)) " CONTAINS "    (format-val (nth pred 2)) ")")

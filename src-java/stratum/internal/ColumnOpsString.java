@@ -8,6 +8,9 @@ import java.util.concurrent.Future;
  *
  * <p>Contains:
  * <ul>
+ *   <li>The LIKE pattern engine: a single tokenizer ({@link #tokenizeLike})
+ *       feeding both the regex fallback ({@link #likeToRegex}) and the
+ *       contains/startsWith/endsWith fast-path classifier ({@link #analyzeLike})</li>
  *   <li>Bitmask pre-filtering (alpha + bigram masks) for LIKE</li>
  *   <li>Dict-encoded LIKE matching (contains/startsWith/endsWith fast-paths)</li>
  *   <li>Raw string LIKE matching</li>
@@ -26,6 +29,134 @@ public final class ColumnOpsString {
 
     private static ForkJoinPool POOL = ColumnOps.POOL;
     private static int MORSEL_SIZE = ColumnOps.MORSEL_SIZE;
+
+    // =========================================================================
+    // LIKE pattern engine
+    //
+    // SQL LIKE is a tiny regular language: `%`→.*, `_`→. , everything else a
+    // literal, matched anchored (whole-string). The `ESCAPE c` clause adds no
+    // expressive power — it is purely a lexing rule: `c` followed by `%`, `_`,
+    // or `c` yields a literal character. The escape char is consumed during
+    // tokenization and never reaches a per-row loop. A single tokenizer feeds
+    // both the regex fallback and the fast-path classifier so the two can
+    // never disagree about which `%`/`_` is a wildcard.
+    // =========================================================================
+
+    /** Parsed LIKE pattern: parallel token arrays, first {@code count} valid.
+     *  {@code kinds[i]}: 0 = literal (char in {@code lits[i]}), 1 = `_`
+     *  (match any one char), 2 = `%` (match any run of chars). */
+    static final class LikeTokens {
+        final int[] kinds;
+        final char[] lits;
+        final int count;
+        LikeTokens(int[] kinds, char[] lits, int count) {
+            this.kinds = kinds;
+            this.lits = lits;
+            this.count = count;
+        }
+    }
+
+    /** Fast-path shape of a LIKE pattern.
+     *  {@code kind}: 0 = general (use regex), 1 = contains, 2 = startsWith,
+     *  3 = endsWith. {@code literal} is the de-escaped literal core for
+     *  kinds 1-3, {@code null} otherwise. */
+    static final class LikeShape {
+        final int kind;
+        final String literal;
+        LikeShape(int kind, String literal) {
+            this.kind = kind;
+            this.literal = literal;
+        }
+    }
+
+    /** Tokenize a SQL LIKE pattern. {@code escape} is the escape character's
+     *  code point, or -1 when there is no ESCAPE clause. An escape character
+     *  that quotes the following `%`, `_`, or escape character collapses to a
+     *  single literal token. A dangling escape (escape char as the final
+     *  character) is treated as a literal — strict rejection of a malformed
+     *  escape sequence happens earlier, at SQL parse time. */
+    static LikeTokens tokenizeLike(String pattern, int escape) {
+        int n = pattern.length();
+        int[] kinds = new int[n];
+        char[] lits = new char[n];
+        int t = 0;
+        for (int i = 0; i < n; i++) {
+            char c = pattern.charAt(i);
+            if (escape >= 0 && c == (char) escape && i + 1 < n) {
+                kinds[t] = 0;
+                lits[t] = pattern.charAt(++i);
+                t++;
+            } else if (c == '%') {
+                kinds[t] = 2;
+                t++;
+            } else if (c == '_') {
+                kinds[t] = 1;
+                t++;
+            } else {
+                kinds[t] = 0;
+                lits[t] = c;
+                t++;
+            }
+        }
+        return new LikeTokens(kinds, lits, t);
+    }
+
+    /** Classify a LIKE pattern into a fast-path shape, or fall back to regex.
+     *  A fast path applies when the pattern is a pure-literal core wrapped in
+     *  an optional single leading and/or trailing `%`. An exact pattern (no
+     *  wildcard at all) falls to the regex path, matching prior behavior. */
+    static LikeShape analyzeLike(String pattern, int escape) {
+        LikeTokens tok = tokenizeLike(pattern, escape);
+        int t = tok.count;
+        int[] kinds = tok.kinds;
+        boolean firstMany = t > 0 && kinds[0] == 2;
+        boolean lastMany = t > 0 && kinds[t - 1] == 2;
+        int s = firstMany ? 1 : 0;
+        int e = lastMany ? t - 1 : t;
+        if (e <= s) return new LikeShape(0, null);              // empty literal core
+        for (int k = s; k < e; k++) {
+            if (kinds[k] != 0) return new LikeShape(0, null);   // wildcard inside core
+        }
+        String literal = new String(tok.lits, s, e - s);
+        if (firstMany && lastMany) return new LikeShape(1, literal);   // %core%
+        if (lastMany) return new LikeShape(2, literal);                // core%
+        if (firstMany) return new LikeShape(3, literal);               // %core
+        return new LikeShape(0, null);                          // exact match → regex
+    }
+
+    /** Convert a SQL LIKE pattern to a Java regex string (no ESCAPE clause). */
+    public static String likeToRegex(String pattern) {
+        return likeToRegex(pattern, -1);
+    }
+
+    /** Convert a SQL LIKE pattern to a Java regex string, honoring an optional
+     *  escape code point (-1 = no ESCAPE clause). The escape character itself
+     *  never appears in the result — it is consumed during tokenization. */
+    public static String likeToRegex(String pattern, int escape) {
+        LikeTokens tok = tokenizeLike(pattern, escape);
+        StringBuilder sb = new StringBuilder(tok.count + 8);
+        for (int i = 0; i < tok.count; i++) {
+            int kind = tok.kinds[i];
+            if (kind == 2) {
+                sb.append(".*");
+            } else if (kind == 1) {
+                sb.append('.');
+            } else {
+                char c = tok.lits[i];
+                if (".^$|()[]{}\\+*?".indexOf(c) >= 0) sb.append('\\');
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /** Compile a LIKE pattern to an anchored regex. DOTALL so `_`/`%` span
+     *  embedded newlines, matching SQL semantics (and the estimate/server
+     *  paths, which now share this same compiler). */
+    private static java.util.regex.Pattern compileLikeRegex(String pattern, int escape) {
+        return java.util.regex.Pattern.compile(likeToRegex(pattern, escape),
+                                               java.util.regex.Pattern.DOTALL);
+    }
 
     // =========================================================================
     // Bitmask pre-filtering for LIKE
@@ -74,21 +205,29 @@ public final class ColumnOpsString {
 
     /** LIKE predicate on dict-encoded column with fast-path detection + parallel matching. */
     public static long[] arrayStringLikeFast(long[] codes, String[] dict, String pattern, int length) {
-        return arrayStringLikeFastMasked(codes, dict, pattern, length, null, null);
+        return arrayStringLikeFastMasked(codes, dict, pattern, -1, length, null, null);
     }
 
-    /** LIKE predicate with optional bitmask pre-filtering for large dictionaries.
+    /** LIKE without an ESCAPE clause — see the 7-arg overload. */
+    public static long[] arrayStringLikeFastMasked(long[] codes, String[] dict, String pattern,
+                                                   int length, int[] alphaMasks, long[] bigramMasks) {
+        return arrayStringLikeFastMasked(codes, dict, pattern, -1, length, alphaMasks, bigramMasks);
+    }
+
+    /** LIKE predicate with optional bitmask pre-filtering for large dictionaries
+     *  and an optional escape code point ({@code escape}; -1 = no ESCAPE clause).
      *  F-015: NULL strings dict-encode as Long.MIN_VALUE; gathering with
      *  `(int) Long.MIN_VALUE = Integer.MIN_VALUE` would AIOOBE into
      *  dictMatch. SQL 3VL says NULL LIKE x → UNKNOWN → row drops out of
      *  WHERE, so emit 0 for NULL rows without touching the dict. */
     public static long[] arrayStringLikeFastMasked(long[] codes, String[] dict, String pattern,
-                                                    int length, int[] alphaMasks, long[] bigramMasks) {
+                                                   int escape, int length,
+                                                   int[] alphaMasks, long[] bigramMasks) {
         boolean[] dictMatch = new boolean[dict.length];
         if (dict.length > 100000) {
-            matchDictLikeParallel(dict, pattern, dictMatch, alphaMasks, bigramMasks);
+            matchDictLikeParallel(dict, pattern, escape, dictMatch, alphaMasks, bigramMasks);
         } else {
-            matchDictLike(dict, pattern, dictMatch, alphaMasks, bigramMasks);
+            matchDictLike(dict, pattern, escape, dictMatch, alphaMasks, bigramMasks);
         }
         long[] r = new long[length];
         for (int i = 0; i < length; i++) {
@@ -104,6 +243,13 @@ public final class ColumnOpsString {
 
     /** LIKE predicate on raw String[] column with fast-path detection + parallel scan. */
     public static long[] arrayRawStringLikeFast(String[] strings, String pattern, int length) {
+        return arrayRawStringLikeFast(strings, pattern, -1, length);
+    }
+
+    /** LIKE predicate on raw String[] column, honoring an optional escape code
+     *  point ({@code escape}; -1 = no ESCAPE clause). */
+    public static long[] arrayRawStringLikeFast(String[] strings, String pattern,
+                                                int escape, int length) {
         long[] r = new long[length];
         if (length > ColumnOps.PARALLEL_THRESHOLD) {
             int nThreads = Math.min(POOL.getParallelism(), length / MORSEL_SIZE);
@@ -116,7 +262,7 @@ public final class ColumnOpsString {
                 final int end = Math.min(start + range, length);
                 if (start >= length) break;
                 futures[t] = POOL.submit(() -> {
-                    rawStringLikeRange(strings, pattern, r, start, end);
+                    rawStringLikeRange(strings, pattern, escape, r, start, end);
                 });
             }
             for (int t = 0; t < nThreads; t++) {
@@ -124,7 +270,7 @@ public final class ColumnOpsString {
                 try { futures[t].get(); } catch (Exception e) { throw new RuntimeException(e); }
             }
         } else {
-            rawStringLikeRange(strings, pattern, r, 0, length);
+            rawStringLikeRange(strings, pattern, escape, r, 0, length);
         }
         return r;
     }
@@ -132,33 +278,32 @@ public final class ColumnOpsString {
     /** Apply LIKE pattern to a range of raw strings with fast-path detection.
      *  F-015 (raw path): null entries match SQL NULL semantics — UNKNOWN
      *  → row excluded from WHERE — so emit 0 without dereferencing. */
-    private static void rawStringLikeRange(String[] strings, String pattern, long[] r, int start, int end) {
-        int pLen = pattern.length();
-        boolean startsPercent = pLen > 0 && pattern.charAt(0) == '%';
-        boolean endsPercent = pLen > 0 && pattern.charAt(pLen - 1) == '%';
-        String inner = pattern.substring(startsPercent ? 1 : 0, endsPercent ? pLen - 1 : pLen);
-        boolean innerHasWild = inner.indexOf('%') >= 0 || inner.indexOf('_') >= 0;
-        if (!innerHasWild && startsPercent && endsPercent && inner.length() > 0) {
+    private static void rawStringLikeRange(String[] strings, String pattern, int escape,
+                                           long[] r, int start, int end) {
+        LikeShape shape = analyzeLike(pattern, escape);
+        if (shape.kind == 0) {
+            java.util.regex.Pattern p = compileLikeRegex(pattern, escape);
+            for (int i = start; i < end; i++) {
+                String s = strings[i];
+                r[i] = (s != null && p.matcher(s).matches()) ? 1L : 0L;
+            }
+            return;
+        }
+        String inner = shape.literal;
+        if (shape.kind == 1) {
             for (int i = start; i < end; i++) {
                 String s = strings[i];
                 r[i] = (s != null && s.contains(inner)) ? 1L : 0L;
             }
-        } else if (!innerHasWild && !startsPercent && endsPercent && inner.length() > 0) {
+        } else if (shape.kind == 2) {
             for (int i = start; i < end; i++) {
                 String s = strings[i];
                 r[i] = (s != null && s.startsWith(inner)) ? 1L : 0L;
             }
-        } else if (!innerHasWild && startsPercent && !endsPercent && inner.length() > 0) {
+        } else {
             for (int i = start; i < end; i++) {
                 String s = strings[i];
                 r[i] = (s != null && s.endsWith(inner)) ? 1L : 0L;
-            }
-        } else {
-            String regex = ColumnOps.likeToRegex(pattern);
-            java.util.regex.Pattern p = java.util.regex.Pattern.compile(regex);
-            for (int i = start; i < end; i++) {
-                String s = strings[i];
-                r[i] = (s != null && p.matcher(s).matches()) ? 1L : 0L;
             }
         }
     }
@@ -168,8 +313,9 @@ public final class ColumnOpsString {
     // =========================================================================
 
     /** Parallel dict matching for large dictionaries (>100K entries). */
-    private static void matchDictLikeParallel(String[] dict, String pattern, boolean[] dictMatch,
-                                               int[] alphaMasks, long[] bigramMasks) {
+    private static void matchDictLikeParallel(String[] dict, String pattern, int escape,
+                                              boolean[] dictMatch,
+                                              int[] alphaMasks, long[] bigramMasks) {
         int nThreads = POOL.getParallelism();
         int chunkSize = (dict.length + nThreads - 1) / nThreads;
         @SuppressWarnings("unchecked")
@@ -179,7 +325,7 @@ public final class ColumnOpsString {
             final int end = Math.min(start + chunkSize, dict.length);
             if (start >= dict.length) break;
             futures[t] = POOL.submit(() -> {
-                matchDictLikeRange(dict, pattern, dictMatch, start, end, alphaMasks, bigramMasks);
+                matchDictLikeRange(dict, pattern, escape, dictMatch, start, end, alphaMasks, bigramMasks);
             });
         }
         for (int t = 0; t < nThreads; t++) {
@@ -189,16 +335,17 @@ public final class ColumnOpsString {
     }
 
     /** Match a range of dictionary entries with fast-path detection and optional bitmask pre-filtering. */
-    private static void matchDictLikeRange(String[] dict, String pattern, boolean[] dictMatch,
-                                            int start, int end, int[] alphaMasks, long[] bigramMasks) {
-        int pLen = pattern.length();
-        boolean startsPercent = pLen > 0 && pattern.charAt(0) == '%';
-        boolean endsPercent = pLen > 0 && pattern.charAt(pLen - 1) == '%';
-        String inner = pattern.substring(startsPercent ? 1 : 0, endsPercent ? pLen - 1 : pLen);
-        boolean innerHasWild = inner.indexOf('%') >= 0 || inner.indexOf('_') >= 0;
-
-        boolean useMasks = alphaMasks != null && bigramMasks != null
-                           && !innerHasWild && inner.length() >= 2;
+    private static void matchDictLikeRange(String[] dict, String pattern, int escape,
+                                           boolean[] dictMatch, int start, int end,
+                                           int[] alphaMasks, long[] bigramMasks) {
+        LikeShape shape = analyzeLike(pattern, escape);
+        if (shape.kind == 0) {
+            java.util.regex.Pattern p = compileLikeRegex(pattern, escape);
+            for (int d = start; d < end; d++) dictMatch[d] = p.matcher(dict[d]).matches();
+            return;
+        }
+        String inner = shape.literal;
+        boolean useMasks = alphaMasks != null && bigramMasks != null && inner.length() >= 2;
         int patAlpha = 0;
         long patBigram = 0;
         if (useMasks) {
@@ -206,34 +353,30 @@ public final class ColumnOpsString {
             patBigram = bigramMask(inner);
         }
 
-        if (!innerHasWild && startsPercent && endsPercent && inner.length() > 0) {
+        if (shape.kind == 1) {
             for (int d = start; d < end; d++) {
                 if (useMasks && ((alphaMasks[d] & patAlpha) != patAlpha
                                  || (bigramMasks[d] & patBigram) != patBigram)) continue;
                 dictMatch[d] = dict[d].contains(inner);
             }
-        } else if (!innerHasWild && !startsPercent && endsPercent && inner.length() > 0) {
+        } else if (shape.kind == 2) {
             for (int d = start; d < end; d++) {
                 if (useMasks && ((alphaMasks[d] & patAlpha) != patAlpha
                                  || (bigramMasks[d] & patBigram) != patBigram)) continue;
                 dictMatch[d] = dict[d].startsWith(inner);
             }
-        } else if (!innerHasWild && startsPercent && !endsPercent && inner.length() > 0) {
+        } else {
             for (int d = start; d < end; d++) {
                 if (useMasks && ((alphaMasks[d] & patAlpha) != patAlpha
                                  || (bigramMasks[d] & patBigram) != patBigram)) continue;
                 dictMatch[d] = dict[d].endsWith(inner);
             }
-        } else {
-            String regex = ColumnOps.likeToRegex(pattern);
-            java.util.regex.Pattern p = java.util.regex.Pattern.compile(regex);
-            for (int d = start; d < end; d++) dictMatch[d] = p.matcher(dict[d]).matches();
         }
     }
 
     /** Match dictionary entries against LIKE pattern with fast-path for common patterns. */
-    private static void matchDictLike(String[] dict, String pattern, boolean[] dictMatch,
-                                       int[] alphaMasks, long[] bigramMasks) {
-        matchDictLikeRange(dict, pattern, dictMatch, 0, dict.length, alphaMasks, bigramMasks);
+    private static void matchDictLike(String[] dict, String pattern, int escape,
+                                      boolean[] dictMatch, int[] alphaMasks, long[] bigramMasks) {
+        matchDictLikeRange(dict, pattern, escape, dictMatch, 0, dict.length, alphaMasks, bigramMasks);
     }
 }

@@ -225,10 +225,12 @@
 
         (or (= :is-null op-raw)     (= 'is-null op-raw))     [(second items) :is-null]
         (or (= :is-not-null op-raw) (= 'is-not-null op-raw)) [(second items) :is-not-null]
-        (or (= :like op-raw)        (= 'like op-raw))        [(second items) :like     (nth items 2)]
-        (or (= :not-like op-raw)    (= 'not-like op-raw))    [(second items) :not-like (nth items 2)]
-        (or (= :ilike op-raw)       (= 'ilike op-raw))       [(second items) :ilike    (nth items 2)]
-        (or (= :not-ilike op-raw)   (= 'not-ilike op-raw))   [(second items) :not-ilike (nth items 2)]
+        ;; LIKE family carries an optional trailing ESCAPE character —
+        ;; `subvec` from slot 2 preserves it (3-element form when absent).
+        (or (= :like op-raw)        (= 'like op-raw))        (into [(second items) :like]      (subvec items 2))
+        (or (= :not-like op-raw)    (= 'not-like op-raw))    (into [(second items) :not-like]  (subvec items 2))
+        (or (= :ilike op-raw)       (= 'ilike op-raw))       (into [(second items) :ilike]     (subvec items 2))
+        (or (= :not-ilike op-raw)   (= 'not-ilike op-raw))   (into [(second items) :not-ilike] (subvec items 2))
         (or (= :contains op-raw)    (= 'contains op-raw))    [(second items) :contains   (nth items 2)]
         (or (= :starts-with op-raw) (= 'starts-with op-raw)) [(second items) :starts-with (nth items 2)]
         (or (= :ends-with op-raw)   (= 'ends-with op-raw))   [(second items) :ends-with   (nth items 2)]

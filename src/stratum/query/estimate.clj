@@ -408,52 +408,48 @@
   (Class/forName "[Ljava.lang.String;"))
 
 (defn- like->regex
-  "Compile a SQL `LIKE` pattern to a `java.util.regex.Pattern`. `%`
-   is `.*`, `_` is `.`, every other regex metacharacter is quoted.
+  "Compile a SQL `LIKE` pattern to a `java.util.regex.Pattern`, honoring
+   an optional escape code point (-1 = no ESCAPE clause). Delegates to the
+   shared `ColumnOpsString/likeToRegex` so selectivity estimation can never
+   disagree with the SIMD matcher about which `%`/`_` is a wildcard.
    `Pattern/DOTALL` so `.` covers embedded newlines."
-  ^java.util.regex.Pattern [^String pat]
-  (let [sb (StringBuilder.)
-        n  (.length pat)]
-    (loop [i 0]
-      (if (>= i n)
-        (java.util.regex.Pattern/compile (.toString sb)
-                                         java.util.regex.Pattern/DOTALL)
-        (let [c (.charAt pat i)]
-          (case c
-            \% (.append sb ".*")
-            \_ (.append sb ".")
-            (do (when (or (= c \\) (= c \.) (= c \()
-                          (= c \)) (= c \[) (= c \])
-                          (= c \{) (= c \}) (= c \^)
-                          (= c \$) (= c \|) (= c \?)
-                          (= c \*) (= c \+))
-                  (.append sb \\))
-                (.append sb c)))
-          (recur (inc i)))))))
+  ^java.util.regex.Pattern [^String pat escape]
+  (java.util.regex.Pattern/compile
+   (stratum.internal.ColumnOpsString/likeToRegex pat (int escape))
+   java.util.regex.Pattern/DOTALL))
 
 (defn- compile-string-matcher
   "Return a `(fn [^String s])` that returns true if the row passes
    the string predicate. Returns nil for unsupported ops or arg
-   shapes — the caller falls back to heuristic selectivity."
+   shapes — the caller falls back to heuristic selectivity.
+
+   `args` is the predicate's argument slots: `[pattern]`, or
+   `[pattern escape]` for a `LIKE ... ESCAPE` clause."
   [op args]
-  (when (= 1 (count args))
-    (let [pat (first args)]
-      (when (string? pat)
-        (case op
-          :contains    (fn [^String s] (and s (.contains    s ^String pat)))
-          :starts-with (fn [^String s] (and s (.startsWith  s ^String pat)))
-          :ends-with   (fn [^String s] (and s (.endsWith    s ^String pat)))
-          :like        (let [re (like->regex pat)]
-                         (fn [^String s] (and s (.matches (.matcher re s)))))
-          :not-like    (let [re (like->regex pat)]
-                         (fn [^String s] (or (nil? s)
-                                             (not (.matches (.matcher re s))))))
-          :ilike       (let [re (like->regex (.toLowerCase ^String pat))]
-                         (fn [^String s] (and s (.matches (.matcher re (.toLowerCase s))))))
-          :not-ilike   (let [re (like->regex (.toLowerCase ^String pat))]
-                         (fn [^String s] (or (nil? s)
-                                             (not (.matches (.matcher re (.toLowerCase s)))))))
-          nil)))))
+  (when (and (>= (count args) 1) (string? (first args)))
+    (let [pat (first args)
+          esc-str (when (and (>= (count args) 2) (string? (second args))
+                             (= 1 (count ^String (second args))))
+                    (second args))
+          esc    (if esc-str (int (.charAt ^String esc-str 0)) -1)
+          esc-ci (if esc-str
+                   (int (Character/toLowerCase (.charAt ^String esc-str 0)))
+                   -1)]
+      (case op
+        :contains    (fn [^String s] (and s (.contains    s ^String pat)))
+        :starts-with (fn [^String s] (and s (.startsWith  s ^String pat)))
+        :ends-with   (fn [^String s] (and s (.endsWith    s ^String pat)))
+        :like        (let [re (like->regex pat esc)]
+                       (fn [^String s] (and s (.matches (.matcher re s)))))
+        :not-like    (let [re (like->regex pat esc)]
+                       (fn [^String s] (or (nil? s)
+                                           (not (.matches (.matcher re s))))))
+        :ilike       (let [re (like->regex (.toLowerCase ^String pat) esc-ci)]
+                       (fn [^String s] (and s (.matches (.matcher re (.toLowerCase s))))))
+        :not-ilike   (let [re (like->regex (.toLowerCase ^String pat) esc-ci)]
+                       (fn [^String s] (or (nil? s)
+                                           (not (.matches (.matcher re (.toLowerCase s)))))))
+        nil))))
 
 (defn- string-sample
   "Return up to `MAX_DICT_SAMPLE` strings from a column. Prefers the

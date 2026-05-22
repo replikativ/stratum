@@ -159,6 +159,7 @@
      [:between :col 5 15]             — range
      [:in :col 1 2 3]                — set membership
      [:like :col \"%pattern%\"]         — string matching
+     [:like :col \"100\\\\%\" \"\\\\\"]      — LIKE with optional ESCAPE char
      [:is-null :col]                  — null check
      [:or [:< :a 1] [:> :b 2]]       — disjunction
      [:not [:= :x 0]]                — negation"
