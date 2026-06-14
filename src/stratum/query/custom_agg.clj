@@ -53,6 +53,42 @@
     (dotimes [g n-groups] (aset out g (finalize (aget accs g))))
     out))
 
+(defn grouped-fold-prim-long
+  "Primitive (boxing-free) grouped fold for monoids over LONG values — Layer A of the morsel-fold path.
+   Dense `long[]` accumulators scattered via a `java.util.function.LongBinaryOperator combine` + a long
+   `identity`; parallel partition+merge (the same `combine`, correct because it is associative). Unlike
+   `grouped-fold` (Object accumulators + IFn → boxing/allocation per element), this mutates a `long[]`
+   with a typed callback the JIT can inline — so a verified numeric monoid runs at near-built-in speed
+   while staying an OPEN op outside stratum's closed agg set. Returns a `long[]` indexed by group code."
+  [^longs codes ^longs vals n-groups identity
+   ^java.util.function.LongBinaryOperator combine threads]
+  (let [n         (alength codes)
+        n-groups  (long n-groups)
+        identity  (long identity)
+        threads   (long threads)
+        fold-range (fn ^longs [^long lo ^long hi]
+                     (let [accs (long-array n-groups identity)]
+                       (loop [i lo]
+                         (when (< i hi)
+                           (let [g (aget codes i)]
+                             (aset accs g (.applyAsLong combine (aget accs g) (aget vals i))))
+                           (recur (inc i))))
+                       accs))]
+    (if (<= threads 1)
+      (fold-range 0 n)
+      (let [p     (int threads)
+            chunk (long (Math/ceil (/ (double n) p)))
+            parts (mapv (fn [t] (future (fold-range (* (long t) chunk)
+                                                    (min n (* (inc (long t)) chunk)))))
+                        (range p))
+            parts (mapv deref parts)
+            merged (long-array n-groups identity)]
+        (dotimes [g n-groups]
+          (let [m (long (reduce (fn [^long a ^longs part] (.applyAsLong combine a (aget part g)))
+                                identity parts))]
+            (aset merged g m)))
+        merged))))
+
 (defn dense-code-columns
   "Convenience: encode a Clojure seq of keys into dense codes 0..G-1 (first-seen order) + a code->key
    decoder vector. Mirrors how the engine's dense path numbers groups; lets callers that hold row-shaped
