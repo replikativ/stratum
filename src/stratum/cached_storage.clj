@@ -154,8 +154,12 @@
   (let [measure-ops (create-measure-ops)
         settings  (Settings. (int BRANCHING_FACTOR) RefType/WEAK measure-ops)
         pss-rh    (pss-fress/read-handlers settings)              ; pss/leaf + pss/branch
-        root-read (pss-fress/root-read-handler {:settings settings
-                                                :resolve-storage (fn [_] @storage-atom)})]
+        ;; ONE local store ⇒ a fixed reconstruction SCOPE (storage = circular-ref atom;
+        ;; settings carries bf 64 + WEAK + measure-ops; comparator nil — re-stamped on descent).
+        root-read (pss-fress/root-read-handler
+                   {:resolve-scope (fn [_] {:storage     @storage-atom
+                                            :settings    settings
+                                            :resolve-cmp (constantly nil)})})]
     {:read-handlers
      (merge
       {pss-fress/set-tag root-read}                              ; pss/set
