@@ -5,8 +5,11 @@
  :paths ["src" "src-java" "target/classes" "resources"]
 
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
-        ;; PSS for tree structure with persistence
-        org.replikativ/persistent-sorted-set {:mvn/version "0.4.119"}
+        ;; PSS for tree structure with persistence.
+        ;; LOCAL while the canonical fressian node+root handlers
+        ;; (org.replikativ.persistent-sorted-set.fressian, feat/canonical-serialization-handlers)
+        ;; are unreleased — re-pin to the released version once it ships.
+        org.replikativ/persistent-sorted-set {:local/root "../persistent-sorted-set"}
         ;; konserve for durable storage
         org.replikativ/konserve {:mvn/version "0.9.345"
                                  :exclusions [org.clojure/clojurescript

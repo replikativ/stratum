@@ -13,6 +13,7 @@
             [konserve.core :as k]
             [konserve.serializers :refer [fressian-serializer]]
             [hasch.core :as hasch]
+            [org.replikativ.persistent-sorted-set.fressian :as pss-fress]
             [stratum.chunk :as chunk]
             [stratum.stats :as stats])
   (:import [org.fressian.handlers WriteHandler ReadHandler]
@@ -138,82 +139,58 @@
 (defn create-fressian-handlers
   "Create Fressian read/write handlers for PSS nodes and stratum domain types.
 
+   The Leaf/Branch NODE and root handlers are the canonical, shared ones from
+   `org.replikativ.persistent-sorted-set.fressian` (one codec across datahike / yggdrasil /
+   proximum / stratum). stratum is the IMeasure exerciser: the canonical Branch codec
+   CARRIES a non-nil `_measure` (here a `ChunkStats`), which recurses through stratum's own
+   `stratum.ChunkStats` element handler — so the live measure now round-trips instead of
+   being recomputed (settings still carries the measure-ops for the lazy/old-data path).
+   ChunkEntry/ChunkStats stay stratum's domain ELEMENT handlers.
+
    The storage-atom resolves the circular reference: deserialized PersistentSortedSet
    nodes need their IStorage to lazy-load children, but the storage holds the store
    which holds the serializer which holds the handlers."
   [storage-atom]
   (let [measure-ops (create-measure-ops)
-        settings (Settings. (int BRANCHING_FACTOR) RefType/WEAK measure-ops)]
+        settings  (Settings. (int BRANCHING_FACTOR) RefType/WEAK measure-ops)
+        pss-rh    (pss-fress/read-handlers settings)              ; pss/leaf + pss/branch
+        root-read (pss-fress/root-read-handler {:settings settings
+                                                :resolve-storage (fn [_] @storage-atom)})]
     {:read-handlers
-     {;; PSS top-level set
-      "stratum.PersistentSortedSet"
-      (reify ReadHandler
-        (read [_ reader _tag _component-count]
-          (let [{:keys [meta address count]} (.readObject reader)]
-            (PersistentSortedSet. meta nil address @storage-atom nil (int count) settings 0))))
+     (merge
+      {pss-fress/set-tag root-read}                              ; pss/set
+      pss-rh
+      ;; BACKWARDS COMPAT: pre-canonical stratum.*-tagged root/leaf/branch blobs read with
+      ;; the SAME canonical handlers — old {:meta :address :count} / {:keys} /
+      ;; {:level :keys :addresses} forms are subsets of the canonical maps (missing
+      ;; subtree-count/measure/slots default fine). New writes use the pss/ tags.
+      {"stratum.PersistentSortedSet"        root-read
+       "stratum.PersistentSortedSet.Leaf"   (get pss-rh pss-fress/leaf-tag)
+       "stratum.PersistentSortedSet.Branch" (get pss-rh pss-fress/branch-tag)}
+      ;; stratum domain ELEMENT handlers (unchanged)
+      {"stratum.ChunkEntry"
+       (reify ReadHandler
+         (read [_ reader _tag _component-count]
+           (let [{:keys [chunk-id chunk-bytes chunk-stats]} (.readObject reader)
+                 chunk (chunk/chunk-from-bytes chunk-bytes)
+                 entry-stats (stats/->ChunkStats (:count chunk-stats)
+                                                 (:sum chunk-stats)
+                                                 (:sum-sq chunk-stats)
+                                                 (:min-val chunk-stats)
+                                                 (:max-val chunk-stats)
+                                                 (or (:null-count chunk-stats) 0))]
+             (make-chunk-entry chunk-id chunk entry-stats))))
 
-      ;; PSS Leaf node
-      "stratum.PersistentSortedSet.Leaf"
-      (reify ReadHandler
-        (read [_ reader _tag _component-count]
-          (let [{:keys [keys]} (.readObject reader)]
-            (Leaf. ^List keys settings))))
-
-      ;; PSS Branch node
-      "stratum.PersistentSortedSet.Branch"
-      (reify ReadHandler
-        (read [_ reader _tag _component-count]
-          (let [{:keys [keys level addresses]} (.readObject reader)]
-            (Branch. (int level) ^List keys ^List (seq addresses) settings))))
-
-      ;; ChunkEntry (defrecord from stratum.index)
-      "stratum.ChunkEntry"
-      (reify ReadHandler
-        (read [_ reader _tag _component-count]
-          (let [{:keys [chunk-id chunk-bytes chunk-stats]} (.readObject reader)
-                chunk (chunk/chunk-from-bytes chunk-bytes)
-                entry-stats (stats/->ChunkStats (:count chunk-stats)
-                                                (:sum chunk-stats)
-                                                (:sum-sq chunk-stats)
-                                                (:min-val chunk-stats)
-                                                (:max-val chunk-stats)
-                                                (or (:null-count chunk-stats) 0))]
-            (make-chunk-entry chunk-id chunk entry-stats))))
-
-      ;; ChunkStats (defrecord from stratum.stats)
-      "stratum.ChunkStats"
-      (reify ReadHandler
-        (read [_ reader _tag _component-count]
-          (let [{:keys [count sum sum-sq min-val max-val null-count]} (.readObject reader)]
-            (stats/->ChunkStats count sum sum-sq min-val max-val (or null-count 0)))))}
+       "stratum.ChunkStats"
+       (reify ReadHandler
+         (read [_ reader _tag _component-count]
+           (let [{:keys [count sum sum-sq min-val max-val null-count]} (.readObject reader)]
+             (stats/->ChunkStats count sum sum-sq min-val max-val (or null-count 0)))))})
 
      :write-handlers
-     {PersistentSortedSet
-      {"stratum.PersistentSortedSet"
-       (reify WriteHandler
-         (write [_ writer pset]
-           (when (nil? (.-_address ^PersistentSortedSet pset))
-             (throw (ex-info "PSS must be stored before serialization" {:type :must-be-flushed})))
-           (.writeTag writer "stratum.PersistentSortedSet" 1)
-           (.writeObject writer {:meta (meta pset)
-                                 :address (.-_address ^PersistentSortedSet pset)
-                                 :count (count pset)})))}
-
-      Leaf
-      {"stratum.PersistentSortedSet.Leaf"
-       (reify WriteHandler
-         (write [_ writer leaf]
-           (.writeTag writer "stratum.PersistentSortedSet.Leaf" 1)
-           (.writeObject writer {:keys (vec (.keys ^Leaf leaf))})))}
-
-      Branch
-      {"stratum.PersistentSortedSet.Branch"
-       (reify WriteHandler
-         (write [_ writer node]
-           (.writeTag writer "stratum.PersistentSortedSet.Branch" 1)
-           (.writeObject writer {:level (.level ^Branch node)
-                                 :keys (vec (.keys ^Branch node))
-                                 :addresses (vec (.addresses ^Branch node))})))}}}))
+     (merge
+      {PersistentSortedSet {pss-fress/set-tag (pss-fress/root-write-handler)}}  ; pss/set
+      pss-fress/write-handlers)}))                                ; pss/leaf + pss/branch
 
 (defn- chunk-entry-write-handler
   "Fressian write handler for ChunkEntry records.
