@@ -152,14 +152,14 @@
    which holds the serializer which holds the handlers."
   [storage-atom]
   (let [measure-ops (create-measure-ops)
-        settings  (Settings. (int BRANCHING_FACTOR) RefType/WEAK measure-ops)
-        pss-rh    (pss-fress/read-handlers settings)              ; pss/leaf + pss/branch
-        ;; ONE local store ⇒ a fixed reconstruction SCOPE (storage = circular-ref atom;
-        ;; settings carries bf 64 + WEAK + measure-ops; comparator nil — re-stamped on descent).
-        root-read (pss-fress/root-read-handler
-                   {:resolve-scope (fn [_] {:storage     @storage-atom
-                                            :settings    settings
-                                            :resolve-cmp (constantly nil)})})]
+        pss-rh    (pss-fress/read-handlers {:measure-ops measure-ops :default-bf BRANCHING_FACTOR})
+        ;; ONE local store ⇒ LEXICAL resolvers: storage = circular-ref atom; measure = stratum's
+        ;; ChunkEntryMeasureOps (the non-serializable IMeasure); comparator nil (re-stamped on
+        ;; descent). bf 64 now self-describes per node from the blob (`:default-bf` backstops
+        ;; pre-bf blobs).
+        root-read (pss-fress/root-read-handler {:resolve-storage (fn [_] @storage-atom)
+                                                :resolve-measure (constantly measure-ops)
+                                                :default-bf      BRANCHING_FACTOR})]
     {:read-handlers
      (merge
       {pss-fress/set-tag root-read}                              ; pss/set
