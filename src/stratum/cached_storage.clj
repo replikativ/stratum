@@ -334,7 +334,8 @@
        (let [in-ch (async/to-chan! pending)
              out-ch (async/chan parallelism)
              af (fn [[address node] result-ch]
-                  (let [w-ch (k/assoc store address node {:sync? false})]
+                  ;; content-addressed node → immutable
+                  (let [w-ch (k/assoc store address node {:immutable? true} {:sync? false})]
                     (async/take! w-ch (fn [_] (async/close! result-ch)))))]
          (async/pipeline-async parallelism out-ch af in-ch)
          (async/go
@@ -371,8 +372,9 @@
        (let [in-ch (async/to-chan! all-items)
              out-ch (async/chan parallelism)
              af (fn [[^CachedStorage storage address node] result-ch]
+                  ;; content-addressed node → immutable
                   (let [w-ch (k/assoc (.-store storage) address node
-                                      {:sync? false})]
+                                      {:immutable? true} {:sync? false})]
                     (async/take! w-ch (fn [_] (async/close! result-ch)))))]
          (async/pipeline-async parallelism out-ch af in-ch)
          (async/go
