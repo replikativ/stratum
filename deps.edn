@@ -11,9 +11,7 @@
         ;; are unreleased — re-pin to the released version once it ships.
         org.replikativ/persistent-sorted-set {:local/root "../persistent-sorted-set"}
         ;; konserve for durable storage
-        ;; TEMPORARY: local konserve for the per-write metadata channel (immutable
-        ;; marking on content-addressed writes). Revert to mvn on release.
-        org.replikativ/konserve {:local/root "../konserve"
+        org.replikativ/konserve {:mvn/version "0.9.350"
                                  :exclusions [org.clojure/clojurescript
                                               com.github.pkpkpk/cljs-node-io
                                               com.github.pkpkpk/fress
@@ -213,7 +211,7 @@
   ;; Use published deps (for CI/release)
   :release
   {:override-deps {org.replikativ/persistent-sorted-set {:mvn/version "0.4.119"}
-                   org.replikativ/konserve {:mvn/version "0.9.345"
+                   org.replikativ/konserve {:mvn/version "0.9.350"
                                             :exclusions [org.clojure/clojurescript
                                                          com.github.pkpkpk/cljs-node-io
                                                          com.github.pkpkpk/fress
