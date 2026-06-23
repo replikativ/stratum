@@ -108,7 +108,8 @@
    When `*skip-commit-write?*` is true, the write is skipped entirely."
   [store commit-id snapshot]
   (when-not *skip-commit-write?*
-    (k/assoc store [:indices :commits commit-id] snapshot {:sync? true}))
+    ;; content-addressed commit → immutable
+    (k/assoc store [:indices :commits commit-id] snapshot {:immutable? true} {:sync? true}))
   snapshot)
 
 (defn load-index-commit
@@ -124,7 +125,7 @@
   "Write a dataset snapshot to [:datasets :commits uuid].
    Immutable — once written, never changes."
   [store commit-id snapshot]
-  (k/assoc store [:datasets :commits commit-id] snapshot {:sync? true})
+  (k/assoc store [:datasets :commits commit-id] snapshot {:immutable? true} {:sync? true})
   snapshot)
 
 (defn update-dataset-head!
