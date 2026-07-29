@@ -13,6 +13,7 @@
    legacy materialize-then-sort path remains the fallback for every
    other shape."
   (:require [stratum.chunk :as chunk]
+            [stratum.column :as column]
             [stratum.dataset :as dataset]
             [stratum.index :as index]
             [stratum.query.expression :as expr]
@@ -41,14 +42,22 @@
 
 (defn- order-col-eligible?
   "An order column is eligible for the streaming heap when it's
-   index- or array-backed and primitive (`:int64`/`:float64`),
-   excluding dict-encoded strings (whose dict-ID order ≠
-   lexicographic order)."
+   index- or array-backed and primitive (`:int64`/`:float64`).
+
+   Dict-encoded strings qualify only when the dictionary happens to be
+   in lexicographic order: then codes are ranks and comparing them
+   numerically is comparing the strings. Encoding never sorts, so this
+   is opportunistic — a Parquet file already sorted on the column gets
+   the heap for free. Otherwise the column falls back to the
+   sort-decoded-rows path in `postprocess/apply-order`, which is correct
+   either way. Asked of the dict array itself (memoised, O(d) once)
+   rather than read from a stored flag, so it cannot go stale."
   [col-info]
   (and col-info
        (or (:index col-info) (:data col-info))
        (#{:int64 :float64} (:type col-info))
-       (not= :string (:dict-type col-info))))
+       (or (not= :string (:dict-type col-info))
+           (column/dict-sorted? (:dict col-info)))))
 
 (defn top-n-eligible?
   "Returns true if `query` over `columns` is a clean top-N shape:
@@ -137,10 +146,11 @@
 (defn- key-double
   "Extract a double key from a chunk's value at index `i`. For string
    columns the chunk stores dict-IDs (longs); we cast to double for
-   comparison ordering — dict-IDs are insertion-ordered and not
-   directly meaningful, so string ordering returns is supported only
-   when a sorted dict (or numeric dict) is in use. Callers gate on
-   `:type` already; this is a guard.
+   comparison ordering. That is only meaningful when the dictionary is
+   in lexicographic order, where the ID *is* the rank —
+   `order-col-eligible?` enforces exactly that via `column/dict-sorted?`, so
+   this case is now reachable rather than dead. Callers gate on `:type`
+   already; this is a guard.
 
    F-019: long NULL (Long.MIN_VALUE) maps to Double/NaN so the heap
    comparator (`Double/compare`) sorts NULL keys after every real

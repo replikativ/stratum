@@ -50,6 +50,80 @@
       (identical? hit ::no-nulls) nil
       :else hit)))
 
+;; ----------------------------------------------------------------------------
+;; Dictionary order
+;;
+;; A dict-encoded string column stores `long[]` codes indexing a `String[]`
+;; reverse dictionary. Codes are assigned in FIRST-SEEN order, so the code
+;; space carries no ordering information: `MIN(code)` is the first value
+;; encountered, not the lexicographically smallest.
+;;
+;; Encoding deliberately does not sort. Sorting at encode time would tax
+;; every ingest (O(d log d) plus a full O(n) rewrite of the codes) to serve
+;; only the queries that want order, and it could never be a global
+;; invariant anyway: `dataset/append!`, `parquet` streaming ingest and the
+;; lazily-extended `parquet-dataset` global dict all hand out codes before
+;; the dictionary is complete, and for persisted columns those codes are
+;; already durable. A per-column "is it sorted?" flag then has to be
+;; carried by every producer and consulted by every consumer — which is
+;; how a dropped flag becomes a wrong answer. DuckDB is first-seen
+;; everywhere for the same reason, keeping ordering in the statistics
+;; instead of the codes.
+;;
+;; Ordering is therefore derived where it is needed, not where data is
+;; written: `stratum.query.string-order` ranks a dictionary at QUERY time,
+;; only for the columns a query actually orders by, and only when the
+;; dictionary is not already sorted. `dict-sorted?` below is the cheap
+;; test that lets that step no-op — it is a PREDICATE on the array, never
+;; a stored property, so it cannot go stale or be dropped.
+;; ----------------------------------------------------------------------------
+
+;; Dicts above this size use Arrays/parallelSort. Below it the ForkJoin
+;; split costs more than the sort saves. Measured on an 8-core box: a
+;; 200k-entry String[] sorts in ~147ms serial vs ~34ms parallel, while a
+;; 10-entry dict is free either way.
+(def ^:private ^:const PARALLEL_SORT_THRESHOLD 8192)
+
+(def ^:private ^java.util.Map dict-sorted-cache
+  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+
+(defn dict-sorted?
+  "True when `dict` (a `String[]` reverse dictionary) is in ascending
+   lexicographic order, i.e. its codes are ranks and comparing codes
+   numerically is equivalent to comparing the strings they denote.
+
+   O(d) on the first call per dict array, then memoised on array
+   identity (dict arrays are treated as immutable once attached to a
+   column; the paths that grow one build a fresh array).
+
+   nil / empty / single-entry dicts are trivially sorted.
+
+   Anything that is not a `String[]` answers `false` rather than
+   throwing. A dict in mid-growth is a `java.util.ArrayList` (see
+   `dataset/transient!`), and that shape reaches here through
+   `encode-column`'s already-normalized branch; \"not order-preserving\"
+   is both the safe answer and the true one, since an ArrayList dict is
+   by definition still being appended to."
+  [dict]
+  (if-not (instance? (Class/forName "[Ljava.lang.String;") dict)
+    false
+    (let [hit (.get dict-sorted-cache dict)]
+      (if (some? hit)
+        (identical? hit ::sorted)
+        (let [^"[Ljava.lang.String;" d dict
+              n (alength d)
+              sorted? (loop [i 1]
+                        (cond
+                          (>= i n) true
+                          ;; A nil entry means the dict has a hole — treat
+                          ;; as unsorted rather than NPE-ing on compareTo.
+                          (or (nil? (aget d i)) (nil? (aget d (dec i)))) false
+                          (pos? (.compareTo ^String (aget d (dec i)) ^String (aget d i)))
+                          false
+                          :else (recur (unchecked-inc i))))]
+          (.put dict-sorted-cache d (if sorted? ::sorted ::unsorted))
+          sorted?)))))
+
 (defn encode-column
   "Detect column type and extract data array from various inputs.
    Pre-encoding columns avoids repeated dictionary encoding on every query.
@@ -86,7 +160,8 @@
   ([col-val {:keys [nullable? no-sentinel-null? validity]
              :or {nullable? true no-sentinel-null? false}}]
    (cond
-    ;; Already normalized
+    ;; Already normalized — passed through untouched. Dictionary order is
+    ;; never assumed here; ask `dict-sorted?` at the point of use.
      (and (map? col-val) (:type col-val) (or (:data col-val) (:index col-val)))
      col-val
 
@@ -131,28 +206,48 @@
          {:type :int64 :data (long-array 0) :dict (make-array String 0) :dict-type :string}
          (let [dict-map (java.util.HashMap.)
                encoded (long-array n)
-               next-id (long-array 1)] ;; mutable counter
-           (dotimes [i n]
-             (let [s (aget strings i)]
-               (if (nil? s)
+               next-id (long-array 1) ;; mutable counter
+               ;; The encoding loop already knows whether any NULL was
+               ;; written, and `Long/MIN_VALUE` lands in `encoded` only
+               ;; where the source string was nil. Remembering that lets
+               ;; the all-valid case skip the separate O(n) sentinel scan
+               ;; below entirely.
+               any-null? (loop [i 0 any-null? false]
+                           (if (>= i n)
+                             any-null?
+                             (let [s (aget strings i)]
+                               (if (nil? s)
                 ;; NULL string → Long.MIN_VALUE sentinel
-                 (aset encoded i Long/MIN_VALUE)
-                 (let [id (.get dict-map s)]
-                   (if id
-                     (aset encoded i (long id))
-                     (let [new-id (aget next-id 0)]
-                       (.put dict-map s new-id)
-                       (aset encoded i new-id)
-                       (aset next-id 0 (inc new-id))))))))
+                                 (do (aset encoded i Long/MIN_VALUE)
+                                     (recur (unchecked-inc i) true))
+                                 (let [id (.get dict-map s)]
+                                   (if id
+                                     (aset encoded i (long id))
+                                     (let [new-id (aget next-id 0)]
+                                       (.put dict-map s new-id)
+                                       (aset encoded i new-id)
+                                       (aset next-id 0 (inc new-id))))
+                                   (recur (unchecked-inc i) any-null?))))))]
           ;; Build reverse dict: int → String
            (let [dict-size (aget next-id 0)
                  reverse-dict (make-array String dict-size)]
              (doseq [^java.util.Map$Entry e (.entrySet dict-map)]
                (when-let [k (.getKey e)]
                  (aset ^"[Ljava.lang.String;" reverse-dict (int (long (.getValue e))) k)))
-            ;; nil strings became Long.MIN_VALUE sentinels above; derive
-            ;; validity so downstream Nullable kernels see the NULL set.
-             (let [v (chunk/scan-validity encoded :int64 n)]
+            ;; Codes stay in FIRST-SEEN order. Encoding does not sort: a
+            ;; column's dictionary order is not a correctness property of
+            ;; the column — `MIN`/`MAX` gets its ordering from
+            ;; `stratum.query.string-order`, which ranks the dictionary at
+            ;; query time and only when a query actually asks for it.
+            ;; Sorting here instead would tax every ingest (O(d log d) plus
+            ;; a full O(n) rewrite of the codes) to serve the queries that
+            ;; do, and — because `append!`, streaming Parquet ingest and
+            ;; the lazily-extended `parquet-dataset` dict all hand out
+            ;; codes before the dictionary is complete — it could only ever
+            ;; hold for SOME columns, leaving every consumer to ask whether
+            ;; this one is ordered. DuckDB is first-seen everywhere for the
+            ;; same reason; it keeps ordering in the statistics instead.
+             (let [v (when any-null? (chunk/scan-validity encoded :int64 n))]
                (cond-> {:type :int64 :data encoded :dict reverse-dict :dict-type :string
                         :dict-alpha-masks (ColumnOpsString/buildDictAlphaMasks reverse-dict)
                         :dict-bigram-masks (ColumnOpsString/buildDictBigramMasks reverse-dict)}

@@ -1,6 +1,7 @@
 (ns stratum.query.postprocess
   "Post-processing pipeline for query results: formatting, distinct, having, order, limit/offset."
-  (:require [stratum.query.normalization :as norm]))
+  (:require [clojure.string :as str]
+            [stratum.query.normalization :as norm]))
 
 (set! *warn-on-reflection* true)
 
@@ -112,6 +113,153 @@
         value  (if recipe (apply-linear-recipe raw cnt recipe) raw)]
     [{(keyword alias) value
       :_count cnt}]))
+
+;; ============================================================================
+;; Aggregates over dictionary-encoded string columns
+;; ============================================================================
+;;
+;; A dict-encoded string column is a `long[]` of codes to every kernel in
+;; the engine; nothing below this layer knows the codes denote strings.
+;; That splits the aggregate vocabulary three ways:
+;;
+;;   * COUNT / COUNT(col) / COUNT(DISTINCT col) are exact regardless of
+;;     encoding — the dict is a bijection, so cardinalities carry over.
+;;     These keep working untouched.
+;;
+;;   * MIN / MAX are order queries. They return the winning *code*, which
+;;     denotes the right string only when the dict is sorted (see
+;;     `stratum.column/dict-sorted?`). We map the code back to its string
+;;     here; that mapping is the only place aggregate results are decoded,
+;;     since group keys are decoded much deeper (`group_by/decode-accs-to-map`
+;;     via `group-dicts`) while agg results come out of a bare `double[]`.
+;;
+;;   * SUM / AVG / VARIANCE / STDDEV / CORR / SUM(a*b) are arithmetic on
+;;     codes. There is no string answer to decode to — the number is
+;;     meaningless and always has been. They raise.
+;;     MEDIAN / PERCENTILE raise for the same reason: both interpolate
+;;     between neighbouring values, and the midpoint of two codes is not a
+;;     code. (PostgreSQL agrees: `percentile_cont` rejects text; only the
+;;     discrete `percentile_disc` accepts it.)
+;;
+;; Messages go in the exception MESSAGE, not ex-data — the pgwire server
+;; drops ex-data when translating to an ErrorResponse.
+
+(def ^:private string-order-agg-ops
+  "Aggregates whose result is one of the input values, so it can be
+   decoded back to a string."
+  #{:min :max})
+
+(def ^:private string-invalid-agg-ops
+  "Aggregates that are arithmetic on dict codes — no string meaning."
+  #{:sum :avg :stddev :stddev-pop :variance :variance-pop
+    :corr :sum-product :median :percentile :approx-quantile})
+
+(defn- dict-string-col?
+  [col-info]
+  (and col-info (= :string (:dict-type col-info)) (some? (:dict col-info))))
+
+(defn- agg-source-cols
+  "Column keywords an agg reads directly. Expression-sourced aggs
+   (`:expr`) are excluded: the expression path builds its own result
+   column and dict, so the source column's encoding no longer describes
+   the values being aggregated."
+  [agg]
+  (when-not (:expr agg)
+    (cond
+      (:col agg)  [(:col agg)]
+      (:cols agg) (:cols agg)
+      :else       nil)))
+
+(defn validate-string-aggs!
+  "Reject aggregates that would silently compute arithmetic on dictionary
+   codes.
+
+   `aggs` are normalized+aliased agg maps, `columns` the normalized column
+   map. MIN/MAX are always answerable — `query.string-order` ranks the
+   dictionary at query time, so no dictionary-order precondition is
+   imposed here and no column is ever refused for how it was encoded.
+
+   Throws ex-info with a self-contained message; returns nil otherwise."
+  [aggs columns]
+  (doseq [agg aggs
+          col (agg-source-cols agg)
+          :let [col-info (get columns col)]
+          :when (dict-string-col? col-info)]
+    (let [op (:op agg)]
+      (when (contains? string-invalid-agg-ops op)
+        (throw (ex-info
+                (str (str/upper-case (name op)) " is not defined for the string column "
+                     (pr-str col)
+                     " — it would compute arithmetic on dictionary codes, not on the "
+                     "strings themselves. Use COUNT, COUNT(DISTINCT ...), MIN or MAX "
+                     "on string columns, or CAST the column to a numeric type.")
+                {:op op :col col :dict-type :string}))))))
+
+(defn string-agg-decoders
+  "Map of result alias → `String[]` dict, for every MIN/MAX over a
+   dict-encoded string column. Empty map when there is nothing to decode,
+   which is the overwhelmingly common case and costs one pass over the
+   agg list.
+
+   The dict must be the one the codes actually index — callers pass the
+   RANKED columns from `query.string-order`, not the raw source columns."
+  [aggs columns]
+  (persistent!
+   (reduce (fn [acc agg]
+             (let [col (when (contains? string-order-agg-ops (:op agg))
+                         (first (agg-source-cols agg)))
+                   col-info (when col (get columns col))]
+               (if (and col-info (dict-string-col? col-info))
+                 (assoc! acc (keyword (or (:as agg) (:op agg))) (:dict col-info))
+                 acc)))
+           (transient {})
+           aggs)))
+
+(defn- decode-code
+  "Map one aggregate result (a dict code, arriving as a double from the
+   `double[]` accumulators or as a long from the group-by decoder) back
+   to its string. nil (empty group) and out-of-range codes yield nil.
+
+   Values that are not numbers are passed through untouched, which makes
+   the decode idempotent: `compile-query`'s fallback branch routes
+   through `q`, so a result can legitimately arrive already decoded."
+  [v ^"[Ljava.lang.String;" dict]
+  (if-not (number? v)
+    v
+    (let [i (long (Math/round (double v)))]
+      (if (and (<= 0 i) (< i (alength dict)))
+        (aget dict (int i))
+        nil))))
+
+(defn decode-string-aggs
+  "Rewrite MIN/MAX results that are dict codes into the strings they
+   denote. `results` is either the row-map vector or, for `:result
+   :columns`, the columnar map; both shapes are handled. A no-op when
+   `decoders` is empty."
+  [results decoders]
+  (if (empty? decoders)
+    results
+    (cond
+      ;; Columnar output: {alias array-or-seq ... :n-rows N}
+      (map? results)
+      (reduce-kv (fn [acc alias dict]
+                   (if-let [col (get acc alias)]
+                     (assoc acc alias
+                            (into-array String (map #(decode-code % dict) (seq col))))
+                     acc))
+                 results decoders)
+
+      ;; Row-map output
+      (sequential? results)
+      (mapv (fn [row]
+              (reduce-kv (fn [r alias dict]
+                           (if (contains? r alias)
+                             (assoc r alias (decode-code (get r alias) dict))
+                             r))
+                         row decoders))
+            results)
+
+      :else results)))
 
 (defn- canonicalize-distinct-val
   "Normalize a value before hashing for DISTINCT comparison so SQL

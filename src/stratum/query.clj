@@ -43,6 +43,7 @@
             [stratum.query.group-by :as gb]
             [stratum.query.join :as jn]
             [stratum.query.postprocess :as post]
+            [stratum.query.string-order :as so]
             [stratum.query.window :as win]
             [stratum.query.execution :as x]
             [stratum.query.executor :as exec]
@@ -392,40 +393,101 @@
         (let [first-result (first sub-results)
               to-remove (reduce (fn [acc r] (into acc r)) #{} (rest sub-results))]
           (vec (remove to-remove first-result)))))
-    (if (or *use-planner*
-            ;; ASOF joins must go through the planner — the legacy hardcoded
-            ;; path doesn't know about LAsofJoin/PAsofJoin.
-            (some #(#{:asof :asof-left} (:type %)) join))
+    ;; Validation and column resolution are identical for both engines, so
+    ;; they run once here. `resolved-cols` is also what the dict-encoded
+    ;; string-aggregate checks below need: whether MIN/MAX over a string
+    ;; column can be answered depends on that column's dictionary, which
+    ;; neither engine surfaces in its results.
+    (do
+      (spec/validate! spec/SQuery query {:op :execute})
+      (when-not (seq join)
+        (validate-query from where agg group select (:window query)))
+      (let [base-cols (if (satisfies? dataset/IDataset from)
+                        (dataset/columns from)  ;; Already normalized
+                        (x/prepare-columns from))
+            norm-aggs (when (seq agg)
+                        (norm/auto-alias-aggs (mapv norm/normalize-agg agg)))
+            ;; A join's `:with` contributes queryable — and aggregatable —
+            ;; columns that never appear in `:from`. Validation and ranking
+            ;; must see them, or MIN over a joined string column answers
+            ;; with a raw dictionary code and SUM over one escapes the
+            ;; arithmetic check entirely.
+            agg-cols (if (seq join)
+                       (merge (so/join-with-columns join x/prepare-columns) base-cols)
+                       base-cols)
+            _ (when norm-aggs
+                (post/validate-string-aggs! norm-aggs agg-cols)
+                ;; MIN/MAX over a string-producing EXPRESSION cannot be
+                ;; answered yet: the expression path mints its own
+                ;; dictionary while the query runs, so there is nothing to
+                ;; rank or decode against at this point. Say so instead of
+                ;; returning the dictionary code, which is what both the
+                ;; previous behaviour and a raw-code answer amount to.
+                (doseq [a norm-aggs
+                        :when (and (contains? so/order-agg-ops (:op a))
+                                   (:expr a)
+                                   (expr/string-producing-expr? (:expr a)))]
+                  (throw (ex-info
+                          (str (clojure.string/upper-case (name (:op a)))
+                               " over a string-valued expression is not supported yet — the"
+                               " expression builds its own dictionary while the query runs,"
+                               " so the winning code cannot be mapped back to a string."
+                               " Aggregate the column directly, or compute the expression"
+                               " into a column first.")
+                          {:op (:op a) :expr (:expr a) :dict-type :string}))))
+            ;; MIN/MAX over a dict-encoded string column compares CODES, and
+            ;; codes are assigned in first-seen order — so the winning code
+            ;; is the first value seen, not the smallest. Rank those columns
+            ;; here, before either engine resolves them, so both get the
+            ;; ordering for free and the result decodes through the ranked
+            ;; dictionary. Only the columns a query actually MIN/MAXes are
+            ;; touched, and an already-sorted dictionary is left alone.
+            ranked-cols (if norm-aggs
+                          (so/rank-order-agg-columns norm-aggs base-cols)
+                          base-cols)
+            ;; …and the ranked join columns go back into the join spec,
+            ;; which is where the join path reads them from.
+            [join' join-ranked?] (if (and norm-aggs (seq join))
+                                   (so/rank-join-with-columns join norm-aggs x/prepare-columns)
+                                   [join false])
+            query (if join-ranked? (assoc query :join join') query)
+            join (if join-ranked? join' join)
+            ;; Substituting `:from` is what carries the ranked columns into
+            ;; the planner, which re-resolves columns from the query map
+            ;; rather than taking them as an argument. Columns that needed
+            ;; no ranking are passed through by identity, so an index-backed
+            ;; column stays index-backed and keeps its chunk pruning.
+            query (if (identical? ranked-cols base-cols) query (assoc query :from ranked-cols))
+            from (if (identical? ranked-cols base-cols) from ranked-cols)
+            resolved-cols ranked-cols
+            ;; alias → String[] dict for the MIN/MAX results that need
+            ;; mapping from dict code back to string. Usually empty. Built
+            ;; from the RANKED columns so it decodes against the same
+            ;; dictionary the codes now index.
+            str-agg-decoders (if norm-aggs
+                               (post/string-agg-decoders
+                                norm-aggs
+                                (if join-ranked?
+                                  (merge (so/join-with-columns join' x/prepare-columns) ranked-cols)
+                                  (merge (so/join-with-columns join x/prepare-columns) ranked-cols)))
+                               {})
+            raw-results
+            (if (or *use-planner*
+                    ;; ASOF joins must go through the planner — the legacy hardcoded
+                    ;; path doesn't know about LAsofJoin/PAsofJoin.
+                    (some #(#{:asof :asof-left} (:type %)) join))
       ;; === IR Planner path ===
-      (do
-        (spec/validate! spec/SQuery query {:op :execute})
-        (when-not (seq join)
-          (validate-query from where agg group select (:window query)))
+              (do
         ;; Bind column-pruning refs here too: even though the planner
         ;; has its own `column-pruning` pass, materialize-columns and
         ;; check-memory-budget! inside `exec/run-query` consult this
         ;; var, so leaving it at the default `nil` (= "all columns")
         ;; would re-introduce the OOM symptoms the legacy fix solved.
-        (let [resolved-cols (if (satisfies? dataset/IDataset from)
-                              (dataset/columns from)
-                              (x/prepare-columns from))]
-          (binding [cols/*query-column-refs*
-                    (cols/query-references query resolved-cols)]
-            (exec/run-query query (= :columns result)))))
+                (binding [cols/*query-column-refs*
+                          (cols/query-references query resolved-cols)]
+                  (exec/run-query query (= :columns result))))
       ;; === Original hardcoded path ===
-      (do
-  ;; Structural validation via malli specs
-        (spec/validate! spec/SQuery query {:op :execute})
-  ;; Semantic validation: column existence, type checks
-        (when-not (seq join)
-          (validate-query from where agg group select (:window query)))
-
-  ;; Extract normalized columns from dataset or prepare from map
-  ;; Datasets already have normalized columns (via encode-column in make-dataset)
-  ;; Maps need normalization via prepare-columns
-        (let [columns (if (satisfies? dataset/IDataset from)
-                        (dataset/columns from)  ;; Already normalized
-                        (x/prepare-columns from))
+              (let [columns resolved-cols
         ;; Strip SQL table-qualifier namespaces from group/order/window keywords
               group (when group (mapv #(if (keyword? %) (norm/strip-ns %) %) group))
               order (when order (mapv (fn [[c dir]] [(norm/strip-ns c) dir]) order))
@@ -1188,20 +1250,48 @@
                                       (mapv #(apply dissoc % _order-only-keys) results)
                                       results)
                             results (if (or limit offset) (post/apply-limit-offset results limit offset) results)]
-                        results))))))))))))
+                        results)))))))))]
+        ;; MIN/MAX over a dict-encoded string column arrive here as codes;
+        ;; this is the one place aggregate results are decoded back to
+        ;; values. No-op (identity) when nothing string-valued was
+        ;; aggregated, which is the common case.
+        (post/decode-string-aggs raw-results str-agg-decoders)))))
 
 (defn compile-query
   "Compile a query for repeated execution. Returns a zero-arg function.
    Use when the same query will be executed multiple times on the same data."
   [{:keys [from where agg] :as query}]
-  (if *use-planner*
+  ;; Same string-aggregate contract as `q`: reject arithmetic over dict
+  ;; codes at compile time (so the caller finds out once, not on every
+  ;; invocation) and decode MIN/MAX codes back to strings on the way out.
+  ;; The `:else` fallback below routes through `q`, which does this
+  ;; itself, so the wrapper must be a no-op when there is nothing to
+  ;; decode — which `decode-string-aggs` guarantees for an empty map.
+  (let [base-cols (if (satisfies? dataset/IDataset from)
+                    (dataset/columns from)
+                    (x/prepare-columns from))
+        norm-aggs (when (seq agg)
+                    (norm/auto-alias-aggs (mapv norm/normalize-agg agg)))
+        _ (when norm-aggs
+            (post/validate-string-aggs! norm-aggs base-cols))
+        ;; Same ranking `q` applies, for the same reason — see there.
+        ranked-cols (if norm-aggs (so/rank-order-agg-columns norm-aggs base-cols) base-cols)
+        ranked? (not (identical? ranked-cols base-cols))
+        query (if ranked? (assoc query :from ranked-cols) query)
+        from (if ranked? ranked-cols from)
+        resolved-cols ranked-cols
+        decoders (if norm-aggs
+                   (post/string-agg-decoders norm-aggs ranked-cols)
+                   {})
+        run
+        (if *use-planner*
     ;; Planner path: build plan once, execute plan each invocation.
     ;; The physical plan captures columns/predicates/aggs — pure data.
-    (let [physical (exec/compile-physical query)]
-      (fn [] (exec/execute-physical physical false)))
+          (let [physical (exec/compile-physical query)]
+            (fn [] (exec/execute-physical physical false)))
     ;; Original compiled paths
-    (let [columns (x/prepare-columns from)
-          preds (mapv norm/normalize-pred (or where []))
+          (let [columns resolved-cols
+                preds (mapv norm/normalize-pred (or where []))
           aggs (mapv norm/normalize-agg (or agg []))
           length (x/get-column-length (val (first columns)))]
       (cond
@@ -1246,8 +1336,11 @@
                     :_count cnt}])
                 (post/format-fused-result result agg)))))
         ;; Fall back to interpreted execution
-        :else
-        (fn [] (q query))))))
+                :else
+                (fn [] (q query)))))]
+    (if (empty? decoders)
+      run
+      (fn [] (post/decode-string-aggs (run) decoders)))))
 
 (defn explain
   "Show execution plan without running the query.

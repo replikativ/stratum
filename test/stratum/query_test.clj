@@ -2,6 +2,7 @@
   "Comprehensive tests for the Stratum query DSL"
   (:require [clojure.test :refer [deftest testing is]]
             [stratum.query :as q]
+            [stratum.column]
             [stratum.query.simd-primitive :as simd]
             [stratum.index :as index]
             [stratum.chunk :as chunk]
@@ -4369,14 +4370,133 @@
       (is (= 3 (count result)))
       (is (= [(dec n) (- n 2) (- n 3)] (mapv :v result))))))
 
-(deftest top-n-rejects-string-dict-test
-  (testing "top-N eligibility rejects string-dict columns (would order by dict-id)"
+(deftest top-n-string-dict-eligibility-test
+  (testing "top-N accepts a string column whose dictionary happens to be sorted"
+    ;; Encoding assigns codes in first-seen order and never sorts, so the
+    ;; heap is available exactly when the input arrived in lexicographic
+    ;; order — then the dict-id IS the rank. Opportunistic, not a
+    ;; guarantee, and asked of the dict itself rather than a stored flag.
     (let [strs (into-array String ["AAA" "BBB" "CCC"])
           encoded (q/encode-column strs)
           col-info (assoc encoded :type :int64)]
+      (is (stratum.column/dict-sorted? (:dict encoded)))
+      (is (stratum.query.top-n/top-n-eligible?
+           {:order [[:sym :desc]] :limit 1}
+           {:sym col-info}))))
+
+  (testing "top-N rejects a column whose dictionary is not in order"
+    ;; Same data, arriving unsorted: codes are first-seen positions, so
+    ;; the heap would rank by arrival. Falls back to the decode-and-sort
+    ;; path, which is correct either way.
+    (let [strs (into-array String ["CCC" "AAA" "BBB"])
+          encoded (q/encode-column strs)]
+      (is (not (stratum.column/dict-sorted? (:dict encoded))))
       (is (not (stratum.query.top-n/top-n-eligible?
                 {:order [[:sym :desc]] :limit 1}
-                {:sym col-info}))))))
+                {:sym (assoc encoded :type :int64)})))))
+
+  (testing "top-N still rejects an insertion-order dictionary (dict-id ≠ rank)"
+    ;; Columns whose codes were handed out before the dict was complete
+    ;; (streaming parquet ingest, append! after creation) keep first-seen
+    ;; order; ordering by their codes would rank by arrival.
+    (let [col-info {:type :int64
+                    :data (long-array [0 1 2])
+                    :dict (into-array String ["CCC" "AAA" "BBB"])
+                    :dict-type :string}]
+      (is (not (stratum.query.top-n/top-n-eligible?
+                {:order [[:sym :desc]] :limit 1}
+                {:sym col-info})))))
+
+  (testing "ORDER BY string ... LIMIT is lexicographic through the heap path"
+    (let [strs (into-array String ["delta" "alpha" "charlie" "bravo"])
+          result (q/q {:from {:s strs} :select [:s] :order [[:s :asc]] :limit 2})]
+      (is (= ["alpha" "bravo"] (mapv :s result))))
+    (let [strs (into-array String ["delta" "alpha" "charlie" "bravo"])
+          result (q/q {:from {:s strs} :select [:s] :order [[:s :desc]] :limit 2})]
+      (is (= ["delta" "charlie"] (mapv :s result))))))
+
+;; ============================================================================
+;; Aggregates over dict-encoded string columns
+;; ============================================================================
+;;
+;; String columns are `long[]` dictionary codes below the query API.
+;; Codes used to be assigned in first-seen order, so MIN/MAX returned a
+;; meaningless number and SUM/AVG happily averaged codes. Encoding is now
+;; order-preserving, MIN/MAX decode back to strings, and the arithmetic
+;; aggregates raise instead of computing on codes.
+
+(deftest string-min-max-decodes-to-strings-test
+  (testing "MIN/MAX over a string column return strings, not dict codes"
+    (let [strs (into-array String ["b" "a" "c" "a"])
+          r (first (q/q {:from {:v strs} :agg [[:min :v] [:max :v]]}))]
+      (is (= "a" (:min r)))
+      (is (= "c" (:max r)))))
+
+  (testing "counting aggregates are unaffected — the dictionary is a bijection"
+    (let [strs (into-array String ["b" "a" "c" "a"])
+          r (first (q/q {:from {:v strs}
+                         :agg [[:count :v] [:count-distinct :v]]}))]
+      (is (= 4 (:count r)))
+      (is (= 3 (:count-distinct r)))))
+
+  (testing "MIN/MAX are lexicographic, not first-seen"
+    ;; "zebra" is seen first; insertion-order codes would make it the MIN.
+    (let [strs (into-array String ["zebra" "apple" "mango"])
+          r (first (q/q {:from {:v strs} :agg [[:min :v] [:max :v]]}))]
+      (is (= "apple" (:min r)))
+      (is (= "zebra" (:max r)))))
+
+  (testing "NULLs are skipped, not treated as a value"
+    (let [strs (into-array String ["b" nil "a"])
+          r (first (q/q {:from {:v strs} :agg [[:min :v] [:max :v]]}))]
+      (is (= "a" (:min r)))
+      (is (= "b" (:max r)))))
+
+  (testing "GROUP BY decodes both the group key and the aggregate"
+    (let [strs (into-array String ["b" "a" "c" "a"])
+          rows (q/q {:from {:v strs :n (long-array [1 2 3 4])}
+                     :group [:v]
+                     :agg [[:min :v] [:sum :n]]})]
+      (is (= #{["a" "a" 6.0] ["b" "b" 1.0] ["c" "c" 3.0]}
+             (set (mapv (fn [r] [(:v r) (:min r) (double (:sum r))]) rows)))))))
+
+(deftest string-arithmetic-aggregates-raise-test
+  (testing "arithmetic over dict codes raises with a self-contained message"
+    (let [strs (into-array String ["b" "a" "c"])]
+      (doseq [op [:sum :avg :variance :stddev :median]]
+        (let [e (is (thrown? clojure.lang.ExceptionInfo
+                             (q/q {:from {:v strs} :agg [[op :v]]})))]
+          ;; pgwire drops ex-data, so the explanation must be in the message.
+          (is (re-find #"string column" (.getMessage ^Exception e))
+              (str op " message should name the problem"))))))
+
+  (testing "MIN/MAX over an insertion-order dictionary are answered, not refused"
+    ;; A column whose codes were durable before the dict was complete
+    ;; (streaming parquet ingest, append! after creation) keeps first-seen
+    ;; codes, so MIN(code) is the first value seen. `query.string-order`
+    ;; ranks the dictionary at query time, so the answer is the real
+    ;; lexicographic extreme and no column is refused for how it was
+    ;; encoded.
+    (let [col {:type :int64
+               :data (long-array [0 1 2])
+               :dict (into-array String ["zebra" "apple" "mango"])
+               :dict-type :string}
+          row (first (q/q {:from {:v col} :agg [[:min :v] [:max :v]]}))]
+      (is (= "apple" (:min row)))
+      (is (= "zebra" (:max row)))
+      ;; ...and counting is unaffected (the dict is a bijection).
+      (is (= 3 (:count-distinct
+                (first (q/q {:from {:v col} :agg [[:count-distinct :v]]})))))))
+
+  (testing "the source column is not mutated by ranking"
+    ;; Ranking builds fresh arrays: the input may be shared with a
+    ;; persisted dataset or with another column in the same query.
+    (let [dict (into-array String ["zebra" "apple" "mango"])
+          data (long-array [0 1 2])
+          col {:type :int64 :data data :dict dict :dict-type :string}]
+      (q/q {:from {:v col} :agg [[:min :v]]})
+      (is (= ["zebra" "apple" "mango"] (vec dict)))
+      (is (= [0 1 2] (vec data))))))
 
 (deftest distinct-double-zero-canonicalization-test
   (testing "DISTINCT treats -0.0 and +0.0 as one value (SQL semantics)"
