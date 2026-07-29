@@ -15,7 +15,8 @@
      5. operator-fusion       — merge adjacent compatible physical nodes
 
    Each pass is a pure function: plan → plan."
-  (:require [stratum.query.ir :as ir]
+  (:require [stratum.column :as column]
+            [stratum.query.ir :as ir]
             [stratum.query.normalization :as norm]
             [stratum.query.columns :as cols]
             [stratum.query.predicate :as pred]
@@ -1990,9 +1991,13 @@
 
 (defn- top-n-order-eligible?
   "Every ORDER BY column must be primitive numeric (`:int64` or
-   `:float64`) and not a dict-string. The streaming heap supports
-   any number of keys (multi-key compared in declared order, mixed
-   asc/desc allowed) — same gate as `query.top-n/top-n-eligible?`."
+   `:float64`). Dict-encoded strings qualify only when the dictionary
+   happens to be in lexicographic order — then the code IS the rank, so
+   the heap's numeric comparison is the string comparison. Encoding
+   never sorts, so this is opportunistic; asked of the dict array
+   (memoised) rather than read from a stored flag. The streaming heap supports any number of keys (multi-key
+   compared in declared order, mixed asc/desc allowed) — same gate as
+   `query.top-n/top-n-eligible?`."
   [order-specs scan-cols]
   (and (>= (count order-specs) 1)
        (every? (fn [spec]
@@ -2001,7 +2006,8 @@
                         (let [c (get scan-cols col)]
                           (and c
                                (#{:int64 :float64} (:type c))
-                               (not= :string (:dict-type c)))))))
+                               (or (not= :string (:dict-type c))
+                                   (column/dict-sorted? (:dict c))))))))
                order-specs)))
 
 (defn- find-scan-cols

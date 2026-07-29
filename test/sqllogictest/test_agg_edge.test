@@ -24,6 +24,49 @@ SELECT COUNT(c), COUNT(DISTINCT c) FROM t1
 5	3
 
 # ============================================================
+# MIN / MAX over a TEXT column
+#
+# Dict-encoded string columns are long[] codes to every kernel.
+# With order-preserving encoding the code is the lexicographic
+# rank, so MIN/MAX pick the right value and it is decoded back
+# to a string on the way out.
+# ============================================================
+
+query T nosort
+SELECT MIN(c) FROM t1
+----
+x
+
+query T nosort
+SELECT MAX(c) FROM t1
+----
+z
+
+query TT nosort
+SELECT MIN(c), MAX(c) FROM t1
+----
+x	z
+
+# GROUP BY with MIN/MAX over the grouped text column
+query IT nosort
+SELECT a, MIN(c) FROM t1 GROUP BY a ORDER BY a
+----
+1	x
+2	y
+3	z
+
+# ============================================================
+# Arithmetic aggregates over TEXT are rejected rather than
+# computed over dictionary codes.
+# ============================================================
+
+statement error
+SELECT SUM(c) FROM t1
+
+statement error
+SELECT AVG(c) FROM t1
+
+# ============================================================
 # Compound agg expressions: MAX(a) - MIN(a)
 # ============================================================
 
