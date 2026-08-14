@@ -31,7 +31,10 @@
          validate-period!
          apply-axis-config
          system-now-from-tx-meta
-         replace-row-bitemporal!)
+         replace-row-bitemporal!
+         upsert-matcher
+         matcher-key
+         unmatched-inserts)
 
 (defprotocol IDataset
   "Core dataset protocol for Stratum columnar engine.
@@ -118,34 +121,53 @@
      The 1-arg form behaves like the 2-arg form with `nil` tx-meta.")
 
   (upsert! [this opts] [this opts tx-meta]
-    "SCD2 close-and-reopen on a bitemporal dataset. Must be transient.
+    "Update the rows this names; insert where nothing matched. Must be
+     transient.
 
-     opts: {:where <predicate> :set {col-kw value ...}}
+     Rows are named in ONE of two ways:
+
+       {:where <predicate> :set {col-kw value ...}}
+       {:by <key-col> :rows {key {col-kw value ...} ...}}
+
        :where  - row predicate; either a vector clause
                  (e.g. [[:= :eid 1]]) or a function `(fn [row-map])`
-       :set    - the new column values for the appended row;
-                 columns omitted here inherit from the previous
-                 (closed) row, so partial updates work.
+       :set    - the new column values; columns omitted here inherit
+                 from the previous (closed) row, so partial updates work
+       :by     - key COLUMN, with :rows giving each key its own values
 
-     For every matching row whose `:valid` axis is currently open
-     (`_valid_to = Long/MAX_VALUE`), closes it to the tx-meta
-     `:valid-from`, then appends a new row with the merged values +
-     the new vt-window. The new row's axis columns are auto-stamped
-     just like `append!`.
+     `:by` exists for cost, not expressiveness. `:where` is evaluated per
+     row, so N different value-sets mean N passes — O(rows × N). Keying
+     names the column to look up, so one pass with an O(1) probe serves
+     all N: O(rows + N). Everything below row selection is identical.
 
-     Throws when the dataset is not bitemporal (no `:valid` axis).")
+     Behaviour follows the dataset's temporal configuration:
+
+       :valid + :system  SCD2 on both axes — close the open row's valid
+                         window to the tx-meta :valid-from, close its
+                         _system_to, append the replacement.
+       :valid only       close the open row's valid window, append the
+                         merged row.
+       neither           overwrite the matched row in place; there is no
+                         window to close.
+
+     In every case a key (or predicate) that matched no row is appended.")
 
   (retract! [this opts] [this opts tx-meta]
-    "Close-without-reopen on a bitemporal dataset. Must be transient.
+    "Remove the rows this names. Must be transient.
 
-     opts: {:where <predicate>}
+     Rows are named as in `upsert!`, minus the values a retraction does
+     not carry:
 
-     For every matching open row, closes its `_valid_to` to the
-     tx-meta `:valid-from`. Does not append. Logically a retraction
-     over the specified vt slice. Physical purge stays on
+       {:where <predicate>}
+       {:by <key-col> :keys [key ...]}
+
+     On a dataset with a `:valid` axis this is close-WITHOUT-reopen: each
+     matching open row has its `_valid_to` closed to the tx-meta
+     `:valid-from`, nothing is appended, and physical purge stays on
      `:db/purge`-style semantics — never auto-triggered here.
 
-     Throws when the dataset is not bitemporal.")
+     With no temporal axis there is no window to close, so the matching
+     rows are physically removed (`ds-delete-rows!`).")
 
   (ds-delete-rows! [this row-idxs]
     "Physically remove the rows at the given indices from a transient
@@ -328,18 +350,46 @@
 
   (upsert! [this opts] (upsert! this opts nil))
 
-  (upsert! [this {:keys [where set auto-split?] :as opts} tx-meta]
+  (upsert! [this {:keys [auto-split?] :as opts} tx-meta]
     (when-not edit
       (throw (IllegalStateException. "Cannot mutate persistent dataset. Call transient first.")))
     (let [bt (:bitemporal ds-metadata-field)
           valid-cfg (when (:valid bt) (merge {:unit :micros} (:valid bt)))
-          system-cfg (when (:system bt) (merge {:unit :micros} (:system bt)))]
-      (when-not valid-cfg
-        (throw (ex-info "upsert! requires a :valid axis on the dataset's :bitemporal config"
-                        {:metadata ds-metadata-field})))
-      (when (nil? where)
-        (throw (ex-info "upsert! requires :where" {:opts opts})))
-      (let [{vf-col :from-col vt-col :to-col vt-unit :unit} valid-cfg
+          system-cfg (when (:system bt) (merge {:unit :micros} (:system bt)))
+          ;; ONE matcher for both input shapes — see `upsert-matcher`. Every
+          ;; rule below it (classification, overlap handling, mutation order)
+          ;; is therefore written once and cannot drift between them.
+          [match-fn unmatched] (upsert-matcher opts)]
+      (if-not valid-cfg
+        ;; ----- Current-state path (no temporal axis) -----
+        ;;
+        ;; The third arm of the same dispatch, not a different operation. On a
+        ;; plain table "update the rows this names, insert where nothing
+        ;; matched" is still upsert; there is simply no window to close, so the
+        ;; matched row is overwritten in place instead of being closed and
+        ;; reopened. This used to throw, which left a table with no `:valid`
+        ;; axis with no upsert at all — callers hand-rolled scan-and-rebuild
+        ;; instead, and that is where their bugs lived.
+        ;;
+        ;; `set-at!` and `append!` are the existing primitives; nothing about
+        ;; row layout or column typing is re-derived here.
+        (let [n (long row-count-val)
+              matched? (volatile! false)]
+          (dotimes [i n]
+            (let [row (materialize-row columns-field i)]
+              (when-let [row-set (match-fn row)]
+                (vreset! matched? true)
+                (when-let [k (matcher-key opts row)] (.remove ^java.util.Set unmatched k))
+                (doseq [[col v] row-set] (set-at! this col i v)))))
+          ;; INSERT-where-nothing-matched, the same two cases the temporal paths
+          ;; have: one per unmatched KEY, or — for the predicate form, which
+          ;; cannot say which key was missing — one if nothing matched at all.
+          (doseq [[k row-set] (unmatched-inserts opts unmatched)]
+            (append! this (assoc row-set (:by opts) k)))
+          (when (and (nil? (:by opts)) (not @matched?))
+            (append! this (:set opts)))
+          this)
+        (let [{vf-col :from-col vt-col :to-col vt-unit :unit} valid-cfg
             close-vt-val (or (coerce-temporal-value (:valid-from tx-meta) vt-unit)
                              (now-in-unit vt-unit))
             n (long row-count-val)
@@ -373,7 +423,7 @@
                 {:close-safe (persistent! (:close-safe acc))
                  :overlaps   (persistent! (:overlaps acc))}
                 (let [row (materialize-row columns-field i)]
-                  (if (eval-pred where row)
+                  (if-let [row-set (match-fn row)]
                     (let [row-vf (long (get row vf-col))
                           row-vt (long (get row vt-col))
                           open?  (= row-vt Long/MAX_VALUE)
@@ -382,10 +432,15 @@
                                   ;; Closed row entirely before new-vf — no overlap
                                   (and (not open?) (<= row-vt close-vt-val)) :no-conflict
                                   :else :overlaps)]
+                      ;; A key that named an existing row is updated, so it must
+                      ;; not ALSO be inserted below.
+                      (when-let [k (matcher-key opts row)] (.remove ^java.util.Set unmatched k))
                       (recur (inc i)
                              (if (= :no-conflict klass)
                                acc
-                               (update acc klass conj! [i row]))))
+                               ;; `row-set` travels with the row: under the keyed
+                               ;; form each matched row carries its own values.
+                               (update acc klass conj! [i row row-set]))))
                     (recur (inc i) acc)))))
         ;; Auto-split partitions overlaps by row-vf vs new-vf:
         ;;   row-vf <  new-vf → partial left overlap → TRUNCATE
@@ -400,7 +455,7 @@
         ;; VALID_TIME FROM x TO y`.)
             {auto-truncate :truncate auto-drop :drop}
             (if (and (seq overlaps) auto-split?)
-              (group-by (fn [[_i r]]
+              (group-by (fn [[_i r _s]]
                           (if (< (long (get r vf-col)) close-vt-val)
                             :truncate
                             :drop))
@@ -409,9 +464,10 @@
 
             _ (when (and (seq overlaps) (not auto-split?))
                 (throw (ex-info "upsert! would overlap existing rows' vt-windows"
-                                {:where where
+                                {:where (:where opts)
+                                 :by (:by opts)
                                  :new-window [close-vt-val Long/MAX_VALUE]
-                                 :overlaps (mapv (fn [[i r]]
+                                 :overlaps (mapv (fn [[i r _s]]
                                                    (assoc (select-keys r [vf-col vt-col]) :row-idx i))
                                                  overlaps)
                                  :hint "pass :auto-split? true to split overlapping rows, or restructure the write"})))]
@@ -431,59 +487,82 @@
           ;; the audit chain so `FOR SYSTEM_TIME AS OF <past>` still
           ;; sees the pre-surgery state.
           (let [system-now (system-now-from-tx-meta system-cfg tx-meta)]
-            (doseq [[i prev-row] close-safe]
+            (doseq [[i prev-row row-set] close-safe]
               (let [orig-vf (long (get prev-row vf-col))]
                 (replace-row-bitemporal!
                  this prev-row i system-now valid-cfg system-cfg
                  [{:vf orig-vf :vt close-vt-val}
-                  {:vf close-vt-val :vt Long/MAX_VALUE :data set}]
+                  {:vf close-vt-val :vt Long/MAX_VALUE :data row-set}]
                  tx-meta)))
-            (doseq [[i prev-row] auto-truncate]
+            (doseq [[i prev-row _s] auto-truncate]
               (let [orig-vf (long (get prev-row vf-col))]
                 (replace-row-bitemporal!
                  this prev-row i system-now valid-cfg system-cfg
                  [{:vf orig-vf :vt close-vt-val}]
                  tx-meta)))
-            (doseq [[i prev-row] auto-drop]
+            (doseq [[i prev-row _s] auto-drop]
               (replace-row-bitemporal!
                this prev-row i system-now valid-cfg system-cfg
                []
                tx-meta))
-            (when (empty? close-safe)
-              (append! this set
+            ;; INSERT-where-nothing-matched. The predicate form has one such
+            ;; case — no row matched at all — while the keyed form has one per
+            ;; key that named no row, which is why `unmatched` is a set rather
+            ;; than a boolean.
+            (doseq [[k row-set] (unmatched-inserts opts unmatched)]
+              (append! this (assoc row-set (:by opts) k)
+                       (assoc tx-meta :valid-from close-vt-val
+                              :system-from system-now)))
+            (when (and (nil? (:by opts)) (empty? close-safe))
+              (append! this (:set opts)
                        (assoc tx-meta :valid-from close-vt-val
                               :system-from system-now))))
           ;; ----- Valid-only path (existing in-place mutation) -----
           (do
-            (doseq [[i _prev-row] close-safe]
+            (doseq [[i _prev-row _s] close-safe]
               (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
-            (doseq [[i _r] auto-truncate]
+            (doseq [[i _r _s] auto-truncate]
               (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
             (when (seq auto-drop)
               (ds-delete-rows! this (mapv first auto-drop)))
-            (doseq [[_i prev-row] close-safe]
+            (doseq [[_i prev-row row-set] close-safe]
               (let [merged-row (merge (dissoc prev-row vf-col vt-col)
-                                      set)]
+                                      row-set)]
                 (append! this
                          (assoc merged-row vf-col close-vt-val)
                          tx-meta)))
-            (when (empty? close-safe)
-              (append! this set (assoc tx-meta :valid-from close-vt-val)))))
-        this)))
+            (doseq [[k row-set] (unmatched-inserts opts unmatched)]
+              (append! this (assoc row-set (:by opts) k)
+                       (assoc tx-meta :valid-from close-vt-val)))
+            (when (and (nil? (:by opts)) (empty? close-safe))
+              (append! this (:set opts) (assoc tx-meta :valid-from close-vt-val)))))
+        this))))
 
   (retract! [this opts] (retract! this opts nil))
 
-  (retract! [this {:keys [where auto-split?] :as opts} tx-meta]
+  (retract! [this {:keys [auto-split?] :as opts} tx-meta]
     (when-not edit
       (throw (IllegalStateException. "Cannot mutate persistent dataset. Call transient first.")))
     (let [bt (:bitemporal ds-metadata-field)
           valid-cfg (when (:valid bt) (merge {:unit :micros} (:valid bt)))
-          system-cfg (when (:system bt) (merge {:unit :micros} (:system bt)))]
-      (when-not valid-cfg
-        (throw (ex-info "retract! requires a :valid axis on the dataset's :bitemporal config"
-                        {:metadata ds-metadata-field})))
-      (when (nil? where)
-        (throw (ex-info "retract! requires :where" {:opts opts})))
+          system-cfg (when (:system bt) (merge {:unit :micros} (:system bt)))
+          ;; Same matcher as `upsert!` — `{:where <pred>}` or `{:by :eid :keys
+          ;; [k ...]}`, the latter naming N rows in one pass instead of N.
+          [match-fn _unmatched] (upsert-matcher opts)]
+      (if-not valid-cfg
+        ;; ----- Current-state path (no temporal axis) -----
+        ;; No window to close, so a retraction physically removes the row. That
+        ;; is `ds-delete-rows!`, the primitive the SQL `DELETE` lowering
+        ;; already uses; nothing here re-derives row removal.
+        (let [n (long row-count-val)
+              victims (persistent!
+                       (reduce (fn [acc i]
+                                 (if (match-fn (materialize-row columns-field i))
+                                   (conj! acc i)
+                                   acc))
+                               (transient []) (range n)))]
+          (when (seq victims) (ds-delete-rows! this victims))
+          this)
       (let [{vf-col :from-col vt-col :to-col vt-unit :unit} valid-cfg
             close-vt-val (or (coerce-temporal-value (:valid-from tx-meta) vt-unit)
                              (now-in-unit vt-unit))
@@ -524,7 +603,7 @@
                      :trunc-vf (persistent! (:trunc-vf acc))
                      :splits   (persistent! (:splits acc))}
                     (let [row (materialize-row columns-field i)]
-                      (if (eval-pred where row)
+                      (if (match-fn row)
                         (let [row-vf (long (get row vf-col))
                               row-vt (long (get row vt-col))
                               klass (cond
@@ -606,7 +685,7 @@
                     {:close-safe (persistent! (:close-safe acc))
                      :overlaps   (persistent! (:overlaps acc))}
                     (let [row (materialize-row columns-field i)]
-                      (if (eval-pred where row)
+                      (if (match-fn row)
                         (let [row-vf (long (get row vf-col))
                               row-vt (long (get row vt-col))
                               open?  (= row-vt Long/MAX_VALUE)
@@ -629,7 +708,8 @@
                   {:truncate [] :drop []})]
             (when (and (seq overlaps) (not auto-split?))
               (throw (ex-info "retract! would touch rows whose vt-window doesn't cover the retract instant"
-                              {:where where
+                              {:where (:where opts)
+                               :by (:by opts)
                                :retract-at close-vt-val
                                :overlaps (mapv (fn [[i r]]
                                                  (assoc (select-keys r [vf-col vt-col]) :row-idx i))
@@ -664,7 +744,7 @@
                   (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
                 (when (seq auto-drop)
                   (ds-delete-rows! this (mapv first auto-drop)))
-                this)))))))
+                this))))))))
 
   (ds-delete-rows! [this row-idxs]
     (when-not edit
@@ -1272,6 +1352,76 @@
 
     :else
     (throw (ex-info "Unsupported predicate shape" {:pred pred}))))
+
+(defn- upsert-matcher
+  "Resolve `upsert!`/`retract!` `opts` into ONE row-matching function, so the
+   predicate form and the keyed form share every rule below it.
+
+   Returns `[match-fn unmatched]`, where `match-fn` is `(fn [row] -> set-map |
+   nil)` and `unmatched` is a mutable set of keys not yet seen (empty for the
+   predicate form). Both shapes describe the SAME operation — update the rows
+   this names, insert where nothing matched — and differ only in HOW a row is
+   named:
+
+     {:where <pred> :set {col v}}      one predicate, one set of values
+     {:by :eid :rows {k {col v}}}      one key column, per-key values
+
+   The keyed form exists for cost, not expressiveness. `:where` is evaluated
+   per row, so applying N different value-sets means N passes — O(rows × N).
+   Keying names the column to look up, so one pass with an O(1) probe per row
+   serves all N: O(rows + N). A caller writing a transaction of ten thousand
+   updates cannot use the predicate form without quadratic behaviour, and
+   expressing that as ten thousand `:where` clauses would hide the cost rather
+   than remove it. `[[:in :eid ks]]` does not help — it selects the right rows
+   but carries one `:set` for all of them.
+
+   Keys are compared with `=` after reading the column, so a keyed upsert sees
+   exactly what a `[[:= :eid k]]` predicate would."
+  [{:keys [where set by rows] :as opts}]
+  (let [keyed? (some? by)]
+    (when (and keyed? (some? where))
+      (throw (ex-info "Pass :where or :by, not both — they are two ways to name the same rows."
+                      {:opts opts})))
+    (cond
+      keyed?
+      ;; `:rows` for `upsert!`, which needs a value-set per key; `:keys` for
+      ;; `retract!`, which names rows and carries no values. One matcher either
+      ;; way, so "which rows does this opts map name" has a single answer.
+      (let [row-map (cond
+                      (map? rows) rows
+                      (some? (:keys opts)) (zipmap (:keys opts) (repeat nil))
+                      :else (throw (ex-info ":by requires :rows (key -> {col value}) or :keys"
+                                            {:opts opts})))]
+        [(fn [row] (let [k (get row by)]
+                     ;; `find` not `get`: a key whose value-set is nil (retract,
+                     ;; or an upsert clearing every column) still MATCHED.
+                     (when-let [e (find row-map k)] (or (val e) {}))))
+         (java.util.HashSet. ^java.util.Collection (keys row-map))])
+
+      (some? where)
+      ;; `(or set {})`, not `set`: `retract!` carries no `:set`, and a matcher
+      ;; that returned nil for a matched row would silently match nothing.
+      [(fn [row] (when (eval-pred where row) (or set {}))) (java.util.HashSet.)]
+
+      :else
+      (throw (ex-info "requires :where or :by" {:opts opts})))))
+
+(defn- unmatched-inserts
+  "The `[key set-map]` pairs whose keys named no existing row, i.e. the INSERT
+   half of upsert. Empty for the predicate form, which cannot say which of
+   several keys was missing — it has only \"nothing matched\", handled by its
+   own branch at the call site."
+  [{:keys [by rows] :as opts} ^java.util.Set unmatched]
+  (when by
+    (let [row-map (if (map? rows) rows (zipmap (:keys opts) (repeat nil)))]
+      (keep (fn [k] (when (.contains unmatched k) [k (or (get row-map k) {})]))
+            (keys row-map)))))
+
+(defn- matcher-key
+  "The key `match-fn` matched a row on, or nil for the predicate form. Used to
+   strike a key off `unmatched` so it is not also inserted."
+  [{:keys [by]} row]
+  (when by (get row by)))
 
 (defn- read-col-at
   "Read column value at row position `i`. Handles array-backed

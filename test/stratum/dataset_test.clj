@@ -1053,23 +1053,114 @@
     (testing ":_valid_to closed to tx-meta :valid-from"
       (is (= 1719792000000000 (:_valid_to (first rows)))))))
 
-(deftest upsert!-throws-on-non-bitemporal-dataset
-  (let [ds (dataset/make-dataset
-            {:eid (index/index-from-seq :int64 [1])
-             :salary (index/index-from-seq :int64 [100])})]
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"upsert! requires a :valid axis"
-         (-> ds transient
-             (dataset/upsert! {:where [[:= :eid 1]] :set {:salary 200}}))))))
+(deftest upsert!-on-a-plain-dataset-overwrites-in-place
+  (testing "a table with no :valid axis has no window to close, so the matched
+            row is overwritten rather than closed-and-reopened. This used to
+            throw, which left plain tables with no upsert at all — callers
+            hand-rolled scan-and-rebuild instead."
+    (let [ds (dataset/make-dataset
+              {:eid (index/index-from-seq :int64 [1 2])
+               :salary (index/index-from-seq :int64 [100 200])})
+          result (-> ds transient
+                     (dataset/upsert! {:where [[:= :eid 1]] :set {:salary 150}})
+                     persistent!)
+          rows (ds-rows result)]
+      (is (= 2 (count rows)) "overwrite in place — no row is appended")
+      (is (= 150 (:salary (first (filter #(= 1 (:eid %)) rows)))))
+      (is (= 200 (:salary (first (filter #(= 2 (:eid %)) rows))))
+          "and the row that did not match is untouched"))))
 
-(deftest retract!-throws-on-non-bitemporal-dataset
+(deftest upsert!-on-a-plain-dataset-inserts-when-nothing-matched
   (let [ds (dataset/make-dataset
             {:eid (index/index-from-seq :int64 [1])
-             :salary (index/index-from-seq :int64 [100])})]
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"retract! requires a :valid axis"
-         (-> ds transient
-             (dataset/retract! {:where [[:= :eid 1]]}))))))
+             :salary (index/index-from-seq :int64 [100])})
+        result (-> ds transient
+                   (dataset/upsert! {:where [[:= :eid 9]] :set {:eid 9 :salary 900}})
+                   persistent!)
+        rows (ds-rows result)]
+    (is (= 2 (count rows)) "the INSERT half of upsert still applies")
+    (is (= 900 (:salary (first (filter #(= 9 (:eid %)) rows)))))))
+
+(deftest retract!-on-a-plain-dataset-removes-the-row
+  (testing "with no :valid axis there is no window to close, so a retraction
+            physically removes the row — via `ds-delete-rows!`, the same
+            primitive the SQL DELETE lowering uses."
+    (let [ds (dataset/make-dataset
+              {:eid (index/index-from-seq :int64 [1 2])
+               :salary (index/index-from-seq :int64 [100 200])})
+          result (-> ds transient
+                     (dataset/retract! {:where [[:= :eid 1]]})
+                     persistent!)
+          rows (ds-rows result)]
+      (is (= 1 (count rows)))
+      (is (= 2 (:eid (first rows))) "the row that did not match survives"))))
+
+;; ---------------------------------------------------------------------------
+;; Keyed batch — one pass for N keys
+
+(deftest keyed-upsert-applies-a-different-set-per-key-in-one-pass
+  (testing "`:where` is evaluated per row, so N different value-sets need N
+            passes — O(rows × N). `:by` names the column to look up instead, so
+            one pass with an O(1) probe per row serves all N. Same operation,
+            same rules; only how a row is named differs."
+    (let [ds (dataset/make-dataset
+              {:eid (index/index-from-seq :int64 [1 2 3])
+               :salary (index/index-from-seq :int64 [100 200 300])})
+          result (-> ds transient
+                     (dataset/upsert! {:by :eid :rows {1 {:salary 111}
+                                                       3 {:salary 333}}})
+                     persistent!)
+          by-eid (into {} (map (juxt :eid :salary)) (ds-rows result))]
+      (is (= {1 111 2 200 3 333} by-eid)
+          "each key got ITS values; the unnamed row is untouched"))))
+
+(deftest keyed-upsert-inserts-keys-that-named-no-row
+  (let [ds (dataset/make-dataset
+            {:eid (index/index-from-seq :int64 [1])
+             :salary (index/index-from-seq :int64 [100])})
+        result (-> ds transient
+                   (dataset/upsert! {:by :eid :rows {1 {:salary 111}
+                                                     9 {:salary 999}}})
+                   persistent!)
+        by-eid (into {} (map (juxt :eid :salary)) (ds-rows result))]
+    (is (= {1 111 9 999} by-eid)
+        "the INSERT half applies per KEY — which is why unmatched is a set and
+         not the predicate form's single did-anything-match flag")))
+
+(deftest keyed-upsert-on-a-vt-dataset-closes-and-reopens-each-key
+  (testing "the keyed form changes only row selection, so the SCD2 rules apply
+            to it unchanged"
+    (let [ds (vt-only-ds [{:eid 1 :salary 100 :_valid_from 100 :_valid_to Long/MAX_VALUE}
+                          {:eid 2 :salary 200 :_valid_from 100 :_valid_to Long/MAX_VALUE}])
+          result (-> ds transient
+                     (dataset/upsert! {:by :eid :rows {1 {:salary 111} 2 {:salary 222}}}
+                                      {:valid-from 500})
+                     persistent!)
+          rows (ds-rows result)]
+      (is (= 4 (count rows)) "two closed + two open")
+      (is (= #{[100 500] [200 500]}
+             (set (map (juxt :salary :_valid_to) (filter #(not= Long/MAX_VALUE (:_valid_to %)) rows))))
+          "each old row closed at the new valid-from")
+      (is (= #{111 222}
+             (set (map :salary (filter #(= Long/MAX_VALUE (:_valid_to %)) rows))))
+          "and each key's own new value is open"))))
+
+(deftest keyed-retract-names-rows-by-key
+  (let [ds (dataset/make-dataset
+            {:eid (index/index-from-seq :int64 [1 2 3])
+             :salary (index/index-from-seq :int64 [100 200 300])})
+        result (-> ds transient
+                   (dataset/retract! {:by :eid :keys [1 3]})
+                   persistent!)]
+    (is (= [2] (mapv :eid (ds-rows result)))
+        ":keys rather than :rows — a retraction names rows and carries no values")))
+
+(deftest where-and-by-together-are-refused
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo #"not both"
+       (-> (dataset/make-dataset {:eid (index/index-from-seq :int64 [1])})
+           transient
+           (dataset/upsert! {:where [[:= :eid 1]] :by :eid :rows {1 {}}})))))
 
 (deftest append!-works-on-non-bitemporal-dataset-with-tx-meta
   (testing "non-bitemporal datasets ignore tx-meta and require all columns"
