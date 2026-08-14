@@ -34,7 +34,8 @@
          replace-row-bitemporal!
          upsert-matcher
          matcher-key
-         unmatched-inserts)
+         unmatched-inserts
+         dict-encode)
 
 (defprotocol IDataset
   "Core dataset protocol for Stratum columnar engine.
@@ -267,7 +268,12 @@
     (when-not edit
       (throw (IllegalStateException. "Cannot mutate persistent dataset. Call transient first.")))
     (when-let [col (get columns-field col-name)]
-      (idx/idx-set! (:index col) row val))
+      ;; Through `dict-encode`, like `append!`. A dict-encoded string column
+      ;; stores CODES in an int64 index, so writing the string itself threw
+      ;; `String cannot be cast to Number` — `set-at!` was usable on numeric
+      ;; columns only, and silently so: the throw came from deep in the index
+      ;; and named neither the column nor the dict.
+      (idx/idx-set! (:index col) row (dict-encode col val)))
     this)
 
   (append! [this row-map]
@@ -329,22 +335,8 @@
       ;; nil propagates straight through — idx/chunk handle the NULL
       ;; sentinel themselves.
       (doseq [[col-name col-data] columns-field]
-        (let [val (get row col-name)
-              encoded
-              (if (and (= :string (:dict-type col-data))
-                       (some? val)
-                       (string? val))
-                (let [^java.util.HashMap fwd (:dict-fwd col-data)
-                      ^java.util.ArrayList dict (:dict col-data)
-                      existing (.get fwd ^String val)]
-                  (if existing
-                    (long existing)
-                    (let [new-code (long (.size dict))]
-                      (.add dict ^String val)
-                      (.put fwd ^String val new-code)
-                      new-code)))
-                val)]
-          (idx/idx-append! (:index col-data) encoded)))
+        (idx/idx-append! (:index col-data)
+                          (dict-encode col-data (get row col-name))))
       (set! row-count-val (unchecked-inc row-count-val))
       this))
 
@@ -1353,6 +1345,32 @@
     :else
     (throw (ex-info "Unsupported predicate shape" {:pred pred}))))
 
+(defn- dict-encode
+  "The value as the column's INDEX stores it.
+
+   A dict-encoded string column keeps codes in an int64 index and the strings
+   in a side dict, so every write has to intern first — appending or setting
+   the string itself writes a String where a long belongs. One function
+   because `append!` and `set-at!` must agree about what a code means; when
+   this logic lived inside `append!`, `set-at!` did not encode at all.
+
+   Interning MUTATES the column's dict, which is what makes a previously
+   unseen string writable. `nil` passes through — the index and chunk layers
+   own the NULL sentinel. Anything that is not a string in a dict column
+   passes through too, so a caller writing a raw code still can."
+  [col-data val]
+  (if (and (= :string (:dict-type col-data)) (some? val) (string? val))
+    (let [^java.util.HashMap fwd (:dict-fwd col-data)
+          ^java.util.ArrayList dict (:dict col-data)
+          existing (.get fwd ^String val)]
+      (if existing
+        (long existing)
+        (let [new-code (long (.size dict))]
+          (.add dict ^String val)
+          (.put fwd ^String val new-code)
+          new-code)))
+    val))
+
 (defn- upsert-matcher
   "Resolve `upsert!`/`retract!` `opts` into ONE row-matching function, so the
    predicate form and the keyed form share every rule below it.
@@ -1437,7 +1455,15 @@
       (let [^longs arr (or data (idx/idx-materialize-to-array idx))
             code (aget arr i)]
         (when-not (= code Long/MIN_VALUE)
-          (aget ^"[Ljava.lang.String;" dict (int code))))
+          ;; The dict is a String[] as built, but a java.util.List once an
+          ;; `append!` has grown it — a column written and then updated has the
+          ;; second shape. Reading only the first made `upsert!`/`retract!`
+          ;; throw ClassCastException on any dict-encoded string column that had
+          ;; ever been appended to, which is every such column after its first
+          ;; insert.
+          (if (instance? java.util.List dict)
+            (.get ^java.util.List dict (int code))
+            (aget ^"[Ljava.lang.String;" dict (int code)))))
 
       ;; Raw double array
       (and data (instance? (Class/forName "[D") data))
