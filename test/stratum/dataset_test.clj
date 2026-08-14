@@ -1155,6 +1155,30 @@
     (is (= [2] (mapv :eid (ds-rows result)))
         ":keys rather than :rows — a retraction names rows and carries no values")))
 
+(deftest upsert!-reads-a-string-column-whose-dict-has-grown
+  (testing "a dict-encoded string column starts as a String[] and becomes a
+            java.util.List once `append!` grows it. `read-col-at` handled only
+            the first shape, so `materialize-row` — and therefore every
+            `upsert!`/`retract!` predicate — threw ClassCastException on any
+            string column that had ever been appended to. Two writes are the
+            minimum to see it: the first inserts, the second must read back."
+    (let [ds (dataset/ensure-indexed
+              (dataset/make-dataset
+               {:eid (index/index-from-seq :int64 [1])
+                :dept (into-array String ["eng"])}))
+          once (-> ds transient
+                   (dataset/upsert! {:by :eid :rows {2 {:dept "ops"}}})
+                   persistent!)
+          twice (-> once transient
+                    (dataset/upsert! {:by :eid :rows {1 {:dept "sales"}}})
+                    persistent!)
+          ;; Queried rather than read through `ds-rows`: that helper reads the
+          ;; raw column and a dict-encoded string column holds CODES, so it
+          ;; would report {1 2, 2 1}. `q` decodes.
+          by-eid (into {} (map (juxt :eid :dept))
+                       (stratum.api/q {:from twice :select [:eid :dept]}))]
+      (is (= {1 "sales" 2 "ops"} by-eid)))))
+
 (deftest where-and-by-together-are-refused
   (is (thrown-with-msg?
        clojure.lang.ExceptionInfo #"not both"
