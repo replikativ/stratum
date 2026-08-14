@@ -424,9 +424,17 @@
                                   ;; Closed row entirely before new-vf — no overlap
                                   (and (not open?) (<= row-vt close-vt-val)) :no-conflict
                                   :else :overlaps)]
-                      ;; A key that named an existing row is updated, so it must
-                      ;; not ALSO be inserted below.
-                      (when-let [k (matcher-key opts row)] (.remove ^java.util.Set unmatched k))
+                      ;; A key is struck off only when the row it named is
+                      ;; actually going to carry the new values. `:no-conflict`
+                      ;; means the matched row is closed and entirely in the
+                      ;; PAST — it is left alone, so the key still needs its
+                      ;; insert. Striking it here regardless meant a write whose
+                      ;; validity window abuts an existing closed one was
+                      ;; silently dropped: the old row was not updated (correct)
+                      ;; and the new row was never appended (not).
+                      (when-not (= :no-conflict klass)
+                        (when-let [k (matcher-key opts row)]
+                          (.remove ^java.util.Set unmatched k)))
                       (recur (inc i)
                              (if (= :no-conflict klass)
                                acc

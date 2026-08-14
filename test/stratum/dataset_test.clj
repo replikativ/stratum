@@ -1179,6 +1179,22 @@
                        (stratum.api/q {:from twice :select [:eid :dept]}))]
       (is (= {1 "sales" 2 "ops"} by-eid)))))
 
+(deftest keyed-upsert-inserts-when-the-matched-row-is-closed-in-the-past
+  (testing "a matched row classified `:no-conflict` — closed, entirely before
+            the new write's window — is correctly left alone, but the key still
+            needs its row. Striking it off `unmatched` on the mere fact of a
+            match dropped the write: nothing updated, nothing inserted."
+    (let [ds (vt-only-ds [{:eid 1 :salary 100 :_valid_from 100 :_valid_to 500}])
+          result (-> ds transient
+                     (dataset/upsert! {:by :eid :rows {1 {:salary 200}}}
+                                      {:valid-from 500})
+                     persistent!)
+          rows (ds-rows result)]
+      (is (= 2 (count rows)) "the closed historical row AND the new one")
+      (is (= #{100 200} (set (map :salary rows))))
+      (is (= 500 (:_valid_from (first (filter #(= 200 (:salary %)) rows))))
+          "the new row opens where the old one closed"))))
+
 (deftest where-and-by-together-are-refused
   (is (thrown-with-msg?
        clojure.lang.ExceptionInfo #"not both"
