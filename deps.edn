@@ -6,10 +6,10 @@
 
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         ;; PSS for tree structure with persistence.
-        ;; LOCAL while the canonical fressian node+root handlers
-        ;; (org.replikativ.persistent-sorted-set.fressian, feat/canonical-serialization-handlers)
-        ;; are unreleased — re-pin to the released version once it ships.
-        org.replikativ/persistent-sorted-set {:mvn/version "0.4.126"}
+        ;; 0.5.x maintains a branch's cached `:measure` by delta instead of recomputing it
+        ;; from all children, so a write to a cold index no longer erases the aggregate and
+        ;; `idx-stats` no longer restores the subtree to rebuild it (replikativ/persistent-sorted-set#24).
+        org.replikativ/persistent-sorted-set {:mvn/version "0.5.141"}
         ;; konserve for durable storage
         org.replikativ/konserve {:mvn/version "0.9.350"
                                  :exclusions [org.clojure/clojurescript
@@ -210,7 +210,7 @@
 
   ;; Use published deps (for CI/release)
   :release
-  {:override-deps {org.replikativ/persistent-sorted-set {:mvn/version "0.4.126"}
+  {:override-deps {org.replikativ/persistent-sorted-set {:mvn/version "0.5.141"}
                    org.replikativ/konserve {:mvn/version "0.9.350"
                                             :exclusions [org.clojure/clojurescript
                                                          com.github.pkpkpk/cljs-node-io
