@@ -65,7 +65,12 @@
                                                       javax.servlet/javax.servlet-api]}}
 
  :aliases
- {:dev
+ ;; Sibling checkout for the konserve gc-guard vertical: stratum's GC/sync lock
+ ;; keys on `konserve.protocols/store-id`, which is unreleased. Every repo in
+ ;; the vertical must point at the SAME konserve checkout.
+ {:local {:override-deps {org.replikativ/konserve {:local/root "../konserve"}}}
+
+  :dev
   {:extra-paths ["dev" "test" "bench" "notebooks"]
    :extra-deps {nrepl/nrepl {:mvn/version "1.3.0"}
                 cider/cider-nrepl {:mvn/version "0.50.2"}

@@ -7,6 +7,8 @@
             [konserve.memory :refer [new-mem-store]]
             [konserve.filestore :refer [connect-fs-store]]
             [konserve.core :as k]
+            [konserve.store :as ks]
+            [konserve.protocols :as kp]
             [org.replikativ.persistent-sorted-set :as pss]))
 
 ;; ============================================================================
@@ -324,3 +326,47 @@
       (is (= 3.14 (chunk/chunk-constant-val cc)))
       (is (= 3.14 (chunk/read-double cc 0)))
       (is (= 1000 (chunk/chunk-length cc))))))
+
+;; ============================================================================
+;; GC / sync coordination lock
+;; ============================================================================
+
+(deftest storage-lock-follows-the-store-not-the-object
+  (testing "REGRESSION: the lock keyed on the store REFERENCE, on the reasoning
+            that record equality would make two connections to one path share a
+            monitor. They do not — two `connect-fs-store` calls on one path are
+            neither `identical?` nor `=`, and hash differently — so a process
+            that connected twice got two independent monitors, and a `gc!` on
+            one could run inside a `sync!` on the other and sweep chunks it was
+            about to reference.
+
+            Keying on konserve's `:id` fixes it, and follows the same rule the
+            GC safe point does: the key may be COARSER than the physical store,
+            never finer."
+    (let [path (str "/tmp/stratum-lock-test-" (random-uuid))
+          id (random-uuid)
+          cfg {:backend :file :path path :id id}
+          _ (ks/create-store cfg {:sync? true})
+          a (ks/connect-store cfg {:sync? true})
+          b (ks/connect-store cfg {:sync? true})]
+      (is (not= a b)
+          "the premise: two connections to one store are NOT equal")
+      (is (= (kp/store-id a) (kp/store-id b))
+          "but they agree on the store they name")
+      ;; The monitor itself is private, so observe it through the behaviour it
+      ;; exists for: a lock held on one connection must exclude the other.
+      (let [entered (promise)
+            blocked (atom true)
+            t (Thread. (fn []
+                         (storage/with-storage-lock a
+                           (fn [] (deliver entered true) (Thread/sleep 300)))))]
+        (.start t)
+        @entered
+        (let [waited (let [t0 (System/nanoTime)]
+                       (storage/with-storage-lock b (fn [] (reset! blocked false)))
+                       (/ (- (System/nanoTime) t0) 1e6))]
+          (.join t)
+          (is (false? @blocked))
+          (is (> waited 100.0)
+              (str "a lock held on one connection must exclude the other; "
+                   "waited only " waited "ms")))))))
