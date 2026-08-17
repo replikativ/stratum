@@ -14,6 +14,7 @@
      [:indices  :commits <uuid>]     → index-snapshot
      <uuid>                          → serialized PSS node (Leaf or Branch)"
   (:require [konserve.core :as k]
+            [konserve.protocols :as kp]
             [hasch.core :as hasch]
             [clojure.set :as set]
             [org.replikativ.persistent-sorted-set :as pss])
@@ -26,35 +27,54 @@
 ;; ============================================================================
 
 (def ^:private store-locks
-  "Per-store GC/sync coordination locks, keyed by the store
-   reference itself. Map identity follows the store's `.equals`
-   semantics:
+  "Per-store GC/sync coordination locks, keyed by the store's konserve `:id`.
 
-   - Konserve memory store / typical deftypes: default Object
-     equality (identity) → distinct instances get distinct locks.
-   - File-store / S3-store records with content-based equality:
-     two instances configured against the same backing storage
-     share a lock — which is what we want (they protect the same
-     physical data).
+   KEYED BY ID, NOT BY THE STORE OBJECT, and the distinction is the whole
+   point. This used to key on the store reference and reason that
+   \"file-store / S3-store records with content-based equality: two instances
+   configured against the same backing storage share a lock\". They do not —
+   two `connect-fs-store` calls on one path are neither `identical?` nor `=`,
+   and hash differently. So two connections to one store got two independent
+   monitors and a `gc!` on one could run inside a `sync!` on the other,
+   sweeping chunks the other was about to reference.
 
-   Worst case for an oddly-implemented backend is two locks
-   collapsed into one (over-locking, safe). Under-locking is
-   impossible: distinct keys always get distinct locks.
+   The old note that \"under-locking is impossible\" had it backwards: two
+   distinct keys for ONE physical store is exactly under-locking. The safe
+   direction is the opposite one, and it is the same rule
+   `konserve.gc-guard` follows for the safe point — the key may be COARSER
+   than the physical store (two stores collapsing onto one lock merely
+   over-locks) but never FINER.
 
-   Stratum apps typically run with a small bounded set of stores
-   per JVM (often one), so we don't worry about cleanup. Inspect
-   the current set via `(locked-stores)`."
+   konserve's `:id` is coarser: it is a logical identity, shared by replicas
+   across machines. Within one JVM — which is all a monitor can reach — one
+   id names one store.
+
+   A store built through a backend constructor rather than
+   `konserve.store/connect-store` carries no id, and falls back to the object.
+   That is the old behaviour, under-locking included, so such callers should
+   still avoid connecting twice.
+
+   Stratum apps typically run with a small bounded set of stores per JVM
+   (often one), so we don't worry about cleanup. Inspect the current set via
+   `(locked-stores)`."
   (java.util.concurrent.ConcurrentHashMap.))
+
+(defn- lock-key
+  "What identifies the physical store for locking: its konserve `:id` when it
+   has one, otherwise the store itself. See `store-locks`."
+  [store]
+  (or (kp/store-id store) store))
 
 (defn- store-lock
   "Lazily allocate (or return) the Object monitor associated with
    `store`. Same store across calls → same Object. The
    `putIfAbsent` cycle resolves the racy double-allocation."
   [store]
-  (or (.get ^java.util.concurrent.ConcurrentHashMap store-locks store)
-      (let [o (Object.)
-            existing (.putIfAbsent ^java.util.concurrent.ConcurrentHashMap store-locks store o)]
-        (or existing o))))
+  (let [k (lock-key store)]
+    (or (.get ^java.util.concurrent.ConcurrentHashMap store-locks k)
+        (let [o (Object.)
+              existing (.putIfAbsent ^java.util.concurrent.ConcurrentHashMap store-locks k o)]
+          (or existing o)))))
 
 (defn with-storage-lock
   "Execute f while holding the per-store GC/sync coordination
