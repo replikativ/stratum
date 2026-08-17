@@ -11,7 +11,7 @@
         ;; `idx-stats` no longer restores the subtree to rebuild it (replikativ/persistent-sorted-set#24).
         org.replikativ/persistent-sorted-set {:mvn/version "0.5.141"}
         ;; konserve for durable storage
-        org.replikativ/konserve {:mvn/version "0.9.350"
+        org.replikativ/konserve {:mvn/version "0.9.375"
                                  :exclusions [org.clojure/clojurescript
                                               com.github.pkpkpk/cljs-node-io
                                               com.github.pkpkpk/fress
@@ -65,9 +65,8 @@
                                                       javax.servlet/javax.servlet-api]}}
 
  :aliases
- ;; Sibling checkout for the konserve gc-guard vertical: stratum's GC/sync lock
- ;; keys on `konserve.protocols/store-id`, which is unreleased. Every repo in
- ;; the vertical must point at the SAME konserve checkout.
+ ;; Sibling checkout, for co-development across the replikativ stack.
+ ;; Not required to build — konserve 0.9.375 carries `store-id`.
  {:local {:override-deps {org.replikativ/konserve {:local/root "../konserve"}}}
 
   :dev
@@ -216,7 +215,7 @@
   ;; Use published deps (for CI/release)
   :release
   {:override-deps {org.replikativ/persistent-sorted-set {:mvn/version "0.5.141"}
-                   org.replikativ/konserve {:mvn/version "0.9.350"
+                   org.replikativ/konserve {:mvn/version "0.9.375"
                                             :exclusions [org.clojure/clojurescript
                                                          com.github.pkpkpk/cljs-node-io
                                                          com.github.pkpkpk/fress
