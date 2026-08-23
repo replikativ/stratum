@@ -133,6 +133,24 @@ clj -M:olap asof         # ASOF JOIN tier only (3 canonical shapes)
 (st/q {:from ds :agg [[:avg :age]]})
 ```
 
+## Warming
+
+A dataset loaded from storage is lazy — every node a query touches is a storage
+round trip, paid one blocking read at a time. `stratum.warm/warm!` pulls the
+index trees in concurrently instead: every indexed column shares one budget
+round-robin, `:depth :interior` (the default) makes stats and pruning free, and
+`:depth :with-leaves` prefetches the column data a known scan will read. After
+a full warm the scan that follows performs **zero** further storage reads.
+
+```clojure
+(def ds (dataset/load store "main"))
+(warm/warm! ds)                                    ; spine, all columns
+(warm/warm! ds {:depth :with-leaves :budget 2000}) ; data, budget-bounded
+```
+
+See [doc/warming.md](doc/warming.md) for depth semantics, the report, and what
+warming deliberately does not promise.
+
 ## Server-side durability
 
 By default, a Stratum PgWire server starts with an empty in-memory registry — convenient for ad-hoc demos and read-only queries against pre-indexed files (`--index`), but SQL `CREATE TABLE`, `INSERT`/`UPDATE`/`DELETE`, `CREATE MODEL`, and `register-live-table!` bindings live only in heap and evaporate on restart.
@@ -369,6 +387,13 @@ Stratum is part of the [Replikativ](https://github.com/replikativ) ecosystem - a
 - **[Proximum](https://github.com/replikativ/proximum)** - vector search
 
 All share copy-on-write semantics and can be branched together via Yggdrasil.
+
+When stratum runs embedded as a datahike secondary index it shares datahike's
+konserve store, which is why its garbage collection contributes marks instead
+of sweeping — see
+[doc/gc-and-store-ownership.md](doc/gc-and-store-ownership.md) for the
+invariant that keeps that safe and the open store-ownership decision for the
+ecosystem.
 
 ## Features
 

@@ -1,11 +1,12 @@
 # GC and store ownership
 
-Why stratum's garbage collection looks different from datahike's, scriptum's and
-proximum's, and what would have to be decided to make them the same.
+Stratum's garbage collection deliberately differs from datahike's, scriptum's
+and proximum's. This document explains why the difference is structural rather
+than an oversight, what invariant keeps it safe, and what would have to be
+decided to unify the ecosystem — a decision that is still open, and recorded
+here so it is made deliberately rather than by drift.
 
-Written while landing `konserve.gc-guard` across the stack.
-
-## Two patterns already exist
+## Two patterns exist in the ecosystem
 
 | adapter | where its data lives | `mark-from-key-map` |
 | --- | --- | --- |
@@ -73,11 +74,11 @@ store and implement real marks.
   sweep deletes that library's data. One library's mark bug becomes another's
   data loss.
 
-Two things that landed this week change what is available here. Scriptum's
-konserve backing makes Model 2 *possible* for it at all — under the path design
-its data was files, which is why its `-sec-mark` still reads "Scriptum uses
-filesystem, not konserve — nothing to mark". And `konserve.gc-guard` makes
-Model 2 *safe*, being the shared safe point across libraries in one store.
+Two prerequisites for Model 2 exist today. Scriptum's konserve backing makes
+it *possible* for scriptum at all — under the earlier path design its data was
+files, which is why its `-sec-mark` still reads "Scriptum uses filesystem, not
+konserve — nothing to mark". And `konserve.gc-guard` makes it *safe*, being
+the shared safe point across libraries in one store.
 
 Weak recommendation: **Model 1.** Failure containment is worth more than
 operational tidiness, and landing this work surfaced two independent mark bugs —
@@ -91,7 +92,7 @@ If scriptum's konserve backing ever shares datahike's store,
 `mark-from-key-map :scriptum` returning `#{}` becomes a data-loss bug. It is
 correct today only because scriptum owns its store.
 
-## Fixed here: the GC/sync lock key
+## The GC/sync lock key (a fixed bug, kept as a design rule)
 
 `with-storage-lock` allocated its monitor in a map keyed by the store
 *reference*, reasoning that record equality would make two connections to one
