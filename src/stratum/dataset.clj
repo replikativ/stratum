@@ -336,7 +336,7 @@
       ;; sentinel themselves.
       (doseq [[col-name col-data] columns-field]
         (idx/idx-append! (:index col-data)
-                          (dict-encode col-data (get row col-name))))
+                         (dict-encode col-data (get row col-name))))
       (set! row-count-val (unchecked-inc row-count-val))
       this))
 
@@ -382,9 +382,9 @@
             (append! this (:set opts)))
           this)
         (let [{vf-col :from-col vt-col :to-col vt-unit :unit} valid-cfg
-            close-vt-val (or (coerce-temporal-value (:valid-from tx-meta) vt-unit)
-                             (now-in-unit vt-unit))
-            n (long row-count-val)
+              close-vt-val (or (coerce-temporal-value (:valid-from tx-meta) vt-unit)
+                               (now-in-unit vt-unit))
+              n (long row-count-val)
             ;; Pass 1: classify every matching row. A row is :close-safe
             ;; iff it's currently open (vt=MAX) AND its vf is strictly
             ;; before the new write's vf — i.e. closing it to new-vf
@@ -408,22 +408,22 @@
             ;;                  (row-vt <= new-vf). Ignored.
             ;;   :overlap     — anything else; can't proceed without
             ;;                  auto-split.
-            {:keys [close-safe overlaps]}
-            (loop [i 0 acc {:close-safe (transient [])
-                            :overlaps (transient [])}]
-              (if (>= i n)
-                {:close-safe (persistent! (:close-safe acc))
-                 :overlaps   (persistent! (:overlaps acc))}
-                (let [row (materialize-row columns-field i)]
-                  (if-let [row-set (match-fn row)]
-                    (let [row-vf (long (get row vf-col))
-                          row-vt (long (get row vt-col))
-                          open?  (= row-vt Long/MAX_VALUE)
-                          klass (cond
-                                  (and open? (< row-vf close-vt-val)) :close-safe
+              {:keys [close-safe overlaps]}
+              (loop [i 0 acc {:close-safe (transient [])
+                              :overlaps (transient [])}]
+                (if (>= i n)
+                  {:close-safe (persistent! (:close-safe acc))
+                   :overlaps   (persistent! (:overlaps acc))}
+                  (let [row (materialize-row columns-field i)]
+                    (if-let [row-set (match-fn row)]
+                      (let [row-vf (long (get row vf-col))
+                            row-vt (long (get row vt-col))
+                            open?  (= row-vt Long/MAX_VALUE)
+                            klass (cond
+                                    (and open? (< row-vf close-vt-val)) :close-safe
                                   ;; Closed row entirely before new-vf — no overlap
-                                  (and (not open?) (<= row-vt close-vt-val)) :no-conflict
-                                  :else :overlaps)]
+                                    (and (not open?) (<= row-vt close-vt-val)) :no-conflict
+                                    :else :overlaps)]
                       ;; A key is struck off only when the row it named is
                       ;; actually going to carry the new values. `:no-conflict`
                       ;; means the matched row is closed and entirely in the
@@ -432,16 +432,16 @@
                       ;; validity window abuts an existing closed one was
                       ;; silently dropped: the old row was not updated (correct)
                       ;; and the new row was never appended (not).
-                      (when-not (= :no-conflict klass)
-                        (when-let [k (matcher-key opts row)]
-                          (.remove ^java.util.Set unmatched k)))
-                      (recur (inc i)
-                             (if (= :no-conflict klass)
-                               acc
+                        (when-not (= :no-conflict klass)
+                          (when-let [k (matcher-key opts row)]
+                            (.remove ^java.util.Set unmatched k)))
+                        (recur (inc i)
+                               (if (= :no-conflict klass)
+                                 acc
                                ;; `row-set` travels with the row: under the keyed
                                ;; form each matched row carries its own values.
-                               (update acc klass conj! [i row row-set]))))
-                    (recur (inc i) acc)))))
+                                 (update acc klass conj! [i row row-set]))))
+                      (recur (inc i) acc)))))
         ;; Auto-split partitions overlaps by row-vf vs new-vf:
         ;;   row-vf <  new-vf → partial left overlap → TRUNCATE
         ;;                       (set row-vt = new-vf, keep the
@@ -453,24 +453,24 @@
         ;; new-vt is always MAX in upsert!/retract!. They become
         ;; reachable once Phase D wires SQL `FOR PORTION OF
         ;; VALID_TIME FROM x TO y`.)
-            {auto-truncate :truncate auto-drop :drop}
-            (if (and (seq overlaps) auto-split?)
-              (group-by (fn [[_i r _s]]
-                          (if (< (long (get r vf-col)) close-vt-val)
-                            :truncate
-                            :drop))
-                        overlaps)
-              {:truncate [] :drop []})
+              {auto-truncate :truncate auto-drop :drop}
+              (if (and (seq overlaps) auto-split?)
+                (group-by (fn [[_i r _s]]
+                            (if (< (long (get r vf-col)) close-vt-val)
+                              :truncate
+                              :drop))
+                          overlaps)
+                {:truncate [] :drop []})
 
-            _ (when (and (seq overlaps) (not auto-split?))
-                (throw (ex-info "upsert! would overlap existing rows' vt-windows"
-                                {:where (:where opts)
-                                 :by (:by opts)
-                                 :new-window [close-vt-val Long/MAX_VALUE]
-                                 :overlaps (mapv (fn [[i r _s]]
-                                                   (assoc (select-keys r [vf-col vt-col]) :row-idx i))
-                                                 overlaps)
-                                 :hint "pass :auto-split? true to split overlapping rows, or restructure the write"})))]
+              _ (when (and (seq overlaps) (not auto-split?))
+                  (throw (ex-info "upsert! would overlap existing rows' vt-windows"
+                                  {:where (:where opts)
+                                   :by (:by opts)
+                                   :new-window [close-vt-val Long/MAX_VALUE]
+                                   :overlaps (mapv (fn [[i r _s]]
+                                                     (assoc (select-keys r [vf-col vt-col]) :row-idx i))
+                                                   overlaps)
+                                   :hint "pass :auto-split? true to split overlapping rows, or restructure the write"})))]
         ;; Mutation order is load-bearing:
         ;;   1. set-at! everything (close-safe + truncate) — indices stay
         ;;      stable across set-at!.
@@ -479,64 +479,64 @@
         ;;      truncate) would point at the wrong row.
         ;;   3. append! the new rows (close-safe merged-row, or degenerate
         ;;      insert).
-        (if system-cfg
+          (if system-cfg
           ;; ----- Bitemporal path (SCD2-on-both-axes) -----
           ;; Every mutation of a row's vt-window is also a system-time
           ;; event: close the old row's _system_to, append the
           ;; replacement(s) with a fresh _system_from. This preserves
           ;; the audit chain so `FOR SYSTEM_TIME AS OF <past>` still
           ;; sees the pre-surgery state.
-          (let [system-now (system-now-from-tx-meta system-cfg tx-meta)]
-            (doseq [[i prev-row row-set] close-safe]
-              (let [orig-vf (long (get prev-row vf-col))]
+            (let [system-now (system-now-from-tx-meta system-cfg tx-meta)]
+              (doseq [[i prev-row row-set] close-safe]
+                (let [orig-vf (long (get prev-row vf-col))]
+                  (replace-row-bitemporal!
+                   this prev-row i system-now valid-cfg system-cfg
+                   [{:vf orig-vf :vt close-vt-val}
+                    {:vf close-vt-val :vt Long/MAX_VALUE :data row-set}]
+                   tx-meta)))
+              (doseq [[i prev-row _s] auto-truncate]
+                (let [orig-vf (long (get prev-row vf-col))]
+                  (replace-row-bitemporal!
+                   this prev-row i system-now valid-cfg system-cfg
+                   [{:vf orig-vf :vt close-vt-val}]
+                   tx-meta)))
+              (doseq [[i prev-row _s] auto-drop]
                 (replace-row-bitemporal!
                  this prev-row i system-now valid-cfg system-cfg
-                 [{:vf orig-vf :vt close-vt-val}
-                  {:vf close-vt-val :vt Long/MAX_VALUE :data row-set}]
-                 tx-meta)))
-            (doseq [[i prev-row _s] auto-truncate]
-              (let [orig-vf (long (get prev-row vf-col))]
-                (replace-row-bitemporal!
-                 this prev-row i system-now valid-cfg system-cfg
-                 [{:vf orig-vf :vt close-vt-val}]
-                 tx-meta)))
-            (doseq [[i prev-row _s] auto-drop]
-              (replace-row-bitemporal!
-               this prev-row i system-now valid-cfg system-cfg
-               []
-               tx-meta))
+                 []
+                 tx-meta))
             ;; INSERT-where-nothing-matched. The predicate form has one such
             ;; case — no row matched at all — while the keyed form has one per
             ;; key that named no row, which is why `unmatched` is a set rather
             ;; than a boolean.
-            (doseq [[k row-set] (unmatched-inserts opts unmatched)]
-              (append! this (assoc row-set (:by opts) k)
-                       (assoc tx-meta :valid-from close-vt-val
-                              :system-from system-now)))
-            (when (and (nil? (:by opts)) (empty? close-safe))
-              (append! this (:set opts)
-                       (assoc tx-meta :valid-from close-vt-val
-                              :system-from system-now))))
+              (doseq [[k row-set] (unmatched-inserts opts unmatched)]
+                (append! this (assoc row-set (:by opts) k)
+                         (assoc tx-meta :valid-from close-vt-val
+                                :system-from system-now)))
+              (when (and (nil? (:by opts)) (empty? close-safe))
+                (append! this (:set opts)
+                         (assoc tx-meta :valid-from close-vt-val
+                                :system-from system-now))))
           ;; ----- Valid-only path (existing in-place mutation) -----
-          (do
-            (doseq [[i _prev-row _s] close-safe]
-              (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
-            (doseq [[i _r _s] auto-truncate]
-              (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
-            (when (seq auto-drop)
-              (ds-delete-rows! this (mapv first auto-drop)))
-            (doseq [[_i prev-row row-set] close-safe]
-              (let [merged-row (merge (dissoc prev-row vf-col vt-col)
-                                      row-set)]
-                (append! this
-                         (assoc merged-row vf-col close-vt-val)
-                         tx-meta)))
-            (doseq [[k row-set] (unmatched-inserts opts unmatched)]
-              (append! this (assoc row-set (:by opts) k)
-                       (assoc tx-meta :valid-from close-vt-val)))
-            (when (and (nil? (:by opts)) (empty? close-safe))
-              (append! this (:set opts) (assoc tx-meta :valid-from close-vt-val)))))
-        this))))
+            (do
+              (doseq [[i _prev-row _s] close-safe]
+                (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+              (doseq [[i _r _s] auto-truncate]
+                (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+              (when (seq auto-drop)
+                (ds-delete-rows! this (mapv first auto-drop)))
+              (doseq [[_i prev-row row-set] close-safe]
+                (let [merged-row (merge (dissoc prev-row vf-col vt-col)
+                                        row-set)]
+                  (append! this
+                           (assoc merged-row vf-col close-vt-val)
+                           tx-meta)))
+              (doseq [[k row-set] (unmatched-inserts opts unmatched)]
+                (append! this (assoc row-set (:by opts) k)
+                         (assoc tx-meta :valid-from close-vt-val)))
+              (when (and (nil? (:by opts)) (empty? close-safe))
+                (append! this (:set opts) (assoc tx-meta :valid-from close-vt-val)))))
+          this))))
 
   (retract! [this opts] (retract! this opts nil))
 
@@ -563,21 +563,21 @@
                                (transient []) (range n)))]
           (when (seq victims) (ds-delete-rows! this victims))
           this)
-      (let [{vf-col :from-col vt-col :to-col vt-unit :unit} valid-cfg
-            close-vt-val (or (coerce-temporal-value (:valid-from tx-meta) vt-unit)
-                             (now-in-unit vt-unit))
+        (let [{vf-col :from-col vt-col :to-col vt-unit :unit} valid-cfg
+              close-vt-val (or (coerce-temporal-value (:valid-from tx-meta) vt-unit)
+                               (now-in-unit vt-unit))
             ;; `:valid-to` explicitly present in tx-meta selects the
             ;; bounded surgery path even when the value is MAX (the
             ;; `FOR ALL VALID_TIME` form passes `Long/MAX_VALUE` and
             ;; expects every matching row to be dropped).
-            bounded? (contains? tx-meta :valid-to)
-            close-vt-end (or (coerce-temporal-value (:valid-to tx-meta) vt-unit)
-                             Long/MAX_VALUE)
-            _ (when bounded?
+              bounded? (contains? tx-meta :valid-to)
+              close-vt-end (or (coerce-temporal-value (:valid-to tx-meta) vt-unit)
+                               Long/MAX_VALUE)
+              _ (when bounded?
                 ;; Bounded retract has explicit [vf, vt) — reject
                 ;; zero-width / reverse periods that would silently
                 ;; degenerate the overlap test to a no-op.
-                (validate-period! close-vt-val close-vt-end :valid))
+                  (validate-period! close-vt-val close-vt-end :valid))
             ;; Bounded retract — SQL:2011 `FOR PORTION OF VALID_TIME
             ;; FROM x TO y DELETE` semantic. For each matching row's
             ;; window [row-vf, row-vt), apply surgery against
@@ -588,163 +588,163 @@
             ;;   straddles both    → split (truncate + append right tail)
             ;; Bounded retract is unconditional — no `:auto-split?` flag,
             ;; the bounded form IS the surgical semantic.
-            n (long row-count-val)]
-        (if bounded?
+              n (long row-count-val)]
+          (if bounded?
           ;; ----- Bounded retract (SQL:2011 FOR PORTION OF VALID_TIME) -----
           ;; Surgery is unconditional — no `:auto-split?` flag.
-          (let [{:keys [drops trunc-vt trunc-vf splits]}
-                (loop [i 0 acc {:drops (transient [])
-                                :trunc-vt (transient [])
-                                :trunc-vf (transient [])
-                                :splits (transient [])}]
-                  (if (>= i n)
-                    {:drops    (persistent! (:drops acc))
-                     :trunc-vt (persistent! (:trunc-vt acc))
-                     :trunc-vf (persistent! (:trunc-vf acc))
-                     :splits   (persistent! (:splits acc))}
-                    (let [row (materialize-row columns-field i)]
-                      (if (match-fn row)
-                        (let [row-vf (long (get row vf-col))
-                              row-vt (long (get row vt-col))
-                              klass (cond
-                                      (or (<= row-vt close-vt-val)
-                                          (>= row-vf close-vt-end))
-                                      :no-conflict
+            (let [{:keys [drops trunc-vt trunc-vf splits]}
+                  (loop [i 0 acc {:drops (transient [])
+                                  :trunc-vt (transient [])
+                                  :trunc-vf (transient [])
+                                  :splits (transient [])}]
+                    (if (>= i n)
+                      {:drops    (persistent! (:drops acc))
+                       :trunc-vt (persistent! (:trunc-vt acc))
+                       :trunc-vf (persistent! (:trunc-vf acc))
+                       :splits   (persistent! (:splits acc))}
+                      (let [row (materialize-row columns-field i)]
+                        (if (match-fn row)
+                          (let [row-vf (long (get row vf-col))
+                                row-vt (long (get row vt-col))
+                                klass (cond
+                                        (or (<= row-vt close-vt-val)
+                                            (>= row-vf close-vt-end))
+                                        :no-conflict
 
-                                      (and (>= row-vf close-vt-val)
-                                           (<= row-vt close-vt-end))
-                                      :drops
+                                        (and (>= row-vf close-vt-val)
+                                             (<= row-vt close-vt-end))
+                                        :drops
 
-                                      (and (<  row-vf close-vt-val)
-                                           (<= row-vt close-vt-end))
-                                      :trunc-vt
+                                        (and (<  row-vf close-vt-val)
+                                             (<= row-vt close-vt-end))
+                                        :trunc-vt
 
-                                      (and (>= row-vf close-vt-val)
-                                           (>  row-vt close-vt-end))
-                                      :trunc-vf
+                                        (and (>= row-vf close-vt-val)
+                                             (>  row-vt close-vt-end))
+                                        :trunc-vf
 
-                                      :else :splits)]
-                          (recur (inc i)
-                                 (if (= :no-conflict klass)
-                                   acc
-                                   (update acc klass conj! [i row]))))
-                        (recur (inc i) acc)))))]
-            (if system-cfg
+                                        :else :splits)]
+                            (recur (inc i)
+                                   (if (= :no-conflict klass)
+                                     acc
+                                     (update acc klass conj! [i row]))))
+                          (recur (inc i) acc)))))]
+              (if system-cfg
               ;; ----- Bitemporal bounded retract -----
               ;; Each surgery class gets its system-time event: close
               ;; old row's system-to, append the surviving slice(s)
               ;; with fresh system-from. Drops have no replacements.
-              (let [system-now (system-now-from-tx-meta system-cfg tx-meta)]
-                (doseq [[i prev-row] drops]
-                  (replace-row-bitemporal!
-                   this prev-row i system-now valid-cfg system-cfg
-                   []
-                   tx-meta))
-                (doseq [[i prev-row] trunc-vt]
-                  (let [orig-vf (long (get prev-row vf-col))]
+                (let [system-now (system-now-from-tx-meta system-cfg tx-meta)]
+                  (doseq [[i prev-row] drops]
                     (replace-row-bitemporal!
                      this prev-row i system-now valid-cfg system-cfg
-                     [{:vf orig-vf :vt close-vt-val}]
-                     tx-meta)))
-                (doseq [[i prev-row] trunc-vf]
-                  (let [orig-vt (long (get prev-row vt-col))]
-                    (replace-row-bitemporal!
-                     this prev-row i system-now valid-cfg system-cfg
-                     [{:vf close-vt-end :vt orig-vt}]
-                     tx-meta)))
-                (doseq [[i prev-row] splits]
-                  (let [orig-vf (long (get prev-row vf-col))
-                        orig-vt (long (get prev-row vt-col))]
-                    (replace-row-bitemporal!
-                     this prev-row i system-now valid-cfg system-cfg
-                     [{:vf orig-vf :vt close-vt-val}
-                      {:vf close-vt-end :vt orig-vt}]
-                     tx-meta)))
-                this)
+                     []
+                     tx-meta))
+                  (doseq [[i prev-row] trunc-vt]
+                    (let [orig-vf (long (get prev-row vf-col))]
+                      (replace-row-bitemporal!
+                       this prev-row i system-now valid-cfg system-cfg
+                       [{:vf orig-vf :vt close-vt-val}]
+                       tx-meta)))
+                  (doseq [[i prev-row] trunc-vf]
+                    (let [orig-vt (long (get prev-row vt-col))]
+                      (replace-row-bitemporal!
+                       this prev-row i system-now valid-cfg system-cfg
+                       [{:vf close-vt-end :vt orig-vt}]
+                       tx-meta)))
+                  (doseq [[i prev-row] splits]
+                    (let [orig-vf (long (get prev-row vf-col))
+                          orig-vt (long (get prev-row vt-col))]
+                      (replace-row-bitemporal!
+                       this prev-row i system-now valid-cfg system-cfg
+                       [{:vf orig-vf :vt close-vt-val}
+                        {:vf close-vt-end :vt orig-vt}]
+                       tx-meta)))
+                  this)
               ;; ----- Valid-only bounded retract (existing in-place) -----
-              (do
-                (doseq [[i _r] trunc-vt]
-                  (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
-                (doseq [[i _r] trunc-vf]
-                  (idx/idx-set! (:index (get columns-field vf-col)) i close-vt-end))
-                (let [tails (mapv (fn [[i r]]
-                                    (idx/idx-set! (:index (get columns-field vt-col))
-                                                  i close-vt-val)
-                                    (-> r (assoc vf-col close-vt-end)))
-                                  splits)]
-                  (when (seq drops)
-                    (ds-delete-rows! this (mapv first drops)))
-                  (doseq [tail tails]
-                    (append! this tail tx-meta)))
-                this)))
+                (do
+                  (doseq [[i _r] trunc-vt]
+                    (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+                  (doseq [[i _r] trunc-vf]
+                    (idx/idx-set! (:index (get columns-field vf-col)) i close-vt-end))
+                  (let [tails (mapv (fn [[i r]]
+                                      (idx/idx-set! (:index (get columns-field vt-col))
+                                                    i close-vt-val)
+                                      (-> r (assoc vf-col close-vt-end)))
+                                    splits)]
+                    (when (seq drops)
+                      (ds-delete-rows! this (mapv first drops)))
+                    (doseq [tail tails]
+                      (append! this tail tx-meta)))
+                  this)))
           ;; ----- Open-window retract (existing behavior) -----
-          (let [{:keys [close-safe overlaps]}
-                (loop [i 0 acc {:close-safe (transient [])
-                                :overlaps (transient [])}]
-                  (if (>= i n)
-                    {:close-safe (persistent! (:close-safe acc))
-                     :overlaps   (persistent! (:overlaps acc))}
-                    (let [row (materialize-row columns-field i)]
-                      (if (match-fn row)
-                        (let [row-vf (long (get row vf-col))
-                              row-vt (long (get row vt-col))
-                              open?  (= row-vt Long/MAX_VALUE)
-                              klass (cond
-                                      (and open? (< row-vf close-vt-val)) :close-safe
-                                      (and (not open?) (<= row-vt close-vt-val)) :no-conflict
-                                      :else :overlaps)]
-                          (recur (inc i)
-                                 (if (= :no-conflict klass)
-                                   acc
-                                   (update acc klass conj! [i row]))))
-                        (recur (inc i) acc)))))
-                {auto-truncate :truncate auto-drop :drop}
-                (if (and (seq overlaps) auto-split?)
-                  (group-by (fn [[_i r]]
-                              (if (< (long (get r vf-col)) close-vt-val)
-                                :truncate
-                                :drop))
-                            overlaps)
-                  {:truncate [] :drop []})]
-            (when (and (seq overlaps) (not auto-split?))
-              (throw (ex-info "retract! would touch rows whose vt-window doesn't cover the retract instant"
-                              {:where (:where opts)
-                               :by (:by opts)
-                               :retract-at close-vt-val
-                               :overlaps (mapv (fn [[i r]]
-                                                 (assoc (select-keys r [vf-col vt-col]) :row-idx i))
-                                               overlaps)
-                               :hint "pass :auto-split? true to split overlapping rows, or restructure the write"})))
-            (if system-cfg
+            (let [{:keys [close-safe overlaps]}
+                  (loop [i 0 acc {:close-safe (transient [])
+                                  :overlaps (transient [])}]
+                    (if (>= i n)
+                      {:close-safe (persistent! (:close-safe acc))
+                       :overlaps   (persistent! (:overlaps acc))}
+                      (let [row (materialize-row columns-field i)]
+                        (if (match-fn row)
+                          (let [row-vf (long (get row vf-col))
+                                row-vt (long (get row vt-col))
+                                open?  (= row-vt Long/MAX_VALUE)
+                                klass (cond
+                                        (and open? (< row-vf close-vt-val)) :close-safe
+                                        (and (not open?) (<= row-vt close-vt-val)) :no-conflict
+                                        :else :overlaps)]
+                            (recur (inc i)
+                                   (if (= :no-conflict klass)
+                                     acc
+                                     (update acc klass conj! [i row]))))
+                          (recur (inc i) acc)))))
+                  {auto-truncate :truncate auto-drop :drop}
+                  (if (and (seq overlaps) auto-split?)
+                    (group-by (fn [[_i r]]
+                                (if (< (long (get r vf-col)) close-vt-val)
+                                  :truncate
+                                  :drop))
+                              overlaps)
+                    {:truncate [] :drop []})]
+              (when (and (seq overlaps) (not auto-split?))
+                (throw (ex-info "retract! would touch rows whose vt-window doesn't cover the retract instant"
+                                {:where (:where opts)
+                                 :by (:by opts)
+                                 :retract-at close-vt-val
+                                 :overlaps (mapv (fn [[i r]]
+                                                   (assoc (select-keys r [vf-col vt-col]) :row-idx i))
+                                                 overlaps)
+                                 :hint "pass :auto-split? true to split overlapping rows, or restructure the write"})))
+              (if system-cfg
               ;; ----- Bitemporal open-window retract -----
-              (let [system-now (system-now-from-tx-meta system-cfg tx-meta)]
-                (doseq [[i prev-row] close-safe]
-                  (let [orig-vf (long (get prev-row vf-col))]
+                (let [system-now (system-now-from-tx-meta system-cfg tx-meta)]
+                  (doseq [[i prev-row] close-safe]
+                    (let [orig-vf (long (get prev-row vf-col))]
+                      (replace-row-bitemporal!
+                       this prev-row i system-now valid-cfg system-cfg
+                       [{:vf orig-vf :vt close-vt-val}]
+                       tx-meta)))
+                  (doseq [[i prev-row] auto-truncate]
+                    (let [orig-vf (long (get prev-row vf-col))]
+                      (replace-row-bitemporal!
+                       this prev-row i system-now valid-cfg system-cfg
+                       [{:vf orig-vf :vt close-vt-val}]
+                       tx-meta)))
+                  (doseq [[i prev-row] auto-drop]
                     (replace-row-bitemporal!
                      this prev-row i system-now valid-cfg system-cfg
-                     [{:vf orig-vf :vt close-vt-val}]
-                     tx-meta)))
-                (doseq [[i prev-row] auto-truncate]
-                  (let [orig-vf (long (get prev-row vf-col))]
-                    (replace-row-bitemporal!
-                     this prev-row i system-now valid-cfg system-cfg
-                     [{:vf orig-vf :vt close-vt-val}]
-                     tx-meta)))
-                (doseq [[i prev-row] auto-drop]
-                  (replace-row-bitemporal!
-                   this prev-row i system-now valid-cfg system-cfg
-                   []
-                   tx-meta))
-                this)
+                     []
+                     tx-meta))
+                  this)
               ;; ----- Valid-only open-window retract -----
-              (do
-                (doseq [[i _row] close-safe]
-                  (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
-                (doseq [[i _r] auto-truncate]
-                  (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
-                (when (seq auto-drop)
-                  (ds-delete-rows! this (mapv first auto-drop)))
-                this))))))))
+                (do
+                  (doseq [[i _row] close-safe]
+                    (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+                  (doseq [[i _r] auto-truncate]
+                    (idx/idx-set! (:index (get columns-field vt-col)) i close-vt-val))
+                  (when (seq auto-drop)
+                    (ds-delete-rows! this (mapv first auto-drop)))
+                  this))))))))
 
   (ds-delete-rows! [this row-idxs]
     (when-not edit
