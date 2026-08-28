@@ -78,10 +78,10 @@
 
 (defn with-storage-lock
   "Execute f while holding the per-store GC/sync coordination
-   lock. Used by `ds-sync!` and `gc!` so that on a single store
+   lock. Used by generation writes and `gc!` so that on a single store
    the two cannot interleave: `gc!`'s mark phase walks branch
    heads to determine reachability, then sweeps unreachable PSS
-   nodes. If `ds-sync!` writes a fresh chunk between mark and
+   nodes. If a generation write creates a fresh chunk between mark and
    sweep, the sweep would otherwise delete a node referenced by
    the just-updated branch head, corrupting the dataset.
 
@@ -218,6 +218,27 @@
             ;; walk-addresses calls consume-fn with each address; return true to recurse
             (pss/walk-addresses tree (fn [addr] (swap! live-addrs conj addr) true))))))
     @live-addrs))
+
+(defn generation-reachable-keys
+  "Return the exact konserve keys needed to reopen one immutable dataset
+   generation. Parent generations and mutable branch cells are deliberately
+   excluded: an embedding system owns history and ref retention policy. When
+   using this API, that owner must be the sole GC authority for the shared
+   store; standalone `gc!` intentionally traces only Stratum-native branches."
+  [store generation-id]
+  (with-storage-lock
+    store
+    (fn []
+      (when-not (load-dataset-commit store generation-id)
+        (throw (ex-info "Dataset generation not found"
+                        {:generation-id generation-id})))
+      (let [index-ids (collect-live-index-commits store #{generation-id})
+            pss-addresses (collect-live-pss-addresses store index-ids)]
+        (into #{[:datasets :commits generation-id]}
+              (concat (map (fn [index-id]
+                             [:indices :commits index-id])
+                           index-ids)
+                      pss-addresses))))))
 
 (defn- list-all-keys-by-prefix
   "List all keys with a given 2-element vector prefix."

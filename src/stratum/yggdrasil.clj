@@ -359,12 +359,18 @@
   (snapshot-meta [this snap-id] (p/snapshot-meta this snap-id nil))
   (snapshot-meta [_ snap-id _opts]
     (let [uuid (if (uuid? snap-id) snap-id (parse-uuid (str snap-id)))
-          snapshot (when uuid (storage/load-dataset-commit store uuid))]
+          snapshot (when uuid (storage/load-dataset-commit store uuid))
+          ;; Branch membership belongs to mutable refs, not the immutable
+          ;; generation. One generation may be named by several branches.
+          branch (when snapshot
+                   (first
+                    (filter #(= uuid (storage/load-dataset-head store %))
+                            (or (storage/list-dataset-branches store) #{}))))]
       (when snapshot
         {:snapshot-id (str (:dataset-id snapshot))
          :parent-ids (set (map str (:parents snapshot)))
          :timestamp (:timestamp snapshot)
-         :branch (:branch snapshot)
+         :branch branch
          :name (:name snapshot)
          :row-count (:row-count snapshot)
          :metadata (:metadata snapshot)})))
