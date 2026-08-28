@@ -385,10 +385,27 @@
   dataset/schema)
 
 (def sync!
-  "Atomically persist dataset + all indices to storage.
+  "Persist dataset + all indices and publish a branch.
    Returns new dataset with commit metadata.
    See stratum.dataset/sync!."
   dataset/sync!)
+
+(def seal-generation!
+  "Persist an immutable dataset generation without moving a branch.
+   See stratum.dataset/seal-generation!."
+  dataset/seal-generation!)
+
+(def generation-id
+  "Return the immutable generation ID of a sealed dataset."
+  dataset/generation-id)
+
+(def open-generation
+  "Open exactly one immutable dataset generation without resolving a branch."
+  dataset/open-generation)
+
+(def generation-reachable-keys
+  "Return the exact konserve keys reachable from one dataset generation."
+  storage/generation-reachable-keys)
 
 (def load
   "Load dataset from storage by branch name or commit UUID.

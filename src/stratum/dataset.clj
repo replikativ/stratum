@@ -35,7 +35,10 @@
          upsert-matcher
          matcher-key
          unmatched-inserts
-         dict-encode)
+         dict-encode
+         seal-generation-under-lock
+         dataset-at-branch
+         load)
 
 (defprotocol IDataset
   "Core dataset protocol for Stratum columnar engine.
@@ -183,7 +186,7 @@
 
   ;; Persistence
   (sync! [this store branch]
-    "Atomically persist dataset + all indices to storage.
+    "Persist an immutable generation and publish it as `branch`.
      Returns new dataset with commit metadata.")
 
   (dirty? [this]
@@ -770,68 +773,17 @@
   ;; ========================================================================
 
   (sync! [this store branch]
-    (when edit
-      (throw (IllegalStateException. "Cannot sync transient dataset. Call persistent! first.")))
-    (validate-all-indices! columns-field "sync!")
-
-    ;; Wrap in per-store storage lock to prevent concurrent GC on the same
-    ;; store from deleting freshly written chunks.
-    (storage/with-storage-lock store
+    ;; Keep generation writes and the mutable branch publication inside the
+    ;; same native GC exclusion window.  Embedded callers use
+    ;; `seal-generation!` and let their owning root provide visibility instead.
+    (storage/with-storage-lock
+      store
       (fn []
-        ;; 1. Sync each index column (no branch)
-        (let [synced-columns
-              (into {}
-                    (map (fn [[col-name col-data]]
-                           (let [index (:index col-data)
-                                 synced-index (idx/idx-sync! index store)
-                                 idx-commit-id (get-in (meta synced-index) [:commit :id])]
-                             [col-name (assoc col-data
-                                              :index synced-index
-                                              :index-commit idx-commit-id)])))
-                    columns-field)
-
-              ;; 2. Build dataset snapshot
-              column-commits (into {}
-                                   (map (fn [[col-name col-data]]
-                                          [col-name (cond-> {:index-commit (:index-commit col-data)
-                                                             :type (:type col-data)}
-                                                      ;; Persist dict info so load can restore it
-                                                      (:dict col-data)
-                                                      (assoc :dict (vec (:dict col-data))
-                                                             :dict-type (:dict-type col-data)))]))
-                                   synced-columns)
-              parent-commit (:id commit-info-field)
-              parents (if parent-commit #{parent-commit} #{})
-              crypto-hash? (:crypto-hash? ds-metadata-field)
-              dataset-commit-id (if crypto-hash?
-                                  (storage/generate-commit-id
-                                   {:columns column-commits
-                                    :schema schema-field
-                                    :metadata ds-metadata-field})
-                                  (storage/generate-commit-id))
-              ds-snapshot {:dataset-id dataset-commit-id
-                           :name ds-name-field
-                           :branch branch
-                           :parents parents
-                           :columns column-commits
-                           :schema schema-field
-                           :row-count row-count-val
-                           :metadata ds-metadata-field
-                           :timestamp (System/currentTimeMillis)}]
-
-          ;; 3. Write dataset commit
-          (storage/write-dataset-commit! store dataset-commit-id ds-snapshot)
-
-          ;; 4. Update branch HEAD
-          (storage/update-dataset-head! store branch dataset-commit-id)
-
-          ;; 5. Register branch
+        (let [sealed (seal-generation-under-lock this store)
+              generation-id (get-in sealed [:commit-info :id])]
+          (storage/update-dataset-head! store branch generation-id)
           (storage/register-dataset-branch! store branch)
-
-          ;; 6. Return new dataset with commit metadata
-          (let [new-commit-info {:id dataset-commit-id :branch branch}]
-            (StratumDataset. ds-name-field synced-columns schema-field row-count-val
-                             ds-metadata-field nil new-commit-info obj-meta))))))
+          (dataset-at-branch sealed branch)))))
 
   (dirty? [_]
     (some (fn [[_col-name col-data]]
@@ -1836,6 +1788,92 @@
 ;; ============================================================================
 ;; Standalone Persistence Functions
 ;; ============================================================================
+
+(defn- seal-generation-under-lock
+  "Write one immutable dataset generation. The caller owns Stratum's storage
+   lock, allowing standalone `sync!` to keep the write and ref publication in
+   one GC exclusion window."
+  [ds store]
+  (when (:transient? ds)
+    (throw (IllegalStateException.
+            "Cannot seal transient dataset. Call persistent! first.")))
+  (validate-all-indices! (columns ds) "seal-generation!")
+  (let [synced-columns
+        (into {}
+              (map (fn [[col-name col-data]]
+                     (let [synced-index (idx/idx-sync! (:index col-data) store)
+                           idx-commit-id (get-in (meta synced-index) [:commit :id])]
+                       [col-name (assoc col-data
+                                        :index synced-index
+                                        :index-commit idx-commit-id)])))
+              (columns ds))
+        column-commits
+        (into {}
+              (map (fn [[col-name col-data]]
+                     [col-name
+                      (cond-> {:index-commit (:index-commit col-data)
+                               :type (:type col-data)}
+                        (:dict col-data)
+                        (assoc :dict (vec (:dict col-data))
+                               :dict-type (:dict-type col-data)))]))
+              synced-columns)
+        parent-commit (get-in ds [:commit-info :id])
+        parents (if parent-commit #{parent-commit} #{})
+        ds-metadata (metadata ds)
+        generation-id (if (:crypto-hash? ds-metadata)
+                        (storage/generate-commit-id
+                         {:columns column-commits
+                          :schema (schema ds)
+                          :metadata ds-metadata})
+                        (storage/generate-commit-id))
+        snapshot {:dataset-id generation-id
+                  :name (ds-name ds)
+                  :parents parents
+                  :columns column-commits
+                  :schema (schema ds)
+                  :row-count (row-count ds)
+                  :metadata ds-metadata
+                  :timestamp (System/currentTimeMillis)}]
+    (storage/write-dataset-commit! store generation-id snapshot)
+    (with-meta
+      (StratumDataset. (ds-name ds) synced-columns (schema ds)
+                       (long (row-count ds)) ds-metadata nil
+                       {:id generation-id :branch nil} (meta ds))
+      (meta ds))))
+
+(defn- dataset-at-branch
+  "Return the already sealed dataset with standalone branch provenance."
+  [ds branch]
+  (with-meta
+    (StratumDataset. (ds-name ds) (columns ds) (schema ds)
+                     (long (row-count ds)) (metadata ds) nil
+                     {:id (get-in ds [:commit-info :id]) :branch branch}
+                     (meta ds))
+    (meta ds)))
+
+(defn seal-generation!
+  "Persist an immutable dataset generation without moving or creating a
+   branch. The returned dataset is pinned to that exact generation. Embedding
+   systems must keep the generation protected from GC until their owning root
+   has been published and must retain it through `generation-reachable-keys`;
+   standalone `stratum.storage/gc!` traces only Stratum's native branches."
+  [ds store]
+  (storage/with-storage-lock
+    store
+    #(seal-generation-under-lock ds store)))
+
+(defn generation-id
+  "Return the immutable generation ID of a sealed dataset, or nil."
+  [ds]
+  (get-in ds [:commit-info :id]))
+
+(defn open-generation
+  "Open exactly `generation-id`, never resolving a mutable branch ref."
+  [store generation-id]
+  (when-not (uuid? generation-id)
+    (throw (ex-info "A Stratum generation ID must be a UUID"
+                    {:generation-id generation-id})))
+  (load store generation-id))
 
 (defn load
   "Load dataset from storage by branch name or commit UUID.
