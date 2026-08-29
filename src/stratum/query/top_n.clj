@@ -8,8 +8,9 @@
         chunk's `read-double` / `read-long` / `read-value` protocol
         method (each touched chunk decodes once and is cached).
 
-   Eligibility gate intentionally narrow: single-column ORDER BY,
-   small LIMIT, no predicates / aggs / groups / joins / window. The
+   Eligibility gate intentionally narrow: small LIMIT, optional exact range
+   conjunctions on a sole ORDER BY column, and no aggs / groups / joins /
+   window. The
    legacy materialize-then-sort path remains the fallback for every
    other shape."
   (:require [stratum.chunk :as chunk]
@@ -59,11 +60,46 @@
        (or (not= :string (:dict-type col-info))
            (column/dict-sorted? (:dict col-info)))))
 
+(def ^:private range-ops #{:eq :gt :gte :lt :lte})
+
+(defn- int64-literal?
+  [value]
+  (and (integer? value)
+       (<= Long/MIN_VALUE value Long/MAX_VALUE)))
+
+(defn range-predicates
+  "Return a normalized exact range conjunction for a one-column ORDER BY.
+
+   Nil means the WHERE clause is not safely representable by the streaming
+   top-N path. An empty vector means there is no WHERE clause. Keeping this
+   proof here lets the map executor and the IR rewrite share one eligibility
+   boundary."
+  [order where columns]
+  (let [order (mapv order-spec-col-and-dir order)
+        predicates (mapv norm/normalize-pred (or where []))]
+    (cond
+      (empty? predicates) []
+      (not= 1 (count order)) nil
+      :else
+      (let [order-col (ffirst order)
+            datatype (:type (get columns order-col))]
+        (when (and (#{:int64 :float64} datatype)
+                   (every? (fn [[col op value :as pred]]
+                             (and (= 3 (count pred))
+                                  (= order-col col)
+                                  (contains? range-ops op)
+                                  (if (= datatype :int64)
+                                    (int64-literal? value)
+                                    (number? value))))
+                           predicates))
+          predicates)))))
+
 (defn top-n-eligible?
   "Returns true if `query` over `columns` is a clean top-N shape:
    1-or-more-column ORDER BY (each numeric, non-string), LIMIT ≤
-   `*top-n-limit*`, no GROUP/AGG/HAVING/JOIN/WHERE/WINDOW/DISTINCT,
-   no OFFSET. Multi-key ORDER BY keeps separate primitive long and double
+   `*top-n-limit*`, no GROUP/AGG/HAVING/JOIN/WINDOW/DISTINCT, and no OFFSET.
+   WHERE may be a conjunction of scalar ranges on the sole ORDER BY column.
+   Multi-key ORDER BY keeps separate primitive long and double
    sort keys per row in the heap; comparison walks keys in declared order
    (matching DuckDB's `CreateSortKey` blob comparison)."
   [query columns]
@@ -79,7 +115,7 @@
          (empty? agg)
          (empty? having)
          (empty? join)
-         (empty? where)
+         (some? (range-predicates order where columns))
          (empty? window)
          (not distinct)
          ;; Every order column must be present, primitive-numeric,
@@ -117,6 +153,77 @@
    NaN NULL sentinel last, matching the existing top-N null convention."
   [^double a ^double b]
   (Double/compare a b))
+
+(defn- prepare-range-predicates
+  [predicates datatype]
+  (mapv (fn [[_col op value]]
+          [op (if (= datatype :float64) (double value) (long value))])
+        predicates))
+
+(defn- comparison-matches?
+  [op comparison]
+  (case op
+    :eq (zero? comparison)
+    :gt (pos? comparison)
+    :gte (not (neg? comparison))
+    :lt (neg? comparison)
+    :lte (not (pos? comparison))))
+
+(defn- range-key-matches?
+  [predicates datatype long-key double-key]
+  (if (empty? predicates)
+    true
+    ;; Long/MIN_VALUE and NaN are Stratum's NULL sentinels. Every ordinary
+    ;; comparison with NULL is UNKNOWN and therefore excluded by WHERE.
+    (when-not (if (= datatype :float64)
+                (Double/isNaN (double double-key))
+                (= Long/MIN_VALUE (long long-key)))
+      (every? (fn [[op bound]]
+                (comparison-matches?
+                 op
+                 (if (= datatype :float64)
+                   (Double/compare (double double-key) (double bound))
+                   (Long/compare (long long-key) (long bound)))))
+              predicates))))
+
+(declare compare-bound-asc)
+
+(defn- chunk-has-non-null-values?
+  [^ChunkEntry entry]
+  (let [^ChunkStats stats (.stats entry)]
+    (< (long (:null-count stats)) (long (:count stats)))))
+
+(defn- chunk-may-match-range?
+  [^ChunkEntry entry predicates datatype]
+  (cond
+    (empty? predicates)
+    true
+
+    ;; SQL comparisons never match NULL. An all-NULL chunk has sentinel
+    ;; extrema (Double/MAX_VALUE and -Double/MAX_VALUE), not useful bounds.
+    (not (chunk-has-non-null-values? entry))
+    false
+
+    :else
+    (let [^ChunkStats stats (.stats entry)
+          min-value (:min-val stats)
+          max-value (:max-val stats)]
+      (every? (fn [[op bound]]
+                ;; Int64 extrema are rounded doubles. Monotonic conversion
+                ;; still permits a conservative proof when the rounded values
+                ;; are strictly separated, but equality is inconclusive near
+                ;; 2^53 and must retain the chunk.
+                (let [bound (if (= datatype :int64) (double bound) bound)
+                      min-cmp (compare-double-asc min-value bound)
+                      max-cmp (compare-double-asc max-value bound)]
+                  (case op
+                    :eq (and (not (pos? min-cmp))
+                             (not (neg? max-cmp)))
+                    :gt (not (neg? max-cmp))
+                    :gte (not (neg? max-cmp))
+                    :lt (not (pos? min-cmp))
+                    :lte (not (pos? min-cmp)))))
+              predicates))))
 
 (defn- ^Comparator entry-cmp
   "Comparator for the heap. The PriorityQueue is a min-heap, so the
@@ -200,13 +307,16 @@
   "Multi-column array path. Iterates row-by-row across `arrs`, fills a
    reused `scratch` keys array per row, and feeds the heap. Single-
    key callers pass a 1-element `arrs`/`datatypes` vec."
-  [arrs ^long n dirs datatypes]
-  (let [n-keys   (count arrs)
+  [arrs n dirs datatypes range-preds]
+  (let [n (long n)
+        n-keys   (count arrs)
         long-key? (boolean-array (map #(not= :float64 %) datatypes))
         ^Comparator cmp (entry-cmp (dirs->int-array dirs) long-key?)
         pq       (PriorityQueue. (max 1 (int n)) cmp)
         scratch-longs (long-array n-keys)
         scratch-doubles (double-array n-keys)
+        first-datatype (first datatypes)
+        range-preds (prepare-range-predicates range-preds first-datatype)
         ;; All arrays share the same length (rows of a single table).
         first-arr (nth arrs 0)
         first-dt  (nth datatypes 0)
@@ -222,7 +332,10 @@
             (set-key-from-array! scratch-longs scratch-doubles k
                                  (nth arrs k) i (nth datatypes k))
             (recur (unchecked-inc k))))
-        (maybe-evict-and-offer! pq cmp n scratch-longs scratch-doubles nil i)
+        (when (range-key-matches? range-preds first-datatype
+                                  (aget scratch-longs 0)
+                                  (aget scratch-doubles 0))
+          (maybe-evict-and-offer! pq cmp n scratch-longs scratch-doubles nil i))
         (recur (unchecked-inc i))))
     pq))
 
@@ -234,16 +347,17 @@
    in `:order`; tiebreaker keys aren't used for chunk pruning."
   [first-entries chunk-i ^clojure.lang.Keyword first-dir datatype]
   (let [chunk-i (long chunk-i)
-        ^ChunkEntry e (nth first-entries chunk-i)
-        ^ChunkStats s (.stats e)]
-    (let [bound (if (= first-dir :desc) (:max-val s) (:min-val s))]
-      (if (= datatype :float64) (double bound) (long bound)))))
+        ^ChunkEntry e (nth first-entries chunk-i)]
+    ;; ChunkStats extrema are doubles for both datatypes. Int64 bounds are
+    ;; therefore only conservative ordering hints: callers may prune on strict
+    ;; separation, never on equality. All-NULL chunks return nil explicitly.
+    (when (chunk-has-non-null-values? e)
+      (let [^ChunkStats s (.stats e)]
+        (double (if (= first-dir :desc) (:max-val s) (:min-val s)))))))
 
 (defn- compare-bound-asc
   [a b datatype]
-  (if (= datatype :float64)
-    (compare-double-asc (double a) (double b))
-    (compare-long-asc (long a) (long b))))
+  (compare-double-asc (double a) (double b)))
 
 (defn- chunk-iteration-order
   "Permutation `[0..n-chunks)` sorted so the most promising chunks
@@ -255,34 +369,56 @@
    instead of a separate scan-reorder pass)."
   [first-entries ^clojure.lang.Keyword first-dir datatype]
   (let [n (count first-entries)
-        positions (range n)
-        cmp (fn [a b]
-              (let [c (long
-                       (compare-bound-asc
-                        (chunk-primary-bound first-entries (long a) first-dir datatype)
-                        (chunk-primary-bound first-entries (long b) first-dir datatype)
-                        datatype))]
-                (if (= first-dir :desc) (int (- c)) (int c))))]
-    (vec (sort cmp positions))))
+        positions (vec (range n))]
+    ;; Rounded int64 extrema remain monotonic, so they safely order chunks even
+    ;; though equal rounded bounds cannot prove pruning. DESC ordering is safe
+    ;; only when no chunk contains NULL/NaN (those sort first but are omitted
+    ;; from extrema).
+    (if (or (= first-dir :asc)
+            (every? (fn [^ChunkEntry entry]
+                      (zero? (long (:null-count (.stats entry)))))
+                    first-entries))
+      (let [cmp (fn [a b]
+                  (let [a-bound (chunk-primary-bound first-entries (long a)
+                                                     first-dir datatype)
+                        b-bound (chunk-primary-bound first-entries (long b)
+                                                     first-dir datatype)]
+                    (cond
+                      (nil? a-bound) (if (nil? b-bound) 0 1)
+                      (nil? b-bound) -1
+                      :else (let [c (int (compare-bound-asc a-bound b-bound
+                                                            datatype))]
+                              (if (= first-dir :desc) (- c) c)))))]
+        (vec (sort cmp positions)))
+      positions)))
 
 (defn- can-prune-rest?
   "When the heap is full, no future chunk whose primary bound is
-   already worse than the heap's worst-kept primary key can
-   contribute a winning row. For ASC: skip when `chunk-min >=
-   heap-worst-primary` (strict-positive comparator means equal
-   values don't evict, so the `>=` is sound). For DESC: skip when
-   `chunk-max <= heap-worst-primary`."
-  [^PriorityQueue pq n ^clojure.lang.Keyword first-dir bound datatype]
+   provably worse than the heap's worst-kept primary key can
+   contribute a winning row. Exact float64 single-key bounds may prune
+   equality; rounded int64 or multi-key bounds require strict primary
+   separation. DESC pruning additionally requires NULL-free chunks."
+  [^PriorityQueue pq n n-keys ^clojure.lang.Keyword first-dir bound datatype
+   desc-stats-safe?]
   (let [n (long n)]
-    (when (= n (.size pq))
+    ;; Conservative proof boundary:
+    ;; - rounded int64 bounds prove only strict separation;
+    ;; - DESC extrema are safe only when every chunk is NULL/NaN-free;
+    ;; - equal primary bounds cannot prune a multi-key ORDER BY because a later
+    ;;   chunk may contain a better secondary key.
+    (when (and (or (= first-dir :asc) desc-stats-safe?)
+               (some? bound)
+               (= n (.size pq)))
       (let [^TopNEntry top (.peek pq)
             worst (if (= datatype :float64)
                     (aget ^doubles (.-double-keys top) 0)
                     (aget ^longs (.-long-keys top) 0))
-            c (long (compare-bound-asc bound worst datatype))]
-        (if (= first-dir :desc)
-          (<= c 0)
-          (>= c 0))))))
+            c (long (compare-double-asc (double bound) (double worst)))
+            strict-worse? (if (= first-dir :desc) (neg? c) (pos? c))
+            equal-safe? (and (= datatype :float64)
+                             (= 1 (long n-keys))
+                             (zero? c))]
+        (or strict-worse? equal-safe?)))))
 
 (defn- find-top-n-on-indices
   "Multi-column index path. Walks chunks in primary-order (ASC: min
@@ -295,8 +431,9 @@
 
    All order indices must share chunk boundaries — true for
    stratum's column store (chunks are dataset-level)."
-  [indices ^long n dirs datatypes]
-  (let [n-keys (count indices)
+  [indices n dirs datatypes range-preds]
+  (let [n (long n)
+        n-keys (count indices)
         long-key? (boolean-array (map #(not= :float64 %) datatypes))
         ^Comparator cmp (entry-cmp (dirs->int-array dirs) long-key?)
         pq (PriorityQueue. (max 1 (int n)) cmp)
@@ -304,19 +441,29 @@
         scratch-doubles (double-array n-keys)
         per-col-entries (mapv (fn [idx] (vec (pss/slice (index/idx-tree idx) nil nil)))
                               indices)
-        n-chunks (long (count (first per-col-entries)))
         first-entries (first per-col-entries)
         first-dir (first dirs)
         first-datatype (first datatypes)
+        desc-stats-safe? (or (= first-dir :asc)
+                             (every? (fn [^ChunkEntry entry]
+                                       (zero? (long (:null-count (.stats entry)))))
+                                     first-entries))
+        range-preds (prepare-range-predicates range-preds first-datatype)
         ;; Visit chunks ordered by primary-key stats — promising chunks first.
-        sorted-positions (chunk-iteration-order first-entries first-dir
-                                                first-datatype)]
+        sorted-positions (->> (chunk-iteration-order first-entries first-dir
+                                                     first-datatype)
+                              (filterv (fn [position]
+                                         (chunk-may-match-range?
+                                          (nth first-entries position)
+                                          range-preds first-datatype))))
+        n-chunks (long (count sorted-positions))]
     (loop [pos-idx 0]
       (when (< pos-idx n-chunks)
         (let [chunk-i (long (nth sorted-positions pos-idx))
               bound (chunk-primary-bound first-entries chunk-i first-dir
                                          first-datatype)]
-          (if (can-prune-rest? pq n first-dir bound first-datatype)
+          (if (can-prune-rest? pq n n-keys first-dir bound first-datatype
+                               desc-stats-safe?)
             ;; All remaining chunks (in primary order) are at least as
             ;; bad as `bound`; nothing they contain can dethrone the
             ;; heap. Stop iterating.
@@ -336,8 +483,11 @@
                       (set-key-from-chunk! scratch-longs scratch-doubles k
                                            (aget chunks k) i (nth datatypes k))
                       (recur (unchecked-inc k))))
-                  (maybe-evict-and-offer! pq cmp n scratch-longs
-                                          scratch-doubles chunk-id i)
+                  (when (range-key-matches? range-preds first-datatype
+                                            (aget scratch-longs 0)
+                                            (aget scratch-doubles 0))
+                    (maybe-evict-and-offer! pq cmp n scratch-longs
+                                            scratch-doubles chunk-id i))
                   (recur (unchecked-inc i))))
               (recur (unchecked-inc pos-idx)))))))
     pq))
@@ -409,7 +559,7 @@
    shorthand for ASC); the heap walks all keys in declared order
    for tie-breaking, mixed `:asc`/`:desc` is supported."
   [query columns]
-  (let [{:keys [order limit select]} query
+  (let [{:keys [order limit select where]} query
         n          (long limit)
         ;; Decompose every `:order` spec into [col dir] pairs.
         decomposed (mapv order-spec-col-and-dir order)
@@ -417,6 +567,9 @@
         dirs       (mapv second decomposed)
         order-infos (mapv (fn [k] (get columns k)) order-cols)
         datatypes   (mapv :type order-infos)
+        range-preds (or (range-predicates order where columns)
+                        (throw (ex-info "Unsupported WHERE in streaming top-N"
+                                        {:where where :order order})))
         ;; Same-source assumption: either every order column has
         ;; `:data`, or every order column has `:index`. Mixed isn't
         ;; supported (it would imply the order columns came from
@@ -435,9 +588,9 @@
         ;; Phase 1: streaming top-N
         pq (cond
              all-data?  (find-top-n-on-arrays
-                         (mapv :data order-infos) n dirs datatypes)
+                         (mapv :data order-infos) n dirs datatypes range-preds)
              all-index? (find-top-n-on-indices
-                         (mapv :index order-infos) n dirs datatypes)
+                         (mapv :index order-infos) n dirs datatypes range-preds)
              :else (throw (ex-info "top-N: order columns must all be array- or all index-backed"
                                    {:order-cols order-cols})))
         sorted (drain-heap-sorted pq)

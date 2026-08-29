@@ -174,6 +174,38 @@
       (is (instance? LTopN plan))
       (is (= [[:cat :asc] [:pri :desc]] (:order-specs plan))))))
 
+(deftest topn-same-key-range-rewrite-eligibility
+  (let [data {:id (long-array (range 100))
+              :rank (long-array (range 100))}]
+    (testing "a conjunction of ranges on the sole order key is absorbed"
+      (let [plan (optimize {:from data
+                            :where [[:> :rank 80] [:<= :rank 90]]
+                            :select [:id :rank]
+                            :order [[:rank :asc]]
+                            :limit 3})]
+        (is (instance? LTopN plan))
+        (is (= [[:rank :gt 80] [:rank :lte 90]]
+               (:predicates plan)))))
+    (testing "all five exact comparison operators qualify"
+      (doseq [predicate [[:= :rank 50] [:> :rank 50] [:>= :rank 50]
+                         [:< :rank 50] [:<= :rank 50]]]
+        (is (instance? LTopN
+                       (optimize {:from data :where [predicate]
+                                  :order [[:rank :asc]] :limit 3})))))
+    (testing "other columns, composite order, and non-scalar ranges decline"
+      (doseq [query [{:where [[:> :id 80]]
+                      :order [[:rank :asc]]}
+                     {:where [[:> :rank 80]]
+                      :order [[:rank :asc] [:id :asc]]}
+                     {:where [[:between :rank 80 90]]
+                      :order [[:rank :asc]]}
+                     {:where [[:> :rank 9223372036854775808N]]
+                      :order [[:rank :asc]]}
+                     {:where [[:or [:> :rank 80] [:< :rank 10]]]
+                      :order [[:rank :asc]]}]]
+        (is (not (instance? LTopN
+                            (optimize (merge {:from data :limit 3} query)))))))))
+
 (deftest topn-multi-key-matches-naive-sort
   (testing "Multi-key ASC/DESC produces identical ordering to a naive sort+limit"
     (let [data {:a (long-array [3 1 2 3 1 2])
@@ -206,6 +238,29 @@
                    :select [:id :x]
                    :order [[:x :desc]]
                    :limit 1}))))))
+
+(deftest topn-same-key-ranges-preserve-sql-semantics
+  (let [lo 9007199254740992
+        values [Long/MIN_VALUE (+ lo 3) lo (+ lo 2) (+ lo 1)]
+        data {:x (long-array values)}]
+    (testing "every comparison remains full-width and excludes NULL"
+      (is (= [(+ lo 1) (+ lo 2)]
+             (mapv :x (q/q {:from data :where [[:> :x lo] [:<= :x (+ lo 2)]]
+                            :order [[:x :asc]] :limit 10}))))
+      (is (= [lo]
+             (mapv :x (q/q {:from data :where [[:= :x lo]]
+                            :order [[:x :asc]] :limit 10}))))
+      (is (= [lo (+ lo 1)]
+             (mapv :x (q/q {:from data :where [[:< :x (+ lo 2)]]
+                            :order [[:x :asc]] :limit 10}))))
+      (is (= [(+ lo 3) (+ lo 2)]
+             (mapv :x (q/q {:from data :where [[:>= :x (+ lo 2)]]
+                            :order [[:x :desc]] :limit 10}))))))
+  (testing "float ranges use the same exact gate"
+    (let [data {:x (double-array [Double/NaN 4.0 1.0 3.0 2.0])}]
+      (is (= [2.0 3.0]
+             (mapv :x (q/q {:from data :where [[:> :x 1.0] [:< :x 4.0]]
+                            :order [[:x :asc]] :limit 10})))))))
 
 (deftest topn-mixed-keys-preserve-int64-order
   (testing "an int64 primary key is not collapsed before a double tiebreak"
@@ -261,6 +316,79 @@
                      :order [[:x :asc]]
                      :limit 1})]
       (is (= [lo] (mapv :x rows))))))
+
+(deftest topn-int64-chunk-stats-are-never-used-as-exact-bounds
+  (let [two-to-53 9007199254740992]
+    (testing "DESC scans a later value rounded down by double ChunkStats"
+      (let [winner (inc two-to-53)
+            idx (index/index-from-seq
+                 :int64 (conj (vec (repeat 8192 two-to-53)) winner))]
+        (is (= [winner]
+               (mapv :x (q/q {:from {:x idx}
+                              :order [[:x :desc]]
+                              :limit 1}))))))
+    (testing "ASC scans a later value rounded up by double ChunkStats"
+      (let [first-value (+ two-to-53 4)
+            winner (+ two-to-53 3)
+            idx (index/index-from-seq
+                 :int64 (conj (vec (repeat 8192 first-value)) winner))]
+        (is (= [winner]
+               (mapv :x (q/q {:from {:x idx}
+                              :order [[:x :asc]]
+                              :limit 1}))))))))
+
+(deftest topn-equal-primary-chunk-bound-cannot-prune-secondary-key
+  (testing "a later equal-primary chunk may have the winning tiebreaker"
+    (let [a-idx (index/index-from-seq :int64 (repeat 8193 1))
+          b-idx (index/index-from-seq
+                 :int64 (conj (vec (repeat 8192 100)) 0))]
+      (is (= [{:a 1 :b 0}]
+             (q/q {:from {:a a-idx :b b-idx}
+                   :order [[:a :asc] [:b :asc]]
+                   :limit 1}))))))
+
+(deftest topn-all-null-chunks-do-not-produce-numeric-bounds
+  (testing "an all-NULL int64 chunk neither throws nor hides a real value"
+    (let [idx (index/index-from-seq
+               :int64 (conj (vec (repeat 8192 Long/MIN_VALUE)) 7))]
+      (is (= [7]
+             (mapv :x (q/q {:from {:x idx}
+                            :order [[:x :asc]]
+                            :limit 1}))))
+      (is (= [nil]
+             (mapv :x (q/q {:from {:x idx}
+                            :order [[:x :desc]]
+                            :limit 1})))))))
+
+(deftest topn-desc-null-and-nan-are-not-hidden-by-chunk-stats
+  (testing "a later int64 NULL sorts first in DESC"
+    (let [idx (index/index-from-seq
+               :int64 (conj (vec (repeat 8192 1)) Long/MIN_VALUE))]
+      (is (= [nil]
+             (mapv :x (q/q {:from {:x idx}
+                            :order [[:x :desc]]
+                            :limit 1}))))))
+  (testing "a later float64 NaN/NULL sorts first in DESC"
+    (let [idx (index/index-from-seq
+               :float64 (conj (vec (repeat 8192 1.0)) Double/NaN))]
+      (is (= [nil]
+             (mapv :x (q/q {:from {:x idx}
+                            :order [[:x :desc]]
+                            :limit 1})))))))
+
+(deftest topn-range-prunes-chunks-with-full-int64-bounds
+  (testing "a >2^53 boundary is evaluated row-wise without rounding"
+    (let [lo 9007199254740992
+          hi 9007199254740993
+          winner 9007199254740994
+          values (conj (vec (repeat 8192 hi)) winner)
+          idx (index/index-from-seq :int64 values)
+          rows (q/q {:from {:x idx}
+                     :where [[:> :x hi]]
+                     :order [[:x :asc]]
+                     :limit 1})]
+      (is (= [winner] (mapv :x rows)))
+      (is (not-any? #{lo hi} (map :x rows))))))
 
 (deftest topn-sorted-input-desc-correctness
   (testing "Top-N DESC on a strictly-ascending column returns last N values"

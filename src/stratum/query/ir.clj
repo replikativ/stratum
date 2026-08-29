@@ -87,11 +87,9 @@
   ;;
   ;; `order-specs` is a vec of `[col dir]` pairs (or bare `col` for
   ;; ASC). The heap walks them in declared order; mixed
-  ;; `:asc`/`:desc` is supported. Cross-column comparison uses the
-  ;; same `key-double` cast as the single-key path (loses precision
-  ;; only for int64 values >2^53, which doesn't occur in typical
-  ;; timestamps or dict-IDs).
-           [order-specs limit select input])
+  ;; `:asc`/`:desc` is supported with typed primitive keys. `predicates`
+  ;; is empty or an exact conjunction of ranges on the sole order column.
+           [order-specs limit select predicates input])
 
 (defrecord LHead
   ;; LIMIT N without ORDER BY — return the first N rows in scan
