@@ -63,8 +63,8 @@
   "Returns true if `query` over `columns` is a clean top-N shape:
    1-or-more-column ORDER BY (each numeric, non-string), LIMIT ≤
    `*top-n-limit*`, no GROUP/AGG/HAVING/JOIN/WHERE/WINDOW/DISTINCT,
-   no OFFSET. Multi-key ORDER BY uses a packed `^doubles` sort key
-   per row in the heap; comparison walks keys in declared order
+   no OFFSET. Multi-key ORDER BY keeps separate primitive long and double
+   sort keys per row in the heap; comparison walks keys in declared order
    (matching DuckDB's `CreateSortKey` blob comparison)."
   [query columns]
   (let [{:keys [order limit group agg having join distinct where window
@@ -97,14 +97,26 @@
 ;; chunk-id is the full ChunkEntry chunk-id vector (e.g. [3] or [3 1]
 ;; after a split). Storing only the first element collapses split
 ;; chunks together and makes downstream point-slice lookups miss.
-;; `keys` is a `double[]` carrying one encoded key per ORDER BY
-;; column (length 1 for the common single-key case). Casting int64
-;; to double is fine for typical ranges (timestamps in millis up to
-;; year 287396, dict-IDs up to 2^53); precise multi-key comparison
-;; over very large longs would require a packed byte[] encoding —
-;; matches DuckDB's `CreateSortKey` blob — and isn't worth the
-;; complexity until we hit it.
-(deftype ^:private TopNEntry [^doubles keys chunk-id ^long local-idx])
+;; Long and double keys stay in separate primitive arrays. In particular, an
+;; int64 key must never pass through double: adjacent integers above 2^53 then
+;; compare equal and an exact top-N can retain the wrong row. The unused slot
+;; in the other array is deliberately cheaper than boxing every key.
+(deftype ^:private TopNEntry
+         [^longs long-keys ^doubles double-keys chunk-id ^long local-idx])
+
+(defn- compare-long-asc
+  "Compare int64 keys in ascending SQL order (NULL sentinel last)."
+  [^long a ^long b]
+  (cond
+    (= a Long/MIN_VALUE) (if (= b Long/MIN_VALUE) 0 1)
+    (= b Long/MIN_VALUE) -1
+    :else (Long/compare a b)))
+
+(defn- compare-double-asc
+  "Compare float64 keys in ascending SQL order. Double/compare places the
+   NaN NULL sentinel last, matching the existing top-N null convention."
+  [^double a ^double b]
+  (Double/compare a b))
 
 (defn- ^Comparator entry-cmp
   "Comparator for the heap. The PriorityQueue is a min-heap, so the
@@ -115,26 +127,27 @@
    the first non-zero per-key result. Mixed direction (`ORDER BY x
    ASC, y DESC`) is supported — `dirs[i] ∈ {+1, -1}` flips the per-
    key sense."
-  [^ints dirs]
+  [^ints dirs ^booleans long-key?]
   (let [n (alength dirs)]
     (reify Comparator
       (compare [_ a b]
-        (let [^doubles ka (.keys ^TopNEntry a)
-              ^doubles kb (.keys ^TopNEntry b)]
+        (let [^longs la (.-long-keys ^TopNEntry a)
+              ^longs lb (.-long-keys ^TopNEntry b)
+              ^doubles da (.-double-keys ^TopNEntry a)
+              ^doubles db (.-double-keys ^TopNEntry b)]
           (loop [i 0]
             (if (>= i n)
               0
-              (let [va (aget ka i)
-                    vb (aget kb i)
-                    d  (long (aget dirs i))
-                    c  (if (= d 1)
-                         ;; ASC: smaller a is better → +1 when va < vb
-                         (Double/compare vb va)
-                         ;; DESC: larger a is better → +1 when va > vb
-                         (Double/compare va vb))]
+              (let [asc-cmp (long
+                             (if (aget long-key? i)
+                               (compare-long-asc (aget la i) (aget lb i))
+                               (compare-double-asc (aget da i) (aget db i))))
+                    ;; The heap comparator is deliberately reversed: positive
+                    ;; means a is better, while PriorityQueue.peek is worst.
+                    c (if (= 1 (aget dirs i)) (- asc-cmp) asc-cmp)]
                 (if (zero? c)
                   (recur (unchecked-inc i))
-                  c)))))))))
+                  (int c))))))))))
 
 (defn- ^ints dirs->int-array
   "Convert a vec of `:asc`/`:desc` keywords into a primitive int[]
@@ -143,38 +156,21 @@
   [dirs]
   (int-array (map #(if (= % :desc) -1 1) dirs)))
 
-(defn- key-double
-  "Extract a double key from a chunk's value at index `i`. For string
-   columns the chunk stores dict-IDs (longs); we cast to double for
-   comparison ordering. That is only meaningful when the dictionary is
-   in lexicographic order, where the ID *is* the rank —
-   `order-col-eligible?` enforces exactly that via `column/dict-sorted?`, so
-   this case is now reachable rather than dead. Callers gate on `:type`
-   already; this is a guard.
+(defn- set-key-from-chunk!
+  [^longs long-keys ^doubles double-keys k chk i datatype]
+  (let [k (int k)
+        i (long i)]
+    (case datatype
+      :float64 (aset double-keys k (double (chunk/read-double chk i)))
+      (:int64 :string) (aset long-keys k (long (chunk/read-long chk i))))))
 
-   F-019: long NULL (Long.MIN_VALUE) maps to Double/NaN so the heap
-   comparator (`Double/compare`) sorts NULL keys after every real
-   value in ASC order — matches PG's default NULLS LAST. Without the
-   mapping, Long.MIN_VALUE casted to double is -9.22e18 and sorts as
-   the smallest, putting NULLs FIRST."
-  ^double [chk ^long i datatype]
-  (case datatype
-    :float64 (chunk/read-double chk i)
-    :int64   (let [lv (chunk/read-long chk i)]
-               (if (= lv Long/MIN_VALUE) Double/NaN (double lv)))
-    :string  (let [lv (chunk/read-long chk i)]
-               (if (= lv Long/MIN_VALUE) Double/NaN (double lv)))))
-
-(defn- key-double-from-array
-  "Same as `key-double` but pulls from a heap array (long[]/double[]).
-   F-019: long NULL sentinel maps to NaN — see `key-double`."
-  ^double [arr ^long i datatype]
-  (case datatype
-    :float64 (aget ^doubles arr i)
-    :int64   (let [lv (aget ^longs arr i)]
-               (if (= lv Long/MIN_VALUE) Double/NaN (double lv)))
-    :string  (let [lv (aget ^longs arr i)]
-               (if (= lv Long/MIN_VALUE) Double/NaN (double lv)))))
+(defn- set-key-from-array!
+  [^longs long-keys ^doubles double-keys k arr i datatype]
+  (let [k (int k)
+        i (int i)]
+    (case datatype
+      :float64 (aset double-keys k (aget ^doubles arr i))
+      (:int64 :string) (aset long-keys k (aget ^longs arr i)))))
 
 (defn- maybe-evict-and-offer!
   "Heap-fill or evict-and-replace logic shared between the index and
@@ -182,19 +178,23 @@
    we copy it (so the in-heap entry doesn't alias the next row).
    `n` and `local-idx` are passed boxed-long since Clojure's primitive
    fn rule caps `^long`/`^double` args at four."
-  [^PriorityQueue pq ^Comparator cmp n ^doubles scratch chunk-id local-idx]
-  (let [n-keys     (alength scratch)
+  [^PriorityQueue pq ^Comparator cmp n ^longs scratch-longs
+   ^doubles scratch-doubles chunk-id local-idx]
+  (let [n-keys     (alength scratch-longs)
         n-long     (long n)
         local-long (long local-idx)]
     (if (< (.size pq) n-long)
-      (let [keys (java.util.Arrays/copyOf scratch n-keys)]
-        (.offer pq (TopNEntry. keys chunk-id local-long)))
+      (.offer pq (TopNEntry. (java.util.Arrays/copyOf scratch-longs n-keys)
+                             (java.util.Arrays/copyOf scratch-doubles n-keys)
+                             chunk-id local-long))
       (let [^TopNEntry top (.peek pq)
-            tmp-entry (TopNEntry. scratch chunk-id local-long)]
+            tmp-entry (TopNEntry. scratch-longs scratch-doubles
+                                  chunk-id local-long)]
         (when (pos? (.compare cmp tmp-entry top))
           (.poll pq)
-          (let [keys (java.util.Arrays/copyOf scratch n-keys)]
-            (.offer pq (TopNEntry. keys chunk-id local-long))))))))
+          (.offer pq (TopNEntry. (java.util.Arrays/copyOf scratch-longs n-keys)
+                                 (java.util.Arrays/copyOf scratch-doubles n-keys)
+                                 chunk-id local-long)))))))
 
 (defn- find-top-n-on-arrays
   "Multi-column array path. Iterates row-by-row across `arrs`, fills a
@@ -202,9 +202,11 @@
    key callers pass a 1-element `arrs`/`datatypes` vec."
   [arrs ^long n dirs datatypes]
   (let [n-keys   (count arrs)
-        ^Comparator cmp (entry-cmp (dirs->int-array dirs))
+        long-key? (boolean-array (map #(not= :float64 %) datatypes))
+        ^Comparator cmp (entry-cmp (dirs->int-array dirs) long-key?)
         pq       (PriorityQueue. (max 1 (int n)) cmp)
-        scratch  (double-array n-keys)
+        scratch-longs (long-array n-keys)
+        scratch-doubles (double-array n-keys)
         ;; All arrays share the same length (rows of a single table).
         first-arr (nth arrs 0)
         first-dt  (nth datatypes 0)
@@ -217,9 +219,10 @@
         ;; Fill scratch with this row's keys.
         (loop [k 0]
           (when (< k n-keys)
-            (aset scratch k (key-double-from-array (nth arrs k) i (nth datatypes k)))
+            (set-key-from-array! scratch-longs scratch-doubles k
+                                 (nth arrs k) i (nth datatypes k))
             (recur (unchecked-inc k))))
-        (maybe-evict-and-offer! pq cmp n scratch nil i)
+        (maybe-evict-and-offer! pq cmp n scratch-longs scratch-doubles nil i)
         (recur (unchecked-inc i))))
     pq))
 
@@ -229,12 +232,18 @@
    iteration and (b) decide when remaining chunks can no longer
    contribute. The primary order column is always the first key
    in `:order`; tiebreaker keys aren't used for chunk pruning."
-  ^double [first-entries ^long chunk-i ^clojure.lang.Keyword first-dir]
-  (let [^ChunkEntry e (nth first-entries chunk-i)
+  [first-entries chunk-i ^clojure.lang.Keyword first-dir datatype]
+  (let [chunk-i (long chunk-i)
+        ^ChunkEntry e (nth first-entries chunk-i)
         ^ChunkStats s (.stats e)]
-    (if (= first-dir :desc)
-      (double (:max-val s))
-      (double (:min-val s)))))
+    (let [bound (if (= first-dir :desc) (:max-val s) (:min-val s))]
+      (if (= datatype :float64) (double bound) (long bound)))))
+
+(defn- compare-bound-asc
+  [a b datatype]
+  (if (= datatype :float64)
+    (compare-double-asc (double a) (double b))
+    (compare-long-asc (long a) (long b))))
 
 (defn- chunk-iteration-order
   "Permutation `[0..n-chunks)` sorted so the most promising chunks
@@ -244,16 +253,17 @@
    worst kept value (DuckDB calls this `RowGroupPruner`'s
    set_scan_order; we apply the same idea but to streaming top-N
    instead of a separate scan-reorder pass)."
-  [first-entries ^clojure.lang.Keyword first-dir]
+  [first-entries ^clojure.lang.Keyword first-dir datatype]
   (let [n (count first-entries)
-        positions (range n)]
-    (case first-dir
-      :desc (vec (sort-by (fn [^long i]
-                            (- (chunk-primary-bound first-entries i :desc)))
-                          positions))
-      (vec (sort-by (fn [^long i]
-                      (chunk-primary-bound first-entries i :asc))
-                    positions)))))
+        positions (range n)
+        cmp (fn [a b]
+              (let [c (long
+                       (compare-bound-asc
+                        (chunk-primary-bound first-entries (long a) first-dir datatype)
+                        (chunk-primary-bound first-entries (long b) first-dir datatype)
+                        datatype))]
+                (if (= first-dir :desc) (int (- c)) (int c))))]
+    (vec (sort cmp positions))))
 
 (defn- can-prune-rest?
   "When the heap is full, no future chunk whose primary bound is
@@ -262,13 +272,17 @@
    heap-worst-primary` (strict-positive comparator means equal
    values don't evict, so the `>=` is sound). For DESC: skip when
    `chunk-max <= heap-worst-primary`."
-  [^PriorityQueue pq ^long n ^clojure.lang.Keyword first-dir ^double bound]
-  (when (= n (.size pq))
-    (let [^TopNEntry top (.peek pq)
-          worst (aget ^doubles (.keys top) 0)]
-      (if (= first-dir :desc)
-        (<= bound worst)
-        (>= bound worst)))))
+  [^PriorityQueue pq n ^clojure.lang.Keyword first-dir bound datatype]
+  (let [n (long n)]
+    (when (= n (.size pq))
+      (let [^TopNEntry top (.peek pq)
+            worst (if (= datatype :float64)
+                    (aget ^doubles (.-double-keys top) 0)
+                    (aget ^longs (.-long-keys top) 0))
+            c (long (compare-bound-asc bound worst datatype))]
+        (if (= first-dir :desc)
+          (<= c 0)
+          (>= c 0))))))
 
 (defn- find-top-n-on-indices
   "Multi-column index path. Walks chunks in primary-order (ASC: min
@@ -283,21 +297,26 @@
    stratum's column store (chunks are dataset-level)."
   [indices ^long n dirs datatypes]
   (let [n-keys (count indices)
-        ^Comparator cmp (entry-cmp (dirs->int-array dirs))
+        long-key? (boolean-array (map #(not= :float64 %) datatypes))
+        ^Comparator cmp (entry-cmp (dirs->int-array dirs) long-key?)
         pq (PriorityQueue. (max 1 (int n)) cmp)
-        scratch (double-array n-keys)
+        scratch-longs (long-array n-keys)
+        scratch-doubles (double-array n-keys)
         per-col-entries (mapv (fn [idx] (vec (pss/slice (index/idx-tree idx) nil nil)))
                               indices)
         n-chunks (long (count (first per-col-entries)))
         first-entries (first per-col-entries)
         first-dir (first dirs)
+        first-datatype (first datatypes)
         ;; Visit chunks ordered by primary-key stats — promising chunks first.
-        sorted-positions (chunk-iteration-order first-entries first-dir)]
+        sorted-positions (chunk-iteration-order first-entries first-dir
+                                                first-datatype)]
     (loop [pos-idx 0]
       (when (< pos-idx n-chunks)
         (let [chunk-i (long (nth sorted-positions pos-idx))
-              bound  (chunk-primary-bound first-entries chunk-i first-dir)]
-          (if (can-prune-rest? pq n first-dir bound)
+              bound (chunk-primary-bound first-entries chunk-i first-dir
+                                         first-datatype)]
+          (if (can-prune-rest? pq n first-dir bound first-datatype)
             ;; All remaining chunks (in primary order) are at least as
             ;; bad as `bound`; nothing they contain can dethrone the
             ;; heap. Stop iterating.
@@ -314,9 +333,11 @@
                 (when (< i chunk-len)
                   (loop [k 0]
                     (when (< k n-keys)
-                      (aset scratch k (key-double (aget chunks k) i (nth datatypes k)))
+                      (set-key-from-chunk! scratch-longs scratch-doubles k
+                                           (aget chunks k) i (nth datatypes k))
                       (recur (unchecked-inc k))))
-                  (maybe-evict-and-offer! pq cmp n scratch chunk-id i)
+                  (maybe-evict-and-offer! pq cmp n scratch-longs
+                                          scratch-doubles chunk-id i)
                   (recur (unchecked-inc i))))
               (recur (unchecked-inc pos-idx)))))))
     pq))

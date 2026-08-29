@@ -190,6 +190,41 @@
           rows (q/q {:from data :order [[:x :asc]] :limit 3})]
       (is (= [1 2 3] (mapv :x rows))))))
 
+(deftest topn-preserves-full-int64-order
+  (testing "adjacent integers above double's exact range remain distinct"
+    (let [lo 9007199254740992
+          hi 9007199254740993
+          data {:id (long-array [1 2])
+                :x (long-array [hi lo])}]
+      (is (= [{:id 2 :x lo}]
+             (q/q {:from data
+                   :select [:id :x]
+                   :order [[:x :asc]]
+                   :limit 1})))
+      (is (= [{:id 1 :x hi}]
+             (q/q {:from data
+                   :select [:id :x]
+                   :order [[:x :desc]]
+                   :limit 1}))))))
+
+(deftest topn-mixed-keys-preserve-int64-order
+  (testing "an int64 primary key is not collapsed before a double tiebreak"
+    (let [lo 9007199254740992
+          hi 9007199254740993
+          rows (q/q {:from {:a (long-array [hi lo])
+                            :b (double-array [0.0 100.0])}
+                     :order [[:a :asc] [:b :asc]]
+                     :limit 1})]
+      (is (= [{:a lo :b 100.0}] rows))))
+  (testing "an int64 tiebreak keeps full precision after a double key"
+    (let [lo 9007199254740992
+          hi 9007199254740993
+          rows (q/q {:from {:a (double-array [1.0 1.0])
+                            :b (long-array [hi lo])}
+                     :order [[:a :asc] [:b :asc]]
+                     :limit 1})]
+      (is (= [{:a 1.0 :b lo}] rows)))))
+
 (deftest topn-index-backed-multi-key
   (testing "Multi-key TopN over index-backed columns produces correct order"
     (let [n 5000
@@ -212,6 +247,20 @@
           ts-idx (index/index-from-seq :int64 (range n))
           rows (q/q {:from {:ts ts-idx} :order [[:ts :asc]] :limit 10})]
       (is (= (vec (range 10)) (mapv :ts rows))))))
+
+(deftest topn-chunk-pruning-preserves-full-int64-bounds
+  (testing "a later chunk whose minimum differs only below double precision is not pruned"
+    (let [lo 9007199254740992
+          hi 9007199254740993
+          ;; The default chunk size is 8192. Put only the true minimum in the
+          ;; second chunk: double-valued chunk bounds compare equal and used to
+          ;; prune it after filling the heap from the first chunk.
+          values (conj (vec (repeat 8192 hi)) lo)
+          idx (index/index-from-seq :int64 values)
+          rows (q/q {:from {:x idx}
+                     :order [[:x :asc]]
+                     :limit 1})]
+      (is (= [lo] (mapv :x rows))))))
 
 (deftest topn-sorted-input-desc-correctness
   (testing "Top-N DESC on a strictly-ascending column returns last N values"
