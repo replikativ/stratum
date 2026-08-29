@@ -376,6 +376,24 @@
                             :order [[:x :desc]]
                             :limit 1})))))))
 
+(deftest fallback-desc-null-order-matches-streaming-topn
+  (testing "OFFSET disables streaming top-N without changing PostgreSQL NULL order"
+    (let [data {:eid (long-array [1 2 3])
+                :x (long-array [10 20 Long/MIN_VALUE])}]
+      (is (= [[3 nil] [2 20]]
+             (mapv (juxt :eid :x)
+                   (q/q {:from data
+                         :select [:eid :x]
+                         :order [[:x :desc]]
+                         :limit 2}))))
+      (is (= [[2 20] [1 10]]
+             (mapv (juxt :eid :x)
+                   (q/q {:from data
+                         :select [:eid :x]
+                         :order [[:x :desc]]
+                         :limit 2
+                         :offset 1})))))))
+
 (deftest topn-range-prunes-chunks-with-full-int64-bounds
   (testing "a >2^53 boundary is evaluated row-wise without rounding"
     (let [lo 9007199254740992
