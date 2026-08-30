@@ -59,6 +59,22 @@
           plan (optimize {:from data :limit 3 :offset 5})]
       (is (not (instance? LHead plan))))))
 
+(deftest top-n-rewrite-supports-bounded-offset
+  (testing "ORDER BY retains LIMIT + OFFSET rows in LTopN"
+    (let [data {:a (long-array (range 100))}
+          optimized (optimize {:from data
+                               :order [[:a :asc]]
+                               :limit 3
+                               :offset 5})]
+      (is (instance? LTopN optimized))
+      (is (= 3 (:limit optimized)))
+      (is (= 5 (:offset optimized)))
+      (is (= [5 6 7]
+             (mapv :a (q/q {:from data
+                            :order [[:a :asc]]
+                            :limit 3
+                            :offset 5})))))))
+
 (deftest head-rewrite-skips-above-threshold
   (testing "LIMIT > *head-limit* falls through to PLimit"
     (let [data {:a (long-array (range 100))}

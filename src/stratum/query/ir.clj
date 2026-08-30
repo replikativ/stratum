@@ -81,7 +81,9 @@
   ;; one or more numeric columns. The optimizer recognizes the
   ;; LLimit-over-LSort shape and rewrites to this; the executor
   ;; delegates to `stratum.query.top-n/execute-top-n`, which keeps a
-  ;; fixed-size heap and fetches only the surviving rows. `select`
+  ;; fixed-size heap and fetches only the surviving rows. `offset` is applied
+  ;; inside the bounded heap path when `limit + offset` is below its threshold.
+  ;; `select`
   ;; is the (already normalized) projection (or nil for SELECT *)
   ;; so the rewrite can happen below the LProject layer.
   ;;
@@ -89,7 +91,7 @@
   ;; ASC). The heap walks them in declared order; mixed
   ;; `:asc`/`:desc` is supported with typed primitive keys. `predicates`
   ;; is empty or an exact conjunction of ranges on the sole order column.
-           [order-specs limit select predicates input])
+           [order-specs limit offset select predicates input])
 
 (defrecord LHead
   ;; LIMIT N without ORDER BY — return the first N rows in scan
@@ -328,7 +330,7 @@
   ;; Physical counterpart of LTopN. The executor delegates to
   ;; `stratum.query.top-n/execute-top-n` after recovering the column
   ;; context from the input scan.
-           [order-spec limit select input])
+           [order-spec limit offset select input])
 
 ;; --- Expression materialization (inserted by passes) ------------------------
 

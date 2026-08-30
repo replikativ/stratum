@@ -31,6 +31,20 @@
    matches DuckDB's heap-vs-sort cutoff."
   1024)
 
+(defn retained-count
+  "Return the heap size needed for LIMIT/OFFSET, or nil for an invalid or
+   overflowing pair. OFFSET is implemented by retaining `limit + offset`
+   rows in the bounded heap and discarding the prefix after ordering."
+  [limit offset]
+  (when (some? limit)
+    (try
+      (let [limit (long limit)
+            offset (long (or offset 0))
+            retained (Math/addExact limit offset)]
+        (when (and (not (neg? limit)) (not (neg? offset)))
+          retained))
+      (catch ArithmeticException _ nil))))
+
 ;; ============================================================================
 ;; Eligibility
 ;; ============================================================================
@@ -97,20 +111,21 @@
 (defn top-n-eligible?
   "Returns true if `query` over `columns` is a clean top-N shape:
    1-or-more-column ORDER BY (each numeric, non-string), LIMIT ≤
-   `*top-n-limit*`, no GROUP/AGG/HAVING/JOIN/WINDOW/DISTINCT, and no OFFSET.
+   `*top-n-limit*` retained rows, no GROUP/AGG/HAVING/JOIN/WINDOW/DISTINCT.
+   A non-negative OFFSET is eligible when `LIMIT + OFFSET` remains within the
+   same bound.
    WHERE may be a conjunction of scalar ranges on the sole ORDER BY column.
    Multi-key ORDER BY keeps separate primitive long and double
    sort keys per row in the heap; comparison walks keys in declared order
    (matching DuckDB's `CreateSortKey` blob comparison)."
   [query columns]
   (let [{:keys [order limit group agg having join distinct where window
-                offset]} query]
+                offset]} query
+        retained (retained-count limit offset)]
     (and order
          (>= (count order) 1)
-         limit
-         (<= 0 (long limit))
-         (<= (long limit) (long *top-n-limit*))
-         (or (nil? offset) (zero? (long offset)))
+         (some? retained)
+         (<= retained (long *top-n-limit*))
          (empty? group)
          (empty? agg)
          (empty? having)
@@ -559,8 +574,11 @@
    shorthand for ASC); the heap walks all keys in declared order
    for tie-breaking, mixed `:asc`/`:desc` is supported."
   [query columns]
-  (let [{:keys [order limit select where]} query
-        n          (long limit)
+  (let [{:keys [order limit offset select where]} query
+        offset     (long (or offset 0))
+        n          (or (retained-count limit offset)
+                       (throw (ex-info "Invalid LIMIT/OFFSET in streaming top-N"
+                                       {:limit limit :offset offset})))
         ;; Decompose every `:order` spec into [col dir] pairs.
         decomposed (mapv order-spec-col-and-dir order)
         order-cols (mapv first decomposed)
@@ -593,7 +611,10 @@
                          (mapv :index order-infos) n dirs datatypes range-preds)
              :else (throw (ex-info "top-N: order columns must all be array- or all index-backed"
                                    {:order-cols order-cols})))
-        sorted (drain-heap-sorted pq)
+        retained (drain-heap-sorted pq)
+        sorted (if (zero? offset)
+                 retained
+                 (subvec retained (min (count retained) (int offset))))
         ;; Surviving rows live in only a small set of chunk-ids;
         ;; fetch a per-output-column map of {chunk-id → chunk} for
         ;; only those ids. On konserve-backed indices with thousands

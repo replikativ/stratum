@@ -4228,6 +4228,14 @@
       (is (not (stratum.query.top-n/top-n-eligible?
                 {:order [[:price :desc]] :limit 1000}
                 {:price {:type :float64 :data (double-array [1.0])}}))))))
+(testing "bounded OFFSET retains LIMIT + OFFSET rows"
+  (let [columns {:price {:type :float64
+                         :data (double-array [1.0 2.0 3.0])}}]
+    (is (stratum.query.top-n/top-n-eligible?
+         {:order [[:price :desc]] :limit 2 :offset 1} columns))
+    (binding [stratum.query.top-n/*top-n-limit* 2]
+      (is (not (stratum.query.top-n/top-n-eligible?
+                {:order [[:price :desc]] :limit 2 :offset 1} columns))))))
 
 (deftest top-n-pushdown-correctness-test
   (testing "DESC LIMIT 1 on array column"
@@ -4240,6 +4248,13 @@
                        :limit 1})]
       (is (= 1 (count result)))
       (is (== (* 1.5 (dec n)) (:val (first result))))))
+
+  (testing "ORDER BY + LIMIT + OFFSET returns the requested ordered window"
+    (let [rows (q/q {:from {:id (long-array [5 1 4 2 3])}
+                     :order [[:id :asc]]
+                     :limit 2
+                     :offset 2})]
+      (is (= [3 4] (mapv :id rows)))))
 
   (testing "ASC LIMIT 5 returns the 5 smallest values in order"
     (let [n 200

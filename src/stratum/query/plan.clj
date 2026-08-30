@@ -2044,13 +2044,11 @@
         range-ok? (and scan-cols
                        (some? (top-n/range-predicates
                                (:order-specs sort-node) predicates scan-cols)))
-        no-offset?  (and limit-node?
-                         (or (nil? (:offset plan)) (zero? (long (:offset plan)))))
-        small?      (and limit-node?
-                         (some? (:limit plan))
-                         (<= 0 (long (:limit plan)))
-                         (<= (long (:limit plan)) (long *top-n-limit*)))]
-    (if (and limit-node? sort? scan order-ok? range-ok? no-offset? small?)
+        retained    (when limit-node?
+                      (top-n/retained-count (:limit plan) (:offset plan)))
+        small?      (and (some? retained)
+                         (<= retained (long *top-n-limit*)))]
+    (if (and limit-node? sort? scan order-ok? range-ok? small?)
       ;; Capture any LProject between LSort and the scan: top-N's
       ;; row-fetch can apply the projection itself, dropping the
       ;; LProject so the LScan keeps every column the projection
@@ -2058,6 +2056,7 @@
       (with-meta
         (ir/->LTopN (vec (:order-specs sort-node))
                     (long (:limit plan))
+                    (long (or (:offset plan) 0))
                     items
                     (vec predicates)
                     scan)
