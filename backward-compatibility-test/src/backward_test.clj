@@ -1,4 +1,5 @@
 (ns backward-test
+  "Cross-release persistence fixture; loaded only by the compatibility script."
   (:require [konserve.filestore]
             [konserve.store :as kstore]
             [stratum.dataset :as dataset]

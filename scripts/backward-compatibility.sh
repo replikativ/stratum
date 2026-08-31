@@ -23,7 +23,7 @@ clojure -T:build compile-java
   clojure -T:build compile-java
 )
 
-fixture_path="${repo_root}/test/backward_compatibility_test/src"
+fixture_path="${repo_root}/backward-compatibility-test/src"
 old_deps="{:deps {org.replikativ/stratum {:local/root \"${release_root}\"}} :paths [\"${fixture_path}\"]}"
 current_deps="{:deps {org.replikativ/stratum {:local/root \"${repo_root}\"}} :paths [\"${fixture_path}\"]}"
 
