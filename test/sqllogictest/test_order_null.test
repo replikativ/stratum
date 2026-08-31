@@ -22,14 +22,14 @@ SELECT a, b FROM t1 ORDER BY a ASC
 NULL	x
 
 # ============================================================
-# ORDER BY DESC — NULLs last (Stratum uses NULLs-last for both ASC/DESC)
+# ORDER BY DESC — NULLs first (PostgreSQL default)
 # ============================================================
 
 query IT nosort
 SELECT a, b FROM t1 ORDER BY a DESC
 ----
+NULL	x
 5	NULL
 3	c
 2	b
 1	a
-NULL	x

@@ -1179,7 +1179,9 @@
     (top-n/execute-top-n
      {:order  (vec order-specs)
       :limit  (:limit node)
-      :select select}
+      :offset (:offset node)
+      :select select
+      :where  (:predicates node)}
      columns)))
 
 (defn- execute-head-node

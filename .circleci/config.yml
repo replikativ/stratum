@@ -70,6 +70,16 @@ jobs:
           name: Run tests
           command: clojure -M:release:test
 
+  backward-compatibility:
+    executor: clojure-java22
+    steps:
+      - attach_workspace:
+          at: ~/
+      - install-clojure
+      - run:
+          name: Open the latest release with current code
+          command: bash scripts/backward-compatibility.sh
+
   build-uber:
     executor: clojure-java22
     steps:
@@ -139,6 +149,9 @@ workflows:
       - test:
           requires:
             - build
+      - backward-compatibility:
+          requires:
+            - setup
       - build-uber:
           requires:
             - build
@@ -150,6 +163,7 @@ workflows:
               only: main
           requires:
             - test
+            - backward-compatibility
       - release:
           context:
             - github-token

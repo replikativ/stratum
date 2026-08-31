@@ -22,6 +22,7 @@
             [stratum.query.predicate :as pred]
             [stratum.query.expression :as expr]
             [stratum.query.estimate :as est]
+            [stratum.query.top-n :as top-n]
             [stratum.query.group-by :as gb]
             [stratum.query.execution :as x-cols]
             [stratum.dataset :as dataset])
@@ -1964,30 +1965,24 @@
   1024)
 
 (defn- peel-project
-  "If the node is `(LProject items LScan)`, return `[items LScan]`,
-   otherwise `[nil node]`. Lets top-N capture an explicit SELECT
-   projection while keeping the underlying scan for column lookup."
+  "Peel one projection and return `[items input]`."
   [node]
-  (cond
-    (and (instance? stratum.query.ir.LProject node)
-         (instance? stratum.query.ir.LScan (:input node)))
+  (if (instance? stratum.query.ir.LProject node)
     [(:items node) (:input node)]
+    [nil node]))
 
-    (instance? stratum.query.ir.LScan node)
-    [nil node]
+(defn- peel-top-n-input
+  "Return the narrow `[projection predicates scan]` top-N shape.
 
-    :else
-    [nil nil]))
-
-(defn- top-n-eligible-input?
-  "An input below LSort qualifies if it's a plain scan or a project
-   directly over a scan. The legacy `query.top-n/top-n-eligible?`
-   gate requires `(empty? where)`, so anything with predicates
-   (LFilter), joins, or aggregates leaves the materialize-and-sort
-   path running."
+   A filter is accepted here only structurally; `top-n/range-predicates`
+   below proves that it is an exact same-key range conjunction."
   [node]
-  (let [[_ scan] (peel-project node)]
-    (some? scan)))
+  (let [[items input] (peel-project node)
+        [predicates input] (if (instance? stratum.query.ir.LFilter input)
+                             [(:predicates input) (:input input)]
+                             [[] input])]
+    (when (instance? stratum.query.ir.LScan input)
+      [items predicates input])))
 
 (defn- top-n-order-eligible?
   "Every ORDER BY column must be primitive numeric (`:int64` or
@@ -2041,29 +2036,31 @@
         sort-node   (when limit-node? (:input plan))
         sort?       (and sort-node (instance? stratum.query.ir.LSort sort-node))
         sort-input  (when sort? (:input sort-node))
-        eligible-input? (and sort? (top-n-eligible-input? sort-input))
-        scan-cols   (when eligible-input? (find-scan-cols sort-input))
+        [items predicates scan] (when sort? (peel-top-n-input sort-input))
+        scan-cols   (:columns scan)
         order-ok?   (and scan-cols
                          (top-n-order-eligible? (:order-specs sort-node)
                                                 scan-cols))
-        no-offset?  (and limit-node?
-                         (or (nil? (:offset plan)) (zero? (long (:offset plan)))))
-        small?      (and limit-node?
-                         (some? (:limit plan))
-                         (<= 0 (long (:limit plan)))
-                         (<= (long (:limit plan)) (long *top-n-limit*)))]
-    (if (and limit-node? sort? eligible-input? order-ok? no-offset? small?)
+        range-ok? (and scan-cols
+                       (some? (top-n/range-predicates
+                               (:order-specs sort-node) predicates scan-cols)))
+        retained    (when limit-node?
+                      (top-n/retained-count (:limit plan) (:offset plan)))
+        small?      (and (some? retained)
+                         (<= retained (long *top-n-limit*)))]
+    (if (and limit-node? sort? scan order-ok? range-ok? small?)
       ;; Capture any LProject between LSort and the scan: top-N's
       ;; row-fetch can apply the projection itself, dropping the
       ;; LProject so the LScan keeps every column the projection
       ;; references.
-      (let [[items scan] (peel-project sort-input)]
-        (with-meta
-          (ir/->LTopN (vec (:order-specs sort-node))
-                      (long (:limit plan))
-                      items
-                      scan)
-          (meta plan)))
+      (with-meta
+        (ir/->LTopN (vec (:order-specs sort-node))
+                    (long (:limit plan))
+                    (long (or (:offset plan) 0))
+                    items
+                    (vec predicates)
+                    scan)
+        (meta plan))
       plan)))
 
 (defn head-rewrite

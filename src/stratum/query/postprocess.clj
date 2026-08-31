@@ -388,11 +388,16 @@
                   (fn [a b]
                     (let [va (get-val a)
                           vb (get-val b)
-                          ;; SQL NULL ordering: NULLs last for ASC, first for DESC
+                          ;; Build one ASC comparison and reverse it exactly once
+                          ;; below for DESC. PostgreSQL's default is NULLS LAST
+                          ;; for ASC and NULLS FIRST for DESC; making the nil
+                          ;; branches direction-aware here and then reversing the
+                          ;; result made the fallback sorter put NULL last in both
+                          ;; directions.
                           cmp (cond
                                 (and (nil? va) (nil? vb)) 0
-                                (nil? va) (if (= dir :desc) -1 1)   ;; NULL sorts last (ASC) or first (DESC)
-                                (nil? vb) (if (= dir :desc) 1 -1)
+                                (nil? va) 1
+                                (nil? vb) -1
                                 :else (compare va vb))]
                       (if (= dir :desc) (- cmp) cmp)))))
               order-specs)]
