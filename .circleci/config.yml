@@ -163,6 +163,7 @@ workflows:
               only: main
           requires:
             - test
+            - backward-compatibility
       - release:
           context:
             - github-token
